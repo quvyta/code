@@ -26,7 +26,7 @@ use qframe::storage::atomic_write;
 
 use crate::profile::Profile;
 
-use super::{Loaded, ProjectFile, ProjectId, ProjectIdError};
+use super::{Loaded, ProjectFile, ProjectId, ProjectIdError, ProjectProfile};
 
 /// The name of a project's own file.
 const PROJECT_FILE: &str = "project.qcode";
@@ -178,13 +178,7 @@ impl Workspace {
     ///
     /// A diagnostic naming the directory or file that could not be written.
     pub fn write_project(&self, file: &ProjectFile) -> Result<(), Diagnostic> {
-        let paths = self.project_paths(&file.id);
-        let mut dirs = vec![paths.project.clone(), paths.assets.clone(), paths.harness.clone()];
-        dirs.extend(file.profiles.iter().map(|profile| paths.harness_profile(&profile.name)));
-        for dir in dirs {
-            fs::create_dir_all(&dir).map_err(|error| blocked(&dir, &error))?;
-        }
-        atomic_write(&paths.file, file.to_toml().as_bytes()).map_err(|error| blocked(&paths.file, &error))
+        write_project_at(&self.project_paths(&file.id), file)
     }
 
     /// Reads one project's `project.qcode`.
@@ -312,6 +306,43 @@ impl Workspace {
     }
 }
 
+/// Writes `file` as the `project.qcode` at `paths` atomically, and makes sure the project's
+/// folders — including one per profile it names — are there.
+fn write_project_at(paths: &ProjectPaths, file: &ProjectFile) -> Result<(), Diagnostic> {
+    let mut dirs = vec![paths.project.clone(), paths.assets.clone(), paths.harness.clone()];
+    dirs.extend(file.profiles.iter().map(|profile| paths.harness_profile(&profile.name)));
+    for dir in dirs {
+        fs::create_dir_all(&dir).map_err(|error| blocked(&dir, &error))?;
+    }
+    atomic_write(&paths.file, file.to_toml().as_bytes()).map_err(|error| blocked(&paths.file, &error))
+}
+
+/// Records in the project at `paths` that it carries the profile `name`, added on `added`, and
+/// answers with the file as it now stands.
+///
+/// The file is read again first rather than written from what a screen remembers, so whatever
+/// was changed in it since the screen read it — by hand, or by another window — is kept. A
+/// profile the file already names is left as it is, with its own date.
+///
+/// Runs file work, so it belongs on a background thread.
+///
+/// # Errors
+///
+/// A diagnostic when the file cannot be read, names no usable project, or cannot be written.
+pub fn add_profile(paths: &ProjectPaths, name: &str, added: Date) -> Result<ProjectFile, Diagnostic> {
+    let text = fs::read_to_string(&paths.file).map_err(|error| blocked(&paths.file, &error))?;
+    let read = ProjectFile::parse(PROJECT_FILE, &text);
+    let Some(mut file) = read.value else {
+        let reason = read.diagnostics.first().map_or_else(|| "no usable project".to_owned(), ToString::to_string);
+        return Err(Diagnostic::error(None, format!("{}: {reason}", paths.file.display())));
+    };
+    if !file.profiles.iter().any(|carried| carried.name == name) {
+        file.profiles.push(ProjectProfile { name: name.to_owned(), added: Some(added) });
+        write_project_at(paths, &file)?;
+    }
+    Ok(file)
+}
+
 /// The diagnostic for a path the file system would not let this program use.
 fn blocked(path: &Path, error: &io::Error) -> Diagnostic {
     Diagnostic::error(None, format!("{}: {error}", path.display()))
@@ -321,7 +352,6 @@ fn blocked(path: &Path, error: &io::Error) -> Diagnostic {
 mod tests {
     use super::*;
     use crate::profile::{AccountKind, HarnessKind, MountAccess, NetworkMode, SafeName, Template};
-    use crate::workspace::ProjectProfile;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// A directory of this test's own, removed first so a crashed run cannot poison the next.
@@ -513,6 +543,38 @@ mod tests {
         assert_eq!(entries(&workspace.project_paths(&file.id).harness), ["claude-sub"]);
         assert_eq!(workspace.read_project(&file.id).value, Some(file));
         fs::remove_dir_all(&root).expect("cleaned up");
+    }
+
+    #[test]
+    fn adding_a_profile_records_it_once_and_keeps_what_the_file_already_says() {
+        let root = scratch("add-profile");
+        let workspace = Workspace::new(&root);
+        let mut file = workspace.create_project("Proje", today()).expect("a free name");
+        file.profiles.push(ProjectProfile { name: "opencode".to_owned(), added: Some(today()) });
+        workspace.write_project(&file).expect("writable");
+        let paths = workspace.project_paths(&file.id);
+        let later = Date::new(2026, 9, 18).expect("a real date");
+
+        let added = add_profile(&paths, "claude-sub", later).expect("writable");
+        let names: Vec<&str> = added.profiles.iter().map(|profile| profile.name.as_str()).collect();
+        assert_eq!(names, ["opencode", "claude-sub"], "the profile the file named by hand is kept");
+        assert_eq!(workspace.read_project(&file.id).value, Some(added.clone()), "and it is on disk");
+        assert_eq!(entries(&paths.harness), ["claude-sub", "opencode"], "with a folder of its own");
+
+        // Adding it again changes nothing, not even the day it was first added.
+        let again = add_profile(&paths, "claude-sub", Date::new(2026, 9, 19).expect("a real date")).expect("fine");
+        assert_eq!(again, added);
+        fs::remove_dir_all(&root).expect("cleaned up");
+    }
+
+    #[test]
+    fn adding_a_profile_to_a_project_that_is_not_there_is_a_diagnostic() {
+        let root = scratch("add-missing");
+        let workspace = Workspace::new(&root);
+        let paths = workspace.project_paths(&ProjectId::parse("yok").expect("an id"));
+        let error = add_profile(&paths, "claude-sub", today()).expect_err("nothing to add to");
+        assert!(error.message.contains("project.qcode"), "{}", error.message);
+        assert!(!paths.file.exists(), "no file is made up for a project that is not there");
     }
 
     #[cfg(unix)]

@@ -32,13 +32,9 @@ use crate::workspace::{Config, HostDirs, SetupStep};
 use gates::{EngineCheck, EngineProblem, Gates, LocationCheck, LocationProblem};
 use install::{InstallHost, Remedy};
 
-/// The marks of every choice in the wizard.
-///
-/// A dot and a ring differ in shape, not only in tone, and they keep that difference in ASCII,
-/// where the framework's quieter default mark leaves the chosen option told apart by colour
-/// alone. This is the first screen anyone sees, sometimes over a bare terminal, so the meaning
-/// never rests on colour here.
-const MARK: RadioStyle = RadioStyle::Dot;
+/// The marks of every choice in the wizard: the small square, as on every other screen of
+/// QCode. It is set here by name because the framework's constructor starts from another style.
+const MARK: RadioStyle = RadioStyle::Square;
 
 /// The languages QCode speaks, in the order they are offered.
 const LANGUAGES: [&str; 2] = ["en", "tr"];
@@ -654,16 +650,11 @@ fn location_state(setup: &Setup, ui: &mut View<'_, Msg>) {
     }
 }
 
-/// Draws the key hints of the setup wizard.
-pub fn hints(ui: &mut View<'_, Msg>) {
-    let icons = ui.env().icons();
+/// The keys of the setup wizard that are not in the keymap, for the key list.
+#[must_use]
+pub fn hints(icons: &qframe::icons::Icons) -> Vec<(String, String)> {
     let move_keys = format!("{}{}", icons.glyph("arrow-up"), icons.glyph("arrow-down"));
-    ui.add(
-        KeyHints::new()
-            .hint(move_keys, t!("setup.hint-move"))
-            .hint(icons.glyph("enter").into_owned(), t!("setup.hint-choose")),
-    )
-    .fill_width();
+    vec![(move_keys, t!("setup.hint-move")), (icons.glyph("enter").into_owned(), t!("setup.hint-choose"))]
 }
 
 #[cfg(test)]
@@ -679,7 +670,7 @@ mod tests {
 
     use super::gates::{EngineCheck, EngineProblem, Gates, LocationCheck, LocationProblem};
     use super::install::InstallHost;
-    use super::{Msg, Setup, hints, update, view};
+    use super::{Msg, Setup, update, view};
     use crate::workspace::{Config, HostDirs, Platform, SetupStep};
 
     /// A terminal with room for the steps, a page and the buttons.
@@ -702,7 +693,7 @@ mod tests {
         }
 
         fn view(&self, ui: &mut View<'_, Msg>) {
-            AppShell::new().body(|ui| view(&self.setup, ui)).footer(hints).show(ui);
+            AppShell::new().body(|ui| view(&self.setup, ui)).show(ui);
         }
     }
 
@@ -1025,16 +1016,25 @@ mod tests {
     }
 
     #[test]
-    fn the_chosen_option_is_marked_and_not_merely_coloured() {
-        // In ASCII the mark is all there is: a terminal without colour, or an eye that does not
-        // tell these tones apart, must still see which engine is chosen.
+    fn every_choice_carries_the_small_square_and_the_chosen_one_its_tone() {
         let mut harness = on_engine("language = \"en\"\n", EngineProblem::NotInstalled);
-        harness.set_glyph_mode(GlyphMode::Ascii).render();
+        harness.set_reduced_motion(true).render();
+        let square = harness.env().icons().glyph("radio-mark-small").into_owned();
         let screen = harness.screen();
-        let chosen = screen.lines().find(|line| line.contains("Podman")).expect("podman is offered");
-        let other = screen.lines().find(|line| line.contains("Docker")).expect("docker is offered");
-        assert!(chosen.contains('*'), "the chosen option carries a filled mark:\n{screen}");
-        assert!(other.contains('o') && !other.contains('*'), "the other carries an empty one:\n{screen}");
+        // The row of an option is the one where its label follows the square; the mark is two
+        // cells and stands two cells before the label.
+        let mark = |label: &str| {
+            let (y, line) = screen
+                .lines()
+                .enumerate()
+                .find(|(_, line)| line.contains(&format!("{square}  {label}")))
+                .unwrap_or_else(|| panic!("`{label}` is offered with the small square:\n{screen}"));
+            let x = line[..line.find(label).expect("the label is on the row")].chars().count();
+            let (x, y) = (u16::try_from(x).expect("on screen"), u16::try_from(y).expect("on screen"));
+            harness.fg(x - 4, y)
+        };
+        let (chosen, other) = (mark("Podman"), mark("Docker"));
+        assert_ne!(chosen, other, "the chosen square is told apart by its tone:\n{screen}");
     }
 
     #[test]

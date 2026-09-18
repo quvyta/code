@@ -1,6 +1,5 @@
 //! The home screen: the logo over the menu that opens everything else.
 
-use qframe::keymap::Scope;
 use qframe::prelude::*;
 
 use crate::Msg as AppMsg;
@@ -133,18 +132,11 @@ pub fn view(home: &Home, ui: &mut View<'_, AppMsg>) {
     .justify(Align::Center);
 }
 
-/// Draws the key hints of the home screen.
-pub fn hints(ui: &mut View<'_, AppMsg>) {
-    let icons = ui.env().icons();
+/// The keys of the home screen that are not in the keymap, for the key list.
+#[must_use]
+pub fn hints(icons: &qframe::icons::Icons) -> Vec<(String, String)> {
     let move_keys = format!("{}{}", icons.glyph("arrow-up"), icons.glyph("arrow-down"));
-    let open_key = icons.glyph("enter").into_owned();
-    ui.add(
-        KeyHints::new()
-            .hint(move_keys, t!("hints.move"))
-            .hint(open_key, t!("hints.open"))
-            .action_right(Scope::Global, "quit"),
-    )
-    .fill_width();
+    vec![(move_keys, t!("hints.move")), (icons.glyph("enter").into_owned(), t!("hints.open"))]
 }
 
 #[cfg(test)]
@@ -283,7 +275,6 @@ mod tests {
     #[test]
     fn the_keyboard_moves_the_selection_and_opens_a_row() {
         let mut harness = home(None, SIZE.0, SIZE.1);
-        harness.press("tab");
         assert!(harness.is_focused("menu"), "the menu takes the first focus:\n{}", harness.screen());
         harness.press("end").press("enter");
         assert!(harness.quit_requested(), "the last row leaves the application");
@@ -292,7 +283,7 @@ mod tests {
     #[test]
     fn reduced_motion_keeps_the_menu_working() {
         let mut harness = home(None, SIZE.0, SIZE.1);
-        harness.set_reduced_motion(true).press("tab").press("down").render();
+        harness.set_reduced_motion(true).press("down").render();
         let screen = harness.screen();
         assert!(screen.contains("Projects"), "{screen}");
         harness.press("end").press("enter");

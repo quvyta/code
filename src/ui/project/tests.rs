@@ -19,7 +19,7 @@ use qframe::widgets::TerminalEvent;
 
 use crate::engine::{Container, ContainerState, Engine, EngineKind, HostUser};
 use crate::profile::{AccountKind, HarnessKind, MountAccess, NetworkMode, Profile, SafeName, Template};
-use crate::workspace::{ProjectFile, ProjectId, ProjectPaths};
+use crate::workspace::{ProjectFile, ProjectId, ProjectPaths, ProjectProfile};
 
 use super::plan::{PROJECT_DIR, SHELL};
 use super::{Msg, NewTab, OpenProject, PanelWidget, ProjectScreen, Tab, TabKey, TabKind, TabState};
@@ -72,7 +72,33 @@ impl App for Screen {
     }
 
     fn view(&self, ui: &mut View<'_, Msg>) {
-        super::view(&self.0, ui);
+        super::view(&self.0, ui, std::convert::identity, |_| {}, |_| {});
+    }
+}
+
+/// The project screen inside an application that hands it a header and a footer of its own,
+/// the way QCode does.
+struct Framed(ProjectScreen);
+
+impl App for Framed {
+    type Msg = Msg;
+
+    fn update(&mut self, message: Msg) -> Command<Msg> {
+        super::update(&mut self.0, message)
+    }
+
+    fn view(&self, ui: &mut View<'_, Msg>) {
+        super::view(
+            &self.0,
+            ui,
+            std::convert::identity,
+            |ui| {
+                ui.add(Text::new("HEADER"));
+            },
+            |ui| {
+                ui.add(Text::new("FOOTER"));
+            },
+        );
     }
 }
 
@@ -91,13 +117,18 @@ fn profile(name: &str, harness: HarnessKind) -> Profile {
     }
 }
 
+/// The file of a project `id` carrying the profiles named in `carried`.
+fn file(id: &str, name: &str, carried: &[&str]) -> ProjectFile {
+    let day = Date::new(2026, 9, 17).expect("a day the calendar has");
+    let mut file = ProjectFile::new(ProjectId::parse(id).expect("a usable project id"), name, day);
+    file.profiles = carried.iter().map(|name| ProjectProfile { name: (*name).to_owned(), added: Some(day) }).collect();
+    file
+}
+
+/// A project that carries every one of `profiles`.
 fn project(id: &str, name: &str, paths: ProjectPaths, profiles: Vec<Profile>) -> OpenProject {
-    let file = ProjectFile::new(
-        ProjectId::parse(id).expect("a usable project id"),
-        name,
-        Date::new(2026, 9, 17).expect("a day the calendar has"),
-    );
-    OpenProject::new(&file, paths, profiles)
+    let carried: Vec<&str> = profiles.iter().map(|profile| profile.name.as_str()).collect();
+    OpenProject::new(&file(id, name, &carried), paths, profiles)
 }
 
 fn engine() -> Engine {
@@ -206,6 +237,90 @@ fn the_new_tab_chooser_offers_a_shell_and_every_profile() {
     let kinds: Vec<TabKind> =
         harness.app().0.project().expect("a project").tabs().iter().map(|tab| tab.kind().clone()).collect();
     assert_eq!(kinds, [TabKind::Profile("claude-sub".to_owned())], "the chosen profile is what opened");
+}
+
+#[test]
+fn a_profile_the_project_does_not_carry_is_offered_and_joins_it_when_opened() {
+    // The profile was made after the project, so the project's file does not name it. It is
+    // offered all the same, says that choosing it adds it, and choosing it writes the file.
+    let scratch = Scratch::new("joins");
+    let paths = scratch.paths();
+    let written = file("firefly", "Firefly", &["claude-sub"]);
+    fs::write(&paths.file, written.to_toml()).expect("the project's file");
+    let profiles = vec![profile("opencode", HarnessKind::OpenCode), profile("claude-sub", HarnessKind::ClaudeCode)];
+    let open = OpenProject::new(&written, paths.clone(), profiles);
+    let order: Vec<&str> = open.profiles().iter().map(|profile| profile.name.as_str()).collect();
+    assert_eq!(order, ["claude-sub", "opencode"], "the carried profile comes first");
+    let screen = ProjectScreen::new(Some(engine()), HostUser::Ids { uid: 1000, gid: 1000 }, vec![open]);
+
+    let mut harness = harness(screen, SIZE.0, SIZE.1);
+    harness.click_text("New tab").advance(Duration::from_millis(300));
+    let text = harness.screen();
+    assert!(text.contains("opencode"), "a profile of the workspace is offered:\n{text}");
+    assert!(text.contains("adds to project"), "and says what choosing it does:\n{text}");
+
+    harness.click_text("opencode").advance(Duration::from_millis(300));
+    let open = harness.app().0.project().expect("a project");
+    let kinds: Vec<TabKind> = open.tabs().iter().map(|tab| tab.kind().clone()).collect();
+    assert_eq!(kinds, [TabKind::Profile("opencode".to_owned())], "the tab opened");
+    assert!(open.carries("opencode"), "the screen knows the project carries it now");
+    let on_disk = ProjectFile::parse("project.qcode", &fs::read_to_string(&paths.file).expect("the file is there"));
+    let names: Vec<String> =
+        on_disk.value.expect("still a project").profiles.into_iter().map(|profile| profile.name).collect();
+    assert_eq!(names, ["claude-sub", "opencode"], "the file records it, after what it named before");
+    assert!(paths.harness_profile("opencode").is_dir(), "with the profile's folder in the project");
+}
+
+#[test]
+fn a_profile_that_could_not_be_recorded_still_opens_and_says_so() {
+    // No project.qcode at the project's place: the container does not need it, so the tab opens,
+    // and the person learns the record is missing.
+    let scratch = Scratch::new("unrecorded");
+    let open = OpenProject::new(
+        &file("firefly", "Firefly", &[]),
+        scratch.paths(),
+        vec![profile("claude-sub", HarnessKind::ClaudeCode)],
+    );
+    let screen = ProjectScreen::new(Some(engine()), HostUser::Ids { uid: 1000, gid: 1000 }, vec![open]);
+    let mut harness = harness(screen, SIZE.0, SIZE.1);
+    harness.send(Msg::NewTab(NewTab::Profile(0))).advance(Duration::from_millis(300));
+    let open = harness.app().0.project().expect("a project");
+    assert_eq!(open.tabs().len(), 1, "the tab opened");
+    assert!(!open.carries("claude-sub"));
+    let text = harness.screen();
+    assert!(text.contains("could not be recorded"), "{text}");
+}
+
+#[test]
+fn with_no_profile_at_all_the_chooser_leads_to_the_profiles_screen() {
+    let scratch = Scratch::new("no-profiles");
+    let screen = ProjectScreen::new(
+        Some(engine()),
+        HostUser::Ids { uid: 1000, gid: 1000 },
+        vec![project("firefly", "Firefly", scratch.paths(), Vec::new())],
+    );
+    let mut harness = harness(screen, SIZE.0, SIZE.1);
+    harness.click_text("New tab").advance(Duration::from_millis(300));
+    let text = harness.screen();
+    assert!(text.contains("Shell"), "the shell is still there:\n{text}");
+    assert!(text.contains("New profile"), "and the way to a profile beside it:\n{text}");
+
+    harness.click_text("New profile").advance(Duration::from_millis(300));
+    assert!(harness.app().0.project().expect("a project").tabs().is_empty(), "no tab opened");
+    assert!(!harness.app().0.picker, "the chooser closed for the profiles screen");
+}
+
+#[test]
+fn profiles_read_again_reach_every_open_project() {
+    let scratch = Scratch::new("reread");
+    let mut screen = one_project(&scratch);
+    apply(
+        &mut screen,
+        Msg::Profiles(vec![profile("opencode", HarnessKind::OpenCode), profile("claude-sub", HarnessKind::ClaudeCode)]),
+    );
+    let names: Vec<&str> =
+        screen.project().expect("a project").profiles().iter().map(|profile| profile.name.as_str()).collect();
+    assert_eq!(names, ["claude-sub", "opencode"], "the new one is offered, after the carried one");
 }
 
 #[test]
@@ -372,16 +487,138 @@ fn widgets_are_added_taken_off_and_moved() {
     let mut screen = one_project(&scratch);
     assert_eq!(screen.panel().order(), PanelWidget::ALL);
 
-    apply(&mut screen, Msg::ToggleShown(0));
+    apply(&mut screen, Msg::RemoveWidget(PanelWidget::Files));
     assert!(!screen.panel().carries(PanelWidget::Files), "the widget is off the panel");
-    apply(&mut screen, Msg::ToggleShown(0));
+    assert_eq!(screen.panel().missing(), [PanelWidget::Files]);
+    apply(&mut screen, Msg::ShowWidgets(true));
+    apply(&mut screen, Msg::AddWidget(PanelWidget::Files));
     assert_eq!(screen.panel().order().last(), Some(&PanelWidget::Files), "it comes back at the end");
+    assert!(screen.panel().is_unfolded(2), "unfolded, since it was added to be looked at");
+    assert!(!screen.panel().chooser_open(), "adding closes the chooser");
 
     apply(&mut screen, Msg::MoveWidget { from: 2, to: 0 });
     assert_eq!(screen.panel().order()[0], PanelWidget::Files);
 
     apply(&mut screen, Msg::ToggleWidget(0, false));
     assert!(!screen.panel().is_unfolded(0), "a folded widget stays folded");
+}
+
+/// The line of the panel's title, and the column the title starts at.
+fn panel_title_row(harness: &Harness<Screen>) -> (String, usize) {
+    let (x, y) = harness.find("Panel").expect("the panel's title is on screen");
+    let line =
+        harness.screen().lines().nth(usize::try_from(y).expect("a row on screen")).unwrap_or_default().to_owned();
+    (line, usize::try_from(x).expect("a column on screen"))
+}
+
+#[test]
+fn with_every_widget_on_the_panel_there_is_nothing_to_add_and_no_button() {
+    let scratch = Scratch::new("all-widgets");
+    let harness = harness(one_project(&scratch), SIZE.0, SIZE.1);
+    let (line, x) = panel_title_row(&harness);
+    let after: String = line.chars().skip(x + "Panel".len()).collect();
+    assert!(after.trim().is_empty(), "nothing stands beside the title:\n{}", harness.screen());
+    assert!(!harness.screen().contains("Widgets"), "the old label is gone:\n{}", harness.screen());
+}
+
+#[test]
+fn the_add_button_is_a_bare_plus_that_lists_only_the_missing_widgets() {
+    let scratch = Scratch::new("add-widget");
+    let mut screen = one_project(&scratch);
+    apply(&mut screen, Msg::RemoveWidget(PanelWidget::Info));
+    let mut harness = harness(screen, SIZE.0, SIZE.1);
+    harness.set_reduced_motion(true).render();
+    let (line, x) = panel_title_row(&harness);
+    let after: String = line.chars().skip(x + "Panel".len()).collect();
+    assert_eq!(after.trim(), "+", "an icon and no label:\n{}", harness.screen());
+    assert!(!harness.screen().contains("Widgets"), "{}", harness.screen());
+
+    let (plus_x, plus_y) = {
+        let (_, y) = harness.find("Panel").expect("the title");
+        let column = line.chars().collect::<Vec<_>>().iter().rposition(|c| *c == '+').expect("the plus");
+        (i32::try_from(column).expect("a column"), y)
+    };
+    harness.click(plus_x, plus_y);
+    assert!(harness.app().0.panel().chooser_open(), "{}", harness.screen());
+    let text = harness.screen();
+    assert!(text.contains("Project"), "the missing widget is offered:\n{text}");
+    // The carried ones are on the panel as titles (the popover may cover one), but they are not
+    // offered a second time.
+    assert!(text.matches("Files").count() <= 1, "a carried widget is not offered:\n{text}");
+    assert_eq!(text.matches("Containers").count(), 1, "{text}");
+    for mark in ['✓', '✔', '☐', '☑'] {
+        assert!(!text.contains(mark), "a plain list, no checkboxes:\n{text}");
+    }
+
+    harness.press("enter");
+    let panel = harness.app().0.panel();
+    assert!(panel.carries(PanelWidget::Info), "choosing adds it:\n{}", harness.screen());
+    assert!(!panel.chooser_open(), "and closes the popover");
+    let (line, x) = panel_title_row(&harness);
+    let after: String = line.chars().skip(x + "Panel".len()).collect();
+    assert!(after.trim().is_empty(), "with everything carried the button goes:\n{}", harness.screen());
+}
+
+#[test]
+fn a_right_click_on_the_panel_takes_a_widget_off() {
+    use qframe::event::{MouseButton, MouseKind};
+
+    let scratch = Scratch::new("remove-widget");
+    let mut screen = one_project(&scratch);
+    // Folded, the widget shows only its title, and it can still be taken off.
+    apply(&mut screen, Msg::ToggleWidget(1, false));
+    let mut harness = harness(screen, SIZE.0, SIZE.1);
+    harness.set_reduced_motion(true).render();
+    let (x, y) = harness.find("Project").expect("the folded widget's title");
+    harness.mouse(MouseKind::Down(MouseButton::Right), x, y);
+    harness.mouse(MouseKind::Up(MouseButton::Right), x, y);
+    let text = harness.screen();
+    assert!(text.contains("Remove Project from the panel"), "{text}");
+    harness.click_text("Remove Project from the panel");
+    let panel = harness.app().0.panel();
+    assert!(!panel.carries(PanelWidget::Info), "{}", harness.screen());
+    assert!(panel.carries(PanelWidget::Files) && panel.carries(PanelWidget::Containers));
+    assert!(harness.screen().contains('+'), "and it can be added again:\n{}", harness.screen());
+}
+
+#[test]
+fn the_panel_runs_from_the_top_row_to_the_bottom_one() {
+    let scratch = Scratch::new("full-height");
+    let screen = one_project(&scratch);
+    let mut harness = Harness::with_env(Framed(screen), env(), SIZE.0, SIZE.1);
+    harness.set_locale("en").set_glyph_mode(GlyphMode::Unicode);
+    harness.send(Msg::OpenProject(0)).render();
+    let text = harness.screen();
+    let (panel_x, _) = harness.find("Panel").expect("the panel");
+    let (header_x, header_y) = harness.find("HEADER").expect("the application's header");
+    let (footer_x, footer_y) = harness.find("FOOTER").expect("the application's footer");
+    assert_eq!(header_y, 0, "the header is on the first row:\n{text}");
+    assert_eq!(footer_y, i32::from(SIZE.1) - 1, "the footer on the last:\n{text}");
+    assert!(header_x < panel_x && footer_x < panel_x, "both in the middle column:\n{text}");
+    let right = SIZE.0 - 1;
+    let panel_bg = harness.bg(right, 5);
+    assert_eq!(harness.bg(right, 0), panel_bg, "the panel's own surface on the first row:\n{text}");
+    assert_eq!(harness.bg(right, SIZE.1 - 1), panel_bg, "and on the last:\n{text}");
+    // The rail takes the first columns of the first row, so the header starts beside it, and
+    // its own surface reaches the last row.
+    assert!(header_x >= i32::from(super::RAIL_WIDTH), "the rail runs the whole height too:\n{text}");
+    assert_eq!(harness.bg(0, SIZE.1 - 1), harness.bg(0, SIZE.1 / 2), "{text}");
+
+    // Folding and widening still reach the screen through the application's messages.
+    for _ in 0..8 {
+        if harness.is_focused("project-new-tab") {
+            break;
+        }
+        harness.press("tab");
+    }
+    harness.press("alt+b");
+    assert!(!harness.app().0.panel().is_open(), "alt+b folds the panel:\n{}", harness.screen());
+    harness.press("alt+b");
+    assert!(harness.app().0.panel().is_open(), "and opens it again");
+    harness.set_reduced_motion(true).render();
+    let edge = i32::from(SIZE.0) - i32::from(harness.app().0.panel().width());
+    harness.drag((edge, 10), (edge - 6, 10));
+    assert!(harness.app().0.panel().width() > super::PANEL_WIDTH, "dragging the edge widens it");
 }
 
 #[test]
@@ -407,21 +644,25 @@ fn the_container_widget_lists_this_projects_containers_and_acts_on_one() {
 }
 
 #[test]
-fn a_narrow_screen_keeps_the_rail_the_tabs_and_the_terminal() {
+fn a_narrow_screen_keeps_the_rail_the_terminal_and_the_panel() {
     let scratch = Scratch::new("narrow");
     let mut screen = one_project(&scratch);
     apply(&mut screen, Msg::NewTab(NewTab::Shell));
-    let harness = harness(screen, 46, 18);
+    let mut harness = harness(screen, 46, 18);
     let text = harness.screen();
     // The framework keeps the terminal a quarter of the width whatever the panel asks for, so
     // the middle is narrow here and its label is cut rather than lost.
     assert!(text.contains("Startin"), "the middle keeps its place:\n{text}");
-    assert!(text.contains("Shell"), "the tab strip keeps its place:\n{text}");
     assert!(text.contains("Panel"), "so does the panel:\n{text}");
     assert!(text.contains('F'), "the rail is still there:\n{text}");
     for line in text.lines() {
         assert!(line.chars().count() <= 46, "nothing runs off the screen:\n{text}");
     }
+    // The panel runs the whole height beside the tabs, so on a screen this narrow the tab strip
+    // has its room back once the panel is folded away.
+    harness.set_reduced_motion(true).send(Msg::TogglePanel(false)).render();
+    let text = harness.screen();
+    assert!(text.contains("Shell"), "the tab strip is there with the panel away:\n{text}");
 }
 
 #[test]

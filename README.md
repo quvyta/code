@@ -79,18 +79,11 @@ The program is installed as `qcode` and also as `quvyta-code`.
    terminal that opens and press **I have signed in**.
 3. **A project.** Open **Projects** and make a new project, empty, from a folder or from a git
    address.
-4. **The profile in the project.** In this beta a project is given a profile by naming it in the
-   project's `project.qcode`, below the lines that are already there:
-
-   ```toml
-   [[profile]]
-   name = "claude-sub"
-   ```
-
-   A screen for this is planned.
-5. **Tabs.** In the project, open a new tab: a shell in the project's own container, or a harness
-   from one of its profiles. The first time a profile opens in a project, the project is given its
-   own copy of the profile's login.
+4. **Tabs.** In the project, open a new tab: a shell in the project's own container, or a harness
+   from any of your profiles. A profile the project does not have yet is added to it the moment
+   you open it, and is written into the project's `project.qcode`. The first time a profile opens
+   in a project, the project is given its own copy of the profile's login. With no profile at all,
+   the list offers **New profile** next to the shell, which leads to the profiles screen.
 
 | Key | What it does |
 |---|---|

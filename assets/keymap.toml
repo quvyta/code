@@ -7,3 +7,10 @@
 
 [app]
 back = "esc"
+
+# The list of every key. `?` is the framework's own key for it; F1 is the key help has
+# everywhere else, and it still works while a text field has the keyboard and takes `?` as text.
+# A harness tab's terminal takes both for the program inside it; there the hint in the corner is
+# clicked, or `shift+tab` leaves the terminal first.
+[global]
+help = ["?", "f1"]

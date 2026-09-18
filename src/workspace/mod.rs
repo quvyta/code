@@ -20,7 +20,7 @@ mod project;
 
 pub use config::{Config, SetupStep};
 pub use identity::{ProjectId, ProjectIdError};
-pub use layout::{NewProjectError, ProjectEntry, ProjectPaths, Workspace};
+pub use layout::{NewProjectError, ProjectEntry, ProjectPaths, Workspace, add_profile};
 pub use paths::{HostDirs, Platform, WORKSPACE_DIR_NAME};
 pub use project::{ProjectFile, ProjectProfile};
 

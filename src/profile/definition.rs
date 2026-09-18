@@ -136,11 +136,8 @@ impl Profile {
             return Loaded { profile: None, diagnostics };
         };
         if !harness.supports(account) {
-            let message = format!(
-                "`{ACCOUNT}` is `{}`, which {} cannot sign in with",
-                account.id(),
-                harness.record().display_name
-            );
+            let message =
+                format!("`{ACCOUNT}` is `{}`, which {} does not offer", account.id(), harness.record().display_name);
             diagnostics.push(Diagnostic::error(root.value_location(ACCOUNT).cloned(), message));
             return Loaded { profile: None, diagnostics };
         }
@@ -314,10 +311,27 @@ mode = \"full\"
 
     #[test]
     fn an_account_the_harness_does_not_support_is_refused() {
-        // Every harness qcode knows needs an account, so a profile cannot claim one that is unknown.
+        // An unknown account type is refused like any value outside the choice.
         let loaded = parse("name = \"x\"\nharness = \"codex\"\naccount = \"none\"\n");
         assert_eq!(loaded.profile, None);
         assert!(loaded.diagnostics.iter().any(|d| d.severity == Severity::Error), "{:?}", loaded.diagnostics);
+    }
+
+    #[test]
+    fn free_use_loads_for_opencode_and_is_refused_where_it_is_not_offered() {
+        let text = "name = \"oc\"\nharness = \"opencode\"\naccount = \"free\"\n";
+        let loaded = Profile::parse("oc.toml", text);
+        assert_eq!(loaded.diagnostics, []);
+        let profile = loaded.profile.expect("opencode can be used for free");
+        assert_eq!(profile.account, AccountKind::Free);
+        assert!(profile.to_toml().contains("account = \"free\"\n"), "{}", profile.to_toml());
+        assert_eq!(Profile::parse("oc.toml", &profile.to_toml()).profile, Some(profile));
+
+        let loaded = Profile::parse("x.toml", "name = \"x\"\nharness = \"claude-code\"\naccount = \"free\"\n");
+        assert_eq!(loaded.profile, None);
+        let refused = loaded.diagnostics.iter().find(|d| d.severity == Severity::Error).expect("the reason is given");
+        assert!(refused.message.contains("free") && refused.message.contains("Claude Code"), "{}", refused.message);
+        assert_eq!(refused.location.as_ref().map(ToString::to_string).as_deref(), Some("x.toml:3:11"));
     }
 
     #[test]

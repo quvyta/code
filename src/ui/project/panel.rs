@@ -1,7 +1,7 @@
 //! The widget panel on the right: which widgets it carries, in what order, and what they show.
 
 use qframe::prelude::*;
-use qframe::widgets::{Popover, Section, Spinner, Tree, TreeNode, WidgetDock};
+use qframe::widgets::{ContextItem, ContextMenu, Popover, Section, Spinner, Tooltip, Tree, TreeNode, WidgetDock};
 
 use crate::engine::ContainerState;
 
@@ -62,6 +62,8 @@ pub struct Panel {
     order: Vec<PanelWidget>,
     opened: Vec<PanelWidget>,
     chooser: bool,
+    /// The row of the chooser the keyboard is on.
+    chooser_row: usize,
 }
 
 impl Default for Panel {
@@ -72,6 +74,7 @@ impl Default for Panel {
             order: PanelWidget::ALL.to_vec(),
             opened: vec![PanelWidget::Files, PanelWidget::Containers],
             chooser: false,
+            chooser_row: 0,
         }
     }
 }
@@ -129,9 +132,16 @@ impl Panel {
         self.order.insert(to, widget);
     }
 
-    /// Shows or dismisses the chooser of which widgets the panel carries.
+    /// Shows or dismisses the chooser of the widgets the panel does not carry; it always opens
+    /// on its first row.
     pub fn show_chooser(&mut self, show: bool) {
         self.chooser = show;
+        self.chooser_row = 0;
+    }
+
+    /// Puts the chooser's keyboard on `row`.
+    pub fn highlight(&mut self, row: usize) {
+        self.chooser_row = row;
     }
 
     /// Whether the chooser is open.
@@ -140,17 +150,27 @@ impl Panel {
         self.chooser
     }
 
-    /// Adds the widget at `index` of [`PanelWidget::ALL`] to the panel, or takes it off.
-    ///
-    /// A widget taken off keeps nothing; putting it back gives it the end of the panel, which is
-    /// where the person is looking when they add it.
-    pub fn toggle_shown(&mut self, index: usize) {
-        let Some(widget) = PanelWidget::ALL.get(index).copied() else { return };
-        if self.order.contains(&widget) {
-            self.order.retain(|shown| *shown != widget);
-        } else {
+    /// Adds `widget` to the end of the panel, unfolded, which is where the person is looking when
+    /// they add it, and closes the chooser that offered it. A widget the panel already carries
+    /// stays where it is.
+    pub fn add(&mut self, widget: PanelWidget) {
+        if !self.order.contains(&widget) {
             self.order.push(widget);
+            self.opened.push(widget);
         }
+        self.chooser = false;
+    }
+
+    /// Takes `widget` off the panel; it keeps nothing, so adding it again starts it afresh.
+    pub fn remove(&mut self, widget: PanelWidget) {
+        self.order.retain(|shown| *shown != widget);
+        self.opened.retain(|shown| *shown != widget);
+    }
+
+    /// The widgets the panel does not carry, in the order [`PanelWidget::ALL`] lists them.
+    #[must_use]
+    pub fn missing(&self) -> Vec<PanelWidget> {
+        PanelWidget::ALL.into_iter().filter(|widget| !self.carries(*widget)).collect()
     }
 
     /// Whether the panel carries `widget`.
@@ -159,6 +179,9 @@ impl Panel {
         self.order.contains(&widget)
     }
 }
+
+/// The name the list of widgets to add is focused by.
+pub(super) const CHOOSER_ID: &str = "project-panel-chooser";
 
 /// Draws the panel: its title bar, the chooser of widgets and the dock itself.
 pub(super) fn view(screen: &ProjectScreen, ui: &mut View<'_, Msg>) {
@@ -177,21 +200,38 @@ pub(super) fn view(screen: &ProjectScreen, ui: &mut View<'_, Msg>) {
     .fill();
 }
 
-/// The control that adds widgets to the panel and takes them off again.
+/// The control that adds a widget the panel does not carry yet: an icon-only `+` whose popover
+/// lists just the missing widgets. With every widget on the panel there is nothing to add, so the
+/// control is not drawn at all rather than opening an empty list. Taking a widget off is the
+/// dock's context menu, see [`dock`].
 fn chooser(panel: &Panel, ui: &mut View<'_, Msg>) {
+    let missing = panel.missing();
+    if missing.is_empty() {
+        return;
+    }
     let open = panel.chooser_open();
     Popover::new(open)
         .on_dismiss(Msg::ShowWidgets(false))
         .anchor(|ui| {
-            ui.add(Button::new(t!("project.panel.widgets")).icon("add").on_press(Msg::ShowWidgets(!open)))
-                .id("project-panel-widgets");
+            // The glyph is the label rather than the icon, so the button stays symmetric: an icon
+            // is always followed by a gap that only makes sense before a word.
+            let plus = ui.env().icons().glyph("add").into_owned();
+            ui.add_with(Tooltip::new(t!("project.panel.add")).on_focus(true), |ui| {
+                ui.add(Button::new(plus).on_press(Msg::ShowWidgets(!open))).id("project-panel-add");
+            });
         })
         .content(|ui| {
-            let items = PanelWidget::ALL.map(|widget| ListItem::new(widget.title()).icon(widget.icon(), None));
-            let checked: Vec<bool> = PanelWidget::ALL.iter().map(|widget| panel.carries(*widget)).collect();
-            ui.add(List::new(items).checked(checked).on_toggle(Msg::ToggleShown).on_activate(Msg::ToggleShown))
-                .id("project-panel-chooser")
-                .width(Length::Cells(26));
+            let items = missing.iter().map(|widget| ListItem::new(widget.title()).icon(widget.icon(), None));
+            let offered = missing.clone();
+            let row = panel.chooser_row.min(missing.len() - 1);
+            ui.add(
+                List::new(items)
+                    .selected(Some(row))
+                    .on_select(Msg::HighlightWidget)
+                    .on_activate(move |index| Msg::AddWidget(offered[index])),
+            )
+            .id(CHOOSER_ID)
+            .width(Length::Cells(26));
         })
         .show(ui);
 }
@@ -206,13 +246,23 @@ fn dock(screen: &ProjectScreen, ui: &mut View<'_, Msg>) {
         .empty_text(t!("project.panel.none"))
         .on_toggle(Msg::ToggleWidget)
         .on_move(move |from, to| Msg::MoveWidget { from, to });
-    ui.add_with(dock, |ui| {
-        for widget in panel.order() {
-            ui.column(|ui| body(screen, *widget, ui)).fill().id(widget.key());
-        }
+    // A right click anywhere on the dock, or Shift+F10 from a widget in it, offers to take each
+    // carried widget off. The dock is one area for the menu rather than one per widget, so a
+    // folded widget, which shows only its title, can be taken off as well.
+    let removals = panel.order().iter().map(|widget| {
+        ContextItem::new(t!("project.panel.remove", widget = widget.title()), Msg::RemoveWidget(*widget))
+            .icon(widget.icon())
+    });
+    ui.add_with(ContextMenu::new(removals), |ui| {
+        ui.add_with(dock, |ui| {
+            for widget in panel.order() {
+                ui.column(|ui| body(screen, *widget, ui)).fill().id(widget.key());
+            }
+        })
+        .fill()
+        .id("project-panel-dock");
     })
-    .fill()
-    .id("project-panel-dock");
+    .fill();
 }
 
 /// The content of one widget.
@@ -279,7 +329,10 @@ fn info_widget(screen: &ProjectScreen, project: &OpenProject, ui: &mut View<'_, 
         (t!("project.info.name"), project.name().to_owned()),
         (t!("project.info.id"), project.id().to_owned()),
         (t!("project.info.folder"), project.paths().root.display().to_string()),
-        (t!("project.info.profiles"), project.profiles().len().to_string()),
+        (
+            t!("project.info.profiles"),
+            project.profiles().iter().filter(|profile| project.carries(profile.name.as_str())).count().to_string(),
+        ),
         (t!("project.info.engine"), engine),
     ];
     ui.column(|ui| {

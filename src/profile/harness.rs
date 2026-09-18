@@ -29,6 +29,9 @@ pub enum HarnessKind {
 /// What a profile signs in with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountKind {
+    /// Nothing: the harness runs on models its makers offer for free, without an account. There
+    /// is no login to make, store or carry.
+    Free,
     /// A plan the user logs in to in a browser.
     Subscription,
     /// A key the user pastes in.
@@ -99,13 +102,14 @@ impl HarnessKind {
 }
 
 impl AccountKind {
-    /// Every account type, in the order the profile wizard offers them.
-    pub const ALL: [Self; 2] = [Self::Subscription, Self::ApiKey];
+    /// Every account type. The wizard offers each harness's own list, in that harness's order.
+    pub const ALL: [Self; 3] = [Self::Free, Self::Subscription, Self::ApiKey];
 
     /// How the account type is written in definition files.
     #[must_use]
     pub fn id(self) -> &'static str {
         match self {
+            Self::Free => "free",
             Self::Subscription => "subscription",
             Self::ApiKey => "api-key",
         }
@@ -115,6 +119,13 @@ impl AccountKind {
     #[must_use]
     pub fn parse(id: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|account| account.id() == id)
+    }
+
+    /// Whether a profile with this account has a login at all. One that has none is ready as
+    /// soon as its image is, and nothing about it waits for a credentials volume.
+    #[must_use]
+    pub fn needs_login(self) -> bool {
+        self != Self::Free
     }
 }
 
@@ -160,10 +171,13 @@ static CLAUDE_CODE: Harness = Harness {
 /// that opens the interface. `opencode providers list` prints `Credentials
 /// ~/.local/share/opencode/auth.json` and counts a file placed there, and `opencode debug
 /// config` prints the resolved configuration with the permission below in it.
+///
+/// Free use comes first: opencode starts and works without any login, on the free models it
+/// offers itself, so a profile that signs in to nothing is a complete one here.
 static OPENCODE: Harness = Harness {
     id: "opencode",
     display_name: "opencode",
-    accounts: &[AccountKind::Subscription, AccountKind::ApiKey],
+    accounts: &[AccountKind::Free, AccountKind::Subscription, AccountKind::ApiKey],
     install: &["npm install -g opencode-ai"],
     command: "opencode",
     auto_run: &["--auto"],
@@ -330,8 +344,19 @@ mod tests {
             assert_eq!(AccountKind::parse(account.id()), Some(account));
         }
         assert_eq!(AccountKind::parse("none"), None);
+        assert_eq!(AccountKind::parse("free"), Some(AccountKind::Free));
         assert!(HarnessKind::ClaudeCode.supports(AccountKind::Subscription));
         assert!(HarnessKind::ClaudeCode.supports(AccountKind::ApiKey));
+    }
+
+    #[test]
+    fn only_opencode_is_offered_for_free_and_offers_it_first() {
+        assert_eq!(HarnessKind::OpenCode.record().accounts.first(), Some(&AccountKind::Free));
+        for harness in [HarnessKind::ClaudeCode, HarnessKind::GeminiCli, HarnessKind::Codex] {
+            assert!(!harness.supports(AccountKind::Free), "{harness:?}");
+        }
+        assert!(!AccountKind::Free.needs_login());
+        assert!(AccountKind::Subscription.needs_login() && AccountKind::ApiKey.needs_login());
     }
 
     #[test]

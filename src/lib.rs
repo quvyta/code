@@ -17,9 +17,10 @@ pub mod workspace;
 
 use std::io;
 
+use qframe::keymap::{KeyChord, Scope};
 use qframe::prelude::*;
 use qframe::runtime::{Runtime, Task};
-use qframe::widgets::{PageTransition, Toast};
+use qframe::widgets::{HelpLayer, PageTransition, Toast};
 
 use engine::run::capture;
 use engine::{Engine, EngineKind, HostUser, detect};
@@ -116,7 +117,8 @@ pub struct ProjectContents {
     pub file: ProjectFile,
     /// Where its folders are.
     pub paths: ProjectPaths,
-    /// The definitions of the profiles its file names.
+    /// Every profile of the workspace: a new tab offers them all, and one the project does not
+    /// carry yet is added to it when it is opened.
     pub profiles: Vec<Profile>,
 }
 
@@ -139,6 +141,8 @@ pub enum Msg {
     Settings(ui::settings::Msg),
     /// Leave the screen that is open and go back to the one before it.
     Back,
+    /// The list of every key was opened or closed.
+    Help(bool),
     /// The container engine was looked for again, and this is what was found.
     Looked(EngineKind, Result<Box<Engine>, Trouble>),
     /// The workspace's projects were read, and this one is the one to open.
@@ -164,6 +168,7 @@ pub struct QCode {
     profiles: Option<Profiles>,
     project: Option<ProjectScreen>,
     settings: SettingsScreen,
+    help: bool,
 }
 
 impl QCode {
@@ -223,6 +228,7 @@ impl QCode {
             profiles: None,
             project: None,
             settings,
+            help: false,
         }
     }
 
@@ -323,13 +329,7 @@ impl QCode {
                 .filter_map(|entry| entry.file)
                 .map(|file| {
                     let paths = workspace.project_paths(&file.id);
-                    let profiles = file
-                        .profiles
-                        .iter()
-                        .filter_map(|wanted| known.iter().find(|profile| profile.name.as_str() == wanted.name))
-                        .cloned()
-                        .collect();
-                    ProjectContents { file, paths, profiles }
+                    ProjectContents { file, paths, profiles: known.clone() }
                 })
                 .collect();
             Msg::Read(contents, id)
@@ -477,7 +477,14 @@ impl QCode {
             return Command::none();
         }
         self.router.back();
-        self.take_focus()
+        Command::batch([self.take_focus(), self.reread_profiles()])
+    }
+
+    /// Reads the workspace's profiles again for the project screen when it is returned to, so a
+    /// profile made on the profiles screen in between is offered by the next new tab.
+    fn reread_profiles(&self) -> Command<Msg> {
+        let (Page::Project, Some(workspace)) = (self.page(), self.workspace()) else { return Command::none() };
+        Command::perform(move || Msg::Project(ui::project::Msg::Profiles(workspace.profiles().value)))
     }
 
     /// Whether the profiles screen is showing its list rather than its wizard.
@@ -526,7 +533,8 @@ impl QCode {
 }
 
 /// Which profiles have a login stored, which is what the identity part of the settings screen
-/// shows and acts on.
+/// shows and acts on. A profile that signs in to nothing has no login to refresh or remove, so
+/// it is not listed there.
 ///
 /// Without an engine to ask, nothing is claimed either way and every profile is listed as signed
 /// out, beside the strip that says why nothing here can be done.
@@ -534,6 +542,7 @@ fn identities(engine: Option<&Engine>, profiles: &[Profile]) -> Vec<ui::settings
     let volumes = engine.and_then(|engine| capture(&engine.list_volumes()).ok()).unwrap_or_default();
     profiles
         .iter()
+        .filter(|profile| profile.account.needs_login())
         .map(|profile| {
             let stored = profile::identity::is_stored(&volumes, &profile.name);
             ui::settings::identity::ProfileIdentity::new(profile.name.clone(), stored)
@@ -591,6 +600,34 @@ fn trouble(problem: &ui::setup::gates::EngineProblem) -> Trouble {
     }
 }
 
+/// The one key hint every screen carries, at the bottom right: the key that opens the list of
+/// every key, which is also a button for the pointer. The hint bars the screens once had are that
+/// list now, so the screens keep their room and nothing they listed is lost.
+fn keys_hint(ui: &mut View<'_, Msg>) {
+    let key = ui.env().keymap().chords_for(Scope::Global, "help").first().map(KeyChord::label);
+    ui.row(|ui| {
+        ui.spacer();
+        let mut button = Button::new(t!("app.keys")).on_press(Msg::Help(true));
+        if let Some(key) = key {
+            button = button.shortcut(key);
+        }
+        ui.add(button).id("keys");
+    })
+    .fill_width();
+}
+
+/// The keys of `page` that are not in the keymap, which the list of keys shows first.
+fn screen_hints(page: Page, icons: &qframe::icons::Icons) -> Vec<(String, String)> {
+    match page {
+        Page::Setup => ui::setup::hints(icons),
+        Page::Home => ui::home::hints(icons),
+        Page::Projects => ui::projects::hints(icons),
+        Page::Profiles => ui::profiles::hints(icons),
+        Page::Project => ui::project::hints(icons),
+        Page::Settings => ui::settings::hints(icons),
+    }
+}
+
 impl App for QCode {
     type Msg = Msg;
 
@@ -628,10 +665,14 @@ impl App for QCode {
                     false => command,
                 }
             }
-            Msg::Project(message) => match self.project.as_mut() {
-                Some(screen) => ui::project::update(screen, message).map(Msg::Project),
-                None => Command::none(),
-            },
+            Msg::Project(message) => {
+                let manage = matches!(message, ui::project::Msg::ManageProfiles);
+                let command = match self.project.as_mut() {
+                    Some(screen) => ui::project::update(screen, message).map(Msg::Project),
+                    None => Command::none(),
+                };
+                if manage { Command::batch([command, self.show_profiles()]) } else { command }
+            }
             Msg::Settings(message) => {
                 let (command, request) = ui::settings::update(&mut self.settings, message);
                 let command = command.map(Msg::Settings);
@@ -641,6 +682,10 @@ impl App for QCode {
                 }
             }
             Msg::Back => self.leave(),
+            Msg::Help(open) => {
+                self.help = open;
+                Command::none()
+            }
             Msg::Looked(kind, found) => self.looked(kind, found),
             Msg::Read(contents, id) => self.show_project(contents, &id),
             Msg::SignedOut(Ok(())) => Command::toast(Toast::success(t!("settings.signed-out"))),
@@ -652,9 +697,11 @@ impl App for QCode {
     /// Turns a keymap action into a message. `back` is Esc, which reaches here only when
     /// nothing nearer has used it: a focused widget first, so the terminal of a harness tab
     /// keeps its own Esc, and then an open dialog, which closes instead of letting the screen go.
+    /// `help` is the framework's own action for the list of keys; the application opens it.
     fn action(&self, name: &str) -> Option<Msg> {
         match name {
             "back" => Some(Msg::Back),
+            "help" => Some(Msg::Help(true)),
             _ => None,
         }
     }
@@ -665,31 +712,32 @@ impl App for QCode {
             ui.page(page.key(), |ui| self.draw(page, ui));
         })
         .fill();
+        if self.help {
+            // The keys of the screen that is open come first, then the keymap's own, so the list
+            // holds everything the hint bars of the screens used to show.
+            let hints = screen_hints(page, ui.env().icons());
+            let layer =
+                hints.into_iter().fold(HelpLayer::new(Msg::Help(false)), |layer, (key, label)| layer.hint(key, label));
+            ui.add(layer);
+        }
     }
 }
 
 impl QCode {
     /// Draws the screen that is open.
     ///
-    /// The project screen brings a shell of its own — a rail, tabs and a panel — so it is drawn
-    /// whole, under the same header as every other screen and inside no second shell; every
-    /// other screen is a body in the application's own shell.
+    /// The project screen brings a shell of its own — a rail down the left and a panel down the
+    /// right, both from the top row to the bottom one — so it is drawn whole, with the
+    /// application's header and footer handed in for its middle column; every other screen is a
+    /// body in the application's own shell.
     fn draw(&self, page: Page, ui: &mut View<'_, Msg>) {
-        if page == Page::Project {
-            ui.column(|ui| {
-                self.header(page, ui);
-                if let Some(screen) = &self.project {
-                    ui.map(Msg::Project, |ui| ui::project::view(screen, ui)).fill();
-                }
-            })
-            .fill();
+        if page == Page::Project
+            && let Some(screen) = &self.project
+        {
+            ui::project::view(screen, ui, Msg::Project, |ui| self.header(page, ui), keys_hint);
             return;
         }
-        AppShell::new()
-            .header(|ui| self.header(page, ui))
-            .body(|ui| self.body(page, ui))
-            .footer(|ui| self.hints(page, ui))
-            .show(ui);
+        AppShell::new().header(|ui| self.header(page, ui)).body(|ui| self.body(page, ui)).footer(keys_hint).show(ui);
     }
 
     /// What stands over every screen: the strip while the engine is gone, and the way back.
@@ -733,27 +781,7 @@ impl QCode {
             Page::Settings => {
                 ui.map(Msg::Settings, |ui| ui::settings::view(&self.settings, ui)).fill();
             }
-            // Drawn whole by `draw`, which never comes here with it.
-            Page::Project => {}
-        }
-    }
-
-    /// The keys the screen answers to.
-    fn hints(&self, page: Page, ui: &mut View<'_, Msg>) {
-        match page {
-            Page::Setup => {
-                ui.map(Msg::Setup, ui::setup::hints).fill_width();
-            }
-            Page::Home => ui::home::hints(ui),
-            Page::Projects => {
-                ui.map(Msg::Projects, ui::projects::hints).fill_width();
-            }
-            Page::Profiles => {
-                ui.map(Msg::Profiles, ui::profiles::hints).fill_width();
-            }
-            Page::Settings => {
-                ui.map(Msg::Settings, ui::settings::hints).fill_width();
-            }
+            // Drawn whole by `draw` once its screen exists; before that there is nothing to show.
             Page::Project => {}
         }
     }
@@ -865,6 +893,121 @@ mod tests {
         }
     }
 
+    /// The last row of the screen.
+    fn last_row(harness: &qframe::runtime::Harness<super::QCode>) -> String {
+        harness.screen().lines().last().unwrap_or_default().to_owned()
+    }
+
+    /// Opens the project `Firefly` of a fresh workspace at `root`.
+    fn open_project(root: &std::path::Path) -> qframe::runtime::Harness<super::QCode> {
+        let _ = std::fs::remove_dir_all(root);
+        let workspace = crate::workspace::Workspace::new(root);
+        workspace.create_project("Firefly", qframe::date::Date::today_utc()).expect("the workspace takes a project");
+        let mut harness = harness(app(config(root, &[]), &settled(), None), SIZE.0, SIZE.1);
+        harness.click_text("Projects").advance(MOMENT);
+        harness.click_text("Firefly").advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Project, "{}", harness.screen());
+        harness
+    }
+
+    #[test]
+    fn every_screen_carries_one_key_hint_and_no_hint_bar() {
+        let wizard = harness(
+            app(
+                Config::parse_str("code.toml", ""),
+                &Gates { language: false, engine: EngineCheck::Unknown, location: LocationCheck::Unknown },
+                Some(SetupStep::Language),
+            ),
+            SIZE.0,
+            SIZE.1,
+        );
+        let mut home = harness(app(config(&scratch("hint-bar"), &[]), &settled(), None), SIZE.0, SIZE.1);
+        let mut screens = vec![(Page::Setup, last_row(&wizard), wizard.screen())];
+        screens.push((Page::Home, last_row(&home), home.screen()));
+        for row in ["Projects", "Profiles", "Settings"] {
+            home.click_text(row).advance(MOMENT);
+            screens.push((home.app().page(), last_row(&home), home.screen()));
+            home.click_text("Back").advance(MOMENT);
+        }
+        let root = scratch("hint-bar-project");
+        let project = open_project(&root);
+        screens.push((Page::Project, last_row(&project), project.screen()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        for (page, last, screen) in screens {
+            assert_eq!(last.split_whitespace().collect::<Vec<_>>(), ["?", "Keys"], "{page:?}:\n{screen}");
+            // The words of the old bars are gone: moving, choosing, quitting and the tab keys.
+            for word in ["move", "choose", "quit", "close tab"] {
+                assert!(!screen.contains(word), "{page:?} still says `{word}`:\n{screen}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_key_hint_sits_in_the_bottom_right_corner() {
+        let harness = harness(app(config(&scratch("hint-corner"), &[]), &settled(), None), SIZE.0, SIZE.1);
+        let (x, y) = harness.find("Keys").expect("the hint is on screen");
+        assert_eq!(y, i32::from(SIZE.1) - 1, "{}", harness.screen());
+        assert!(x + 4 >= i32::from(SIZE.0) - 3, "at the right edge:\n{}", harness.screen());
+    }
+
+    #[test]
+    fn the_help_key_opens_the_list_with_the_screens_own_keys_and_esc_closes_it() {
+        let mut harness = harness(app(config(&scratch("help-key"), &[]), &settled(), None), SIZE.0, SIZE.1);
+        harness.click_text("Settings").advance(MOMENT);
+        harness.press("?");
+        let screen = harness.screen();
+        assert!(screen.contains("This screen"), "the key list is open:\n{screen}");
+        for word in ["move", "open", "leave this screen"] {
+            assert!(screen.contains(word), "`{word}` is in the list:\n{screen}");
+        }
+        harness.press("esc").advance(MOMENT);
+        assert!(!harness.screen().contains("This screen"), "Esc closes it:\n{}", harness.screen());
+        assert_eq!(harness.app().page(), Page::Settings, "and only it; the screen stays");
+
+        harness.press("f1");
+        assert!(harness.screen().contains("This screen"), "F1 opens it too:\n{}", harness.screen());
+    }
+
+    #[test]
+    fn a_click_on_the_hint_opens_the_list() {
+        let mut harness = harness(app(config(&scratch("help-click"), &[]), &settled(), None), SIZE.0, SIZE.1);
+        harness.click_text("Keys");
+        let screen = harness.screen();
+        assert!(screen.contains("This screen"), "{screen}");
+        assert!(screen.contains("move"), "the home screen's keys are listed:\n{screen}");
+    }
+
+    #[test]
+    fn the_project_screens_key_list_says_how_to_leave_the_terminal() {
+        let root = scratch("help-project");
+        let mut harness = open_project(&root);
+        harness.click_text("Keys");
+        let screen = harness.screen();
+        for word in ["tabs", "ctrl w", "close tab", "shift tab", "leave the terminal"] {
+            assert!(screen.contains(word), "`{word}` is in the list:\n{screen}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn on_the_project_screen_the_panel_runs_from_the_first_row_to_the_last() {
+        let root = scratch("full-height-panel");
+        let harness = open_project(&root);
+        let screen = harness.screen();
+        let (panel_x, _) = harness.find("Panel").expect("the panel is open");
+        let (back_x, back_y) = harness.find("Back").expect("the way back");
+        let (keys_x, keys_y) = harness.find("Keys").expect("the key hint");
+        assert_eq!(back_y, 0, "the header is on the first row:\n{screen}");
+        assert_eq!(keys_y, i32::from(SIZE.1) - 1, "the hint on the last:\n{screen}");
+        assert!(back_x < panel_x && keys_x < panel_x, "both beside the panel, not over it:\n{screen}");
+        let right = SIZE.0 - 1;
+        let panel = harness.bg(right, SIZE.1 / 2);
+        assert_eq!(harness.bg(right, 0), panel, "the panel's surface on the first row:\n{screen}");
+        assert_eq!(harness.bg(right, SIZE.1 - 1), panel, "and on the last:\n{screen}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn a_machine_that_was_never_set_up_opens_the_wizard_on_the_gate_that_fell() {
         let gates = Gates { language: false, engine: EngineCheck::Unknown, location: LocationCheck::Unknown };
@@ -952,6 +1095,43 @@ mod tests {
         assert!(harness.screen().contains("No tab is open"), "{}", harness.screen());
         harness.click_text("Back").advance(MOMENT);
         assert_eq!(harness.app().page(), Page::Projects, "{}", harness.screen());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_way_to_a_profile_from_a_project_comes_back_with_the_new_profile_offered() {
+        let root = scratch("project-profiles");
+        let _ = std::fs::remove_dir_all(&root);
+        let workspace = crate::workspace::Workspace::new(&root);
+        workspace.create_project("Firefly", qframe::date::Date::today_utc()).expect("the workspace takes a project");
+        let mut harness = harness(app(config(&root, &[]), &settled(), None), SIZE.0, SIZE.1);
+        harness.click_text("Projects").advance(MOMENT);
+        harness.click_text("Firefly").advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Project);
+
+        harness.send(Msg::Project(crate::ui::project::Msg::ManageProfiles)).advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Profiles, "the row of the chooser leads to the profiles screen");
+
+        // A profile made there, while the project screen waits behind it.
+        let profile = crate::profile::Profile {
+            name: SafeName::parse("claude-sub").expect("the name is safe"),
+            harness: crate::profile::HarnessKind::ClaudeCode,
+            template: crate::profile::Template::Recommended,
+            account: crate::profile::AccountKind::Subscription,
+            assets: crate::profile::MountAccess::ReadOnly,
+            network: crate::profile::NetworkMode::Full,
+        };
+        workspace.write_profile(&profile).expect("the workspace takes a profile");
+        harness.click_text("Back").advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Project, "{}", harness.screen());
+        let offered: Vec<String> = harness
+            .app()
+            .project
+            .as_ref()
+            .and_then(ProjectScreen::project)
+            .map(|project| project.profiles().iter().map(|profile| profile.name.as_str().to_owned()).collect())
+            .unwrap_or_default();
+        assert_eq!(offered, ["claude-sub"], "the next new tab offers it without opening the project again");
         let _ = std::fs::remove_dir_all(&root);
     }
 

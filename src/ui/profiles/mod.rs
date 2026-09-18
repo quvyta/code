@@ -22,11 +22,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use qframe::diagnostics::Diagnostic;
-use qframe::keymap::Scope;
 use qframe::prelude::*;
 use qframe::runtime::Task;
 use qframe::widgets::{
-    Badge, EmptyState, Field, LogBuffer, LogLevel, LogLine, LogView, RadioGroup, Terminal, TerminalEvent,
+    Badge, EmptyState, Field, LogBuffer, LogLevel, LogLine, LogView, RadioGroup, RadioStyle, Terminal, TerminalEvent,
     TerminalSession, TextInput, Toast, Wizard,
 };
 
@@ -46,6 +45,19 @@ const PAGE_WIDTH: u16 = 100;
 
 /// Rows the build log and the login terminal are given, so the buttons under them stay put.
 const VIEWPORT_ROWS: u16 = 16;
+
+/// Rows the tallest page of the wizard takes at [`PAGE_WIDTH`], with the steps above it and the
+/// buttons under it: the image page of a machine without an engine. The wizard is placed as if
+/// every page were this tall, so the steps stay on the same row from page to page.
+const WIZARD_ROWS: u16 = 25;
+
+/// Rows the application's own header and footer take around this screen, which the screen's
+/// view cannot see but which share the terminal with it.
+const CHROME_ROWS: u16 = 2;
+
+/// How every choice on these pages is marked: the small square, as everywhere in QCode. It is
+/// set by name because the framework's constructor starts from another style.
+const RADIO: RadioStyle = RadioStyle::Square;
 
 /// What was read out of a workspace's `Profiles/` folder.
 #[derive(Debug, Clone, PartialEq)]
@@ -231,7 +243,7 @@ pub fn update(state: &mut Profiles, message: Msg) -> Command<Msg> {
         Msg::SignInAsked => {
             // A profile without an image has nothing to sign in from; the list says so already.
             let Some(row) = state.selected() else { return Command::none() };
-            if state.engine.is_none() || row.image != Readiness::Present {
+            if state.engine.is_none() || row.image != Readiness::Present || !row.profile.account.needs_login() {
                 return Command::none();
             }
             state.draft = Some(Draft::for_login(&row.profile));
@@ -251,7 +263,16 @@ pub fn update(state: &mut Profiles, message: Msg) -> Command<Msg> {
             state.draft = Some(Draft::new(taken));
             Command::focus("profile-name")
         }
-        Msg::Cancel | Msg::Finish => leave(state),
+        Msg::Cancel => leave(state),
+        // Finish stands where Next would on the last page. A profile with no sign-in ends on its
+        // image page, where finishing before the image is built would leave with nothing made,
+        // so it is answered the way Next is: with the way to the image.
+        Msg::Finish => {
+            if state.draft.as_ref().is_some_and(|draft| draft.blocked().is_some()) {
+                return next(state);
+            }
+            leave(state)
+        }
         Msg::Back => {
             if let Some(draft) = &mut state.draft {
                 draft.back();
@@ -587,17 +608,11 @@ pub fn entry(state: &Profiles) -> Option<&'static str> {
     (!state.rows().is_empty()).then_some("profiles")
 }
 
-/// Draws the key hints of the screen.
-pub fn hints(ui: &mut View<'_, Msg>) {
-    let icons = ui.env().icons();
+/// The keys of the profiles screen that are not in the keymap, for the key list.
+#[must_use]
+pub fn hints(icons: &qframe::icons::Icons) -> Vec<(String, String)> {
     let move_keys = format!("{}{}", icons.glyph("arrow-up"), icons.glyph("arrow-down"));
-    ui.add(
-        KeyHints::new()
-            .hint(move_keys, t!("hints.move"))
-            .hint(icons.glyph("enter").into_owned(), t!("hints.open"))
-            .action_right(Scope::Global, "quit"),
-    )
-    .fill_width();
+    vec![(move_keys, t!("hints.move")), (icons.glyph("enter").into_owned(), t!("hints.open"))]
 }
 
 /// The list of profiles, what the engine says about the chosen one, and the way to a new one.
@@ -650,25 +665,36 @@ fn draw_list(state: &Profiles, ui: &mut View<'_, Msg>) {
         ui.add(List::new(items).selected(Some(state.selected)).on_select(Msg::Select)).id("profiles").fill();
 
         if let Some(row) = selected {
+            let needs_login = row.profile.account.needs_login();
             ui.row(|ui| {
                 ui.add(badge(row.image, "profiles.image"));
-                ui.add(badge(row.identity, "profiles.identity"));
+                if needs_login {
+                    ui.add(badge(row.identity, "profiles.identity"));
+                } else {
+                    // Nothing to ask the engine: a profile that signs in to nothing is as ready
+                    // as its image, and the badge says so rather than "not signed in".
+                    ui.add(Badge::new(t!("profiles.identity-free")).variant("success"));
+                }
             })
             .gap(1);
             ui.add(Text::new(summary(&row.profile)).role("secondary")).fill_width();
             ui.add(Text::new(mounts(&row.profile)).role("secondary")).fill_width();
-            let signed_in = row.identity == Readiness::Present;
+            let signed_in = row.is_signed_in();
             ui.row(|ui| {
-                let mut again = Button::new(t!("profiles.sign-in"));
-                if !engineless && row.image == Readiness::Present {
-                    again = again.on_press(Msg::SignInAsked);
+                // Signing in and out mean nothing to a profile without an account, so it is not
+                // offered two buttons that could never do anything.
+                if needs_login {
+                    let mut again = Button::new(t!("profiles.sign-in"));
+                    if !engineless && row.image == Readiness::Present {
+                        again = again.on_press(Msg::SignInAsked);
+                    }
+                    ui.add(again.disabled(engineless || row.image != Readiness::Present)).id("profile-sign-in");
+                    let mut out = Button::new(t!("profiles.sign-out")).loading(busy);
+                    if !engineless && signed_in && !busy {
+                        out = out.on_press(Msg::SignOutAsked);
+                    }
+                    ui.add(out.variant("danger").disabled(engineless || !signed_in)).id("profile-sign-out");
                 }
-                ui.add(again.disabled(engineless || row.image != Readiness::Present)).id("profile-sign-in");
-                let mut out = Button::new(t!("profiles.sign-out")).loading(busy);
-                if !engineless && signed_in && !busy {
-                    out = out.on_press(Msg::SignOutAsked);
-                }
-                ui.add(out.variant("danger").disabled(engineless || !signed_in)).id("profile-sign-out");
                 ui.spacer();
                 ui.add(Button::new(t!("profiles.new")).variant("primary").on_press(Msg::New)).id("profile-new");
             })
@@ -691,12 +717,17 @@ fn badge(readiness: Readiness, key: &str) -> Badge {
     if variant.is_empty() { badge } else { badge.variant(variant) }
 }
 
-/// What a profile runs, in one line.
+/// What a profile runs, in one line. The template is named without the recommendation the
+/// wizard gives it: that is advice for choosing, and this profile has chosen already.
 fn summary(profile: &Profile) -> String {
+    let template = t!(match profile.template {
+        Template::Base => "profiles.summary-base",
+        Template::Recommended => "profiles.summary-recommended",
+    });
     t!(
         "profiles.summary",
         harness = profile.harness.record().display_name,
-        template = template_word(profile.template).as_str(),
+        template = template.as_str(),
         account = account_word(profile.account).as_str()
     )
 }
@@ -721,6 +752,7 @@ fn template_word(template: Template) -> String {
 /// The word for an account type.
 fn account_word(account: AccountKind) -> String {
     t!(match account {
+        AccountKind::Free => "profiles.account-free",
         AccountKind::Subscription => "profiles.account-subscription",
         AccountKind::ApiKey => "profiles.account-api-key",
     })
@@ -742,26 +774,45 @@ fn network_word(mode: NetworkMode) -> String {
     })
 }
 
-/// The wizard, or the login page on its own when that is all the draft is for.
+/// The wizard, or the login page on its own when that is all the draft is for, in the middle of
+/// the screen.
+///
+/// The column is centred across, and pushed down by half of what the terminal has beyond the
+/// tallest page rather than centred on the page being shown: pages differ in height, and a wizard
+/// centred on each one would move its steps up and down on every Next. A terminal too short for
+/// the tallest page gets the wizard at the top, where it was, so nothing is pushed off the screen.
 fn draw_wizard(state: &Profiles, draft: &Draft, ui: &mut View<'_, Msg>) {
-    if draft.is_only_login() {
-        ui.column(|ui| {
-            ui.add(Text::new(t!("profiles.wizard.sign-in-title", name = draft.name.as_str())).bold());
-            draw_login(state, draft, ui);
-            ui.row(|ui| {
-                ui.spacer();
-                ui.add(Button::new(t!("profiles.wizard.close")).variant("primary").on_press(Msg::Finish))
-                    .id("login-close");
-            })
-            .fill_width();
-        })
-        .fill()
-        .gap(1)
-        .width(Length::Cells(PAGE_WIDTH));
-        return;
-    }
+    let top = ui.size().height.saturating_sub(WIZARD_ROWS + CHROME_ROWS) / 2;
+    ui.column(|ui| {
+        ui.spacer().height(Length::Cells(top));
+        if draft.is_only_login() {
+            draw_sign_in(state, draft, ui);
+        } else {
+            draw_steps(state, draft, ui);
+        }
+    })
+    .fill()
+    .align(Align::Center);
+}
 
-    let labels = Stage::ALL.map(step_word);
+/// The login page on its own, for a profile that exists already.
+fn draw_sign_in(state: &Profiles, draft: &Draft, ui: &mut View<'_, Msg>) {
+    ui.column(|ui| {
+        ui.add(Text::new(t!("profiles.wizard.sign-in-title", name = draft.name.as_str())).bold());
+        draw_login(state, draft, ui);
+        ui.row(|ui| {
+            ui.spacer();
+            ui.add(Button::new(t!("profiles.wizard.close")).variant("primary").on_press(Msg::Finish)).id("login-close");
+        })
+        .fill_width();
+    })
+    .gap(1)
+    .width(Length::Cells(PAGE_WIDTH));
+}
+
+/// The whole wizard, one page at a time.
+fn draw_steps(state: &Profiles, draft: &Draft, ui: &mut View<'_, Msg>) {
+    let labels = draft.stages().iter().map(|stage| step_word(*stage));
     let wizard = Wizard::new(labels)
         .current(draft.stage.index())
         .busy(draft.is_busy())
@@ -805,6 +856,7 @@ fn draw_harness(draft: &Draft, ui: &mut View<'_, Msg>) {
     ui.add(Text::new(t!("profiles.wizard.harness-lead")).role("secondary")).fill_width();
     ui.add(
         RadioGroup::new(HarnessKind::ALL.map(|harness| harness.record().display_name.to_owned()))
+            .style(RADIO)
             .selected(chosen)
             .on_select(Msg::PickHarness),
     )
@@ -837,8 +889,10 @@ fn draw_harness(draft: &Draft, ui: &mut View<'_, Msg>) {
 fn draw_template(draft: &Draft, ui: &mut View<'_, Msg>) {
     let chosen = Template::ALL.iter().position(|template| *template == draft.template);
     ui.add(Text::new(t!("profiles.wizard.template-lead")).role("secondary")).fill_width();
-    ui.add(RadioGroup::new(Template::ALL.map(template_word)).selected(chosen).on_select(Msg::PickTemplate))
-        .id("profile-template");
+    ui.add(
+        RadioGroup::new(Template::ALL.map(template_word)).style(RADIO).selected(chosen).on_select(Msg::PickTemplate),
+    )
+    .id("profile-template");
     let detail = match draft.template {
         Template::Base => t!("profiles.wizard.template-base-detail"),
         Template::Recommended => t!("profiles.wizard.template-recommended-detail"),
@@ -854,10 +908,15 @@ fn draw_account(draft: &Draft, ui: &mut View<'_, Msg>) {
     ui.add(Text::new(t!("profiles.wizard.account-lead")).role("secondary")).fill_width();
     ui.add(
         RadioGroup::new(offered.iter().map(|account| account_word(*account)))
+            .style(RADIO)
             .selected(chosen)
             .on_select(Msg::PickAccount),
     )
     .id("profile-account");
+    if !draft.account.needs_login() {
+        let harness = draft.harness.record().display_name;
+        ui.add(Text::new(t!("profiles.wizard.account-free-detail", harness = harness)).role("secondary")).fill_width();
+    }
 }
 
 /// What the container may see and reach.
@@ -869,6 +928,7 @@ fn draw_permissions(draft: &Draft, ui: &mut View<'_, Msg>) {
     ui.add(Text::new(t!("profiles.wizard.permissions-assets")).bold());
     ui.add(
         RadioGroup::new(MountAccess::ALL.map(access_word))
+            .style(RADIO)
             .selected(MountAccess::ALL.iter().position(|access| *access == draft.assets))
             .horizontal(true)
             .on_select(Msg::PickAssets),
@@ -877,6 +937,7 @@ fn draw_permissions(draft: &Draft, ui: &mut View<'_, Msg>) {
     ui.add(Text::new(t!("profiles.wizard.permissions-network")).bold());
     ui.add(
         RadioGroup::new(NetworkMode::ALL.map(network_word))
+            .style(RADIO)
             .selected(NetworkMode::ALL.iter().position(|mode| *mode == draft.network))
             .horizontal(true)
             .on_select(Msg::PickNetwork),
@@ -896,6 +957,10 @@ fn draw_image(state: &Profiles, draft: &Draft, ui: &mut View<'_, Msg>) {
     };
     ui.add(Text::new(lead).role(if matches!(draft.build, Build::Failed(_)) { "danger" } else { "secondary" }))
         .fill_width();
+    if draft.build == Build::Done && !draft.account.needs_login() {
+        let harness = draft.harness.record().display_name;
+        ui.add(Text::new(t!("profiles.wizard.free-ready", harness = harness)).color("success")).fill_width();
+    }
     if engineless {
         ui.add(Text::new(t!("profiles.no-engine-detail")).color("warning")).fill_width();
     }
@@ -1017,7 +1082,7 @@ mod tests {
         }
 
         fn view(&self, ui: &mut View<'_, Msg>) {
-            AppShell::new().body(|ui| view(&self.state, ui)).footer(hints).show(ui);
+            AppShell::new().body(|ui| view(&self.state, ui)).show(ui);
         }
     }
 
@@ -1152,7 +1217,7 @@ mod tests {
         let harness = loaded(vec![profile("claude-sub", HarnessKind::ClaudeCode)]);
         let screen = harness.screen();
         assert!(screen.contains("Claude Code"), "{screen}");
-        assert!(screen.contains("recommended template"), "{screen}");
+        assert!(screen.contains("Claude Code, QCode optimized, subscription"), "{screen}");
         assert!(screen.contains("subscription"), "{screen}");
         assert!(screen.contains("assets read-only"), "{screen}");
         assert!(screen.contains("network full"), "{screen}");
@@ -1463,13 +1528,166 @@ mod tests {
         let mut harness = loaded(vec![profile("claude-sub", HarnessKind::ClaudeCode)]);
         harness.set_locale("tr").render();
         let screen = harness.screen();
-        for text in ["Profiller", "önerilen", "Giriş yap", "Çıkış yap", "abonelik"] {
+        for text in ["Profiller", "QCode için ayarlı", "Giriş yap", "Çıkış yap", "abonelik"] {
             assert!(screen.contains(text), "`{text}` is missing:\n{screen}");
         }
         harness.send(Msg::New).render();
         let screen = harness.screen();
         assert!(screen.contains("Düzenek"), "{screen}");
         assert!(screen.contains("kodlama ajanı"), "{screen}");
+    }
+
+    /// The column of `label` on the row where it follows the small square of a radio group, and
+    /// that row, so a test can look at the mark two cells before it.
+    fn radio_mark(harness: &Harness<Host>, label: &str) -> (u16, u16) {
+        let square = harness.env().icons().glyph("radio-mark-small").into_owned();
+        let screen = harness.screen();
+        let (y, line) = screen
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains(&format!("{square}  {label}")))
+            .unwrap_or_else(|| panic!("`{label}` is offered with the small square:\n{screen}"));
+        let at = line.find(&format!("{square}  {label}")).expect("the option is on the row");
+        let x = line[..at].chars().count();
+        (u16::try_from(x).expect("on screen"), u16::try_from(y).expect("on screen"))
+    }
+
+    /// A wizard opened on a new profile and walked `pages` pages on.
+    fn wizard_on(pages: usize) -> Harness<Host> {
+        let mut harness = loaded(Vec::new());
+        harness.set_reduced_motion(true).send(Msg::New);
+        for _ in 0..pages {
+            harness.send(Msg::Next);
+        }
+        harness.render();
+        harness
+    }
+
+    #[test]
+    fn the_wizard_stands_in_the_middle_of_a_wide_screen() {
+        let mut harness = wizard_on(0);
+        harness.resize(160, 50).render();
+        let (x, y) = harness.find("Harness").expect("the first step is named");
+        assert!(x >= 25, "the wizard is centred across, not glued to the left edge:\n{}", harness.screen());
+        assert!(y >= 8, "the wizard is pushed down from the top:\n{}", harness.screen());
+        let first = (x, y);
+        harness.send(Msg::Next).render();
+        assert_eq!(harness.find("Harness"), Some(first), "the steps stay where they were from page to page");
+
+        let mut harness = with_engine();
+        harness.send(Msg::Loaded(Listing {
+            profiles: vec![profile("claude-sub", HarnessKind::ClaudeCode)],
+            diagnostics: Vec::new(),
+        }));
+        answer(&mut harness, Readiness::Present, Readiness::Missing);
+        harness.send(Msg::SignInAsked).resize(160, 50).render();
+        let (x, y) = harness.find("Sign claude-sub in").expect("the sign-in page is open");
+        assert!(x >= 25 && y >= 8, "the sign-in page is centred too:\n{}", harness.screen());
+    }
+
+    #[test]
+    fn a_short_terminal_keeps_the_wizard_at_the_top() {
+        let mut harness = wizard_on(4);
+        harness.resize(SIZE.0, 24).render();
+        let (_, y) = harness.find("Harness").expect("the first step is named");
+        assert!(y <= 1, "no room to spare means no rows given away:\n{}", harness.screen());
+    }
+
+    #[test]
+    fn the_tallest_page_fits_the_rows_the_wizard_is_placed_by() {
+        // The image page without an engine is the tallest; if it grows past the constant the
+        // wizard would be placed too low and its buttons pushed towards the bottom edge.
+        let mut harness = wizard_on(4);
+        harness.resize(PAGE_WIDTH, 60).render();
+        let (_, top) = harness.find("Harness").expect("the steps are drawn");
+        let (_, bottom) = harness.find("Cancel").expect("the buttons are drawn");
+        let rows = u16::try_from(bottom - top + 1).expect("the buttons are under the steps");
+        assert!(rows <= WIZARD_ROWS, "{rows} rows:\n{}", harness.screen());
+    }
+
+    #[test]
+    fn every_choice_in_the_wizard_is_marked_with_the_small_square() {
+        let harness = wizard_on(0);
+        let square = harness.env().icons().glyph("radio-mark-small").into_owned();
+        // The square marks every option, the chosen one included; the style that grows the
+        // chosen one into a full box would leave one short.
+        assert_eq!(harness.screen().matches(square.as_str()).count(), HarnessKind::ALL.len(), "{}", harness.screen());
+        let chosen = radio_mark(&harness, "Claude Code");
+        let other = radio_mark(&harness, "Codex");
+        assert_ne!(harness.fg(chosen.0, chosen.1), harness.fg(other.0, other.1), "{}", harness.screen());
+        let harness = wizard_on(1);
+        assert_eq!(harness.screen().matches(square.as_str()).count(), Template::ALL.len(), "{}", harness.screen());
+        let harness = wizard_on(3);
+        let options = MountAccess::ALL.len() + NetworkMode::ALL.len();
+        assert_eq!(harness.screen().matches(square.as_str()).count(), options, "{}", harness.screen());
+    }
+
+    #[test]
+    fn the_assets_come_writable_and_chosen_from_the_first_frame() {
+        let harness = wizard_on(3);
+        assert_eq!(harness.app().state.draft().expect("the wizard is open").assets, MountAccess::ReadWrite);
+        let writable = radio_mark(&harness, "writable");
+        let read_only = radio_mark(&harness, "read-only");
+        let full = radio_mark(&harness, "full");
+        let tone = |(x, y): (u16, u16)| harness.fg(x, y);
+        assert_eq!(tone(writable), tone(full), "writable wears the chosen tone:\n{}", harness.screen());
+        assert_ne!(tone(writable), tone(read_only), "{}", harness.screen());
+    }
+
+    #[test]
+    fn the_recommended_template_says_it_is_set_up_for_qcode() {
+        let harness = wizard_on(1);
+        assert!(harness.screen().contains("QCode optimized (recommended)"), "{}", harness.screen());
+        let mut harness = wizard_on(1);
+        harness.set_locale("tr").render();
+        assert!(harness.screen().contains("QCode için ayarlı (önerilen)"), "{}", harness.screen());
+    }
+
+    #[test]
+    fn opencode_is_offered_free_first_and_finishes_without_a_sign_in() {
+        let mut harness = wizard_on(0);
+        let opencode = HarnessKind::ALL.iter().position(|harness| *harness == HarnessKind::OpenCode);
+        harness.send(Msg::PickHarness(opencode.expect("opencode is offered"))).send(Msg::Next).send(Msg::Next).render();
+        let screen = harness.screen();
+        assert!(screen.contains("free, no account"), "{screen}");
+        assert!(screen.contains("nothing to sign in to"), "{screen}");
+        assert!(!screen.contains("Sign in"), "the steps leave the sign-in out:\n{screen}");
+        let (free, subscription) = (screen.find("free, no account"), screen.find("subscription"));
+        assert!(free < subscription, "free use is listed first:\n{screen}");
+        assert_eq!(harness.app().state.draft().expect("open").account, AccountKind::Free);
+
+        harness.send(Msg::Next).send(Msg::Next).render();
+        assert!(harness.screen().contains("Build the image"), "{}", harness.screen());
+        harness.send(Msg::Finish).render();
+        assert!(harness.app().state.draft().is_some(), "finishing without an image leaves nothing behind");
+        harness.send(Msg::BuildEnded(Ok(()))).render();
+        let screen = harness.screen();
+        assert!(screen.contains("Finish"), "the image page is the last one:\n{screen}");
+        assert!(screen.contains("opencode needs no sign-in"), "{screen}");
+        harness.send(Msg::Next).render();
+        assert_eq!(harness.app().state.draft().expect("open").stage, Stage::Image, "there is no page after it");
+        harness.send(Msg::Finish).render();
+        assert!(harness.app().state.draft().is_none(), "the wizard closes with the profile made");
+    }
+
+    #[test]
+    fn a_free_profile_reads_as_ready_and_offers_no_sign_in() {
+        let mut free = profile("oc-free", HarnessKind::OpenCode);
+        free.account = AccountKind::Free;
+        let mut harness = with_engine();
+        harness.send(Msg::Loaded(Listing { profiles: vec![free], diagnostics: Vec::new() }));
+        answer(&mut harness, Readiness::Present, Readiness::Missing);
+        let screen = harness.screen();
+        assert!(screen.contains("No sign-in needed"), "{screen}");
+        assert!(!screen.contains("Not signed in"), "{screen}");
+        assert!(!screen.contains("Sign in") && !screen.contains("Sign out"), "{screen}");
+        assert!(screen.contains("opencode, QCode optimized, free, no account"), "{screen}");
+        assert!(harness.app().state.selected().expect("chosen").is_runnable());
+        harness.send(Msg::SignInAsked).render();
+        assert!(harness.app().state.draft().is_none(), "there is nothing to sign in to");
+        harness.set_locale("tr").render();
+        assert!(harness.screen().contains("Giriş gerekmez"), "{}", harness.screen());
+        assert!(harness.screen().contains("ücretsiz, hesapsız"), "{}", harness.screen());
     }
 
     #[test]

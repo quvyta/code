@@ -57,10 +57,16 @@ impl Row {
     }
 
     /// Whether a project could open this profile right now: the image is there and so is a
-    /// login. An unknown answer is not a yes.
+    /// login, unless the profile signs in to nothing. An unknown answer is not a yes.
     #[must_use]
     pub fn is_runnable(&self) -> bool {
-        self.image == Readiness::Present && self.identity == Readiness::Present
+        self.image == Readiness::Present && (self.is_signed_in() || !self.profile.account.needs_login())
+    }
+
+    /// Whether a login is known to be kept for the profile.
+    #[must_use]
+    pub fn is_signed_in(&self) -> bool {
+        self.identity == Readiness::Present
     }
 
     /// Takes an answer that is about this profile; answers about another one are ignored.
@@ -111,6 +117,21 @@ mod tests {
             identity: Readiness::Present,
         });
         assert!(row.is_runnable());
+    }
+
+    #[test]
+    fn a_free_profile_is_runnable_with_its_image_alone() {
+        let mut free = profile("oc");
+        free.harness = HarnessKind::OpenCode;
+        free.account = AccountKind::Free;
+        let mut row = Row::new(free);
+        assert!(!row.is_runnable(), "an image nobody has checked is still not a yes");
+        row.apply(&Status {
+            name: SafeName::parse("oc").expect("safe"),
+            image: Readiness::Present,
+            identity: Readiness::Missing,
+        });
+        assert!(row.is_runnable(), "no login is kept, and none is needed");
     }
 
     #[test]

@@ -13,7 +13,7 @@ use qframe::icons::GlyphMode;
 use qframe::prelude::*;
 use qframe::runtime::Harness;
 
-use super::{Msg, Projects, update, view};
+use super::{Msg, Overlay, Projects, update, view};
 use crate::engine::{Engine, EngineKind, detect};
 use crate::workspace::Workspace;
 
@@ -59,7 +59,7 @@ impl App for Screen {
     }
 
     fn view(&self, ui: &mut View<'_, Msg>) {
-        AppShell::new().body(|ui| view(&self.state, ui)).footer(super::hints).show(ui);
+        AppShell::new().body(|ui| view(&self.state, ui)).show(ui);
     }
 }
 
@@ -465,4 +465,28 @@ fn a_git_address_is_cloned_inside_a_container() {
     // leave a project folder that was never filled.
     let project = workspace.join("Projects").join("firefly");
     assert!(!project.exists() || project.join("Project").join(".git").exists(), "{}", harness.screen());
+}
+
+#[test]
+fn a_new_project_starts_empty_and_says_so_with_the_mark_of_a_choice() {
+    let scratch = Scratch::new("source-default");
+    let mut harness = screen(scratch.path(), None);
+    harness.send(Msg::Start).render();
+    let Some(Overlay::New(draft)) = &harness.app().state.overlay else { panic!("the dialog is open") };
+    assert_eq!(draft.source, super::Source::Empty, "the plain empty project is chosen");
+    // Only the chosen option is lit: its label is bold and the others are not.
+    assert!(bold(&harness, "Empty"), "{}", harness.screen());
+    assert!(!bold(&harness, "A folder"), "{}", harness.screen());
+    assert!(!bold(&harness, "A git address"), "{}", harness.screen());
+    // A pointer resting on another option does not make it look chosen.
+    let (x, y) = harness.find("A git address").expect("shown");
+    harness.hover(x + 2, y).render();
+    assert!(!bold(&harness, "A git address"), "{}", harness.screen());
+    assert!(bold(&harness, "Empty"), "{}", harness.screen());
+}
+
+/// Whether the first cell of `word` on the screen is bold.
+fn bold(harness: &Harness<Screen>, word: &str) -> bool {
+    let (x, y) = harness.find(word).unwrap_or_else(|| panic!("`{word}` is shown:\n{}", harness.screen()));
+    harness.is_bold(u16::try_from(x).expect("on screen"), u16::try_from(y).expect("on screen"))
 }

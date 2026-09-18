@@ -1,5 +1,5 @@
-//! The profile wizard's state: the six steps, what has been chosen on each of them, and how far
-//! the image build and the login have got.
+//! The profile wizard's state: the six steps (five for a profile that signs in to nothing), what
+//! has been chosen on each of them, and how far the image build and the login have got.
 //!
 //! The state changes by message only. Nothing here starts work or waits for it, so every state
 //! the screen can be in — including a failed build and an interrupted login — is reached in a
@@ -39,6 +39,10 @@ impl Stage {
     /// Every page, in order.
     pub const ALL: [Self; 6] =
         [Self::Harness, Self::Template, Self::Account, Self::Permissions, Self::Image, Self::Login];
+
+    /// The pages of a profile that has no login: everything up to the image. The sign-in page is
+    /// last so that leaving it out moves no other page.
+    pub const WITHOUT_LOGIN: [Self; 5] = [Self::Harness, Self::Template, Self::Account, Self::Permissions, Self::Image];
 
     /// Which page this is, counting from the first.
     #[must_use]
@@ -171,8 +175,10 @@ impl Draft {
             renamed: false,
             harness,
             template: Template::Recommended,
-            account: AccountKind::ALL[0],
-            assets: MountAccess::ReadOnly,
+            account: first_account(harness),
+            // The assets folder is where the person keeps what the harness is meant to use and
+            // add to, so a new profile may write there unless the person narrows it.
+            assets: MountAccess::ReadWrite,
             network: NetworkMode::Full,
             build: Build::Waiting,
             log: LogBuffer::new(LOG_LINES),
@@ -216,16 +222,25 @@ impl Draft {
         self.harness.record().id.to_owned()
     }
 
-    /// Chooses a harness. While the name has not been touched it follows the harness, and an
-    /// account type the new harness cannot use falls back to one it can.
+    /// Chooses a harness. While the name has not been touched it follows the harness, and a
+    /// different harness brings its own first account type: the account page comes after this
+    /// one, and each harness offers its own list, headed by the one most people start with.
     pub fn choose_harness(&mut self, harness: HarnessKind) {
+        let changed = harness != self.harness;
         self.harness = harness;
         if !self.renamed {
             self.name = self.suggested_name();
         }
-        if !harness.supports(self.account) {
-            self.account = harness.record().accounts.first().copied().unwrap_or(self.account);
+        if changed || !harness.supports(self.account) {
+            self.account = first_account(harness);
         }
+    }
+
+    /// The pages this draft goes through. A profile that signs in to nothing has no sign-in
+    /// page: a step that could only say "nothing to do" would still have to be walked through.
+    #[must_use]
+    pub fn stages(&self) -> &'static [Stage] {
+        if self.account.needs_login() { &Stage::ALL } else { &Stage::WITHOUT_LOGIN }
     }
 
     /// The profile the draft describes, if the name is usable.
@@ -275,7 +290,7 @@ impl Draft {
         if let Some(blocked) = self.blocked() {
             return Some(blocked);
         }
-        if let Some(next) = Stage::at(self.stage.index() + 1) {
+        if let Some(next) = self.stages().get(self.stage.index() + 1).copied() {
             self.stage = next;
         }
         None
@@ -286,7 +301,7 @@ impl Draft {
         if self.is_busy() {
             return;
         }
-        if let Some(previous) = self.stage.index().checked_sub(1).and_then(Stage::at) {
+        if let Some(previous) = self.stage.index().checked_sub(1).and_then(|index| self.stages().get(index).copied()) {
             self.stage = previous;
         }
     }
@@ -297,12 +312,17 @@ impl Draft {
         if self.is_busy() {
             return;
         }
-        if let Some(stage) = Stage::at(index)
+        if let Some(stage) = self.stages().get(index).copied()
             && index < self.stage.index()
         {
             self.stage = stage;
         }
     }
+}
+
+/// The account type a harness is offered with before anyone chooses: the first of its own list.
+fn first_account(harness: HarnessKind) -> AccountKind {
+    harness.record().accounts.first().copied().unwrap_or(AccountKind::Subscription)
 }
 
 #[cfg(test)]
@@ -376,6 +396,44 @@ mod tests {
         draft.account = AccountKind::ApiKey;
         draft.choose_harness(HarnessKind::GeminiCli);
         assert!(draft.harness.supports(draft.account));
+    }
+
+    #[test]
+    fn opencode_starts_free_and_the_others_never_offer_it() {
+        let mut draft = Draft::new([]);
+        assert_eq!(draft.account, AccountKind::Subscription, "Claude Code starts with a subscription");
+        draft.choose_harness(HarnessKind::OpenCode);
+        assert_eq!(draft.account, AccountKind::Free, "opencode is chosen with its free use");
+        draft.account = AccountKind::ApiKey;
+        draft.choose_harness(HarnessKind::OpenCode);
+        assert_eq!(draft.account, AccountKind::ApiKey, "choosing the same harness again keeps the account");
+        for harness in [HarnessKind::ClaudeCode, HarnessKind::GeminiCli, HarnessKind::Codex] {
+            draft.choose_harness(HarnessKind::OpenCode);
+            draft.choose_harness(harness);
+            assert_ne!(draft.account, AccountKind::Free, "{harness:?}");
+        }
+    }
+
+    #[test]
+    fn a_free_profile_has_no_sign_in_page_and_ends_with_its_image() {
+        let mut draft = Draft::new([]);
+        draft.choose_harness(HarnessKind::OpenCode);
+        assert_eq!(draft.stages(), Stage::WITHOUT_LOGIN);
+        draft.stage = Stage::Image;
+        draft.build = Build::Done;
+        assert_eq!(draft.advance(), None);
+        assert_eq!(draft.stage, Stage::Image, "there is no page after the image");
+        draft.go_to(Stage::Login.index());
+        assert_eq!(draft.stage, Stage::Image);
+        draft.account = AccountKind::Subscription;
+        assert_eq!(draft.stages(), Stage::ALL);
+        draft.advance();
+        assert_eq!(draft.stage, Stage::Login);
+    }
+
+    #[test]
+    fn a_new_profile_may_write_to_its_assets_unless_narrowed() {
+        assert_eq!(Draft::new([]).assets, MountAccess::ReadWrite);
     }
 
     #[test]

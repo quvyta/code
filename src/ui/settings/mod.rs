@@ -19,7 +19,6 @@ use std::path::PathBuf;
 
 use qframe::diagnostics::{Diagnostic, Severity};
 use qframe::icons::IconMode;
-use qframe::keymap::Scope;
 use qframe::prelude::*;
 use qframe::widgets::{ScrollView, Segmented, Select, SettingRow, SettingsList, Spinner, Switch};
 
@@ -36,6 +35,11 @@ const CONTROL_WIDTH: u16 = 20;
 
 /// Rows between the blocks of the screen.
 const BLOCK_GAP: u16 = 1;
+
+/// Widest the settings column grows, in cells. A label, its description and a drop-down read as
+/// one line at this width; on a wide terminal a list stretched edge to edge leaves the label and
+/// its control too far apart to read together, so the column stays this wide in the middle.
+const PAGE_WIDTH: u16 = 84;
 
 /// The left margin a settings list keeps for its pillar. Everything drawn under the list keeps
 /// it too, so nothing stands further left than the settings themselves.
@@ -239,102 +243,117 @@ pub fn view(screen: &Settings, ui: &mut View<'_, Msg>) {
     let forced = ui.env().reduced_motion_forced();
     let gate = screen.gate();
 
+    let width = ui.size().width.min(PAGE_WIDTH);
     ui.add_with(ScrollView::new(), |ui| {
-        ui.column(|ui| {
-            repairs(screen, ui);
-            if let Some(reason) = &screen.failure {
-                ui.add(Text::new(t!("settings.store-failed", reason = reason.clone())).color("danger")).fill_width();
-            }
+        ui.row(|ui| {
+            ui.column(|ui| {
+                repairs(screen, ui);
+                if let Some(reason) = &screen.failure {
+                    ui.add(Text::new(t!("settings.store-failed", reason = reason.clone())).color("danger"))
+                        .fill_width();
+                }
 
-            let list = SettingsList::show(ui, |list| {
-                list.heading(t!("settings.appearance"));
+                let list = SettingsList::show(ui, |list| {
+                    list.heading(t!("settings.appearance"));
 
-                let codes: Vec<String> = languages.iter().map(|(code, _)| code.clone()).collect();
-                let names: Vec<String> = languages.iter().map(|(_, name)| name.clone()).collect();
-                let chosen = codes.iter().position(|code| *code == language);
-                list.row(SettingRow::new(t!("settings.language")), |ui| {
-                    ui.add(
-                        Select::new(names).selected(chosen).on_select(move |index| Msg::Language(codes[index].clone())),
-                    )
-                    .id("language")
-                    .width(Length::Cells(CONTROL_WIDTH));
-                });
+                    let codes: Vec<String> = languages.iter().map(|(code, _)| code.clone()).collect();
+                    let names: Vec<String> = languages.iter().map(|(_, name)| name.clone()).collect();
+                    let chosen = codes.iter().position(|code| *code == language);
+                    list.row(SettingRow::new(t!("settings.language")), |ui| {
+                        ui.add(
+                            Select::new(names)
+                                .selected(chosen)
+                                .on_select(move |index| Msg::Language(codes[index].clone())),
+                        )
+                        .id("language")
+                        .width(Length::Cells(CONTROL_WIDTH));
+                    });
 
-                let ids: Vec<String> = themes.iter().map(|(id, _)| id.clone()).collect();
-                let titles: Vec<String> = themes.iter().map(|(_, name)| name.clone()).collect();
-                let chosen = ids.iter().position(|id| *id == theme);
-                list.row(SettingRow::new(t!("settings.theme")), |ui| {
-                    ui.add(Select::new(titles).selected(chosen).on_select(move |index| Msg::Theme(ids[index].clone())))
+                    let ids: Vec<String> = themes.iter().map(|(id, _)| id.clone()).collect();
+                    let titles: Vec<String> = themes.iter().map(|(_, name)| name.clone()).collect();
+                    let chosen = ids.iter().position(|id| *id == theme);
+                    list.row(SettingRow::new(t!("settings.theme")), |ui| {
+                        ui.add(
+                            Select::new(titles).selected(chosen).on_select(move |index| Msg::Theme(ids[index].clone())),
+                        )
                         .id("theme")
                         .width(Length::Cells(CONTROL_WIDTH));
-                });
+                    });
 
-                let modes = IconMode::ALL.map(|mode| t!(&format!("settings.icons-{}", mode.name())));
-                let chosen = IconMode::ALL.iter().position(|mode| *mode == icons);
-                list.row(SettingRow::new(t!("settings.icons")), |ui| {
-                    ui.add(
-                        Select::new(modes).selected(chosen).on_select(move |index| Msg::Icons(IconMode::ALL[index])),
-                    )
-                    .id("icons")
-                    .width(Length::Cells(CONTROL_WIDTH));
-                });
-
-                let note = motion_note(forced, reduced).unwrap_or_else(|| t!("settings.reduce-motion-text"));
-                list.row(SettingRow::new(t!("settings.reduce-motion")).description(note).disabled(forced), |ui| {
-                    ui.add(Switch::new(reduced).disabled(forced).on_toggle(Msg::ReduceMotion));
-                });
-
-                list.heading(t!("settings.containers"));
-                let row = SettingRow::new(t!("settings.engine")).description(screen.engine.summary());
-                list.row(row, |ui| match screen.engine.health() {
-                    Health::Checking => {
-                        ui.add(Spinner::new());
-                    }
-                    Health::Working | Health::Missing(_) => {
-                        let names = ENGINES.map(engine::name);
-                        let chosen = ENGINES.iter().position(|kind| *kind == screen.engine.kind()).unwrap_or(0);
+                    let modes = IconMode::ALL.map(|mode| t!(&format!("settings.icons-{}", mode.name())));
+                    let chosen = IconMode::ALL.iter().position(|mode| *mode == icons);
+                    list.row(SettingRow::new(t!("settings.icons")), |ui| {
                         ui.add(
-                            Segmented::new(names).selected(chosen).on_select(move |index| Msg::Engine(ENGINES[index])),
+                            Select::new(modes)
+                                .selected(chosen)
+                                .on_select(move |index| Msg::Icons(IconMode::ALL[index])),
                         )
-                        .id("engine");
-                    }
-                });
+                        .id("icons")
+                        .width(Length::Cells(CONTROL_WIDTH));
+                    });
 
-                list.heading(t!("settings.workspace"));
-                let folder = screen
-                    .workspace
-                    .as_ref()
-                    .map_or_else(|| t!("settings.workspace-unset"), |path| path.display().to_string());
-                let row = SettingRow::new(t!("settings.workspace-folder"))
-                    .description(folder)
-                    .on_activate(Msg::Request(Request::OpenLocationStep));
-                list.row(row, |ui| {
-                    ui.add(Text::new(t!("settings.workspace-change")).role("secondary"));
+                    let note = motion_note(forced, reduced).unwrap_or_else(|| t!("settings.reduce-motion-text"));
+                    list.row(SettingRow::new(t!("settings.reduce-motion")).description(note).disabled(forced), |ui| {
+                        ui.add(Switch::new(reduced).disabled(forced).on_toggle(Msg::ReduceMotion));
+                    });
+
+                    list.heading(t!("settings.containers"));
+                    let row = SettingRow::new(t!("settings.engine")).description(screen.engine.summary());
+                    list.row(row, |ui| match screen.engine.health() {
+                        Health::Checking => {
+                            ui.add(Spinner::new());
+                        }
+                        Health::Working | Health::Missing(_) => {
+                            let names = ENGINES.map(engine::name);
+                            let chosen = ENGINES.iter().position(|kind| *kind == screen.engine.kind()).unwrap_or(0);
+                            ui.add(
+                                Segmented::new(names)
+                                    .selected(chosen)
+                                    .on_select(move |index| Msg::Engine(ENGINES[index])),
+                            )
+                            .id("engine");
+                        }
+                    });
+
+                    list.heading(t!("settings.workspace"));
+                    let folder = screen
+                        .workspace
+                        .as_ref()
+                        .map_or_else(|| t!("settings.workspace-unset"), |path| path.display().to_string());
+                    let row = SettingRow::new(t!("settings.workspace-folder"))
+                        .description(folder)
+                        .on_activate(Msg::Request(Request::OpenLocationStep));
+                    list.row(row, |ui| {
+                        ui.add(Text::new(t!("settings.workspace-change")).role("secondary"));
+                    });
                 });
-            });
-            list.id("settings");
-            // Everything under the list keeps the list's own left margin, so the screen reads as
-            // one column rather than as a list with loose text beside it.
-            ui.column(|ui| {
-                // What to do about a missing engine, and whatever the engine said, follow the
-                // list rather than the strip: here there is a screen to read them on.
-                if let Health::Missing(trouble) = screen.engine.health() {
-                    let kind = screen.engine.kind();
-                    ui.add(Text::new(trouble.remedy(kind)).role("secondary")).fill_width();
-                    if let Some(said) = trouble.said() {
-                        let words = t!("settings.engine-said", engine = engine::name(kind), output = said);
-                        ui.add(Text::new(words).role("faint")).fill_width();
+                list.id("settings");
+                // Everything under the list keeps the list's own left margin, so the screen reads as
+                // one column rather than as a list with loose text beside it.
+                ui.column(|ui| {
+                    // What to do about a missing engine, and whatever the engine said, follow the
+                    // list rather than the strip: here there is a screen to read them on.
+                    if let Health::Missing(trouble) = screen.engine.health() {
+                        let kind = screen.engine.kind();
+                        ui.add(Text::new(trouble.remedy(kind)).role("secondary")).fill_width();
+                        if let Some(said) = trouble.said() {
+                            let words = t!("settings.engine-said", engine = engine::name(kind), output = said);
+                            ui.add(Text::new(words).role("faint")).fill_width();
+                        }
                     }
-                }
-                ui.spacer().height(Length::Cells(BLOCK_GAP));
-                ui.add(Text::new(t!("settings.profiles")).role("secondary").bold());
-                identity::view(screen.profiles.as_deref(), screen.chosen, &gate, ui);
+                    ui.spacer().height(Length::Cells(BLOCK_GAP));
+                    ui.add(Text::new(t!("settings.profiles")).role("secondary").bold());
+                    identity::view(screen.profiles.as_deref(), screen.chosen, &gate, ui);
+                })
+                .fill_width()
+                .padding(Padding { left: LEAD, ..Padding::default() });
             })
-            .fill_width()
-            .padding(Padding { left: LEAD, ..Padding::default() });
+            .width(Length::Cells(width))
+            .gap(BLOCK_GAP)
+            .id("settings-page");
         })
         .fill_width()
-        .gap(BLOCK_GAP);
+        .justify(Align::Center);
     })
     .fill();
 }
@@ -368,18 +387,11 @@ pub fn entry() -> &'static str {
     "settings"
 }
 
-/// Draws the key hints of the settings screen.
-pub fn hints(ui: &mut View<'_, Msg>) {
-    let icons = ui.env().icons();
+/// The keys of the settings screen that are not in the keymap, for the key list.
+#[must_use]
+pub fn hints(icons: &qframe::icons::Icons) -> Vec<(String, String)> {
     let move_keys = format!("{}{}", icons.glyph("arrow-up"), icons.glyph("arrow-down"));
-    let open_key = icons.glyph("enter").into_owned();
-    ui.add(
-        KeyHints::new()
-            .hint(move_keys, t!("hints.move"))
-            .hint(open_key, t!("hints.open"))
-            .action_right(Scope::Global, "quit"),
-    )
-    .fill_width();
+    vec![(move_keys, t!("hints.move")), (icons.glyph("enter").into_owned(), t!("hints.open"))]
 }
 
 #[cfg(test)]
@@ -467,9 +479,6 @@ pub(crate) mod testing {
                 .body(|ui| {
                     ui.map(HostMsg::Screen, |ui| super::view(&self.screen, ui)).fill();
                 })
-                .footer(|ui| {
-                    ui.map(HostMsg::Screen, super::hints).fill_width();
-                })
                 .show(ui);
         }
     }
@@ -507,6 +516,31 @@ mod tests {
             assert!(screen.contains(label), "`{label}` is missing:\n{screen}");
         }
         assert!(screen.contains("English"), "the language in force is the one shown:\n{screen}");
+    }
+
+    #[test]
+    fn the_settings_stand_in_the_middle_at_a_readable_width() {
+        let mut harness = testing::host(testing::screen(EngineKind::Podman, Health::Working), 160, SIZE.1);
+        harness.render();
+        let (label, _) = harness.find("Language").expect("the language row is shown");
+        let (folder, _) = harness.find("Folder").expect("the folder row is shown");
+        let left = (160 - i32::from(super::PAGE_WIDTH)) / 2;
+        assert!(
+            label >= left && folder >= left,
+            "the column starts in the middle, not at the edge:\n{}",
+            harness.screen()
+        );
+        // The control at the end of a row ends where the column does.
+        let (change, _) = harness.find("Change").expect("the folder row offers a change");
+        let right = left + i32::from(super::PAGE_WIDTH);
+        assert!(change + 6 <= right, "nothing reaches past the column:\n{}", harness.screen());
+        assert!(change + 6 >= right - 4, "the column is as wide as it may be:\n{}", harness.screen());
+
+        // A terminal narrower than the column gives it all of its width.
+        harness.resize(70, SIZE.1).render();
+        assert!(harness.screen().contains("Language"), "{}", harness.screen());
+        let (label, _) = harness.find("Language").expect("the language row is shown");
+        assert!(label < 8, "a narrow terminal keeps the column at its edge:\n{}", harness.screen());
     }
 
     #[test]

@@ -22,7 +22,7 @@ use qframe::prelude::*;
 use qframe::runtime::{Task, TaskEvent, TaskId, TaskOutcome, Tasks};
 use qframe::widgets::{
     EmptyState, Field, FilePicker, FilePickerMsg, Form, FormErrors, LogBuffer, LogLevel, LogLine, LogView, Modal,
-    ScrollView, Segmented, Skeleton, TaskList, TextInput, Toast,
+    RadioGroup, RadioStyle, ScrollView, Skeleton, TaskList, TextInput, Toast,
 };
 
 use crate::engine::Engine;
@@ -368,6 +368,9 @@ fn field_input(field: &str) -> &'static str {
 /// The name of the address input.
 const URL_INPUT: &str = "project-url";
 
+/// The name the choice of where a new project starts from is focused by.
+const SOURCE_GROUP: &str = "project-source";
+
 /// Where the folder browser starts: the person's home folder, or the workspace when there is no
 /// home folder to be had.
 fn start_folder(workspace: &Workspace) -> PathBuf {
@@ -523,9 +526,17 @@ fn form(projects: &Projects, draft: &Draft, ui: &mut View<'_, Msg>) {
             .fill_width();
         });
         fields.field(Field::new(t!("projects.source-label")), |ui| {
+            // A radio group rather than segments: its chosen option carries a mark of its own, so
+            // the plain empty project reads as the one chosen, where a lit segment under a resting
+            // pointer looked like a choice of its own.
             ui.add(
-                Segmented::new(Source::ALL.map(Source::label)).selected(draft.source.index()).on_select(Msg::Source),
+                RadioGroup::new(Source::ALL.map(Source::label))
+                    .style(RadioStyle::Square)
+                    .horizontal(true)
+                    .selected(Some(draft.source.index()))
+                    .on_select(Msg::Source),
             )
+            .id(SOURCE_GROUP)
             .fill_width();
         });
         match draft.source {
@@ -604,10 +615,9 @@ fn problems(entry: &ProjectEntry, ui: &mut View<'_, Msg>) {
     });
 }
 
-/// Draws the key hints of the projects screen.
-pub fn hints(ui: &mut View<'_, Msg>) {
-    let icons = ui.env().icons();
+/// The keys of the projects screen that are not in the keymap, for the key list.
+#[must_use]
+pub fn hints(icons: &qframe::icons::Icons) -> Vec<(String, String)> {
     let move_keys = format!("{}{}", icons.glyph("arrow-up"), icons.glyph("arrow-down"));
-    let open_key = icons.glyph("enter").into_owned();
-    ui.add(KeyHints::new().hint(move_keys, t!("hints.move")).hint(open_key, t!("hints.open"))).fill_width();
+    vec![(move_keys, t!("hints.move")), (icons.glyph("enter").into_owned(), t!("hints.open"))]
 }

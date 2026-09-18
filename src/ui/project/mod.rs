@@ -27,7 +27,9 @@ pub use tab::{Tab, TabKey, TabKind, TabState};
 
 use std::ffi::OsString;
 
-use qframe::keymap::Scope;
+use qframe::date::Date;
+use qframe::icons::Icons;
+use qframe::keymap::KeyChord;
 use qframe::prelude::*;
 use qframe::widgets::{
     CollapsedMarker, EmptyState, Popover, RailTab, Side, SidePanel, Spinner, TabEdit, TabRail, TabWidth, Terminal,
@@ -36,7 +38,7 @@ use qframe::widgets::{
 
 use crate::engine::{Container, Engine, EngineCommand, HostUser};
 use crate::profile::Profile;
-use crate::workspace::{ProjectFile, ProjectId, ProjectPaths};
+use crate::workspace::{ProjectFile, ProjectId, ProjectPaths, add_profile};
 
 /// Width of the project rail: the framework's collapsed strip, which is the same four cells on
 /// every screen. The rail never gives way to a narrow terminal, because losing it would mean
@@ -83,6 +85,13 @@ pub enum Msg {
     ShowPicker(bool),
     /// A new tab was asked for.
     NewTab(NewTab),
+    /// The profiles screen was asked for, to make the first profile. The screen itself cannot go
+    /// there; the application that holds both answers this message.
+    ManageProfiles,
+    /// The profiles of the workspace were read again, after the person may have changed them.
+    Profiles(Vec<Profile>),
+    /// A profile was recorded in a project's `project.qcode`, or could not be.
+    ProfileAdded(String, Result<ProjectFile, String>),
     /// The container of a tab is up, or the engine refused.
     Ready(TabKey, u64, Result<(), LaunchFailure>),
     /// A tab's session printed something or ended.
@@ -104,10 +113,14 @@ pub enum Msg {
         /// Where it lands.
         to: usize,
     },
-    /// The chooser of which widgets the panel carries was shown or dismissed.
+    /// The chooser of widgets the panel does not carry was shown or dismissed.
     ShowWidgets(bool),
-    /// A widget was added to the panel or taken off it.
-    ToggleShown(usize),
+    /// The keyboard moved to another row of the chooser of widgets.
+    HighlightWidget(usize),
+    /// A widget was added to the panel.
+    AddWidget(PanelWidget),
+    /// A widget was taken off the panel.
+    RemoveWidget(PanelWidget),
     /// An entry of the file tree was selected.
     SelectFile(String),
     /// A folder of the file tree was opened or closed.
@@ -135,6 +148,7 @@ pub struct OpenProject {
     name: String,
     paths: ProjectPaths,
     profiles: Vec<Profile>,
+    carried: Vec<String>,
     tabs: Vec<Tab>,
     active_tab: usize,
     files: FileTree,
@@ -145,19 +159,23 @@ pub struct OpenProject {
 }
 
 impl OpenProject {
-    /// A project as its own file describes it, living at `paths`, carrying `profiles`.
+    /// A project as its own file describes it, living at `paths`, offering `profiles`.
     ///
-    /// The profiles are the ones the project's `project.qcode` names, already read from the
-    /// workspace: this screen shows profiles and enters their containers, it does not go looking
-    /// for their definitions.
+    /// The profiles are every profile of the workspace, already read: this screen shows
+    /// profiles and enters their containers, it does not go looking for their definitions. The
+    /// ones the project's `project.qcode` names come first; any other one is added to the project
+    /// the first time a tab of it is opened, so a profile made after the project needs no hand
+    /// edit to be used in it.
     #[must_use]
     pub fn new(file: &ProjectFile, paths: ProjectPaths, profiles: Vec<Profile>) -> Self {
         let files = FileTree::new(paths.project.clone());
-        Self {
+        let carried = file.profiles.iter().map(|profile| profile.name.clone()).collect();
+        let mut project = Self {
             id: file.id.clone(),
             name: file.name.clone(),
             paths,
-            profiles,
+            profiles: Vec::new(),
+            carried,
             tabs: Vec::new(),
             active_tab: 0,
             files,
@@ -165,7 +183,18 @@ impl OpenProject {
             container_row: 0,
             container_error: None,
             busy: false,
-        }
+        };
+        project.set_profiles(profiles);
+        project
+    }
+
+    /// Takes `profiles` as the workspace's profiles, the ones the project carries first in the
+    /// order its file lists them, then the others in the order they came.
+    fn set_profiles(&mut self, mut profiles: Vec<Profile>) {
+        profiles.sort_by_key(|profile| {
+            self.carried.iter().position(|name| name == profile.name.as_str()).unwrap_or(usize::MAX)
+        });
+        self.profiles = profiles;
     }
 
     /// The project's identifier, which is also what its containers are named after.
@@ -186,10 +215,17 @@ impl OpenProject {
         &self.paths
     }
 
-    /// The profiles the project carries.
+    /// The profiles a new tab can open: every profile of the workspace, the ones the project
+    /// carries first.
     #[must_use]
     pub fn profiles(&self) -> &[Profile] {
         &self.profiles
+    }
+
+    /// Whether the project's `project.qcode` names the profile `name`.
+    #[must_use]
+    pub fn carries(&self, name: &str) -> bool {
+        self.carried.iter().any(|carried| carried == name)
     }
 
     /// The tabs open in this project, in the order they are shown.
@@ -378,6 +414,27 @@ pub fn update(screen: &mut ProjectScreen, message: Msg) -> Command<Msg> {
             Command::none()
         }
         Msg::NewTab(what) => open_tab(screen, what),
+        Msg::ManageProfiles => {
+            screen.picker = false;
+            Command::none()
+        }
+        Msg::Profiles(profiles) => {
+            for project in &mut screen.projects {
+                project.set_profiles(profiles.clone());
+            }
+            Command::none()
+        }
+        Msg::ProfileAdded(id, result) => match result {
+            Ok(file) => {
+                if let Some(project) = screen.project_mut(&id) {
+                    project.carried = file.profiles.into_iter().map(|profile| profile.name).collect();
+                }
+                Command::none()
+            }
+            // The tab is open whatever the file says; only the record of it is missing, and the
+            // person is told so rather than finding the profile gone from the file later.
+            Err(reason) => Command::toast(Toast::warning(t!("project.add-failed")).body(reason)),
+        },
         Msg::Ready(key, run, result) => ready(screen, key, run, &result),
         Msg::Output(key, run, event) => output(screen, key, run, event),
         Msg::Checked(key, run, running) => {
@@ -410,10 +467,20 @@ pub fn update(screen: &mut ProjectScreen, message: Msg) -> Command<Msg> {
         }
         Msg::ShowWidgets(show) => {
             screen.panel.show_chooser(show);
+            // The list takes the keyboard as it opens, so a widget is chosen with the arrows and
+            // Enter as readily as with the pointer.
+            if show { Command::focus(panel::CHOOSER_ID) } else { Command::none() }
+        }
+        Msg::HighlightWidget(row) => {
+            screen.panel.highlight(row);
             Command::none()
         }
-        Msg::ToggleShown(index) => {
-            screen.panel.toggle_shown(index);
+        Msg::AddWidget(widget) => {
+            screen.panel.add(widget);
+            Command::none()
+        }
+        Msg::RemoveWidget(widget) => {
+            screen.panel.remove(widget);
             Command::none()
         }
         Msg::SelectFile(key) => {
@@ -486,13 +553,34 @@ fn open_tab(screen: &mut ProjectScreen, what: NewTab) -> Command<Msg> {
         },
     };
     let Some(plan) = project.plan(&kind) else { return Command::none() };
+    let record = match &kind {
+        TabKind::Profile(name) if !project.carries(name) => record_profile(project, name),
+        _ => Command::none(),
+    };
     screen.next_key += 1;
     project.tabs.push(Tab::new(key, kind));
     project.active_tab = project.tabs.len() - 1;
     Command::batch([
         Command::perform(move || Msg::Ready(key, 0, plan::ensure_running(&engine, &plan, user))),
         Command::focus(TERMINAL_ID),
+        record,
     ])
+}
+
+/// Writes into the project's `project.qcode` that it carries the profile `name`, on a background
+/// thread.
+///
+/// The file is the one record of which project carries which profile: refreshing a login from its
+/// profile reaches exactly the projects it names. The container itself does not wait for it, so
+/// the tab opens either way.
+fn record_profile(project: &OpenProject, name: &str) -> Command<Msg> {
+    let id = project.id.as_str().to_owned();
+    let paths = project.paths.clone();
+    let name = name.to_owned();
+    Command::perform(move || {
+        let result = add_profile(&paths, &name, Date::today_utc()).map_err(|problem| problem.to_string());
+        Msg::ProfileAdded(id, result)
+    })
 }
 
 /// Starts the tab `key` again, from its container upwards.
@@ -613,17 +701,54 @@ const TERMINAL_ID: &str = "project-terminal";
 /// The name the control that opens a tab is focused by.
 const NEW_TAB_ID: &str = "project-new-tab";
 
-/// Draws the project screen.
-pub fn view(screen: &ProjectScreen, ui: &mut View<'_, Msg>) {
+/// Draws the project screen for an application whose messages are `P`: `wrap` turns the screen's
+/// own messages into the application's, `above` draws what the application puts over the tabs
+/// (its header) and `below` what it puts under the terminal (its footer).
+///
+/// The rail runs down the whole left edge and the widget panel down the whole right edge, from
+/// the very first row to the very last; the application's header and footer belong to the middle
+/// column only, with the tabs and the terminal. That is why the application hands its parts in
+/// here instead of drawing them around this screen.
+pub fn view<P: 'static>(
+    screen: &ProjectScreen,
+    ui: &mut View<'_, P>,
+    wrap: fn(Msg) -> P,
+    above: impl FnOnce(&mut View<'_, P>),
+    below: impl FnOnce(&mut View<'_, P>),
+) {
     AppShell::new()
         .sidebar_width(RAIL_WIDTH)
         // The rail is the only way between projects, so it never collapses away; four cells fit
         // on any terminal QCode can draw on.
         .collapse_below(0)
-        .sidebar(|ui| rail(screen, ui))
-        .header(|ui| header(screen, ui))
-        .body(|ui| body(screen, ui))
-        .footer(hints)
+        .sidebar(|ui| {
+            ui.map(wrap, |ui| rail(screen, ui)).fill();
+        })
+        .body(|ui| {
+            SidePanel::new(screen.panel.width())
+                .side(Side::Right)
+                .open(screen.panel.is_open())
+                .limits(PANEL_MIN, PANEL_MAX)
+                .on_toggle(move |open| wrap(Msg::TogglePanel(open)))
+                .on_resize(move |width| wrap(Msg::ResizePanel(width)))
+                .panel(|ui| {
+                    ui.map(wrap, |ui| panel::view(screen, ui)).fill();
+                })
+                .body(|ui| {
+                    AppShell::new()
+                        .header(|ui| {
+                            above(ui);
+                            ui.map(wrap, |ui| header(screen, ui)).fill_width();
+                        })
+                        .body(|ui| {
+                            ui.map(wrap, |ui| center(screen, ui)).fill();
+                        })
+                        .footer(below)
+                        .show(ui);
+                })
+                .show(ui)
+                .id("project-body");
+        })
         .show(ui);
 }
 
@@ -683,31 +808,33 @@ fn new_tab(screen: &ProjectScreen, project: &OpenProject, ui: &mut View<'_, Msg>
         .content(|ui| {
             let mut items = vec![ListItem::new(t!("project.tab.shell")).icon("prompt", None)];
             items.extend(project.profiles.iter().map(|profile| {
-                ListItem::new(profile.name.as_str().to_owned())
-                    .icon("bullet", None)
-                    .detail(profile.harness.record().display_name.to_owned())
+                let harness = profile.harness.record().display_name;
+                // A profile the project does not carry yet is offered all the same; the row says
+                // that choosing it adds it, so the file changing is no surprise.
+                let detail = if project.carries(profile.name.as_str()) {
+                    harness.to_owned()
+                } else {
+                    t!("project.tab.adds", harness = harness)
+                };
+                ListItem::new(profile.name.as_str().to_owned()).icon("bullet", None).detail(detail)
             }));
-            ui.add(List::new(items).empty_text(t!("project.no-profiles")).on_activate(move |index| {
-                Msg::NewTab(if index == 0 { NewTab::Shell } else { NewTab::Profile(index - 1) })
+            let none = project.profiles.is_empty();
+            // With no profile at all, the list says where one is made instead of ending at the
+            // shell, and the row takes the person there.
+            if none {
+                items.push(
+                    ListItem::new(t!("project.make-profile")).icon("add", None).detail(t!("project.no-profiles")),
+                );
+            }
+            ui.add(List::new(items).on_activate(move |index| match index {
+                0 => Msg::NewTab(NewTab::Shell),
+                _ if none => Msg::ManageProfiles,
+                _ => Msg::NewTab(NewTab::Profile(index - 1)),
             }))
             .id("project-new-tab-list")
-            .width(Length::Cells(30));
+            .width(Length::Cells(44));
         })
         .show(ui);
-}
-
-/// The terminal and the widget panel beside it.
-fn body(screen: &ProjectScreen, ui: &mut View<'_, Msg>) {
-    SidePanel::new(screen.panel.width())
-        .side(Side::Right)
-        .open(screen.panel.is_open())
-        .limits(PANEL_MIN, PANEL_MAX)
-        .on_toggle(Msg::TogglePanel)
-        .on_resize(Msg::ResizePanel)
-        .panel(|ui| panel::view(screen, ui))
-        .body(|ui| center(screen, ui))
-        .show(ui)
-        .id("project-body");
 }
 
 /// What the middle shows: the open tab, or why there is nothing to show.
@@ -802,16 +929,19 @@ pub fn entry(screen: &ProjectScreen) -> &'static str {
     }
 }
 
-/// Draws the key hints of the project screen.
-pub fn hints(ui: &mut View<'_, Msg>) {
-    let icons = ui.env().icons();
+/// The keys of the project screen that are not in the keymap, for the key list.
+///
+/// A focused terminal hands every key to the program in it but two: `shift+tab`, which leaves
+/// it, and `ctrl+q`. So the list says how to get out of the terminal, after which the rest of
+/// these keys and the key list itself work again.
+#[must_use]
+pub fn hints(icons: &Icons) -> Vec<(String, String)> {
     let tab_keys = format!("{}{}", icons.glyph("arrow-left"), icons.glyph("arrow-right"));
-    ui.add(
-        KeyHints::new()
-            .hint(tab_keys, t!("project.hints.tabs"))
-            .hint("ctrl+w", t!("project.hints.close"))
-            .action(Scope::Global, "toggle-panel")
-            .action_right(Scope::Global, "quit"),
-    )
-    .fill_width();
+    // Written the way the keymap's own keys are, so the list reads as one.
+    let label = |chord: &str| chord.parse::<KeyChord>().map_or_else(|_| chord.to_owned(), |chord| chord.label());
+    vec![
+        (tab_keys, t!("project.hints.tabs")),
+        (label("ctrl+w"), t!("project.hints.close")),
+        (label("shift+tab"), t!("project.hints.leave")),
+    ]
 }
