@@ -1,0 +1,9 @@
+# QCode's own keys, layered over the framework's built-in keymap.
+#
+# Esc leaves the screen that is open. It reaches the application only when nothing nearer has
+# used it: a focused widget first — the terminal of a harness tab keeps its own Esc — then an
+# open dialog, which closes instead. Leaving the application is `ctrl+q` and stays that way, so
+# Esc on the home screen does nothing.
+
+[app]
+back = "esc"

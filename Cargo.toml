@@ -1,0 +1,56 @@
+[workspace]
+resolver = "3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+cast_lossless = "deny"
+needless_pass_by_value = "deny"
+redundant_closure_for_method_calls = "deny"
+semicolon_if_nothing_returned = "deny"
+uninlined_format_args = "deny"
+
+[package]
+name = "quvyta-code"
+description = "Runs coding agent harnesses inside Podman or Docker containers, from the terminal (beta)"
+repository = "https://github.com/quvyta/code"
+readme = "README.md"
+keywords = ["tui", "terminal", "agent", "podman", "docker"]
+categories = ["command-line-utilities", "development-tools"]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+# Only what the program is built from goes into the package; the rest of the repository is for
+# working on it.
+include = ["src/**", "assets/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
+# Both commands are declared below; nothing is discovered by name.
+autobins = false
+
+[lints]
+workspace = true
+
+# The package is quvyta-code; the code says `qcode::`, the way the framework says `qframe::`.
+[lib]
+name = "qcode"
+path = "src/lib.rs"
+
+# The short command is what people type.
+[[bin]]
+name = "qcode"
+path = "src/bin/qcode.rs"
+
+# The long command always works, so a clash over the short name never strands anyone.
+[[bin]]
+name = "quvyta-code"
+path = "src/bin/quvyta-code.rs"
+
+[dependencies]
+# The terminal tabs and the sign-in flow run a harness in a pseudo-terminal.
+quvyta-framework = { version = "0.1.3",  features = ["pty"] }

@@ -1,0 +1,14 @@
+#!/bin/sh
+# Quality gate: formatting, lints, tests and docs must pass before every commit.
+# Enabled once per clone with: git config core.hooksPath .githooks
+set -eu
+# Turkish locales break case-insensitive matching (i/I); keep tools in the C locale.
+export LC_ALL=C
+
+# Until the first crate exists there is no Rust code to check.
+[ -f Cargo.toml ] || exit 0
+
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps

@@ -1,0 +1,4 @@
+# Pinned so every machine runs the same compiler and clippy.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]

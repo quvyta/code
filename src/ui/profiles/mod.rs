@@ -1,0 +1,1480 @@
+//! The profiles screen: the profiles a workspace holds, and the wizard that makes one.
+//!
+//! A profile is what a project opens a harness with, so this screen answers two questions about
+//! every profile — is its image built, and is it signed in — and never answers either of them
+//! from memory. Both come from the engine, and until the engine has answered the screen says
+//! that it does not know yet.
+//!
+//! The screen speaks its own [`Msg`], which the application maps to its own message on the way
+//! out of [`update`] and [`view`]. Everything that touches the disk or
+//! the engine happens in a [`Command`], so the state changes by message alone and every state
+//! the screen has — empty, loading, broken, without an engine, mid-build, mid-login — is reached
+//! in a test with no container runtime.
+
+#[cfg(test)]
+mod live;
+pub(crate) mod recipe;
+mod status;
+mod wizard;
+mod work;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use qframe::diagnostics::Diagnostic;
+use qframe::keymap::Scope;
+use qframe::prelude::*;
+use qframe::runtime::Task;
+use qframe::widgets::{
+    Badge, EmptyState, Field, LogBuffer, LogLevel, LogLine, LogView, RadioGroup, Terminal, TerminalEvent,
+    TerminalSession, TextInput, Toast, Wizard,
+};
+
+use crate::base;
+use crate::engine::Engine;
+use crate::profile::{AccountKind, HarnessKind, MountAccess, NetworkMode, Profile, SafeName, Template};
+use crate::workspace::Workspace;
+
+pub use status::{Readiness, Row, Status};
+pub use wizard::{Blocked, Build, Draft, Login, Stage, Unfinished};
+pub use work::Problem;
+
+/// Width of the wizard's pages: wide enough for every step to keep its name in the row of
+/// steps, and still one column of text. A narrower terminal shrinks it, and the steps fall back
+/// to their markers.
+const PAGE_WIDTH: u16 = 100;
+
+/// Rows the build log and the login terminal are given, so the buttons under them stay put.
+const VIEWPORT_ROWS: u16 = 16;
+
+/// What was read out of a workspace's `Profiles/` folder.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Listing {
+    /// The profiles whose files could be read.
+    pub profiles: Vec<Profile>,
+    /// Everything that was wrong with the files, each with its place in one.
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+/// Everything that can happen on the profiles screen.
+#[derive(Debug, Clone)]
+pub enum Msg {
+    /// Read the workspace again. This is also how the screen is started.
+    Reload,
+    /// The workspace was read.
+    Loaded(Listing),
+    /// The engine answered about every profile.
+    Probed(Vec<Status>),
+    /// The selection moved.
+    Select(usize),
+    /// Signing the chosen profile in was asked for, which is how a login that was interrupted is
+    /// picked up again.
+    SignInAsked,
+    /// Signing a profile out was asked for.
+    SignOutAsked,
+    /// The question was answered with yes.
+    SignOutConfirmed,
+    /// The login was removed, or could not be.
+    SignedOut(Result<(), Problem>),
+    /// Open the wizard.
+    New,
+    /// Leave the wizard without keeping anything that has not been made yet.
+    Cancel,
+    /// Go back a page.
+    Back,
+    /// Go on a page.
+    Next,
+    /// Leave the wizard, keeping what was made.
+    Finish,
+    /// Go back to a finished page.
+    Step(usize),
+    /// The name was typed.
+    Name(String),
+    /// A harness was chosen.
+    PickHarness(usize),
+    /// A template was chosen.
+    PickTemplate(usize),
+    /// An account type was chosen.
+    PickAccount(usize),
+    /// An access for `Assets/` was chosen.
+    PickAssets(usize),
+    /// A network mode was chosen.
+    PickNetwork(usize),
+    /// Build the image.
+    BuildStart,
+    /// The base image was not on the machine, so it is being built before the profile's image.
+    BaseImageStarted,
+    /// The build printed a line.
+    BuildLine(String),
+    /// The build ended.
+    BuildEnded(Result<(), Problem>),
+    /// Stop the build.
+    BuildCancel,
+    /// Open the container the login happens in.
+    LoginStart,
+    /// The container is up and the harness is running on a terminal.
+    LoginOpened {
+        /// The terminal the harness draws on.
+        session: TerminalSession,
+        /// The container it runs in.
+        container: Arc<work::LoginContainer>,
+    },
+    /// Something happened on the login terminal.
+    LoginEvent(TerminalEvent),
+    /// The person says they have signed in; look for the login and store it.
+    LoginDone,
+    /// Stop the login and leave nothing behind.
+    LoginCancel,
+    /// The login was stored, or it was not.
+    LoginStored(Result<usize, Problem>),
+    /// The container could not be opened.
+    LoginFailed(Problem),
+    /// A container a login used has been cleared away.
+    LoginDiscarded,
+}
+
+/// The profiles screen.
+#[derive(Debug)]
+pub struct Profiles {
+    root: Option<PathBuf>,
+    engine: Option<Engine>,
+    loading: bool,
+    rows: Vec<Row>,
+    problems: Vec<Diagnostic>,
+    selected: usize,
+    draft: Option<Draft>,
+    signing_out: bool,
+}
+
+impl Profiles {
+    /// A profiles screen for the workspace at `root`, using `engine`.
+    ///
+    /// Both are optional because both can be missing on a working machine: a workspace that has
+    /// not been chosen yet, and an engine that was uninstalled after the setup. The screen opens
+    /// either way and says what it cannot do.
+    #[must_use]
+    pub fn new(root: Option<PathBuf>, engine: Option<Engine>) -> Self {
+        Self {
+            loading: root.is_some(),
+            root,
+            engine,
+            rows: Vec::new(),
+            problems: Vec::new(),
+            selected: 0,
+            draft: None,
+            signing_out: false,
+        }
+    }
+
+    /// The profiles and what the engine said about them.
+    #[must_use]
+    pub fn rows(&self) -> &[Row] {
+        &self.rows
+    }
+
+    /// The profile the selection is on.
+    #[must_use]
+    pub fn selected(&self) -> Option<&Row> {
+        self.rows.get(self.selected)
+    }
+
+    /// The wizard, while it is open.
+    #[must_use]
+    pub fn draft(&self) -> Option<&Draft> {
+        self.draft.as_ref()
+    }
+
+    /// Whether the workspace is still being read.
+    #[must_use]
+    pub fn is_loading(&self) -> bool {
+        self.loading
+    }
+
+    /// Everything that was wrong with the definition files.
+    #[must_use]
+    pub fn problems(&self) -> &[Diagnostic] {
+        &self.problems
+    }
+
+    /// The workspace, when there is one.
+    fn workspace(&self) -> Option<Workspace> {
+        self.root.as_ref().map(Workspace::new)
+    }
+}
+
+/// Applies a message to the screen. Everything the returned [`Command`] later delivers comes
+/// back through the same `update`.
+pub fn update(state: &mut Profiles, message: Msg) -> Command<Msg> {
+    match message {
+        Msg::Reload => reload(state),
+        Msg::Loaded(listing) => {
+            state.loading = false;
+            state.problems = listing.diagnostics;
+            state.rows = listing.profiles.iter().cloned().map(Row::new).collect();
+            state.selected = state.selected.min(state.rows.len().saturating_sub(1));
+            probe(state, listing.profiles)
+        }
+        Msg::Probed(answers) => {
+            for row in &mut state.rows {
+                for answer in &answers {
+                    row.apply(answer);
+                }
+            }
+            Command::none()
+        }
+        Msg::Select(index) => {
+            if index < state.rows.len() {
+                state.selected = index;
+            }
+            Command::none()
+        }
+        Msg::SignInAsked => {
+            // A profile without an image has nothing to sign in from; the list says so already.
+            let Some(row) = state.selected() else { return Command::none() };
+            if state.engine.is_none() || row.image != Readiness::Present {
+                return Command::none();
+            }
+            state.draft = Some(Draft::for_login(&row.profile));
+            Command::focus("login-open")
+        }
+        Msg::SignOutAsked => ask_sign_out(state),
+        Msg::SignOutConfirmed => sign_out(state),
+        Msg::SignedOut(result) => {
+            state.signing_out = false;
+            match result {
+                Ok(()) => Command::batch([Command::toast(Toast::success(t!("profiles.signed-out"))), reload(state)]),
+                Err(problem) => Command::toast(failure_toast("profiles.sign-out-failed", &problem)),
+            }
+        }
+        Msg::New => {
+            let taken = state.rows.iter().map(|row| row.profile.name.as_str().to_owned());
+            state.draft = Some(Draft::new(taken));
+            Command::focus("profile-name")
+        }
+        Msg::Cancel | Msg::Finish => leave(state),
+        Msg::Back => {
+            if let Some(draft) = &mut state.draft {
+                draft.back();
+            }
+            Command::none()
+        }
+        Msg::Step(index) => {
+            if let Some(draft) = &mut state.draft {
+                draft.go_to(index);
+            }
+            Command::none()
+        }
+        Msg::Next => next(state),
+        Msg::Name(name) => {
+            if let Some(draft) = &mut state.draft {
+                draft.renamed = true;
+                draft.name = name;
+            }
+            Command::none()
+        }
+        Msg::PickHarness(index) => {
+            if let (Some(draft), Some(harness)) = (&mut state.draft, HarnessKind::ALL.get(index)) {
+                draft.choose_harness(*harness);
+            }
+            Command::none()
+        }
+        Msg::PickTemplate(index) => {
+            if let (Some(draft), Some(template)) = (&mut state.draft, Template::ALL.get(index)) {
+                draft.template = *template;
+            }
+            Command::none()
+        }
+        Msg::PickAccount(index) => {
+            if let Some(draft) = &mut state.draft
+                && let Some(account) = draft.harness.record().accounts.get(index)
+            {
+                draft.account = *account;
+            }
+            Command::none()
+        }
+        Msg::PickAssets(index) => {
+            if let (Some(draft), Some(access)) = (&mut state.draft, MountAccess::ALL.get(index)) {
+                draft.assets = *access;
+            }
+            Command::none()
+        }
+        Msg::PickNetwork(index) => {
+            if let (Some(draft), Some(mode)) = (&mut state.draft, NetworkMode::ALL.get(index)) {
+                draft.network = *mode;
+            }
+            Command::none()
+        }
+        Msg::BuildStart => start_build(state),
+        Msg::BaseImageStarted => {
+            if let Some(draft) = &mut state.draft {
+                draft.log.push(LogLine::new(LogLevel::Info, t!("profiles.wizard.build-base")));
+            }
+            Command::none()
+        }
+        Msg::BuildLine(text) => {
+            if let Some(draft) = &mut state.draft {
+                draft.log.push(LogLine::new(LogLevel::Info, text));
+            }
+            Command::none()
+        }
+        Msg::BuildEnded(result) => {
+            let Some(draft) = &mut state.draft else { return Command::none() };
+            match result {
+                Ok(()) => draft.build = Build::Done,
+                Err(problem) => {
+                    report(&mut draft.log, &problem);
+                    draft.build = if problem == Problem::Cancelled { Build::Stopped } else { Build::Failed(problem) };
+                }
+            }
+            Command::none()
+        }
+        Msg::BuildCancel => {
+            let Some(draft) = &mut state.draft else { return Command::none() };
+            let Build::Running(id) = draft.build else { return Command::none() };
+            // The build removes the half-made image itself as soon as it notices the stop.
+            draft.build = Build::Stopped;
+            draft.log.push(LogLine::new(LogLevel::Warn, t!("profiles.wizard.build-stopping")));
+            Command::cancel_task(id)
+        }
+        Msg::LoginStart => start_login(state),
+        Msg::LoginOpened { session, container } => {
+            let engine = state.engine.clone();
+            let Some(draft) = &mut state.draft else {
+                // The wizard was closed while the container was coming up; nothing keeps it.
+                session.kill();
+                return discard(engine, container);
+            };
+            let watch = session.watch();
+            draft.login = Login::Running { session, container };
+            Command::batch([Command::perform(move || Msg::LoginEvent(watch.next())), Command::focus("login-terminal")])
+        }
+        Msg::LoginEvent(event) => login_event(state, event),
+        Msg::LoginDone => store_login(state),
+        Msg::LoginCancel => cancel_login(state),
+        Msg::LoginStored(result) => {
+            let Some(draft) = &mut state.draft else { return Command::none() };
+            draft.login = match result {
+                Ok(stored) => Login::Stored(stored),
+                Err(Problem::NoLogin) => Login::Unfinished(Unfinished::Missing),
+                Err(problem) => Login::Failed(problem),
+            };
+            Command::none()
+        }
+        Msg::LoginFailed(problem) => {
+            if let Some(draft) = &mut state.draft {
+                draft.login = Login::Failed(problem);
+            }
+            Command::none()
+        }
+        Msg::LoginDiscarded => Command::none(),
+    }
+}
+
+/// Reads the workspace again, and asks the engine about what it finds.
+fn reload(state: &mut Profiles) -> Command<Msg> {
+    let Some(workspace) = state.workspace() else {
+        state.loading = false;
+        return Command::none();
+    };
+    state.loading = true;
+    Command::perform(move || {
+        let loaded = workspace.profiles();
+        Msg::Loaded(Listing { profiles: loaded.value, diagnostics: loaded.diagnostics })
+    })
+}
+
+/// Asks the engine whether each profile has an image and a login.
+fn probe(state: &Profiles, profiles: Vec<Profile>) -> Command<Msg> {
+    let (Some(engine), false) = (state.engine.clone(), profiles.is_empty()) else { return Command::none() };
+    Command::task(Task::new(t!("profiles.probing"), move |_| Ok(Msg::Probed(work::probe(&engine, &profiles)))))
+}
+
+/// Asks before removing a login, saying plainly what goes and what stays.
+fn ask_sign_out(state: &Profiles) -> Command<Msg> {
+    let Some(row) = state.selected() else { return Command::none() };
+    if state.engine.is_none() || row.identity != Readiness::Present {
+        return Command::none();
+    }
+    let name = row.profile.name.to_string();
+    Command::confirm(
+        Confirm::new(t!("profiles.sign-out-title", name = name.as_str()), Msg::SignOutConfirmed)
+            .message(t!("profiles.sign-out-message"))
+            .confirm_label(t!("profiles.sign-out"))
+            .danger(),
+    )
+}
+
+/// Removes a profile's login.
+fn sign_out(state: &mut Profiles) -> Command<Msg> {
+    let (Some(engine), Some(row)) = (state.engine.clone(), state.selected()) else { return Command::none() };
+    let name = row.profile.name.clone();
+    state.signing_out = true;
+    Command::task(Task::new(t!("profiles.sign-out"), move |_| Ok(Msg::SignedOut(work::sign_out(&engine, &name)))))
+}
+
+/// Goes on a page, or says why it cannot.
+fn next(state: &mut Profiles) -> Command<Msg> {
+    let Some(draft) = &mut state.draft else { return Command::none() };
+    match draft.advance() {
+        Some(Blocked::NameEmpty | Blocked::NameTaken) => Command::focus("profile-name"),
+        Some(Blocked::NoImage) => Command::focus("build-start"),
+        None if draft.stage == Stage::Image && draft.build == Build::Waiting => start_build(state),
+        None => Command::none(),
+    }
+}
+
+/// Leaves the wizard. Whatever the engine has already made — the image, the login — stays; what
+/// is still running is stopped and cleared away.
+fn leave(state: &mut Profiles) -> Command<Msg> {
+    let mut commands = Vec::new();
+    let engine = state.engine.clone();
+    if let Some(draft) = &state.draft {
+        if let Build::Running(id) = draft.build {
+            commands.push(Command::cancel_task(id));
+        }
+        if let Login::Running { session, container } = &draft.login {
+            session.kill();
+            commands.push(discard(engine, Arc::clone(container)));
+        }
+    }
+    state.draft = None;
+    // Whatever was made is on disk and in the engine now, so the list is read again rather than
+    // guessed at.
+    commands.push(reload(state));
+    Command::batch(commands)
+}
+
+/// Starts the image build.
+fn start_build(state: &mut Profiles) -> Command<Msg> {
+    let (Some(engine), Some(workspace)) = (state.engine.clone(), state.workspace()) else {
+        return Command::none();
+    };
+    let Some(draft) = &mut state.draft else { return Command::none() };
+    let Some(profile) = draft.profile() else { return Command::none() };
+    if matches!(draft.build, Build::Running(_)) {
+        return Command::none();
+    }
+    draft.log.clear();
+    let task = Task::new(t!("profiles.wizard.step-image"), move |cx| {
+        let cancel = || cx.is_cancelled();
+        let mut line = |text: &str| cx.send(Msg::BuildLine(text.to_owned()));
+        // The base image says nothing at all when it is already there, so its first word is
+        // the moment a build of it began, and that is when the log is told what it is watching.
+        let mut announced = false;
+        let base = base::ensure(&engine, &cancel, &mut |text| {
+            if !announced {
+                announced = true;
+                cx.send(Msg::BaseImageStarted);
+            }
+            line(text);
+        });
+        let built = base.map_err(Problem::from).and_then(|_| work::build(&engine, &profile, &cancel, &mut line));
+        // The definition file is written only once there is an image behind it, so a workspace
+        // never holds a profile that cannot be opened.
+        let result =
+            built.and_then(|()| workspace.write_profile(&profile).map_err(|problem| Problem::Machine(problem.message)));
+        Ok(Msg::BuildEnded(result))
+    });
+    draft.build = Build::Running(task.id());
+    Command::task(task)
+}
+
+/// Opens the container the login happens in and starts the harness on a terminal.
+fn start_login(state: &mut Profiles) -> Command<Msg> {
+    let Some(engine) = state.engine.clone() else { return Command::none() };
+    let Some(draft) = &mut state.draft else { return Command::none() };
+    let Some(profile) = draft.profile() else { return Command::none() };
+    if draft.login.is_busy() {
+        return Command::none();
+    }
+    draft.login = Login::Opening;
+    Command::task(Task::new(t!("profiles.wizard.step-login"), move |_| {
+        let container = match work::open_login(&engine, &profile) {
+            Ok(container) => container,
+            Err(problem) => return Ok(Msg::LoginFailed(problem)),
+        };
+        match work::start_harness(&engine, &profile, &container.name) {
+            Ok(session) => Ok(Msg::LoginOpened { session, container: Arc::new(container) }),
+            Err(problem) => {
+                work::close_login(&engine, &container);
+                Ok(Msg::LoginFailed(problem))
+            }
+        }
+    }))
+}
+
+/// Keeps watching the login terminal. A harness that closes by itself is not a login: the
+/// container is asked whether a login file is there, and only that answers the question.
+fn login_event(state: &mut Profiles, event: TerminalEvent) -> Command<Msg> {
+    let Some(draft) = &state.draft else { return Command::none() };
+    let Login::Running { session, .. } = &draft.login else { return Command::none() };
+    match event {
+        TerminalEvent::Output => {
+            let watch = session.watch();
+            Command::perform(move || Msg::LoginEvent(watch.next()))
+        }
+        TerminalEvent::Exited(_) => store_login(state),
+    }
+}
+
+/// Looks for the login the person just made and puts it in the profile's volume.
+fn store_login(state: &mut Profiles) -> Command<Msg> {
+    let Some(engine) = state.engine.clone() else { return Command::none() };
+    let Some(draft) = &mut state.draft else { return Command::none() };
+    let Login::Running { session, container } = &draft.login else { return Command::none() };
+    let Some(profile) = draft.profile() else { return Command::none() };
+    session.kill();
+    let container = Arc::clone(container);
+    draft.login = Login::Storing;
+    Command::task(Task::new(t!("profiles.wizard.storing"), move |_| {
+        let stored = work::store_login(&engine, &profile, &container);
+        work::close_login(&engine, &container);
+        Ok(Msg::LoginStored(stored))
+    }))
+}
+
+/// Stops a login the person no longer wants, leaving no container and no volume behind.
+fn cancel_login(state: &mut Profiles) -> Command<Msg> {
+    let engine = state.engine.clone();
+    let Some(draft) = &mut state.draft else { return Command::none() };
+    let Login::Running { session, container } = &draft.login else { return Command::none() };
+    session.kill();
+    let command = discard(engine, Arc::clone(container));
+    draft.login = Login::Unfinished(Unfinished::Stopped);
+    command
+}
+
+/// Clears away the container a login used.
+fn discard(engine: Option<Engine>, container: Arc<work::LoginContainer>) -> Command<Msg> {
+    let Some(engine) = engine else { return Command::none() };
+    Command::perform(move || {
+        work::close_login(&engine, &container);
+        Msg::LoginDiscarded
+    })
+}
+
+/// Puts a failure's own words into the build log, so the engine is quoted rather than summarised.
+fn report(log: &mut LogBuffer, problem: &Problem) {
+    if let Some(output) = problem.output() {
+        for line in output.lines() {
+            log.push(LogLine::new(LogLevel::Error, line));
+        }
+    }
+}
+
+/// A toast that says what failed and shows the first line the engine said about it.
+fn failure_toast(key: &str, problem: &Problem) -> Toast<Msg> {
+    let toast = Toast::danger(t!(key));
+    match problem.output().and_then(|output| output.lines().next()) {
+        Some(line) => toast.body(line.to_owned()),
+        None => toast,
+    }
+}
+
+/// Draws the screen: the list of profiles, or the wizard while one is being made.
+pub fn view(state: &Profiles, ui: &mut View<'_, Msg>) {
+    match state.draft() {
+        Some(draft) => draw_wizard(state, draft, ui),
+        None => draw_list(state, ui),
+    }
+}
+
+/// The control that takes the keyboard when the screen opens, once there is one: the list of
+/// profiles. An empty screen has a single button and nothing to walk, so nothing is focused and
+/// the button is one Tab away.
+#[must_use]
+pub fn entry(state: &Profiles) -> Option<&'static str> {
+    (!state.rows().is_empty()).then_some("profiles")
+}
+
+/// Draws the key hints of the screen.
+pub fn hints(ui: &mut View<'_, Msg>) {
+    let icons = ui.env().icons();
+    let move_keys = format!("{}{}", icons.glyph("arrow-up"), icons.glyph("arrow-down"));
+    ui.add(
+        KeyHints::new()
+            .hint(move_keys, t!("hints.move"))
+            .hint(icons.glyph("enter").into_owned(), t!("hints.open"))
+            .action_right(Scope::Global, "quit"),
+    )
+    .fill_width();
+}
+
+/// The list of profiles, what the engine says about the chosen one, and the way to a new one.
+fn draw_list(state: &Profiles, ui: &mut View<'_, Msg>) {
+    let engineless = state.engine.is_none();
+    // While a login is being removed the button that asked for it shows the work and takes no
+    // second press.
+    let busy = state.signing_out;
+    let rows = state.rows();
+    let selected = state.selected().cloned();
+    let problems = state.problems().len();
+    let loading = state.is_loading();
+    let workspace = state.root.is_some();
+
+    ui.column(|ui| {
+        // Only the title stands above the list: what a profile is for belongs on the empty
+        // screen, where it is the answer to a question, and a full list needs its rows instead.
+        ui.add(Text::new(t!("profiles.title")).bold());
+        if engineless {
+            ui.add(Text::new(t!("profiles.no-engine")).color("warning")).fill_width();
+        }
+        if !workspace {
+            ui.add(Text::new(t!("profiles.no-workspace")).color("warning")).fill_width();
+            return;
+        }
+        if problems > 0 {
+            ui.add(Text::new(t!("profiles.broken", n = i64::try_from(problems).unwrap_or(i64::MAX))).color("warning"));
+        }
+        if loading {
+            ui.add(Text::new(t!("profiles.reading")).role("secondary"));
+            return;
+        }
+        if rows.is_empty() {
+            ui.add(
+                EmptyState::new(t!("profiles.empty-title"))
+                    .icon("inbox")
+                    .message(t!("profiles.empty-message"))
+                    .action(Button::new(t!("profiles.new")).variant("primary").on_press(Msg::New)),
+            )
+            .id("profiles-empty")
+            .fill();
+            return;
+        }
+
+        // The row carries the name and the harness only; everything else about the chosen
+        // profile is spelled out under the list, where a narrow screen still has room for it.
+        let items = rows
+            .iter()
+            .map(|row| ListItem::new(row.profile.name.to_string()).detail(row.profile.harness.record().display_name));
+        ui.add(List::new(items).selected(Some(state.selected)).on_select(Msg::Select)).id("profiles").fill();
+
+        if let Some(row) = selected {
+            ui.row(|ui| {
+                ui.add(badge(row.image, "profiles.image"));
+                ui.add(badge(row.identity, "profiles.identity"));
+            })
+            .gap(1);
+            ui.add(Text::new(summary(&row.profile)).role("secondary")).fill_width();
+            ui.add(Text::new(mounts(&row.profile)).role("secondary")).fill_width();
+            let signed_in = row.identity == Readiness::Present;
+            ui.row(|ui| {
+                let mut again = Button::new(t!("profiles.sign-in"));
+                if !engineless && row.image == Readiness::Present {
+                    again = again.on_press(Msg::SignInAsked);
+                }
+                ui.add(again.disabled(engineless || row.image != Readiness::Present)).id("profile-sign-in");
+                let mut out = Button::new(t!("profiles.sign-out")).loading(busy);
+                if !engineless && signed_in && !busy {
+                    out = out.on_press(Msg::SignOutAsked);
+                }
+                ui.add(out.variant("danger").disabled(engineless || !signed_in)).id("profile-sign-out");
+                ui.spacer();
+                ui.add(Button::new(t!("profiles.new")).variant("primary").on_press(Msg::New)).id("profile-new");
+            })
+            .gap(2)
+            .fill_width();
+        }
+    })
+    .fill()
+    .gap(1);
+}
+
+/// The badge of one answer, which says plainly when there is no answer yet.
+fn badge(readiness: Readiness, key: &str) -> Badge {
+    let (word, variant) = match readiness {
+        Readiness::Present => ("ready", "success"),
+        Readiness::Missing => ("missing", "warning"),
+        Readiness::Unknown => ("unknown", ""),
+    };
+    let badge = Badge::new(t!(&format!("{key}-{word}")));
+    if variant.is_empty() { badge } else { badge.variant(variant) }
+}
+
+/// What a profile runs, in one line.
+fn summary(profile: &Profile) -> String {
+    t!(
+        "profiles.summary",
+        harness = profile.harness.record().display_name,
+        template = template_word(profile.template).as_str(),
+        account = account_word(profile.account).as_str()
+    )
+}
+
+/// What a profile's containers may see and reach, in one line.
+fn mounts(profile: &Profile) -> String {
+    t!(
+        "profiles.mounts",
+        assets = access_word(profile.assets).as_str(),
+        network = network_word(profile.network).as_str()
+    )
+}
+
+/// The word for a template.
+fn template_word(template: Template) -> String {
+    t!(match template {
+        Template::Base => "profiles.template-base",
+        Template::Recommended => "profiles.template-recommended",
+    })
+}
+
+/// The word for an account type.
+fn account_word(account: AccountKind) -> String {
+    t!(match account {
+        AccountKind::Subscription => "profiles.account-subscription",
+        AccountKind::ApiKey => "profiles.account-api-key",
+    })
+}
+
+/// The word for a mount access.
+fn access_word(access: MountAccess) -> String {
+    t!(match access {
+        MountAccess::ReadWrite => "profiles.access-rw",
+        MountAccess::ReadOnly => "profiles.access-ro",
+    })
+}
+
+/// The word for a network mode.
+fn network_word(mode: NetworkMode) -> String {
+    t!(match mode {
+        NetworkMode::Full => "profiles.network-full",
+        NetworkMode::None => "profiles.network-none",
+    })
+}
+
+/// The wizard, or the login page on its own when that is all the draft is for.
+fn draw_wizard(state: &Profiles, draft: &Draft, ui: &mut View<'_, Msg>) {
+    if draft.is_only_login() {
+        ui.column(|ui| {
+            ui.add(Text::new(t!("profiles.wizard.sign-in-title", name = draft.name.as_str())).bold());
+            draw_login(state, draft, ui);
+            ui.row(|ui| {
+                ui.spacer();
+                ui.add(Button::new(t!("profiles.wizard.close")).variant("primary").on_press(Msg::Finish))
+                    .id("login-close");
+            })
+            .fill_width();
+        })
+        .fill()
+        .gap(1)
+        .width(Length::Cells(PAGE_WIDTH));
+        return;
+    }
+
+    let labels = Stage::ALL.map(step_word);
+    let wizard = Wizard::new(labels)
+        .current(draft.stage.index())
+        .busy(draft.is_busy())
+        .on_next(Msg::Next)
+        .on_back(Msg::Back)
+        .on_cancel(Msg::Cancel)
+        .on_finish(Msg::Finish)
+        .on_step(Msg::Step);
+    wizard
+        .show(ui, |ui| match draft.stage {
+            Stage::Harness => draw_harness(draft, ui),
+            Stage::Template => draw_template(draft, ui),
+            Stage::Account => draw_account(draft, ui),
+            Stage::Permissions => draw_permissions(draft, ui),
+            Stage::Image => draw_image(state, draft, ui),
+            Stage::Login => draw_login(state, draft, ui),
+        })
+        .width(Length::Cells(PAGE_WIDTH));
+}
+
+/// The name of one step.
+fn step_word(stage: Stage) -> String {
+    t!(match stage {
+        Stage::Harness => "profiles.wizard.step-harness",
+        Stage::Template => "profiles.wizard.step-template",
+        Stage::Account => "profiles.wizard.step-account",
+        Stage::Permissions => "profiles.wizard.step-permissions",
+        Stage::Image => "profiles.wizard.step-image",
+        Stage::Login => "profiles.wizard.step-login",
+    })
+}
+
+/// Which harness, and what the profile is called.
+fn draw_harness(draft: &Draft, ui: &mut View<'_, Msg>) {
+    let error = match draft.blocked() {
+        Some(Blocked::NameEmpty) => Some(t!("profiles.wizard.name-empty")),
+        Some(Blocked::NameTaken) => Some(t!("profiles.wizard.name-taken")),
+        _ => None,
+    };
+    let chosen = HarnessKind::ALL.iter().position(|harness| *harness == draft.harness);
+    ui.add(Text::new(t!("profiles.wizard.harness-lead")).role("secondary")).fill_width();
+    ui.add(
+        RadioGroup::new(HarnessKind::ALL.map(|harness| harness.record().display_name.to_owned()))
+            .selected(chosen)
+            .on_select(Msg::PickHarness),
+    )
+    .id("profile-harness");
+    ui.add_with(
+        Field::new(t!("profiles.wizard.name"))
+            .hint(t!("profiles.wizard.name-hint"))
+            .error(error.clone())
+            .required(true),
+        |ui| {
+            ui.add(
+                TextInput::new(draft.name.clone())
+                    .invalid(error.is_some())
+                    .max_length(SafeName::MAX_LENGTH)
+                    .on_change(Msg::Name),
+            )
+            .id("profile-name")
+            .fill_width();
+        },
+    )
+    .fill_width();
+    if let Some(safe) = draft.safe_name()
+        && safe.as_str() != draft.name
+    {
+        ui.add(Text::new(t!("profiles.wizard.name-folded", name = safe.as_str())).role("secondary"));
+    }
+}
+
+/// The harness as it comes, or set up the way QCode runs it.
+fn draw_template(draft: &Draft, ui: &mut View<'_, Msg>) {
+    let chosen = Template::ALL.iter().position(|template| *template == draft.template);
+    ui.add(Text::new(t!("profiles.wizard.template-lead")).role("secondary")).fill_width();
+    ui.add(RadioGroup::new(Template::ALL.map(template_word)).selected(chosen).on_select(Msg::PickTemplate))
+        .id("profile-template");
+    let detail = match draft.template {
+        Template::Base => t!("profiles.wizard.template-base-detail"),
+        Template::Recommended => t!("profiles.wizard.template-recommended-detail"),
+    };
+    ui.add(Text::new(detail).role("secondary")).fill_width();
+    ui.add(Text::new(t!("profiles.wizard.unattended")).role("secondary")).fill_width();
+}
+
+/// What the profile signs in with.
+fn draw_account(draft: &Draft, ui: &mut View<'_, Msg>) {
+    let offered = draft.harness.record().accounts;
+    let chosen = offered.iter().position(|account| *account == draft.account);
+    ui.add(Text::new(t!("profiles.wizard.account-lead")).role("secondary")).fill_width();
+    ui.add(
+        RadioGroup::new(offered.iter().map(|account| account_word(*account)))
+            .selected(chosen)
+            .on_select(Msg::PickAccount),
+    )
+    .id("profile-account");
+}
+
+/// What the container may see and reach.
+fn draw_permissions(draft: &Draft, ui: &mut View<'_, Msg>) {
+    ui.add(Text::new(t!("profiles.wizard.permissions-lead")).role("secondary")).fill_width();
+    ui.add(Text::new(t!("profiles.wizard.permissions-project")).bold());
+    ui.add(Text::new(t!("profiles.access-rw")).role("secondary"));
+    ui.add(Text::new(t!("profiles.wizard.project-why")).role("secondary")).fill_width();
+    ui.add(Text::new(t!("profiles.wizard.permissions-assets")).bold());
+    ui.add(
+        RadioGroup::new(MountAccess::ALL.map(access_word))
+            .selected(MountAccess::ALL.iter().position(|access| *access == draft.assets))
+            .horizontal(true)
+            .on_select(Msg::PickAssets),
+    )
+    .id("profile-assets");
+    ui.add(Text::new(t!("profiles.wizard.permissions-network")).bold());
+    ui.add(
+        RadioGroup::new(NetworkMode::ALL.map(network_word))
+            .selected(NetworkMode::ALL.iter().position(|mode| *mode == draft.network))
+            .horizontal(true)
+            .on_select(Msg::PickNetwork),
+    )
+    .id("profile-network");
+}
+
+/// Building the image, with everything the engine says as it says it.
+fn draw_image(state: &Profiles, draft: &Draft, ui: &mut View<'_, Msg>) {
+    let engineless = state.engine.is_none();
+    let lead = match &draft.build {
+        Build::Waiting => t!("profiles.wizard.build-waiting"),
+        Build::Running(_) => t!("profiles.wizard.build-running"),
+        Build::Done => t!("profiles.wizard.build-done"),
+        Build::Stopped => t!("profiles.wizard.build-stopped"),
+        Build::Failed(_) => t!("profiles.wizard.build-failed"),
+    };
+    ui.add(Text::new(lead).role(if matches!(draft.build, Build::Failed(_)) { "danger" } else { "secondary" }))
+        .fill_width();
+    if engineless {
+        ui.add(Text::new(t!("profiles.no-engine-detail")).color("warning")).fill_width();
+    }
+    ui.add(LogView::new(&draft.log).empty_text(t!("profiles.wizard.build-empty")))
+        .id("build-log")
+        .fill_width()
+        .height(Length::Cells(VIEWPORT_ROWS));
+    ui.row(|ui| {
+        match draft.build {
+            Build::Running(_) => {
+                ui.add(Button::new(t!("profiles.wizard.build-cancel")).on_press(Msg::BuildCancel)).id("build-cancel");
+            }
+            Build::Done => {}
+            _ => {
+                let label = if draft.build == Build::Waiting {
+                    t!("profiles.wizard.build-start")
+                } else {
+                    t!("profiles.wizard.build-again")
+                };
+                let mut button = Button::new(label).variant("primary").disabled(engineless);
+                if !engineless {
+                    button = button.on_press(Msg::BuildStart);
+                }
+                ui.add(button).id("build-start");
+            }
+        }
+        ui.spacer();
+    })
+    .gap(2)
+    .fill_width();
+}
+
+/// Signing in: why a terminal opens, what to do in it, and how QCode decides it worked.
+fn draw_login(state: &Profiles, draft: &Draft, ui: &mut View<'_, Msg>) {
+    let engineless = state.engine.is_none();
+    let harness = draft.harness.record().display_name;
+    match &draft.login {
+        Login::Waiting => {
+            ui.add(Text::new(t!("profiles.wizard.login-why", harness = harness)).role("secondary")).fill_width();
+            ui.add(Text::new(t!("profiles.wizard.login-what")).role("secondary")).fill_width();
+            ui.add(Text::new(t!("profiles.wizard.login-proof")).role("secondary")).fill_width();
+            if engineless {
+                ui.add(Text::new(t!("profiles.no-engine-detail")).color("warning")).fill_width();
+            }
+            let mut button = Button::new(t!("profiles.wizard.login-open")).variant("primary").disabled(engineless);
+            if !engineless {
+                button = button.on_press(Msg::LoginStart);
+            }
+            ui.add(button).id("login-open");
+        }
+        Login::Opening => {
+            ui.add(Text::new(t!("profiles.wizard.login-opening")).role("secondary"));
+        }
+        Login::Running { session, .. } => {
+            ui.add(Text::new(t!("profiles.wizard.login-running", harness = harness)).role("secondary")).fill_width();
+            ui.add(Terminal::new(session)).id("login-terminal").fill_width().height(Length::Cells(VIEWPORT_ROWS));
+            ui.row(|ui| {
+                ui.add(Button::new(t!("profiles.wizard.login-done")).variant("primary").on_press(Msg::LoginDone))
+                    .id("login-done");
+                ui.add(Button::new(t!("profiles.wizard.login-stop")).on_press(Msg::LoginCancel)).id("login-stop");
+                ui.spacer();
+            })
+            .gap(2)
+            .fill_width();
+        }
+        Login::Storing => {
+            ui.add(Text::new(t!("profiles.wizard.login-storing")).role("secondary"));
+        }
+        Login::Stored(files) => {
+            ui.add(
+                Text::new(t!("profiles.wizard.login-stored", n = i64::try_from(*files).unwrap_or(i64::MAX)))
+                    .color("success"),
+            )
+            .fill_width();
+            ui.add(Text::new(t!("profiles.wizard.login-stored-detail")).role("secondary")).fill_width();
+        }
+        Login::Unfinished(why) => {
+            let text = match why {
+                Unfinished::Stopped => t!("profiles.wizard.login-interrupted"),
+                Unfinished::Missing => t!("profiles.wizard.login-not-found"),
+            };
+            ui.add(Text::new(text).color("warning")).fill_width();
+            ui.add(Text::new(t!("profiles.wizard.login-later")).role("secondary")).fill_width();
+            ui.add(Button::new(t!("profiles.wizard.login-again")).on_press(Msg::LoginStart)).id("login-again");
+        }
+        Login::Failed(problem) => {
+            ui.add(Text::new(t!("profiles.wizard.login-failed")).color("danger")).fill_width();
+            if let Some(output) = problem.output() {
+                ui.add(Text::new(output.to_owned()).role("secondary")).fill_width();
+            }
+            ui.add(Text::new(t!("profiles.wizard.login-later")).role("secondary")).fill_width();
+            ui.add(Button::new(t!("profiles.wizard.login-again")).on_press(Msg::LoginStart)).id("login-again");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qframe::env::{AssetDirs, Env};
+    use qframe::icons::GlyphMode;
+    use qframe::runtime::Harness;
+
+    /// A terminal wide enough for the list beside its detail and for a wizard page.
+    const SIZE: (u16, u16) = (96, 34);
+
+    /// The screen on its own, so that a test drives exactly this module and nothing else. The
+    /// application's message is this module's message, which is what wiring the screen into
+    /// QCode does with one more layer around it.
+    struct Host {
+        state: Profiles,
+    }
+
+    impl App for Host {
+        type Msg = Msg;
+
+        fn update(&mut self, message: Msg) -> Command<Msg> {
+            update(&mut self.state, message)
+        }
+
+        fn view(&self, ui: &mut View<'_, Msg>) {
+            AppShell::new().body(|ui| view(&self.state, ui)).footer(hints).show(ui);
+        }
+    }
+
+    fn env() -> Env {
+        Env::load(&AssetDirs { locale_sources: crate::locales(), ..AssetDirs::default() })
+            .expect("the built-in files load")
+    }
+
+    fn profile(name: &str, harness: HarnessKind) -> Profile {
+        Profile {
+            name: SafeName::parse(name).expect("the name is safe"),
+            harness,
+            template: Template::Recommended,
+            account: AccountKind::Subscription,
+            assets: MountAccess::ReadOnly,
+            network: NetworkMode::Full,
+        }
+    }
+
+    /// A workspace path that is never read: the tests deliver what the disk would have given,
+    /// so nothing here touches a file system or an engine.
+    fn root() -> PathBuf {
+        std::env::temp_dir().join("qcode-profiles-screen")
+    }
+
+    /// A screen with a workspace and no engine, on a terminal of `width` by `height`.
+    fn screen(width: u16, height: u16) -> Harness<Host> {
+        let state = Profiles::new(Some(root()), None);
+        let mut harness = Harness::with_env(Host { state }, env(), width, height);
+        harness.set_locale("en").set_glyph_mode(GlyphMode::Unicode);
+        harness.render();
+        harness
+    }
+
+    /// A screen with a workspace and an engine that is never actually run: every answer the
+    /// engine would give is delivered as a message instead.
+    fn with_engine() -> Harness<Host> {
+        // A binary that is not there: an engine QCode holds but never gets an answer out of, so
+        // the test says what the answers are instead of a machine happening to have podman.
+        let engine = Engine::new(crate::engine::EngineKind::Podman, "/qcode/no/such/engine");
+        let state = Profiles::new(Some(root()), Some(engine));
+        let mut harness = Harness::with_env(Host { state }, env(), SIZE.0, SIZE.1);
+        harness.set_locale("en").set_glyph_mode(GlyphMode::Unicode);
+        harness.render();
+        harness
+    }
+
+    /// A screen holding `profiles`, delivered the way the workspace would deliver them.
+    fn loaded(profiles: Vec<Profile>) -> Harness<Host> {
+        let mut harness = screen(SIZE.0, SIZE.1);
+        harness.send(Msg::Loaded(Listing { profiles, diagnostics: Vec::new() })).render();
+        harness
+    }
+
+    /// The engine's answer about every profile on screen.
+    fn answer(harness: &mut Harness<Host>, image: Readiness, identity: Readiness) {
+        let answers: Vec<Status> = harness
+            .app()
+            .state
+            .rows()
+            .iter()
+            .map(|row| Status { name: row.profile.name.clone(), image, identity })
+            .collect();
+        harness.send(Msg::Probed(answers)).render();
+    }
+
+    #[test]
+    fn a_workspace_without_profiles_starts_empty() {
+        let state = Profiles::new(None, None);
+        assert!(state.rows().is_empty());
+        assert!(!state.is_loading(), "without a workspace there is nothing to wait for");
+    }
+
+    #[test]
+    fn an_empty_workspace_says_that_nothing_runs_without_a_profile() {
+        let harness = loaded(Vec::new());
+        let screen = harness.screen();
+        assert!(screen.contains("No profiles yet"), "{screen}");
+        assert!(screen.contains("harness through a profile"), "{screen}");
+        assert!(screen.contains("New profile"), "the way out is offered:\n{screen}");
+    }
+
+    #[test]
+    fn a_workspace_being_read_says_so_instead_of_looking_empty() {
+        let root = std::env::temp_dir().join("qcode-profiles-loading");
+        let state = Profiles::new(Some(root), None);
+        assert!(state.is_loading());
+        let mut harness = Harness::with_env(Host { state }, env(), SIZE.0, SIZE.1);
+        harness.set_locale("en").set_glyph_mode(GlyphMode::Unicode).render();
+        let screen = harness.screen();
+        assert!(screen.contains("Reading the profiles"), "{screen}");
+        assert!(!screen.contains("No profiles yet"), "a workspace being read is not an empty one:\n{screen}");
+    }
+
+    #[test]
+    fn a_broken_definition_file_is_counted_on_the_screen() {
+        let mut harness = screen(SIZE.0, SIZE.1);
+        let diagnostics = vec![qframe::diagnostics::Diagnostic::error(
+            Some(qframe::diagnostics::Location { file: "half.toml".to_owned(), line: 1, column: 1 }),
+            "`name` is missing",
+        )];
+        harness
+            .send(Msg::Loaded(Listing { profiles: vec![profile("claude-sub", HarnessKind::ClaudeCode)], diagnostics }));
+        harness.render();
+        let screen = harness.screen();
+        assert!(screen.contains("1 profile file could not be read"), "{screen}");
+        assert!(screen.contains("claude-sub"), "the readable profile is still listed:\n{screen}");
+    }
+
+    #[test]
+    fn before_the_engine_answers_nothing_claims_to_be_ready() {
+        let harness = loaded(vec![profile("claude-sub", HarnessKind::ClaudeCode)]);
+        let screen = harness.screen();
+        assert!(screen.contains("Image not checked"), "{screen}");
+        assert!(screen.contains("Login not checked"), "{screen}");
+        assert!(!screen.contains("Signed in"), "nothing is signed in until the engine says so:\n{screen}");
+    }
+
+    #[test]
+    fn the_engines_answer_becomes_the_two_badges() {
+        let mut harness = loaded(vec![profile("claude-sub", HarnessKind::ClaudeCode)]);
+        answer(&mut harness, Readiness::Present, Readiness::Missing);
+        let screen = harness.screen();
+        assert!(screen.contains("Image ready"), "{screen}");
+        assert!(screen.contains("Not signed in"), "{screen}");
+        answer(&mut harness, Readiness::Present, Readiness::Present);
+        assert!(harness.screen().contains("Signed in"), "{}", harness.screen());
+    }
+
+    #[test]
+    fn a_profile_summary_says_what_it_runs_and_what_it_may_reach() {
+        let harness = loaded(vec![profile("claude-sub", HarnessKind::ClaudeCode)]);
+        let screen = harness.screen();
+        assert!(screen.contains("Claude Code"), "{screen}");
+        assert!(screen.contains("recommended template"), "{screen}");
+        assert!(screen.contains("subscription"), "{screen}");
+        assert!(screen.contains("assets read-only"), "{screen}");
+        assert!(screen.contains("network full"), "{screen}");
+    }
+
+    #[test]
+    fn without_an_engine_the_screen_says_what_it_cannot_do_and_the_buttons_are_dead() {
+        let mut harness = loaded(vec![profile("claude-sub", HarnessKind::ClaudeCode)]);
+        answer(&mut harness, Readiness::Present, Readiness::Present);
+        let screen = harness.screen();
+        assert!(screen.contains("No container engine was found"), "{screen}");
+        assert!(screen.contains("signed in or signed out"), "the reason stands beside the dead buttons:\n{screen}");
+        harness.click_text("Sign out").render();
+        assert!(!harness.screen().contains("Sign claude-sub out?"), "a dead button asks nothing:\n{screen}");
+    }
+
+    #[test]
+    fn signing_out_is_asked_first_and_says_exactly_what_goes() {
+        let mut harness = with_engine();
+        harness.send(Msg::Loaded(Listing {
+            profiles: vec![profile("claude-sub", HarnessKind::ClaudeCode)],
+            diagnostics: Vec::new(),
+        }));
+        answer(&mut harness, Readiness::Present, Readiness::Present);
+        harness.send(Msg::SignOutAsked).render();
+        let screen = harness.screen();
+        assert!(screen.contains("Sign claude-sub out?"), "{screen}");
+        assert!(screen.contains("Projects that already have a copy keep working"), "{screen}");
+        assert!(screen.contains("new projects get no login"), "{screen}");
+    }
+
+    #[test]
+    fn a_profile_that_is_not_signed_in_cannot_be_signed_out() {
+        let mut harness = with_engine();
+        harness.send(Msg::Loaded(Listing {
+            profiles: vec![profile("claude-sub", HarnessKind::ClaudeCode)],
+            diagnostics: Vec::new(),
+        }));
+        answer(&mut harness, Readiness::Present, Readiness::Missing);
+        harness.send(Msg::SignOutAsked).render();
+        assert!(!harness.screen().contains("Sign claude-sub out?"), "{}", harness.screen());
+    }
+
+    #[test]
+    fn the_wizard_walks_through_its_six_pages_in_order() {
+        let mut harness = loaded(Vec::new());
+        harness.send(Msg::New).render();
+        let screen = harness.screen();
+        assert!(screen.contains("Harness"), "the first step names itself:\n{screen}");
+        assert!(screen.contains("Claude Code") && screen.contains("Codex"), "{screen}");
+        assert!(screen.contains("Name"), "{screen}");
+        for expected in
+            ["How much of the harness", "What this profile signs in with", "may see and reach", "Build the image"]
+        {
+            harness.send(Msg::Next).render();
+            assert!(harness.screen().contains(expected), "`{expected}` is missing:\n{}", harness.screen());
+        }
+        harness.send(Msg::BuildEnded(Ok(()))).send(Msg::Next).render();
+        assert!(harness.screen().contains("Open the sign-in terminal"), "{}", harness.screen());
+        assert_eq!(harness.app().state.draft().expect("the wizard is open").stage, Stage::Login);
+    }
+
+    #[test]
+    fn a_name_that_is_taken_stops_the_wizard_on_the_first_page() {
+        let mut harness = loaded(vec![profile("claude-code", HarnessKind::ClaudeCode)]);
+        harness.send(Msg::New).send(Msg::Next).render();
+        let screen = harness.screen();
+        assert!(screen.contains("There is already a profile with this name"), "{screen}");
+        assert!(harness.is_focused("profile-name"), "the focus goes to the problem:\n{screen}");
+        harness.send(Msg::Name("Günlük İş".to_owned())).render();
+        assert!(harness.screen().contains("It is written as gunluk-is"), "{}", harness.screen());
+        harness.send(Msg::Next).render();
+        assert!(harness.screen().contains("How much of the harness"), "{}", harness.screen());
+    }
+
+    #[test]
+    fn the_permissions_page_says_the_project_is_always_writable() {
+        let mut harness = loaded(Vec::new());
+        harness.send(Msg::New);
+        for _ in 0..3 {
+            harness.send(Msg::Next);
+        }
+        harness.render();
+        let screen = harness.screen();
+        assert!(screen.contains("always writable"), "{screen}");
+        assert!(screen.contains("read-only") && screen.contains("writable"), "{screen}");
+        assert!(screen.contains("full") && screen.contains("none"), "{screen}");
+    }
+
+    #[test]
+    fn the_image_page_cannot_be_left_until_there_is_an_image() {
+        let mut harness = loaded(Vec::new());
+        harness.send(Msg::New);
+        for _ in 0..4 {
+            harness.send(Msg::Next);
+        }
+        harness.render();
+        assert!(harness.screen().contains("Build the image"), "{}", harness.screen());
+        harness.send(Msg::Next).render();
+        assert!(harness.screen().contains("Build the image"), "a page without an image keeps its place");
+        harness.send(Msg::BuildEnded(Ok(()))).render();
+        assert!(harness.screen().contains("written to the workspace"), "{}", harness.screen());
+        harness.send(Msg::Next).render();
+        assert!(harness.screen().contains("signs in with its own flow"), "{}", harness.screen());
+    }
+
+    #[test]
+    fn a_failed_build_shows_the_engines_own_words_and_leaves_no_image() {
+        let mut harness = loaded(Vec::new());
+        harness.send(Msg::New);
+        for _ in 0..4 {
+            harness.send(Msg::Next);
+        }
+        harness.send(Msg::BuildLine("STEP 1/3: FROM qcode/base".to_owned()));
+        harness.send(Msg::BuildEnded(Err(Problem::Refused("Error: qcode/base: image not known".to_owned()))));
+        harness.render();
+        let screen = harness.screen();
+        assert!(screen.contains("The build failed"), "{screen}");
+        assert!(screen.contains("image not known"), "the engine is quoted, not summarised:\n{screen}");
+        assert!(screen.contains("nothing was left behind"), "{screen}");
+        assert!(screen.contains("Build again"), "{screen}");
+        harness.send(Msg::Next).render();
+        assert!(harness.screen().contains("Build again"), "a failed build is not an image");
+    }
+
+    #[test]
+    fn a_stopped_build_says_that_nothing_was_written() {
+        let mut harness = loaded(Vec::new());
+        harness.send(Msg::New);
+        for _ in 0..4 {
+            harness.send(Msg::Next);
+        }
+        harness.send(Msg::BuildEnded(Err(Problem::Cancelled))).render();
+        let screen = harness.screen();
+        assert!(screen.contains("The build was stopped"), "{screen}");
+        assert!(screen.contains("Nothing was written"), "{screen}");
+    }
+
+    #[test]
+    fn the_login_page_says_why_a_terminal_opens_what_to_do_and_how_it_is_checked() {
+        let mut harness = loaded(Vec::new());
+        harness.send(Msg::New);
+        for _ in 0..4 {
+            harness.send(Msg::Next);
+        }
+        harness.send(Msg::BuildEnded(Ok(()))).send(Msg::Next).render();
+        let screen = harness.screen();
+        assert!(screen.contains("Claude Code signs in with its own flow"), "why:\n{screen}");
+        assert!(screen.contains("Sign in in the terminal"), "what to do:\n{screen}");
+        assert!(screen.contains("does not take your word for it"), "how it is checked:\n{screen}");
+        assert!(screen.contains("Open the sign-in terminal"), "{screen}");
+    }
+
+    #[test]
+    fn a_harness_that_closed_without_a_login_is_never_counted_as_signed_in() {
+        let mut harness = loaded(Vec::new());
+        harness.send(Msg::New);
+        for _ in 0..4 {
+            harness.send(Msg::Next);
+        }
+        harness.send(Msg::BuildEnded(Ok(()))).send(Msg::Next);
+        harness.send(Msg::LoginStored(Err(Problem::NoLogin))).render();
+        let screen = harness.screen();
+        assert!(screen.contains("closed without leaving a login"), "{screen}");
+        assert!(screen.contains("nothing was stored"), "{screen}");
+        assert!(screen.contains("Sign in from the list whenever you like"), "the way back is offered:\n{screen}");
+        let draft = harness.app().state.draft().expect("the wizard is open");
+        assert!(!draft.login.is_stored());
+    }
+
+    #[test]
+    fn an_interrupted_login_says_that_nothing_was_kept() {
+        let mut harness = loaded(Vec::new());
+        harness.send(Msg::New);
+        for _ in 0..4 {
+            harness.send(Msg::Next);
+        }
+        harness.send(Msg::BuildEnded(Ok(()))).send(Msg::Next);
+        // The page reached by stopping a sign-in that was under way.
+        harness.send(Msg::LoginFailed(Problem::Refused("Error: no such container".to_owned()))).render();
+        let screen = harness.screen();
+        assert!(screen.contains("The sign-in could not be opened"), "{screen}");
+        assert!(screen.contains("no such container"), "{screen}");
+        assert!(screen.contains("Try again"), "{screen}");
+    }
+
+    #[test]
+    fn a_stored_login_says_how_much_was_kept_and_what_happens_to_it() {
+        let mut harness = loaded(Vec::new());
+        harness.send(Msg::New);
+        for _ in 0..4 {
+            harness.send(Msg::Next);
+        }
+        harness.send(Msg::BuildEnded(Ok(()))).send(Msg::Next);
+        harness.send(Msg::LoginStored(Ok(1))).render();
+        let screen = harness.screen();
+        assert!(screen.contains("Signed in. 1 file was stored"), "{screen}");
+        assert!(screen.contains("gets its own copy"), "{screen}");
+    }
+
+    #[test]
+    fn a_profile_with_an_image_can_be_signed_in_again_from_the_list() {
+        let mut harness = with_engine();
+        harness.send(Msg::Loaded(Listing {
+            profiles: vec![profile("claude-sub", HarnessKind::ClaudeCode)],
+            diagnostics: Vec::new(),
+        }));
+        answer(&mut harness, Readiness::Present, Readiness::Missing);
+        harness.send(Msg::SignInAsked).render();
+        let screen = harness.screen();
+        assert!(screen.contains("Sign claude-sub in"), "{screen}");
+        assert!(screen.contains("Open the sign-in terminal"), "{screen}");
+        assert!(!screen.contains("Permissions"), "signing in again is not the whole wizard:\n{screen}");
+    }
+
+    #[test]
+    fn a_profile_without_an_image_cannot_be_signed_in() {
+        let mut harness = with_engine();
+        harness.send(Msg::Loaded(Listing {
+            profiles: vec![profile("claude-sub", HarnessKind::ClaudeCode)],
+            diagnostics: Vec::new(),
+        }));
+        answer(&mut harness, Readiness::Missing, Readiness::Missing);
+        harness.send(Msg::SignInAsked).render();
+        assert!(!harness.screen().contains("Sign claude-sub in"), "{}", harness.screen());
+    }
+
+    #[test]
+    fn the_keyboard_reaches_the_list_and_moves_the_selection() {
+        let mut harness =
+            loaded(vec![profile("claude-sub", HarnessKind::ClaudeCode), profile("codex-key", HarnessKind::Codex)]);
+        harness.press("tab");
+        assert!(harness.is_focused("profiles"), "the list takes the first focus:\n{}", harness.screen());
+        harness.press("down").render();
+        let selected = harness.app().state.selected().expect("a profile is chosen");
+        assert_eq!(selected.profile.name.as_str(), "codex-key");
+        assert!(harness.screen().contains("Codex"), "{}", harness.screen());
+    }
+
+    #[test]
+    fn the_pointer_chooses_a_profile_and_hovering_changes_nothing_else() {
+        let mut harness =
+            loaded(vec![profile("claude-sub", HarnessKind::ClaudeCode), profile("codex-key", HarnessKind::Codex)]);
+        let (x, y) = harness.find("codex-key").expect("the second profile is on screen");
+        harness.hover(x, y).render();
+        assert_eq!(
+            harness.app().state.selected().expect("a profile is chosen").profile.name.as_str(),
+            "claude-sub",
+            "hovering shows, it does not choose"
+        );
+        harness.click(x, y).render();
+        assert_eq!(harness.app().state.selected().expect("a profile is chosen").profile.name.as_str(), "codex-key");
+    }
+
+    #[test]
+    fn a_narrow_screen_keeps_the_profiles_and_their_state() {
+        let mut harness = loaded(vec![profile("claude-sub", HarnessKind::ClaudeCode)]);
+        harness.resize(34, 18).render();
+        let screen = harness.screen();
+        assert!(screen.contains("claude-sub"), "{screen}");
+        assert!(screen.contains("Sign out"), "{screen}");
+    }
+
+    #[test]
+    fn the_wizard_still_works_in_a_narrow_terminal() {
+        let mut harness = loaded(Vec::new());
+        harness.send(Msg::New).render();
+        harness.resize(40, 20).render();
+        let screen = harness.screen();
+        assert!(screen.contains("Claude Code"), "{screen}");
+        harness.send(Msg::Next).render();
+        assert!(harness.screen().contains("recommended"), "{}", harness.screen());
+    }
+
+    #[test]
+    fn ascii_mode_draws_nothing_but_ascii() {
+        let mut harness = loaded(vec![profile("claude-sub", HarnessKind::ClaudeCode)]);
+        harness.set_glyph_mode(GlyphMode::Ascii).render();
+        let screen = harness.screen();
+        assert!(screen.is_ascii(), "{screen}");
+        assert!(screen.contains("claude-sub"), "{screen}");
+    }
+
+    #[test]
+    fn nothing_is_bracketed_lined_or_framed() {
+        let mut harness = loaded(vec![profile("claude-sub", HarnessKind::ClaudeCode)]);
+        for mode in [GlyphMode::Nerd, GlyphMode::Unicode, GlyphMode::Ascii] {
+            harness.set_glyph_mode(mode).render();
+            let screen = harness.screen();
+            for forbidden in ['[', ']', '{', '}', '|', '┌', '─', '│', '+'] {
+                assert!(!screen.contains(forbidden), "`{forbidden}` in {mode:?}:\n{screen}");
+            }
+            assert!(!screen.contains("=="), "{screen}");
+            assert!(!screen.contains("->"), "{screen}");
+        }
+    }
+
+    #[test]
+    fn reduced_motion_keeps_the_wizard_working() {
+        let mut harness = loaded(Vec::new());
+        harness.set_reduced_motion(true).send(Msg::New).render();
+        harness.send(Msg::Next).send(Msg::Next).render();
+        assert!(harness.screen().contains("What this profile signs in with"), "{}", harness.screen());
+    }
+
+    #[test]
+    fn turkish_reads_as_turkish() {
+        let mut harness = loaded(vec![profile("claude-sub", HarnessKind::ClaudeCode)]);
+        harness.set_locale("tr").render();
+        let screen = harness.screen();
+        for text in ["Profiller", "önerilen", "Giriş yap", "Çıkış yap", "abonelik"] {
+            assert!(screen.contains(text), "`{text}` is missing:\n{screen}");
+        }
+        harness.send(Msg::New).render();
+        let screen = harness.screen();
+        assert!(screen.contains("Düzenek"), "{screen}");
+        assert!(screen.contains("kodlama ajanı"), "{screen}");
+    }
+
+    #[test]
+    fn every_english_key_this_screen_uses_has_a_turkish_one() {
+        let missing = env().i18n().missing_keys("tr", "en");
+        assert_eq!(missing, Vec::<String>::new());
+    }
+}

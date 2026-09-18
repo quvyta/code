@@ -1,0 +1,1128 @@
+//! QCode runs coding agent harnesses inside containers, never on the machine itself.
+//!
+//! The crate carries the application: its state, the messages that change it and the screens
+//! that draw it. The `qcode` and `quvyta-code` commands are thin wrappers around [`QCode`].
+//!
+//! Every screen lives in its own module under [`ui`] and knows nothing about this one: each has
+//! a state, an `update` and a `view`, and speaks a message type of its own that this module maps
+//! into [`Msg`]. This module is where they become one application — which screen is open, what
+//! each of them is given, and what happens when one of them asks for something only the
+//! application can do.
+
+pub mod base;
+pub mod engine;
+pub mod profile;
+pub mod ui;
+pub mod workspace;
+
+use std::io;
+
+use qframe::prelude::*;
+use qframe::runtime::{Runtime, Task};
+use qframe::widgets::{PageTransition, Toast};
+
+use engine::run::capture;
+use engine::{Engine, EngineKind, HostUser, detect};
+use profile::identity::{RefreshError, Refreshed};
+use profile::{Profile, SafeName};
+use ui::home::{Entry, Home};
+use ui::profiles::Profiles;
+use ui::project::{OpenProject, ProjectScreen};
+use ui::projects::Projects;
+use ui::settings::engine::{EngineState, Health, Trouble};
+use ui::settings::{Request, Settings as SettingsScreen};
+use ui::setup::Setup;
+use ui::setup::gates::{EngineCheck, Gates};
+use ui::setup::install::InstallHost;
+use workspace::{Config, HostDirs, ProjectFile, ProjectId, ProjectPaths, SetupStep, Workspace};
+
+/// Starts the application: preferences come from the platform's config folder, the text is
+/// compiled in, and the runtime drives the screens until the person leaves.
+///
+/// The gates of the design are asked here, before the first frame, because they decide what the
+/// first frame is: a setup wizard or the home screen. They read the disk and start the container
+/// engine, which is why they are asked once, on the way in, and never while drawing.
+///
+/// # Errors
+///
+/// Returns the terminal's error when the screen cannot be taken over or restored.
+pub fn run() -> io::Result<()> {
+    let config = Config::load();
+    let settings = config.settings().clone();
+    let app = QCode::start(config, HostDirs::detect(), InstallHost::detect());
+    let (keys, bindings) = keymap();
+    let mut runtime = Runtime::new(app).settings(&settings).keymap_source(keys, bindings);
+    for (file, text) in locales() {
+        runtime = runtime.locale_source(file, text);
+    }
+    runtime.run()
+}
+
+/// The application's own locale files, compiled in so an installed program carries its text with
+/// it instead of looking for files beside the binary.
+#[must_use]
+pub fn locales() -> Vec<(String, String)> {
+    [("en.toml", include_str!("../assets/locales/en.toml")), ("tr.toml", include_str!("../assets/locales/tr.toml"))]
+        .into_iter()
+        .map(|(file, text)| (file.to_owned(), text.to_owned()))
+        .collect()
+}
+
+/// The application's own key bindings, compiled in for the same reason the text is: an
+/// installed program carries its keys with it rather than looking for a file beside the binary.
+#[must_use]
+pub fn keymap() -> (String, String) {
+    ("keymap.toml".to_owned(), include_str!("../assets/keymap.toml").to_owned())
+}
+
+/// The screens the application moves between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Page {
+    /// The setup wizard, which is the only screen until it has been through.
+    Setup,
+    /// The logo and the menu.
+    Home,
+    /// The projects of the workspace.
+    Projects,
+    /// The profiles of the workspace.
+    Profiles,
+    /// One project: its tabs, its terminals and its panel.
+    Project,
+    /// What the person can change about QCode.
+    Settings,
+}
+
+impl Page {
+    /// The name the page keeps its focus and its scrolling under, and the key the transition
+    /// between pages watches.
+    fn key(self) -> &'static str {
+        match self {
+            Self::Setup => "setup",
+            Self::Home => "home",
+            Self::Projects => "projects",
+            Self::Profiles => "profiles",
+            Self::Project => "project",
+            Self::Settings => "settings",
+        }
+    }
+}
+
+/// Everything one project needs before the project screen can show it.
+///
+/// Reading it touches the disk, so it is read on a task thread and travels back in a message.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectContents {
+    /// The project's own file.
+    pub file: ProjectFile,
+    /// Where its folders are.
+    pub paths: ProjectPaths,
+    /// The definitions of the profiles its file names.
+    pub profiles: Vec<Profile>,
+}
+
+/// Everything that can happen in QCode.
+#[derive(Debug, Clone)]
+pub enum Msg {
+    /// Something happened on the home screen.
+    Home(ui::home::Msg),
+    /// A row of the home menu was opened.
+    Open(Entry),
+    /// Something happened in the setup wizard.
+    Setup(ui::setup::Msg),
+    /// Something happened on the projects screen.
+    Projects(ui::projects::Msg),
+    /// Something happened on the profiles screen.
+    Profiles(ui::profiles::Msg),
+    /// Something happened on the project screen.
+    Project(ui::project::Msg),
+    /// Something happened on the settings screen.
+    Settings(ui::settings::Msg),
+    /// Leave the screen that is open and go back to the one before it.
+    Back,
+    /// The container engine was looked for again, and this is what was found.
+    Looked(EngineKind, Result<Box<Engine>, Trouble>),
+    /// The workspace's projects were read, and this one is the one to open.
+    Read(Vec<ProjectContents>, ProjectId),
+    /// A profile's login was deleted, or it was not.
+    SignedOut(Result<(), String>),
+    /// A profile's stored login was written into the projects that use it, or it was not.
+    Refreshed(SafeName, Result<Refreshed, RefreshError>),
+}
+
+/// The application.
+pub struct QCode {
+    router: Router<Page>,
+    config: Config,
+    dirs: HostDirs,
+    host: InstallHost,
+    user: HostUser,
+    engine: EngineState,
+    found: Option<Engine>,
+    setup: Option<Setup>,
+    home: Home,
+    projects: Option<Projects>,
+    profiles: Option<Profiles>,
+    project: Option<ProjectScreen>,
+    settings: SettingsScreen,
+}
+
+impl QCode {
+    /// The application as this machine leaves it: the gates of the design are asked, and the
+    /// first one that does not hold opens the wizard on its step.
+    ///
+    /// A setup that has been through is never asked again — that is the design's rule, and the
+    /// one thing that overrides it is a settings file that has been through the wizard and still
+    /// names no workspace, which leaves nothing to open.
+    #[must_use]
+    pub fn start(config: Config, dirs: HostDirs, host: InstallHost) -> Self {
+        let gates = Gates::probe(&config);
+        // The gates only answer whether the engine works; the engine itself is what every screen
+        // that reaches into a container needs, so it is looked up once more when it does work.
+        let kind = config.engine_kind().and_then(EngineKind::from_name);
+        let found = match (kind, gates.engine == EngineCheck::Working) {
+            (Some(kind), true) => detect(kind).ok(),
+            _ => None,
+        };
+        let settled = config.setup_completed() && config.workspace_path().is_some();
+        let entry = if settled { None } else { gates.entry() };
+        Self::new(config, dirs, host, &gates, found, entry)
+    }
+
+    /// The application with every answer already in hand, which is how a test builds one.
+    ///
+    /// `entry` is the wizard's step, or `None` for an application that opens on its home screen.
+    #[must_use]
+    pub fn new(
+        config: Config,
+        dirs: HostDirs,
+        host: InstallHost,
+        gates: &Gates,
+        found: Option<Engine>,
+        entry: Option<SetupStep>,
+    ) -> Self {
+        let kind = config.engine_kind().and_then(EngineKind::from_name).unwrap_or(EngineKind::Podman);
+        let engine = EngineState::new(kind, health(&gates.engine));
+        let recent = config.recent_projects().first().map(|id| id.as_str().to_owned());
+        let settings = SettingsScreen::new(&config, engine.clone());
+        // Which step the wizard opens on is the gates' answer, never this one: `entry` only
+        // says whether there is anything left to ask.
+        let setup = entry.map(|_| Setup::new(config.clone(), &dirs, gates, host.clone()));
+        Self {
+            router: Router::new(if setup.is_some() { Page::Setup } else { Page::Home }),
+            config,
+            dirs,
+            host,
+            // The container's user mapping is this machine's, and a machine that cannot say who
+            // it is runs the image's own user rather than stopping the application.
+            user: HostUser::current().unwrap_or(HostUser::ImageDefault),
+            engine,
+            found,
+            setup,
+            home: Home::new(recent),
+            projects: None,
+            profiles: None,
+            project: None,
+            settings,
+        }
+    }
+
+    /// Which screen is open.
+    #[must_use]
+    pub fn page(&self) -> Page {
+        *self.router.current()
+    }
+
+    /// The workspace, once the setup has placed one.
+    fn workspace(&self) -> Option<Workspace> {
+        self.config.workspace_path().map(Workspace::new)
+    }
+
+    /// The control the open screen hands the keyboard to, so the arrow keys work from the first
+    /// key the person presses rather than after a Tab they were never told about.
+    ///
+    /// The wizard is not here: it focuses the control of the step it opens on, which only it
+    /// knows. A screen whose list is still being read is not here either; it takes the keyboard
+    /// when its answer arrives, because a control that is not on screen cannot be focused.
+    fn take_focus(&self) -> Command<Msg> {
+        let control = match self.page() {
+            Page::Setup => None,
+            Page::Home => Some(ui::home::entry()),
+            Page::Projects => None,
+            Page::Profiles => self.profiles.as_ref().and_then(ui::profiles::entry),
+            Page::Project => self.project.as_ref().map(ui::project::entry),
+            Page::Settings => Some(ui::settings::entry()),
+        };
+        control.map_or_else(Command::none, Command::focus)
+    }
+
+    /// Opens a row of the home menu.
+    fn open(&mut self, entry: Entry) -> Command<Msg> {
+        match entry {
+            Entry::Quit => Command::quit(),
+            Entry::Projects => self.show_projects(false),
+            Entry::NewProject => self.show_projects(true),
+            Entry::Profiles => self.show_profiles(),
+            Entry::Settings => self.show_settings(),
+            Entry::LastProject => match self.config.recent_projects().first().cloned() {
+                Some(id) => self.read_projects(&id),
+                // The row only stands there while a project was opened before.
+                None => self.show_projects(false),
+            },
+        }
+    }
+
+    /// Opens the projects screen, with the new-project dialog over it when that is what was
+    /// asked for.
+    fn show_projects(&mut self, new: bool) -> Command<Msg> {
+        let Some(workspace) = self.workspace() else { return self.repair(SetupStep::Location) };
+        if self.projects.is_none() {
+            let recent = self.config.recent_projects().iter().map(|id| id.as_str().to_owned()).collect();
+            self.projects = Some(Projects::new(workspace, self.found.clone(), recent));
+        }
+        let Some(screen) = self.projects.as_mut() else { return Command::none() };
+        self.router.push(Page::Projects);
+        let (refresh, _) = ui::projects::update(screen, ui::projects::Msg::Refresh);
+        if !new {
+            return refresh.map(Msg::Projects);
+        }
+        let (start, _) = ui::projects::update(screen, ui::projects::Msg::Start);
+        Command::batch([refresh, start]).map(Msg::Projects)
+    }
+
+    /// Opens the profiles screen.
+    fn show_profiles(&mut self) -> Command<Msg> {
+        let Some(workspace) = self.workspace() else { return self.repair(SetupStep::Location) };
+        if self.profiles.is_none() {
+            self.profiles = Some(Profiles::new(Some(workspace.root().to_path_buf()), self.found.clone()));
+        }
+        let Some(screen) = self.profiles.as_mut() else { return Command::none() };
+        self.router.push(Page::Profiles);
+        ui::profiles::update(screen, ui::profiles::Msg::Reload).map(Msg::Profiles)
+    }
+
+    /// Opens the settings screen.
+    fn show_settings(&mut self) -> Command<Msg> {
+        self.router.push(Page::Settings);
+        let profiles = self.workspace().map(|workspace| workspace.profiles().value).unwrap_or_default();
+        let found = self.found.clone();
+        let read =
+            Command::perform(move || Msg::Settings(ui::settings::Msg::Profiles(identities(found.as_ref(), &profiles))));
+        Command::batch([read, self.take_focus()])
+    }
+
+    /// Reads every project of the workspace, to open `id` with the others beside it in the rail.
+    fn read_projects(&mut self, id: &ProjectId) -> Command<Msg> {
+        let Some(workspace) = self.workspace() else { return self.repair(SetupStep::Location) };
+        let id = id.clone();
+        Command::perform(move || {
+            let known = workspace.profiles().value;
+            let contents = workspace
+                .projects()
+                .value
+                .into_iter()
+                .filter_map(|entry| entry.file)
+                .map(|file| {
+                    let paths = workspace.project_paths(&file.id);
+                    let profiles = file
+                        .profiles
+                        .iter()
+                        .filter_map(|wanted| known.iter().find(|profile| profile.name.as_str() == wanted.name))
+                        .cloned()
+                        .collect();
+                    ProjectContents { file, paths, profiles }
+                })
+                .collect();
+            Msg::Read(contents, id)
+        })
+    }
+
+    /// Shows the projects that were read, with `id` the one the rail has open.
+    fn show_project(&mut self, contents: Vec<ProjectContents>, id: &ProjectId) -> Command<Msg> {
+        let place = contents.iter().position(|project| project.file.id == *id);
+        let Some(place) = place else {
+            // The project is gone from the workspace between the list and the opening of it; the
+            // list is the honest answer, and the recent entry that led here goes.
+            self.config.forget_project(id);
+            self.home = Home::new(self.config.recent_projects().first().map(|id| id.as_str().to_owned()));
+            return Command::batch([self.store(), self.show_projects(false)]);
+        };
+        let projects =
+            contents.into_iter().map(|one| OpenProject::new(&one.file, one.paths, one.profiles)).collect::<Vec<_>>();
+        let mut screen = ProjectScreen::new(self.found.clone(), self.user, projects);
+        let opened = ui::project::update(&mut screen, ui::project::Msg::OpenProject(place)).map(Msg::Project);
+        let entered = ui::project::opened(&mut screen).map(Msg::Project);
+        self.project = Some(screen);
+        self.router.push(Page::Project);
+        self.config.remember_project(id);
+        self.home = Home::new(Some(id.as_str().to_owned()));
+        Command::batch([opened, entered, self.take_focus(), self.store()])
+    }
+
+    /// Runs one step of the setup wizard on its own, which is what the repair strip and the
+    /// settings screen ask for.
+    fn repair(&mut self, step: SetupStep) -> Command<Msg> {
+        let gates = Gates { language: true, engine: self.check(), location: Default::default() };
+        let mut setup = Setup::for_step(self.config.clone(), &self.dirs, &gates, self.host.clone(), step);
+        let asked = ui::setup::opened(&mut setup).map(Msg::Setup);
+        self.setup = Some(setup);
+        self.router.push(Page::Setup);
+        asked
+    }
+
+    /// What the last look at the engine says, in the shape the wizard's gates are written in.
+    fn check(&self) -> EngineCheck {
+        match self.engine.health() {
+            Health::Working => EngineCheck::Working,
+            Health::Checking => EngineCheck::Running,
+            Health::Missing(_) => EngineCheck::Unknown,
+        }
+    }
+
+    /// Applies a message of the setup wizard, and leaves the wizard when it is through.
+    fn wizard(&mut self, message: ui::setup::Msg) -> Command<Msg> {
+        let Some(setup) = self.setup.as_mut() else { return Command::none() };
+        let command = ui::setup::update(setup, message).map(Msg::Setup);
+        if !setup.is_finished() {
+            return command;
+        }
+        let Some(setup) = self.setup.take() else { return command };
+        // The wizard applies the language to the running application and leaves the storing to
+        // whoever owns the settings file, which is here: the language belongs to the whole
+        // application and not to that one screen.
+        let language = setup.language();
+        self.config = setup.into_config();
+        self.config.set_language(language);
+        // Everything a screen was given came from the settings that have just changed, so the
+        // screens are made again from the new ones when they are next opened.
+        self.projects = None;
+        self.profiles = None;
+        self.project = None;
+        self.settings = SettingsScreen::new(&self.config, self.engine.clone());
+        if !self.router.back() {
+            self.router.replace(Page::Home);
+        }
+        Command::batch([command, self.take_focus(), self.store(), self.look()])
+    }
+
+    /// Looks for the chosen engine again, off the render path.
+    fn look(&mut self) -> Command<Msg> {
+        let Some(kind) = self.config.engine_kind().and_then(EngineKind::from_name) else { return Command::none() };
+        self.engine = EngineState::new(kind, Health::Checking);
+        Command::perform(move || {
+            let found = detect(kind).map(Box::new).map_err(|missing| Trouble::of(&missing));
+            Msg::Looked(kind, found)
+        })
+    }
+
+    /// Takes in what the engine answered: the strip over every screen, the settings screen and
+    /// every screen that reaches into a container all follow from this one answer.
+    fn looked(&mut self, kind: EngineKind, found: Result<Box<Engine>, Trouble>) -> Command<Msg> {
+        let health = match &found {
+            Ok(_) => Health::Working,
+            Err(trouble) => Health::Missing(trouble.clone()),
+        };
+        self.engine = EngineState::new(kind, health.clone());
+        self.found = found.ok().map(|engine| *engine);
+        self.projects = None;
+        self.profiles = None;
+        self.project = None;
+        let (command, _) = ui::settings::update(&mut self.settings, ui::settings::Msg::Checked(health));
+        command.map(Msg::Settings)
+    }
+
+    /// Does what the settings screen asked for, past every question it needed.
+    fn asked(&mut self, request: Request) -> Command<Msg> {
+        match request {
+            Request::Language(code) => {
+                self.config.set_language(&code);
+                self.store()
+            }
+            Request::Theme(id) => {
+                self.config.set_theme(&id);
+                self.store()
+            }
+            Request::Icons(mode) => {
+                self.config.set_icons(mode);
+                self.store()
+            }
+            Request::ReducedMotion(reduced) => {
+                self.config.set_reduced_motion(reduced);
+                self.store()
+            }
+            Request::Engine(kind) => {
+                self.config.set_engine_kind(kind.name());
+                Command::batch([self.store(), self.look()])
+            }
+            Request::OpenEngineStep => self.repair(SetupStep::Engine),
+            Request::OpenLocationStep => self.repair(SetupStep::Location),
+            Request::SignOut(profile) => self.sign_out(&profile),
+            Request::RefreshIdentity(profile) => self.refresh_identity(&profile),
+        }
+    }
+
+    /// Whether the screen that is open is one the person may leave, which is what both the way
+    /// out on screen and the Esc key ask.
+    fn can_leave(&self) -> bool {
+        self.router.can_go_back() && (self.page() != Page::Setup || self.setup.as_ref().is_some_and(Setup::is_alone))
+    }
+
+    /// Leaves the screen that is open, when it is one that may be left.
+    ///
+    /// The setup wizard is not: until the three questions are answered there is no application
+    /// behind it to go back to. The one step the repair strip opens is another matter — it
+    /// stands over a working application, and a person whose engine cannot be installed this
+    /// minute must be able to put it down.
+    fn leave(&mut self) -> Command<Msg> {
+        if !self.can_leave() {
+            return Command::none();
+        }
+        self.router.back();
+        self.take_focus()
+    }
+
+    /// Whether the profiles screen is showing its list rather than its wizard.
+    fn draft_is_closed(&self) -> bool {
+        self.profiles.as_ref().is_some_and(|screen| screen.draft().is_none())
+    }
+
+    /// Deletes the volume that holds a profile's login, which is what signing out means.
+    fn sign_out(&mut self, profile: &SafeName) -> Command<Msg> {
+        let Some(engine) = self.found.clone() else { return Command::none() };
+        let volume = profile::identity::sign_out(profile);
+        Command::perform(move || {
+            let gone = capture(&engine.remove_volume(&volume)).map(|_| ()).map_err(|error| said(&error));
+            Msg::SignedOut(gone)
+        })
+    }
+
+    /// Writes a profile's stored login into the home of every project that carries the profile,
+    /// on a task thread, and answers with what came of it.
+    ///
+    /// Which projects those are is read from the workspace on the same thread: the project files
+    /// are the one record of which project carries which profile, and reading them is disk work
+    /// like the rest.
+    fn refresh_identity(&self, profile: &SafeName) -> Command<Msg> {
+        let (Some(engine), Some(workspace)) = (self.found.clone(), self.workspace()) else { return Command::none() };
+        let user = self.user;
+        let profile = profile.clone();
+        Command::task(Task::new(t!("settings.refreshing", profile = profile.as_str()), move |_| {
+            let projects: Vec<ProjectId> = workspace
+                .projects()
+                .value
+                .into_iter()
+                .filter_map(|entry| entry.file)
+                .filter(|file| file.profiles.iter().any(|carried| carried.name == profile.as_str()))
+                .map(|file| file.id)
+                .collect();
+            let done = profile::identity::refresh_all(&engine, &profile, &projects, user);
+            Ok(Msg::Refreshed(profile, done))
+        }))
+    }
+
+    /// Writes the settings file, off the render path, and tells the settings screen how it went.
+    fn store(&self) -> Command<Msg> {
+        self.config.settings().save_command(|stored| Msg::Settings(ui::settings::Msg::Stored(stored)))
+    }
+}
+
+/// Which profiles have a login stored, which is what the identity part of the settings screen
+/// shows and acts on.
+///
+/// Without an engine to ask, nothing is claimed either way and every profile is listed as signed
+/// out, beside the strip that says why nothing here can be done.
+fn identities(engine: Option<&Engine>, profiles: &[Profile]) -> Vec<ui::settings::identity::ProfileIdentity> {
+    let volumes = engine.and_then(|engine| capture(&engine.list_volumes()).ok()).unwrap_or_default();
+    profiles
+        .iter()
+        .map(|profile| {
+            let stored = profile::identity::is_stored(&volumes, &profile.name);
+            ui::settings::identity::ProfileIdentity::new(profile.name.clone(), stored)
+        })
+        .collect()
+}
+
+/// What the person is told when a refresh of `profile`'s login is over.
+///
+/// A round that wrote nowhere because no project carries the profile is said as such: a success
+/// that counts zero would read as if something had been done.
+fn refreshed(profile: &SafeName, outcome: Result<Refreshed, RefreshError>) -> Toast<Msg> {
+    match outcome {
+        Ok(done) if done.written.is_empty() && done.running.is_empty() => {
+            Toast::warning(t!("settings.refresh-unused", profile = profile.as_str()))
+        }
+        Ok(done) if done.running.is_empty() => Toast::success(t!("settings.refreshed", n = done.written.len())),
+        Ok(done) => {
+            let names: Vec<&str> = done.running.iter().map(ProjectId::as_str).collect();
+            Toast::warning(t!("settings.refreshed", n = done.written.len()))
+                .body(t!("settings.refresh-running", projects = names.join(", ")))
+        }
+        Err(RefreshError::NotStored) => Toast::warning(t!("settings.no-identity", profile = profile.as_str())),
+        Err(RefreshError::Engine(said)) => Toast::danger(t!("settings.refresh-failed")).body(said),
+    }
+}
+
+/// What an engine command said when it would not do what was asked.
+fn said(error: &engine::run::EngineError) -> String {
+    match error {
+        engine::run::EngineError::NotRunnable { error, .. } => error.to_string(),
+        engine::run::EngineError::Failed(failure) => failure.output.clone(),
+        engine::run::EngineError::Cancelled { .. } => t!("app.stopped"),
+    }
+}
+
+/// The engine's health as the gates of the wizard left it.
+fn health(check: &EngineCheck) -> Health {
+    match check {
+        EngineCheck::Working => Health::Working,
+        EngineCheck::Unknown | EngineCheck::Running => Health::Checking,
+        EngineCheck::Broken(problem) => Health::Missing(trouble(problem)),
+    }
+}
+
+/// The same reason, in the shape the settings screen and the repair strip keep it.
+fn trouble(problem: &ui::setup::gates::EngineProblem) -> Trouble {
+    use ui::setup::gates::EngineProblem;
+    match problem {
+        EngineProblem::NotInstalled => Trouble::NotInstalled,
+        EngineProblem::DaemonStopped { .. } => Trouble::DaemonStopped,
+        EngineProblem::MachineStopped { .. } => Trouble::MachineStopped,
+        EngineProblem::Refused { output, .. } => Trouble::Refused(output.clone()),
+        EngineProblem::NotRunnable { message, .. } => Trouble::NotRunnable(message.clone()),
+    }
+}
+
+impl App for QCode {
+    type Msg = Msg;
+
+    /// Puts the keyboard on the first screen before the first key is read: the wizard's open
+    /// step, or the menu of the home screen. Without this the first arrow key went nowhere.
+    fn init(&mut self) -> Command<Msg> {
+        match self.setup.as_mut() {
+            Some(setup) => ui::setup::opened(setup).map(Msg::Setup),
+            None => self.take_focus(),
+        }
+    }
+
+    fn update(&mut self, msg: Msg) -> Command<Msg> {
+        match msg {
+            Msg::Home(message) => ui::home::update(&mut self.home, message),
+            Msg::Open(entry) => self.open(entry),
+            Msg::Setup(message) => self.wizard(message),
+            Msg::Projects(message) => {
+                let Some(screen) = self.projects.as_mut() else { return Command::none() };
+                let (command, opened) = ui::projects::update(screen, message);
+                let command = command.map(Msg::Projects);
+                match opened {
+                    Some(id) => Command::batch([command, self.read_projects(&id)]),
+                    None => command,
+                }
+            }
+            Msg::Profiles(message) => {
+                let Some(screen) = self.profiles.as_mut() else { return Command::none() };
+                // The listing is what puts the list on screen, and the wizard is the person's
+                // own doing, so the keyboard is only moved when there is no wizard over it.
+                let landed = matches!(message, ui::profiles::Msg::Loaded(_));
+                let command = ui::profiles::update(screen, message).map(Msg::Profiles);
+                match landed && self.page() == Page::Profiles && self.draft_is_closed() {
+                    true => Command::batch([command, self.take_focus()]),
+                    false => command,
+                }
+            }
+            Msg::Project(message) => match self.project.as_mut() {
+                Some(screen) => ui::project::update(screen, message).map(Msg::Project),
+                None => Command::none(),
+            },
+            Msg::Settings(message) => {
+                let (command, request) = ui::settings::update(&mut self.settings, message);
+                let command = command.map(Msg::Settings);
+                match request {
+                    Some(request) => Command::batch([command, self.asked(request)]),
+                    None => command,
+                }
+            }
+            Msg::Back => self.leave(),
+            Msg::Looked(kind, found) => self.looked(kind, found),
+            Msg::Read(contents, id) => self.show_project(contents, &id),
+            Msg::SignedOut(Ok(())) => Command::toast(Toast::success(t!("settings.signed-out"))),
+            Msg::SignedOut(Err(reason)) => Command::toast(Toast::danger(t!("settings.sign-out-failed")).body(reason)),
+            Msg::Refreshed(profile, outcome) => Command::toast(refreshed(&profile, outcome)),
+        }
+    }
+
+    /// Turns a keymap action into a message. `back` is Esc, which reaches here only when
+    /// nothing nearer has used it: a focused widget first, so the terminal of a harness tab
+    /// keeps its own Esc, and then an open dialog, which closes instead of letting the screen go.
+    fn action(&self, name: &str) -> Option<Msg> {
+        match name {
+            "back" => Some(Msg::Back),
+            _ => None,
+        }
+    }
+
+    fn view(&self, ui: &mut View<'_, Msg>) {
+        let page = self.page();
+        ui.add_with(PageTransition::new(page.key()).slide(true).direction(self.router.direction()), |ui| {
+            ui.page(page.key(), |ui| self.draw(page, ui));
+        })
+        .fill();
+    }
+}
+
+impl QCode {
+    /// Draws the screen that is open.
+    ///
+    /// The project screen brings a shell of its own — a rail, tabs and a panel — so it is drawn
+    /// whole, under the same header as every other screen and inside no second shell; every
+    /// other screen is a body in the application's own shell.
+    fn draw(&self, page: Page, ui: &mut View<'_, Msg>) {
+        if page == Page::Project {
+            ui.column(|ui| {
+                self.header(page, ui);
+                if let Some(screen) = &self.project {
+                    ui.map(Msg::Project, |ui| ui::project::view(screen, ui)).fill();
+                }
+            })
+            .fill();
+            return;
+        }
+        AppShell::new()
+            .header(|ui| self.header(page, ui))
+            .body(|ui| self.body(page, ui))
+            .footer(|ui| self.hints(page, ui))
+            .show(ui);
+    }
+
+    /// What stands over every screen: the strip while the engine is gone, and the way back.
+    fn header(&self, page: Page, ui: &mut View<'_, Msg>) {
+        // The wizard is where a missing engine is put right, so the strip that leads there does
+        // not stand over it.
+        if page != Page::Setup {
+            ui.map(Msg::Settings, |ui| ui::settings::bar::view(&self.engine, ui)).fill_width();
+        }
+        // Whatever Esc does, the way out is also on screen: a screen that can be left says so.
+        // The setup itself cannot be — it is left by finishing it — while the single step the
+        // repair strip opens can, because it stands over an application that already works.
+        if self.can_leave() {
+            ui.row(|ui| {
+                ui.add(Button::new(t!("app.back")).icon("arrow-left").on_press(Msg::Back)).id("back");
+                ui.spacer();
+            })
+            .fill_width();
+        }
+    }
+
+    /// The screen itself.
+    fn body(&self, page: Page, ui: &mut View<'_, Msg>) {
+        match page {
+            Page::Setup => {
+                if let Some(setup) = &self.setup {
+                    ui.map(Msg::Setup, |ui| ui::setup::view(setup, ui)).fill();
+                }
+            }
+            Page::Home => ui::home::view(&self.home, ui),
+            Page::Projects => {
+                if let Some(screen) = &self.projects {
+                    ui.map(Msg::Projects, |ui| ui::projects::view(screen, ui)).fill();
+                }
+            }
+            Page::Profiles => {
+                if let Some(screen) = &self.profiles {
+                    ui.map(Msg::Profiles, |ui| ui::profiles::view(screen, ui)).fill();
+                }
+            }
+            Page::Settings => {
+                ui.map(Msg::Settings, |ui| ui::settings::view(&self.settings, ui)).fill();
+            }
+            // Drawn whole by `draw`, which never comes here with it.
+            Page::Project => {}
+        }
+    }
+
+    /// The keys the screen answers to.
+    fn hints(&self, page: Page, ui: &mut View<'_, Msg>) {
+        match page {
+            Page::Setup => {
+                ui.map(Msg::Setup, ui::setup::hints).fill_width();
+            }
+            Page::Home => ui::home::hints(ui),
+            Page::Projects => {
+                ui.map(Msg::Projects, ui::projects::hints).fill_width();
+            }
+            Page::Profiles => {
+                ui.map(Msg::Profiles, ui::profiles::hints).fill_width();
+            }
+            Page::Settings => {
+                ui.map(Msg::Settings, ui::settings::hints).fill_width();
+            }
+            Page::Project => {}
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod testing {
+    //! What the application's own tests build an application out of, so that none of them needs
+    //! the person's settings file, a container engine or a workspace of their own.
+
+    use std::path::{Path, PathBuf};
+
+    use qframe::env::{AssetDirs, Env};
+    use qframe::icons::GlyphMode;
+    use qframe::runtime::Harness;
+
+    use super::{Config, Engine, EngineKind, Gates, HostDirs, InstallHost, QCode, SetupStep};
+    use crate::ui::setup::gates::{EngineCheck, LocationCheck};
+    use crate::workspace::Platform;
+
+    /// A folder of this machine's temporary directory, named after `what` and this process.
+    pub fn scratch(what: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("qcode-app-{what}-{}", std::process::id()))
+    }
+
+    /// A Linux machine whose home folder is a temporary one.
+    pub fn dirs() -> HostDirs {
+        HostDirs { platform: Platform::Linux, home: Some(scratch("home")), documents_hint: None, user_dirs: None }
+    }
+
+    /// An Arch machine with `paru`, so every install command a test sees is the same one.
+    pub fn host() -> InstallHost {
+        InstallHost::read(Platform::Linux, Some("ID=arch\n"), |tool| tool == "paru")
+    }
+
+    /// Gates that all hold, which is a machine with everything in place.
+    pub fn settled() -> Gates {
+        Gates { language: true, engine: EngineCheck::Working, location: LocationCheck::Usable }
+    }
+
+    /// A settings file of a finished setup, with `recent` as the projects opened before.
+    pub fn config(workspace: &Path, recent: &[&str]) -> Config {
+        let list = recent.iter().map(|id| format!("\"{id}\"")).collect::<Vec<_>>().join(", ");
+        let text = format!(
+            "language = \"en\"\n\n[setup]\ncompleted = true\nstep = \"location\"\n\n[engine]\nkind = \"podman\"\n\n\
+             [workspace]\npath = \"{}\"\n\n[projects]\nrecent = [{list}]\n",
+            workspace.display()
+        );
+        Config::parse_str("code.toml", &text)
+    }
+
+    /// An application over `config`, opening on the wizard's `entry` step or on the home screen.
+    pub fn app(config: Config, gates: &Gates, entry: Option<SetupStep>) -> QCode {
+        QCode::new(config, dirs(), host(), gates, None, entry)
+    }
+
+    /// An application on its home screen holding an engine whose binary is not there: every
+    /// piece of engine work is really run and really fails, with the machine's own words, so a
+    /// test sees that the work was reached without a container runtime on the machine.
+    pub fn app_with_absent_engine(config: Config) -> QCode {
+        let engine = Engine::new(EngineKind::Podman, "/qcode/no/such/engine");
+        QCode::new(config, dirs(), host(), &settled(), Some(engine), None)
+    }
+
+    /// QCode's own text and keys, and nothing of the person's.
+    pub fn env() -> Env {
+        let dirs = AssetDirs {
+            locale_sources: crate::locales(),
+            keymap_source: Some(crate::keymap()),
+            ..AssetDirs::default()
+        };
+        Env::load(&dirs).expect("the built-in files load")
+    }
+
+    /// A harness over `app`, in English, with Unicode glyphs and no motion.
+    pub fn harness(app: QCode, width: u16, height: u16) -> Harness<QCode> {
+        let mut harness = Harness::with_env(app, env(), width, height);
+        harness.set_locale("en").set_glyph_mode(GlyphMode::Unicode).set_reduced_motion(true);
+        harness.render();
+        harness
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Moving through the application: where it opens, how each screen is reached and left, and
+    //! what the repair strip runs. Nothing here needs a container runtime or a settings file.
+
+    use std::time::Duration;
+
+    use super::testing::{app, app_with_absent_engine, config, harness, scratch, settled};
+    use super::{Gates, Msg, OpenProject, Page, ProjectScreen, Request, SetupStep};
+    use crate::profile::SafeName;
+    use crate::ui::setup::gates::{EngineCheck, EngineProblem, LocationCheck};
+    use crate::workspace::Config;
+
+    /// A terminal with room for the logo, the menu and the widest screen behind them.
+    const SIZE: (u16, u16) = (96, 30);
+
+    /// How long a click is given to be answered, for the screens that answer in a command.
+    const MOMENT: Duration = Duration::from_millis(10);
+
+    /// Gates of a machine whose engine is gone and whose workspace is in place.
+    fn without_engine() -> Gates {
+        Gates {
+            language: true,
+            engine: EngineCheck::Broken(EngineProblem::NotInstalled),
+            location: LocationCheck::Usable,
+        }
+    }
+
+    #[test]
+    fn a_machine_that_was_never_set_up_opens_the_wizard_on_the_gate_that_fell() {
+        let gates = Gates { language: false, engine: EngineCheck::Unknown, location: LocationCheck::Unknown };
+        let harness =
+            harness(app(Config::parse_str("code.toml", ""), &gates, Some(SetupStep::Language)), SIZE.0, SIZE.1);
+        assert_eq!(harness.app().page(), Page::Setup);
+        assert!(harness.screen().contains("Pick the language"), "{}", harness.screen());
+    }
+
+    #[test]
+    fn a_finished_setup_opens_the_home_screen() {
+        let harness = harness(app(config(&scratch("open"), &[]), &settled(), None), SIZE.0, SIZE.1);
+        assert_eq!(harness.app().page(), Page::Home);
+        assert!(harness.screen().contains("New project"), "{}", harness.screen());
+    }
+
+    #[test]
+    fn a_gate_that_falls_after_the_setup_leaves_the_wizard_shut_and_puts_the_strip_up() {
+        // The design's rule: once the wizard has been through it never opens by itself again.
+        // A missing engine is said in the strip over the screen, not asked for all over again.
+        let harness = harness(app(config(&scratch("gone"), &[]), &without_engine(), None), SIZE.0, SIZE.1);
+        assert_eq!(harness.app().page(), Page::Home);
+        let screen = harness.screen();
+        assert!(screen.contains("No container engine"), "{screen}");
+        assert!(screen.contains("Repair"), "{screen}");
+    }
+
+    #[test]
+    fn every_row_of_the_menu_opens_its_screen_and_the_way_back_leads_home() {
+        let mut harness = harness(app(config(&scratch("menu"), &[]), &settled(), None), SIZE.0, SIZE.1);
+        for (row, page, word) in [
+            ("Projects", Page::Projects, "New project"),
+            ("Profiles", Page::Profiles, "Profiles"),
+            ("Settings", Page::Settings, "Language"),
+        ] {
+            harness.click_text(row).advance(MOMENT);
+            assert_eq!(harness.app().page(), page, "`{row}` opens its screen:\n{}", harness.screen());
+            assert!(harness.screen().contains(word), "`{word}` is on the screen `{row}` opened:\n{}", harness.screen());
+            harness.click_text("Back").advance(MOMENT);
+            assert_eq!(harness.app().page(), Page::Home, "the way back leads home:\n{}", harness.screen());
+        }
+    }
+
+    /// Walks the whole wizard, choosing the language whose name on the first step is `language`,
+    /// and answers what the settings file says afterwards when it is read back from its own text.
+    fn language_after_the_wizard(name: &str, language: &str, next: &str, finish: &str) -> Option<String> {
+        let gates = Gates { language: false, engine: EngineCheck::Working, location: LocationCheck::Usable };
+        let text = format!("[workspace]\npath = \"{}\"\n", scratch(name).display());
+        let app = app(Config::parse_str("code.toml", &text), &gates, Some(SetupStep::Language));
+        let mut harness = harness(app, SIZE.0, SIZE.1);
+        harness.click_text(language).advance(MOMENT);
+        for _ in 0..2 {
+            harness.click_text(next).advance(MOMENT);
+        }
+        harness.click_text(finish).advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Home, "{}", harness.screen());
+        // Read back from the text that would be written, not from the settings in memory: a
+        // choice that is not in the file is a choice the next start does not have.
+        Config::parse_str("code.toml", &harness.app().config.to_toml()).settings().language()
+    }
+
+    #[test]
+    fn a_wizard_finished_in_turkish_opens_in_turkish_next_time() {
+        assert_eq!(language_after_the_wizard("language-tr", "Turkish", "İleri", "Bitir").as_deref(), Some("tr"));
+    }
+
+    #[test]
+    fn a_wizard_finished_in_english_opens_in_english_next_time() {
+        // English is the answer that used to be the schema's default, and a default is the one
+        // answer a settings file can lose: without it written down, a machine whose own locale
+        // is Turkish would open in Turkish however plainly the person said English.
+        assert_eq!(language_after_the_wizard("language-en", "English", "Next", "Finish").as_deref(), Some("en"));
+    }
+
+    #[test]
+    fn a_project_of_the_list_opens_its_own_screen_and_the_way_back_leads_to_the_list() {
+        let root = scratch("open-project");
+        let _ = std::fs::remove_dir_all(&root);
+        let workspace = crate::workspace::Workspace::new(&root);
+        workspace.create_project("Firefly", qframe::date::Date::today_utc()).expect("the workspace takes a project");
+        let mut harness = harness(app(config(&root, &[]), &settled(), None), SIZE.0, SIZE.1);
+        harness.click_text("Projects").advance(MOMENT);
+        harness.click_text("Firefly").advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Project, "{}", harness.screen());
+        assert!(harness.screen().contains("No tab is open"), "{}", harness.screen());
+        harness.click_text("Back").advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Projects, "{}", harness.screen());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_screen_that_opens_takes_the_keyboard_so_the_arrow_keys_work_at_once() {
+        // The hint under every screen promises the arrow keys. A screen that opens without the
+        // keyboard on its list breaks that promise until a Tab nobody mentioned is pressed.
+        let root = scratch("focus-list");
+        let _ = std::fs::remove_dir_all(&root);
+        let workspace = crate::workspace::Workspace::new(&root);
+        for name in ["Alpha", "Beta"] {
+            workspace.create_project(name, qframe::date::Date::today_utc()).expect("the workspace takes a project");
+        }
+        let mut harness = harness(app(config(&root, &[]), &settled(), None), SIZE.0, SIZE.1);
+        harness.click_text("Projects").advance(MOMENT);
+        assert!(harness.is_focused("projects"), "the list has the keyboard:\n{}", harness.screen());
+        harness.press("down").press("enter").advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Project, "down and enter alone opened the second project");
+        let open = harness.app().project.as_ref().and_then(ProjectScreen::project).map(OpenProject::name);
+        assert_eq!(open, Some("Beta"), "the row under the first one is the one that opened");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_very_first_key_works_on_the_home_screen() {
+        // No click, no Tab: the application has just opened, and the menu already has the
+        // keyboard. Down from the first row is Projects.
+        let mut harness = harness(app(config(&scratch("focus-first"), &[]), &settled(), None), SIZE.0, SIZE.1);
+        assert!(harness.is_focused("menu"), "{}", harness.screen());
+        harness.press("down").press("enter").advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Projects, "{}", harness.screen());
+    }
+
+    #[test]
+    fn the_wizard_opens_with_the_keyboard_on_its_first_question() {
+        let harness =
+            harness(app(config(&scratch("focus-wizard"), &[]), &settled(), Some(SetupStep::Language)), SIZE.0, SIZE.1);
+        // The gates are all settled, so the wizard opens on its last step; the keyboard is on
+        // that step's question, not on the first step's.
+        assert_eq!(harness.app().page(), Page::Setup);
+        assert!(harness.is_focused("setup-location"), "{}", harness.screen());
+    }
+
+    #[test]
+    fn the_settings_screen_takes_the_keyboard_as_it_opens() {
+        let mut harness = harness(app(config(&scratch("focus-settings"), &[]), &settled(), None), SIZE.0, SIZE.1);
+        harness.click_text("Settings").advance(MOMENT);
+        assert!(harness.is_focused("settings"), "{}", harness.screen());
+    }
+
+    #[test]
+    fn coming_back_puts_the_keyboard_on_the_menu_again() {
+        let mut harness = harness(app(config(&scratch("focus-home"), &[]), &settled(), None), SIZE.0, SIZE.1);
+        harness.click_text("Settings").advance(MOMENT);
+        harness.click_text("Back").advance(MOMENT);
+        assert!(harness.is_focused("menu"), "{}", harness.screen());
+        // The click left the selection on Settings, so one press up is the row above it, and
+        // that press is the first key after coming back.
+        harness.press("up").press("enter").advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Profiles, "{}", harness.screen());
+    }
+
+    #[test]
+    fn escape_leaves_the_screen_that_is_open() {
+        let mut harness = harness(app(config(&scratch("escape"), &[]), &settled(), None), SIZE.0, SIZE.1);
+        harness.click_text("Settings").advance(MOMENT);
+        harness.press("esc").advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Home, "{}", harness.screen());
+    }
+
+    #[test]
+    fn escape_closes_what_is_open_over_a_screen_before_it_leaves_the_screen() {
+        let root = scratch("escape-dialog");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut harness = harness(app(config(&root, &[]), &settled(), None), SIZE.0, SIZE.1);
+        harness.click_text("Projects").advance(MOMENT);
+        harness.click_text("New project").advance(MOMENT);
+        assert!(harness.screen().contains("Start from"), "the dialog is open:\n{}", harness.screen());
+        harness.press("esc").advance(MOMENT);
+        assert!(!harness.screen().contains("Start from"), "the dialog closed:\n{}", harness.screen());
+        assert_eq!(harness.app().page(), Page::Projects, "and the screen under it stayed");
+        harness.press("esc").advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Home, "a second press leaves the screen");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn escape_does_nothing_in_the_setup_wizard() {
+        // There is no application behind the wizard to go back to, so the keys that leave a
+        // screen do not leave this one; it is left by finishing it.
+        let gates = Gates { language: false, engine: EngineCheck::Unknown, location: LocationCheck::Unknown };
+        let app = app(Config::parse_str("code.toml", ""), &gates, Some(SetupStep::Language));
+        let mut harness = harness(app, SIZE.0, SIZE.1);
+        harness.press("esc").advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Setup, "{}", harness.screen());
+        assert!(harness.screen().contains("Pick the language"), "{}", harness.screen());
+        assert!(!harness.screen().contains("Back"), "and no way out is offered:\n{}", harness.screen());
+    }
+
+    #[test]
+    fn the_one_step_the_repair_strip_opens_can_be_put_down_again() {
+        // A person whose engine cannot be installed this minute must be able to leave the step
+        // and go on using everything that does not need a container.
+        let mut harness = harness(app(config(&scratch("repair-esc"), &[]), &without_engine(), None), SIZE.0, SIZE.1);
+        harness.click_text("Repair").advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Setup);
+        assert!(harness.screen().contains("Back"), "the way out is on screen too:\n{}", harness.screen());
+        harness.press("esc").advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Home, "{}", harness.screen());
+    }
+
+    #[test]
+    fn escape_leaves_the_project_screen_while_no_tab_holds_the_keyboard() {
+        // With a tab open the terminal has the keyboard and every key, Esc included, belongs to
+        // the harness inside the container; the way out is then the one on screen. That half
+        // needs a container runtime, so it is not tested here. This is the other half.
+        let root = scratch("escape-project");
+        let _ = std::fs::remove_dir_all(&root);
+        let workspace = crate::workspace::Workspace::new(&root);
+        workspace.create_project("Firefly", qframe::date::Date::today_utc()).expect("the workspace takes a project");
+        let mut harness = harness(app(config(&root, &[]), &settled(), None), SIZE.0, SIZE.1);
+        harness.click_text("Projects").advance(MOMENT);
+        harness.click_text("Firefly").advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Project);
+        assert!(harness.screen().contains("Back"), "the way out is on screen:\n{}", harness.screen());
+        harness.press("esc").advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Projects, "{}", harness.screen());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refreshing_an_identity_is_carried_out_and_answered_with_what_came_of_it() {
+        // The request reaches the engine work and the answer is that work's own: with an engine
+        // that is not there, the round stops at the engine and the toast carries its refusal
+        // rather than a promise that the work will exist one day.
+        let mut harness = harness(app_with_absent_engine(config(&scratch("refresh"), &[])), SIZE.0, SIZE.1);
+        harness.click_text("Settings").advance(MOMENT);
+        let profile = SafeName::parse("claude-sub").expect("the name is safe");
+        harness
+            .send(Msg::Settings(crate::ui::settings::Msg::Request(Request::RefreshIdentity(profile))))
+            .advance(MOMENT);
+        let screen = harness.screen();
+        assert!(screen.contains("could not be refreshed"), "{screen}");
+        assert!(!screen.contains("not part of QCode"), "{screen}");
+    }
+
+    #[test]
+    fn the_last_row_leaves_the_application() {
+        let mut harness = harness(app(config(&scratch("quit"), &[]), &settled(), None), SIZE.0, SIZE.1);
+        harness.click_text("Quit");
+        assert!(harness.quit_requested());
+    }
+
+    #[test]
+    fn the_repair_strip_runs_the_wizards_engine_step_on_its_own() {
+        let mut harness = harness(app(config(&scratch("repair"), &[]), &without_engine(), None), SIZE.0, SIZE.1);
+        harness.click_text("Repair").advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Setup);
+        let screen = harness.screen();
+        assert!(screen.contains("Container engine"), "the engine step is the one that opened:\n{screen}");
+        assert!(!screen.contains("Pick the language"), "no step before it is asked again:\n{screen}");
+        assert!(!screen.contains("Workspace"), "and none after it either:\n{screen}");
+    }
+
+    #[test]
+    fn the_settings_screen_can_move_the_workspace_through_the_same_one_step() {
+        let mut harness = harness(app(config(&scratch("move"), &[]), &settled(), None), SIZE.0, SIZE.1);
+        harness.click_text("Settings").advance(MOMENT);
+        harness.click_text("Change").advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Setup, "{}", harness.screen());
+        let screen = harness.screen();
+        assert!(screen.contains("one workspace folder"), "the location step is the one that opened:\n{screen}");
+    }
+}

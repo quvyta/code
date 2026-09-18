@@ -1,0 +1,658 @@
+//! The requests QCode makes of an engine, and the exact command each one becomes.
+//!
+//! Every function here is pure: it reads a request and returns a program with an argument list,
+//! so the commands are checked in tests on a machine with no container runtime at all. Running
+//! them is [`run`](super::run)'s job, and handing an interactive one to a pseudo-terminal is the
+//! terminal layer's.
+
+use super::Engine;
+use super::dialect::{Relabel, UserMapping};
+use std::ffi::{OsStr, OsString};
+use std::io;
+use std::path::{Path, PathBuf};
+
+/// A command to run: the engine binary and its arguments, ready for
+/// [`std::process::Command`] or for `qframe`'s `TerminalSession::spawn`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineCommand {
+    /// The engine binary.
+    pub program: PathBuf,
+    /// Its arguments, in order.
+    pub args: Vec<OsString>,
+}
+
+/// Collects the arguments of one command.
+struct Args(Vec<OsString>);
+
+impl Args {
+    fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    fn push(&mut self, arg: impl AsRef<OsStr>) {
+        self.0.push(arg.as_ref().to_os_string());
+    }
+
+    fn extend<'a>(&mut self, args: impl IntoIterator<Item = &'a &'a str>) {
+        self.0.extend(args.into_iter().map(OsString::from));
+    }
+}
+
+impl Engine {
+    fn command(&self, args: Args) -> EngineCommand {
+        EngineCommand { program: self.bin.clone(), args: args.0 }
+    }
+
+    /// Builds the image `image` from `containerfile`.
+    ///
+    /// The build prints as it goes, so this is the one command
+    /// [`run::stream`](super::run::stream) exists for.
+    #[must_use]
+    pub fn build_image(&self, request: &ImageBuild<'_>) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("build");
+        args.push("--tag");
+        args.push(request.image);
+        args.push("--file");
+        args.push(request.containerfile);
+        args.push(request.context);
+        self.command(args)
+    }
+
+    /// Removes the image `image`, running containers and all.
+    #[must_use]
+    pub fn remove_image(&self, image: &str) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("image");
+        args.push("rm");
+        args.push("--force");
+        args.push(image);
+        self.command(args)
+    }
+
+    /// Asks after an image. It answers only when the image is there, which is how a profile
+    /// knows whether it still has one to start containers from.
+    #[must_use]
+    pub fn image_exists(&self, image: &str) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("image");
+        args.push("inspect");
+        args.push("--format");
+        args.push("{{.Id}}");
+        args.push(image);
+        self.command(args)
+    }
+
+    /// Creates a container without starting it.
+    #[must_use]
+    pub fn create_container(&self, request: &ContainerCreate<'_>) -> EngineCommand {
+        let dialect = self.kind.dialect();
+        let mut args = Args::new();
+        args.push("create");
+        args.push("--name");
+        args.push(request.name);
+        // Spelled the same by both engines, like the network below.
+        args.push("--hostname");
+        args.push(request.hostname);
+        match (dialect.user_mapping, &request.user) {
+            (UserMapping::KeepId, HostUser::Ids { .. }) => args.push("--userns=keep-id"),
+            (UserMapping::Ids, HostUser::Ids { uid, gid }) => {
+                args.push("--user");
+                args.push(format!("{uid}:{gid}"));
+            }
+            (_, HostUser::ImageDefault) => {}
+        }
+        // Both engines spell the network the same way, and full access is the default, so this
+        // is a property of the request rather than a difference between the engines.
+        match request.network {
+            Network::Full => {}
+            Network::None => args.push("--network=none"),
+        }
+        for mount in request.mounts {
+            args.push("--volume");
+            args.push(mount.spelled(dialect.relabel));
+        }
+        if let Some(workdir) = request.workdir {
+            args.push("--workdir");
+            args.push(workdir);
+        }
+        args.push(request.image);
+        args.extend(request.command);
+        self.command(args)
+    }
+
+    /// Starts an existing container.
+    #[must_use]
+    pub fn start_container(&self, name: &str) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("start");
+        args.push(name);
+        self.command(args)
+    }
+
+    /// Stops a running container.
+    #[must_use]
+    pub fn stop_container(&self, name: &str) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("stop");
+        args.push(name);
+        self.command(args)
+    }
+
+    /// Removes a container, stopping it first if it runs.
+    #[must_use]
+    pub fn remove_container(&self, name: &str) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("rm");
+        args.push("--force");
+        args.push(name);
+        self.command(args)
+    }
+
+    /// Runs a command inside a running container, attached to a terminal.
+    ///
+    /// This is what a tab spawns in a pseudo-terminal, so it always asks for an interactive
+    /// session: the harness inside draws and reads keys itself.
+    #[must_use]
+    pub fn exec(&self, request: &Exec<'_>) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("exec");
+        args.push("--interactive");
+        args.push("--tty");
+        args.push(request.container);
+        args.extend(request.command);
+        self.command(args)
+    }
+
+    /// Runs a command inside a running container without a terminal, and lets
+    /// [`run::capture`](super::run::capture) read its output and its exit code.
+    ///
+    /// [`Engine::exec`] is for a tab: the harness draws and reads keys, so it needs a terminal
+    /// and QCode gives it a pseudo-terminal. Everything else — a check, a copy, a clone — wants
+    /// the exit code and the output, and asking for a terminal there costs a pseudo-terminal or,
+    /// on docker, fails outright, because docker refuses `--tty` when the stream behind it is
+    /// not a terminal. Neither `--interactive` nor `--tty` is passed: nothing types into such a
+    /// command, and what it prints is read from the pipes.
+    #[must_use]
+    pub fn exec_without_terminal(&self, request: &Exec<'_>) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("exec");
+        args.push(request.container);
+        args.extend(request.command);
+        self.command(args)
+    }
+
+    /// Asks for one container's state; the output is a word
+    /// [`ContainerState::parse`](super::ContainerState::parse) reads.
+    #[must_use]
+    pub fn container_state(&self, name: &str) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("container");
+        args.push("inspect");
+        args.push("--format");
+        args.push("{{.State.Status}}");
+        args.push(name);
+        self.command(args)
+    }
+
+    /// Lists every container, running or not, as
+    /// [`Container::parse_list`](super::Container::parse_list) reads it.
+    #[must_use]
+    pub fn list_containers(&self) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("ps");
+        args.push("--all");
+        args.push("--format");
+        args.push("{{.Names}}\t{{.State}}");
+        self.command(args)
+    }
+
+    /// Creates a named volume.
+    #[must_use]
+    pub fn create_volume(&self, name: &str) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("volume");
+        args.push("create");
+        args.push(name);
+        self.command(args)
+    }
+
+    /// Removes a named volume. A volume still in use by a container fails loudly rather than
+    /// taking the container with it.
+    #[must_use]
+    pub fn remove_volume(&self, name: &str) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("volume");
+        args.push("rm");
+        args.push(name);
+        self.command(args)
+    }
+
+    /// Lists the names of every volume, one per line.
+    #[must_use]
+    pub fn list_volumes(&self) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("volume");
+        args.push("ls");
+        args.push("--format");
+        args.push("{{.Name}}");
+        self.command(args)
+    }
+
+    /// Copies from the host into a container, which is how content reaches a volume: a container
+    /// with the volume mounted is the volume's door.
+    #[must_use]
+    pub fn copy_in(&self, request: &CopyIn<'_>) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("cp");
+        args.push(request.host);
+        args.push(at(request.container, request.target));
+        self.command(args)
+    }
+
+    /// Copies out of a container onto the host, the other direction of [`Engine::copy_in`].
+    #[must_use]
+    pub fn copy_out(&self, request: &CopyOut<'_>) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("cp");
+        args.push(at(request.container, request.source));
+        args.push(request.host);
+        self.command(args)
+    }
+}
+
+/// `container:path`, how both engines name a place inside a container in a copy.
+fn at(container: &str, path: &Path) -> OsString {
+    let mut spelled = OsString::from(container);
+    spelled.push(":");
+    spelled.push(path);
+    spelled
+}
+
+/// Building the image a profile or the base lives in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageBuild<'a> {
+    /// The name the image gets, e.g. `qcode/profile/claude-sub`.
+    pub image: &'a str,
+    /// The Containerfile to build.
+    pub containerfile: &'a Path,
+    /// The folder the build can read files from.
+    pub context: &'a Path,
+}
+
+/// Creating the lasting container of a project, on its own or with a profile in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContainerCreate<'a> {
+    /// The container's name, e.g. `qcode-myproject-claude-sub`.
+    pub name: &'a str,
+    /// What the container reports as its machine name. QCode always passes
+    /// [`names::HOSTNAME`](super::names::HOSTNAME), so that a login keyed to the machine name
+    /// survives the move from the sign-in container to a project's.
+    pub hostname: &'a str,
+    /// The image it starts from.
+    pub image: &'a str,
+    /// What the container can see of the host and of its volumes.
+    pub mounts: &'a [Mount<'a>],
+    /// Whether the harness inside reaches the network.
+    pub network: Network,
+    /// Who the container runs as.
+    pub user: HostUser,
+    /// Where a shell inside starts.
+    pub workdir: Option<&'a Path>,
+    /// What the container runs. It has to be something long-lived: tabs `exec` into the
+    /// container that is already up rather than starting one each time.
+    pub command: &'a [&'a str],
+}
+
+/// Running a command in a container that is already up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Exec<'a> {
+    /// The running container.
+    pub container: &'a str,
+    /// The command and its arguments.
+    pub command: &'a [&'a str],
+}
+
+/// Copying from the host into a container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CopyIn<'a> {
+    /// What to copy. A folder path ending in `/.` copies the folder's content rather than the
+    /// folder itself, which is what refreshing a credential from a profile wants.
+    pub host: &'a Path,
+    /// The container to copy into.
+    pub container: &'a str,
+    /// Where the copy lands inside it.
+    pub target: &'a Path,
+}
+
+/// Copying out of a container onto the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CopyOut<'a> {
+    /// The container to copy from.
+    pub container: &'a str,
+    /// What to copy out; `/.` at the end copies content rather than the folder.
+    pub source: &'a Path,
+    /// Where it lands on the host.
+    pub host: &'a Path,
+}
+
+/// One thing the container can see at a path of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mount<'a> {
+    /// What is mounted.
+    pub source: MountSource<'a>,
+    /// Where it appears inside the container.
+    pub target: &'a Path,
+    /// Whether the container may write to it.
+    pub access: Access,
+}
+
+impl Mount<'_> {
+    /// The mount as the engine spells it: `source:target:options`.
+    fn spelled(&self, relabel: Relabel) -> OsString {
+        let mut spelled = match self.source {
+            MountSource::Path(path) => path.as_os_str().to_os_string(),
+            MountSource::Volume(name) => OsString::from(name),
+        };
+        spelled.push(":");
+        spelled.push(self.target);
+        spelled.push(match self.access {
+            Access::ReadWrite => ":rw",
+            Access::ReadOnly => ":ro",
+        });
+        if relabel == Relabel::Shared {
+            spelled.push(",z");
+        }
+        spelled
+    }
+}
+
+/// What a mount brings into the container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountSource<'a> {
+    /// A folder on the host, e.g. the project's own files.
+    Path(&'a Path),
+    /// A named volume, e.g. a profile's credential or a project's home.
+    Volume(&'a str),
+}
+
+/// Whether a mount may be written to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    /// The container may write.
+    ReadWrite,
+    /// The container may only read.
+    ReadOnly,
+}
+
+/// Whether a container reaches the network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Network {
+    /// Everything the host reaches.
+    Full,
+    /// Nothing.
+    None,
+}
+
+/// Who a container runs as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostUser {
+    /// The person's own ids. Files the harness writes into the project then belong to them and
+    /// not to root.
+    Ids {
+        /// User id.
+        uid: u32,
+        /// Group id.
+        gid: u32,
+    },
+    /// No POSIX ids to map: on Windows the engine's virtual machine owns that side of the
+    /// mount, and the container runs as the user its image names.
+    ImageDefault,
+}
+
+impl HostUser {
+    /// Who QCode is running as.
+    ///
+    /// # Errors
+    ///
+    /// On Unix, when the temporary folder cannot be written to, which is also where a build
+    /// would fail later.
+    pub fn current() -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            use std::time::{SystemTime, UNIX_EPOCH};
+
+            // A file QCode creates is owned by QCode: its owner is the answer, and reading it
+            // back needs neither libc nor a child process.
+            let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+            let probe = std::env::temp_dir().join(format!("qcode-user-{}-{stamp}", std::process::id()));
+            std::fs::File::create(&probe)?;
+            let owner = std::fs::metadata(&probe).map(|meta| Self::Ids { uid: meta.uid(), gid: meta.gid() });
+            let _ = std::fs::remove_file(&probe);
+            owner
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self::ImageDefault)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{Engine, EngineKind};
+    use crate::engine::{
+        Access, ContainerCreate, CopyIn, CopyOut, Exec, HostUser, ImageBuild, Mount, MountSource, Network,
+    };
+    use std::path::Path;
+
+    fn podman() -> Engine {
+        Engine::new(EngineKind::Podman, "/usr/bin/podman")
+    }
+
+    fn docker() -> Engine {
+        Engine::new(EngineKind::Docker, "/usr/bin/docker")
+    }
+
+    fn args(command: &crate::engine::EngineCommand) -> Vec<String> {
+        command.args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn builds_an_image_from_a_containerfile() {
+        let request = ImageBuild {
+            image: "qcode/profile/claude-sub",
+            containerfile: Path::new("/work/Containerfile"),
+            context: Path::new("/work"),
+        };
+        let command = podman().build_image(&request);
+        assert_eq!(command.program, Path::new("/usr/bin/podman"));
+        assert_eq!(
+            args(&command),
+            ["build", "--tag", "qcode/profile/claude-sub", "--file", "/work/Containerfile", "/work"]
+        );
+        assert_eq!(args(&docker().build_image(&request)), args(&command));
+    }
+
+    #[test]
+    fn removes_an_image() {
+        assert_eq!(args(&podman().remove_image("qcode/base")), ["image", "rm", "--force", "qcode/base"]);
+    }
+
+    #[test]
+    fn asks_whether_an_image_is_there() {
+        assert_eq!(
+            args(&docker().image_exists("qcode/base")),
+            ["image", "inspect", "--format", "{{.Id}}", "qcode/base"]
+        );
+    }
+
+    #[test]
+    fn podman_maps_the_user_with_keep_id_and_relabels_mounts() {
+        let mounts = [
+            Mount {
+                source: MountSource::Path(Path::new("/home/me/QCode/Projects/p/Project")),
+                target: Path::new("/work/Project"),
+                access: Access::ReadWrite,
+            },
+            Mount {
+                source: MountSource::Volume("qcode-home-p-claude"),
+                target: Path::new("/home/qcode"),
+                access: Access::ReadOnly,
+            },
+        ];
+        let request = ContainerCreate {
+            name: "qcode-p-claude",
+            hostname: "qcode",
+            image: "qcode/profile/claude",
+            mounts: &mounts,
+            network: Network::Full,
+            user: HostUser::Ids { uid: 1000, gid: 1000 },
+            workdir: Some(Path::new("/work/Project")),
+            command: &["sleep", "infinity"],
+        };
+        assert_eq!(
+            args(&podman().create_container(&request)),
+            [
+                "create",
+                "--name",
+                "qcode-p-claude",
+                "--hostname",
+                "qcode",
+                "--userns=keep-id",
+                "--volume",
+                "/home/me/QCode/Projects/p/Project:/work/Project:rw,z",
+                "--volume",
+                "qcode-home-p-claude:/home/qcode:ro,z",
+                "--workdir",
+                "/work/Project",
+                "qcode/profile/claude",
+                "sleep",
+                "infinity"
+            ]
+        );
+    }
+
+    #[test]
+    fn docker_names_the_user_ids_and_leaves_mounts_plain() {
+        let mounts = [Mount {
+            source: MountSource::Volume("qcode-home-p-claude"),
+            target: Path::new("/home/qcode"),
+            access: Access::ReadWrite,
+        }];
+        let request = ContainerCreate {
+            name: "qcode-p-claude",
+            hostname: "qcode",
+            image: "qcode/profile/claude",
+            mounts: &mounts,
+            network: Network::None,
+            user: HostUser::Ids { uid: 1000, gid: 100 },
+            workdir: None,
+            command: &[],
+        };
+        assert_eq!(
+            args(&docker().create_container(&request)),
+            [
+                "create",
+                "--name",
+                "qcode-p-claude",
+                "--hostname",
+                "qcode",
+                "--user",
+                "1000:100",
+                "--network=none",
+                "--volume",
+                "qcode-home-p-claude:/home/qcode:rw",
+                "qcode/profile/claude"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_host_without_posix_ids_gets_no_user_flag() {
+        let request = ContainerCreate {
+            name: "qcode-p-base",
+            hostname: "box",
+            image: "qcode/base",
+            mounts: &[],
+            network: Network::Full,
+            user: HostUser::ImageDefault,
+            workdir: None,
+            command: &[],
+        };
+        let expected = ["create", "--name", "qcode-p-base", "--hostname", "box", "qcode/base"];
+        assert_eq!(args(&podman().create_container(&request)), expected);
+        assert_eq!(args(&docker().create_container(&request)), expected);
+    }
+
+    #[test]
+    fn starts_stops_and_removes_a_container() {
+        let engine = podman();
+        assert_eq!(args(&engine.start_container("qcode-p-base")), ["start", "qcode-p-base"]);
+        assert_eq!(args(&engine.stop_container("qcode-p-base")), ["stop", "qcode-p-base"]);
+        assert_eq!(args(&engine.remove_container("qcode-p-base")), ["rm", "--force", "qcode-p-base"]);
+    }
+
+    #[test]
+    fn execs_interactively_for_a_pseudo_terminal() {
+        let request = Exec { container: "qcode-p-claude", command: &["claude", "--dangerously-skip-permissions"] };
+        assert_eq!(
+            args(&docker().exec(&request)),
+            ["exec", "--interactive", "--tty", "qcode-p-claude", "claude", "--dangerously-skip-permissions"]
+        );
+    }
+
+    #[test]
+    fn execs_without_a_terminal_when_the_answer_is_the_exit_code() {
+        // Without a real terminal `docker exec --tty` refuses outright, so a command whose
+        // exit code is the whole point asks for no terminal at all.
+        let request = Exec { container: "qcode-p-base", command: &["sh", "-c", "test -f /work/Project/marker"] };
+        assert_eq!(
+            args(&docker().exec_without_terminal(&request)),
+            ["exec", "qcode-p-base", "sh", "-c", "test -f /work/Project/marker"]
+        );
+        assert_eq!(args(&podman().exec_without_terminal(&request)), args(&docker().exec_without_terminal(&request)));
+    }
+
+    #[test]
+    fn asks_for_one_container_state_and_for_every_one() {
+        assert_eq!(
+            args(&podman().container_state("qcode-p-base")),
+            ["container", "inspect", "--format", "{{.State.Status}}", "qcode-p-base"]
+        );
+        assert_eq!(args(&docker().list_containers()), ["ps", "--all", "--format", "{{.Names}}\t{{.State}}"]);
+    }
+
+    #[test]
+    fn creates_removes_and_lists_volumes() {
+        let engine = docker();
+        assert_eq!(args(&engine.create_volume("qcode-cred-claude")), ["volume", "create", "qcode-cred-claude"]);
+        assert_eq!(args(&engine.remove_volume("qcode-cred-claude")), ["volume", "rm", "qcode-cred-claude"]);
+        assert_eq!(args(&engine.list_volumes()), ["volume", "ls", "--format", "{{.Name}}"]);
+    }
+
+    #[test]
+    fn copies_in_both_directions() {
+        let engine = podman();
+        let into = CopyIn { host: Path::new("/tmp/cred/."), container: "qcode-copy", target: Path::new("/mount") };
+        assert_eq!(args(&engine.copy_in(&into)), ["cp", "/tmp/cred/.", "qcode-copy:/mount"]);
+        let out = CopyOut { container: "qcode-copy", source: Path::new("/mount/."), host: Path::new("/tmp/cred") };
+        assert_eq!(args(&engine.copy_out(&out)), ["cp", "qcode-copy:/mount/.", "/tmp/cred"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_current_user_is_the_one_the_shell_reports() {
+        use std::process::Command;
+
+        let reported = |flag: &str| {
+            let output = Command::new("id").arg(flag).output().expect("`id` runs on every unix");
+            String::from_utf8_lossy(&output.stdout).trim().parse::<u32>().expect("`id` prints a number")
+        };
+        assert_eq!(
+            HostUser::current().expect("the current user is readable"),
+            HostUser::Ids { uid: reported("-u"), gid: reported("-g") }
+        );
+    }
+}
