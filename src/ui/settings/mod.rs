@@ -102,6 +102,8 @@ pub enum Msg {
     Request(Request),
     /// The repair report was read and can go.
     ReadRepairs,
+    /// The report of the old settings files that were not moved was read and can go.
+    ReadLeftBehind,
     /// The application stored the last change, or could not.
     Stored(Result<(), String>),
 }
@@ -113,6 +115,7 @@ pub struct Settings {
     workspace: Option<PathBuf>,
     repairs: Vec<Diagnostic>,
     repairs_read: bool,
+    left_behind: Vec<Diagnostic>,
     profiles: Option<Vec<ProfileIdentity>>,
     chosen: usize,
     failure: Option<String>,
@@ -128,10 +131,27 @@ impl Settings {
             workspace: config.workspace_path(),
             repairs: config.diagnostics().to_vec(),
             repairs_read: false,
+            left_behind: Vec::new(),
             profiles: None,
             chosen: 0,
             failure: None,
         }
+    }
+
+    /// The same screen, also reporting `files`: the settings files of an earlier version that
+    /// stayed where they were when the settings moved to the family's folder, each with the
+    /// reason.
+    #[must_use]
+    pub fn with_left_behind(mut self, files: Vec<Diagnostic>) -> Self {
+        self.left_behind = files;
+        self
+    }
+
+    /// The old settings files the screen still has to report, so a screen made again from new
+    /// settings keeps the news the person has not read yet.
+    #[must_use]
+    pub fn left_behind(&self) -> &[Diagnostic] {
+        &self.left_behind
     }
 
     /// The engine as the last check left it, for the repair strip.
@@ -201,6 +221,10 @@ pub fn update(screen: &mut Settings, message: Msg) -> (Command<Msg>, Option<Requ
             screen.repairs_read = true;
             (Command::none(), None)
         }
+        Msg::ReadLeftBehind => {
+            screen.left_behind.clear();
+            (Command::none(), None)
+        }
         Msg::Stored(stored) => {
             screen.failure = stored.err();
             (Command::none(), None)
@@ -247,7 +271,10 @@ pub fn view(screen: &Settings, ui: &mut View<'_, Msg>) {
     ui.add_with(ScrollView::new(), |ui| {
         ui.row(|ui| {
             ui.column(|ui| {
-                repairs(screen, ui);
+                report(&Report::LEFT_BEHIND, &screen.left_behind, ui);
+                if !screen.repairs_read {
+                    report(&Report::REPAIRS, &screen.repairs, ui);
+                }
                 if let Some(reason) = &screen.failure {
                     ui.add(Text::new(t!("settings.store-failed", reason = reason.clone())).color("danger"))
                         .fill_width();
@@ -358,15 +385,41 @@ pub fn view(screen: &Settings, ui: &mut View<'_, Msg>) {
     .fill();
 }
 
-/// The report of what reading the settings file had to put right. It stands until it is read:
-/// a repair is news, and news that disappears on its own is news nobody got.
-fn repairs(screen: &Settings, ui: &mut View<'_, Msg>) {
-    if screen.repairs.is_empty() || screen.repairs_read {
+/// A report the settings screen stands at its top, one line per diagnostic.
+struct Report {
+    title: &'static str,
+    text: &'static str,
+    dismiss: Msg,
+    id: &'static str,
+}
+
+impl Report {
+    /// What reading the settings file had to put right.
+    const REPAIRS: Self = Self {
+        title: "settings.repaired",
+        text: "settings.repaired-text",
+        dismiss: Msg::ReadRepairs,
+        id: "repairs-read",
+    };
+
+    /// The settings files of an earlier version that were not moved into the family's folder.
+    const LEFT_BEHIND: Self = Self {
+        title: "settings.left-behind",
+        text: "settings.left-behind-text",
+        dismiss: Msg::ReadLeftBehind,
+        id: "left-behind-read",
+    };
+}
+
+/// A report over `lines`. It stands until it is read: a repair or a file left behind is news,
+/// and news that disappears on its own is news nobody got.
+fn report(which: &Report, lines: &[Diagnostic], ui: &mut View<'_, Msg>) {
+    if lines.is_empty() {
         return;
     }
-    ui.add_with(Panel::new().title(t!("settings.repaired")), |ui| {
-        ui.add(Text::new(t!("settings.repaired-text")).role("secondary"));
-        for repair in &screen.repairs {
+    ui.add_with(Panel::new().title(t!(which.title)), |ui| {
+        ui.add(Text::new(t!(which.text)).role("secondary"));
+        for repair in lines {
             let place = repair.location.as_ref().map(ToString::to_string);
             let line = match place {
                 Some(place) => format!("{place}  {}", repair.message),
@@ -375,7 +428,7 @@ fn repairs(screen: &Settings, ui: &mut View<'_, Msg>) {
             let colour = if repair.severity == Severity::Error { "danger" } else { "warning" };
             ui.add(Text::new(line).color(colour));
         }
-        ui.add(Button::new(t!("settings.repaired-dismiss")).on_press(Msg::ReadRepairs)).id("repairs-read");
+        ui.add(Button::new(t!("settings.repaired-dismiss")).on_press(which.dismiss.clone())).id(which.id);
     })
     .fill_width();
 }
@@ -429,7 +482,7 @@ pub(crate) mod testing {
 
     /// A settings screen over the settings file `text`, repairs and all.
     pub fn from_config(text: &str, kind: EngineKind, health: Health) -> Settings {
-        Settings::new(&Config::parse_str("code.toml", text), EngineState::new(kind, health))
+        Settings::new(&Config::parse_str("code.conf", text), EngineState::new(kind, health))
     }
 
     /// A profile with or without a stored login.
@@ -613,9 +666,25 @@ mod tests {
         let mut harness = testing::host(screen, SIZE.0, SIZE.1);
         let shown = harness.screen();
         assert!(shown.contains("The settings file was repaired"), "{shown}");
-        assert!(shown.contains("code.toml:3:1"), "the repair is pinned to its place:\n{shown}");
+        assert!(shown.contains("code.conf:3:1"), "the repair is pinned to its place:\n{shown}");
         harness.click_text("Got it");
         assert!(!harness.screen().contains("The settings file was repaired"), "{}", harness.screen());
+    }
+
+    #[test]
+    fn old_settings_files_that_were_not_moved_are_reported_until_read() {
+        let left = qframe::diagnostics::Diagnostic::warning(
+            None,
+            "/home/ada/.config/quvyta/code/settings.toml: code.conf is already there; it stays where it is",
+        );
+        let screen = testing::screen(EngineKind::Podman, Health::Working).with_left_behind(vec![left]);
+        let mut harness = testing::host(screen, SIZE.0, SIZE.1);
+        let shown = harness.screen();
+        assert!(shown.contains("Some old settings files stayed where they were"), "{shown}");
+        assert!(shown.contains("code/settings.toml"), "the file is named:\n{shown}");
+        assert!(!shown.contains("was repaired"), "a clean file has nothing repaired:\n{shown}");
+        harness.click_text("Got it");
+        assert!(!harness.screen().contains("stayed where they were"), "{}", harness.screen());
     }
 
     #[test]

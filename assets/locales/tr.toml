@@ -362,6 +362,8 @@ no-profile = "Önce bir profil seç."
 repaired = "Ayar dosyası onarıldı"
 repaired-text = "QCode dosyayı okudu ve kullanamadığı yerleri düzeltti. Anladığı hiçbir şey kaybolmadı."
 repaired-dismiss = "Anladım"
+left-behind = "Bazı eski ayar dosyaları yerinde kaldı"
+left-behind-text = "QCode ayarlarını artık code.conf dosyasında tutuyor. Aşağıdaki dosyalar hiçbir şeyin üzerine yazılmasın diye taşınmadı; her biri bulunduğu yerde eksiksiz duruyor. Karşılaştırıp gerekeni elle alabilirsin."
 store-failed = "Değişiklik ayar dosyasına yazılamadı: {reason}"
 
 # Framework'ün kendi sözleri, QCode'da daha dar bir anlamda kullanıldıkları yerde: QCode'un tek

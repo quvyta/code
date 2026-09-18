@@ -49,9 +49,9 @@ use workspace::{Config, HostDirs, Loaded, ProjectFile, ProjectId, ProjectPaths, 
 ///
 /// Returns the terminal's error when the screen cannot be taken over or restored.
 pub fn run() -> io::Result<()> {
-    let config = Config::load();
+    let Loaded { value: config, diagnostics: left_behind } = Config::load();
     let settings = config.settings().clone();
-    let app = QCode::start(config, HostDirs::detect(), InstallHost::detect());
+    let app = QCode::start(config, HostDirs::detect(), InstallHost::detect()).with_left_behind(left_behind);
     let (keys, bindings) = keymap();
     let mut runtime = Runtime::new(app).settings(&settings).keymap_source(keys, bindings);
     for (file, text) in locales() {
@@ -260,6 +260,14 @@ impl QCode {
             save_failed: false,
         }
         .refreshed_home()
+    }
+
+    /// The same application, reporting on its settings screen the settings files of an earlier
+    /// version that stayed where they were when [`Config::load`] moved the settings.
+    #[must_use]
+    pub fn with_left_behind(mut self, files: Vec<qframe::diagnostics::Diagnostic>) -> Self {
+        self.settings = self.settings.with_left_behind(files);
+        self
     }
 
     /// The same application, remembering its open projects in the session file at `path`: the
@@ -590,7 +598,8 @@ impl QCode {
         self.profiles = None;
         self.project = None;
         self.refresh_home();
-        self.settings = SettingsScreen::new(&self.config, self.engine.clone());
+        let left_behind = self.settings.left_behind().to_vec();
+        self.settings = SettingsScreen::new(&self.config, self.engine.clone()).with_left_behind(left_behind);
         if !self.router.back() {
             self.router.replace(Page::Home);
         }
@@ -1018,9 +1027,10 @@ pub(crate) mod testing {
         std::env::temp_dir().join(format!("qcode-app-{what}-{}", std::process::id()))
     }
 
-    /// A Linux machine whose home folder is a temporary one.
+    /// A machine whose Documents folder is in a temporary home folder.
     pub fn dirs() -> HostDirs {
-        HostDirs { platform: Platform::Linux, home: Some(scratch("home")), documents_hint: None, user_dirs: None }
+        let documents = scratch("home").join("Documents");
+        HostDirs { workspace: Some(documents.join("Quvyta").join("Code")), documents: Some(documents) }
     }
 
     /// An Arch machine with `paru`, so every install command a test sees is the same one.
@@ -1041,7 +1051,7 @@ pub(crate) mod testing {
              [workspace]\npath = \"{}\"\n\n[projects]\nrecent = [{list}]\n",
             workspace.display()
         );
-        Config::parse_str("code.toml", &text)
+        Config::parse_str("code.conf", &text)
     }
 
     /// An application over `config`, opening on the wizard's `entry` step or on the home screen.
@@ -1055,6 +1065,26 @@ pub(crate) mod testing {
     pub fn app_with_absent_engine(config: Config) -> QCode {
         let engine = Engine::new(EngineKind::Podman, "/qcode/no/such/engine");
         QCode::new(config, dirs(), host(), &settled(), Some(engine), None)
+    }
+
+    /// Runs the test `name` of this crate again in a process of its own, with none of the
+    /// person's XDG folders and with `vars` set, and answers what it printed.
+    ///
+    /// The framework reads where things live from the environment, and a test process shares
+    /// one environment between all its threads; a child with its own is how a test sees where
+    /// QCode puts things on a machine it describes, without touching the person's folders.
+    pub fn in_child(name: &str, vars: &[(&str, &std::ffi::OsStr)]) -> String {
+        let exe = std::env::current_exe().expect("the test binary");
+        let mut command = std::process::Command::new(exe);
+        command.args([name, "--exact", "--nocapture", "--test-threads=1"]);
+        for var in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_DOCUMENTS_DIR"] {
+            command.env_remove(var);
+        }
+        command.envs(vars.iter().copied());
+        let output = command.output().expect("the test binary runs");
+        let printed = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(output.status.success(), "{printed}{}", String::from_utf8_lossy(&output.stderr));
+        printed
     }
 
     /// QCode's own text and keys, and nothing of the person's.
@@ -1126,7 +1156,7 @@ mod tests {
     fn every_screen_carries_one_key_hint_and_no_hint_bar() {
         let wizard = harness(
             app(
-                Config::parse_str("code.toml", ""),
+                Config::parse_str("code.conf", ""),
                 &Gates { language: false, engine: EngineCheck::Unknown, location: LocationCheck::Unknown },
                 Some(SetupStep::Language),
             ),
@@ -1237,7 +1267,7 @@ mod tests {
     fn a_machine_that_was_never_set_up_opens_the_wizard_on_the_gate_that_fell() {
         let gates = Gates { language: false, engine: EngineCheck::Unknown, location: LocationCheck::Unknown };
         let harness =
-            harness(app(Config::parse_str("code.toml", ""), &gates, Some(SetupStep::Language)), SIZE.0, SIZE.1);
+            harness(app(Config::parse_str("code.conf", ""), &gates, Some(SetupStep::Language)), SIZE.0, SIZE.1);
         assert_eq!(harness.app().page(), Page::Setup);
         assert!(harness.screen().contains("Pick the language"), "{}", harness.screen());
     }
@@ -1247,6 +1277,44 @@ mod tests {
         let harness = harness(app(config(&scratch("open"), &[]), &settled(), None), SIZE.0, SIZE.1);
         assert_eq!(harness.app().page(), Page::Home);
         assert!(harness.screen().contains("New project"), "{}", harness.screen());
+    }
+
+    #[test]
+    fn settings_moved_from_the_old_folder_open_the_home_screen_they_describe() {
+        let folder = scratch("moved-config");
+        let _ = std::fs::remove_dir_all(&folder);
+        let legacy = folder.join("code");
+        std::fs::create_dir_all(&legacy).expect("folder");
+        std::fs::write(legacy.join("settings.toml"), config(&scratch("moved"), &[]).to_toml()).expect("file");
+
+        let loaded = Config::load_in(&folder, &legacy);
+
+        assert!(loaded.is_clean(), "{:?}", loaded.diagnostics);
+        let harness = harness(app(loaded.value, &settled(), None), SIZE.0, SIZE.1);
+        assert_eq!(harness.app().page(), Page::Home, "the finished setup came along");
+        assert!(harness.screen().contains("New project"), "{}", harness.screen());
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn an_old_settings_file_that_stayed_behind_is_said_on_the_settings_screen() {
+        let folder = scratch("left-config");
+        let _ = std::fs::remove_dir_all(&folder);
+        let legacy = folder.join("code");
+        std::fs::create_dir_all(&legacy).expect("folder");
+        std::fs::write(legacy.join("settings.toml"), "[engine]\nkind = \"docker\"\n").expect("file");
+        std::fs::write(folder.join("code.conf"), config(&scratch("left"), &[]).to_toml()).expect("file");
+
+        let loaded = Config::load_in(&folder, &legacy);
+        let app = app(loaded.value, &settled(), None).with_left_behind(loaded.diagnostics);
+        let mut harness = harness(app, SIZE.0, SIZE.1);
+        assert_eq!(harness.app().page(), Page::Home);
+        harness.click_text("Settings");
+
+        let screen = harness.screen();
+        assert!(screen.contains("Some old settings files stayed where they were"), "{screen}");
+        assert!(screen.contains("settings.toml"), "{screen}");
+        let _ = std::fs::remove_dir_all(&folder);
     }
 
     #[test]
@@ -1281,7 +1349,7 @@ mod tests {
     fn language_after_the_wizard(name: &str, language: &str, next: &str, finish: &str) -> Option<String> {
         let gates = Gates { language: false, engine: EngineCheck::Working, location: LocationCheck::Usable };
         let text = format!("[workspace]\npath = \"{}\"\n", scratch(name).display());
-        let app = app(Config::parse_str("code.toml", &text), &gates, Some(SetupStep::Language));
+        let app = app(Config::parse_str("code.conf", &text), &gates, Some(SetupStep::Language));
         let mut harness = harness(app, SIZE.0, SIZE.1);
         harness.click_text(language).advance(MOMENT);
         for _ in 0..2 {
@@ -1291,7 +1359,7 @@ mod tests {
         assert_eq!(harness.app().page(), Page::Home, "{}", harness.screen());
         // Read back from the text that would be written, not from the settings in memory: a
         // choice that is not in the file is a choice the next start does not have.
-        Config::parse_str("code.toml", &harness.app().config.to_toml()).settings().language()
+        Config::parse_str("code.conf", &harness.app().config.to_toml()).settings().language()
     }
 
     #[test]
@@ -1448,7 +1516,7 @@ mod tests {
         // There is no application behind the wizard to go back to, so the keys that leave a
         // screen do not leave this one; it is left by finishing it.
         let gates = Gates { language: false, engine: EngineCheck::Unknown, location: LocationCheck::Unknown };
-        let app = app(Config::parse_str("code.toml", ""), &gates, Some(SetupStep::Language));
+        let app = app(Config::parse_str("code.conf", ""), &gates, Some(SetupStep::Language));
         let mut harness = harness(app, SIZE.0, SIZE.1);
         harness.press("esc").advance(MOMENT);
         assert_eq!(harness.app().page(), Page::Setup, "{}", harness.screen());

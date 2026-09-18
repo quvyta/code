@@ -129,16 +129,12 @@ impl Setup {
             .and_then(EngineKind::from_name)
             .and_then(|kind| ENGINES.iter().position(|known| *known == kind))
             .unwrap_or(0);
-        let default_path = dirs.default_workspace().value;
+        let default_path = dirs.workspace.clone();
         // A workspace already written down is the person's own choice, unless it is the very
         // place QCode would have picked anyway.
         let stored = config.workspace_path().filter(|path| Some(path) != default_path.as_ref());
-        let start = dirs
-            .documents()
-            .value
-            .or_else(|| dirs.home.clone())
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."));
+        let start =
+            dirs.documents.clone().or_else(|| std::env::current_dir().ok()).unwrap_or_else(|| PathBuf::from("."));
         let mut setup = Self {
             config,
             host,
@@ -702,9 +698,10 @@ mod tests {
         std::env::temp_dir().join(format!("qcode-setup-{what}-{}", std::process::id()))
     }
 
-    /// Host directories whose documents folder is below `home`.
+    /// Host directories whose Documents folder is below `home`, or a machine without a home.
     fn dirs(home: Option<PathBuf>) -> HostDirs {
-        HostDirs { platform: Platform::Linux, home, documents_hint: None, user_dirs: None }
+        let documents = home.map(|home| home.join("Documents"));
+        HostDirs { workspace: documents.as_ref().map(|documents| documents.join("Quvyta").join("Code")), documents }
     }
 
     /// An Arch machine with `paru`, so the install command of every test is the same one.
@@ -721,7 +718,7 @@ mod tests {
     }
 
     fn sized(config: &str, gates: &Gates, home: Option<PathBuf>, size: (u16, u16)) -> Harness<Wizard> {
-        let setup = Setup::new(Config::parse_str("code.toml", config), &dirs(home), gates, host());
+        let setup = Setup::new(Config::parse_str("code.conf", config), &dirs(home), gates, host());
         let mut harness = Harness::with_env(Wizard { setup }, env(), size.0, size.1);
         harness.set_locale("en").set_glyph_mode(GlyphMode::Unicode);
         harness.render();
@@ -851,7 +848,7 @@ mod tests {
     fn asking_again_puts_the_question_out_again() {
         // Sent straight to update, so the test never starts a container engine of its own.
         let mut setup = Setup::new(
-            Config::parse_str("code.toml", "language = \"en\"\n"),
+            Config::parse_str("code.conf", "language = \"en\"\n"),
             &dirs(Some(temporary("home"))),
             &gates(EngineCheck::Broken(EngineProblem::NotInstalled), LocationCheck::Unknown),
             host(),
@@ -878,7 +875,10 @@ mod tests {
         let screen = harness.screen();
         assert!(screen.contains("Default place") && screen.contains("Somewhere else"), "{screen}");
         assert!(screen.contains("QCode"), "the default place is named, not implied:\n{screen}");
-        assert_eq!(harness.app().setup.workspace_path(), Some(home.join("Documents").join("QCode")).as_deref());
+        assert_eq!(
+            harness.app().setup.workspace_path(),
+            Some(home.join("Documents").join("Quvyta").join("Code")).as_deref()
+        );
     }
 
     #[test]
@@ -924,7 +924,7 @@ mod tests {
         let config = setup.config();
         assert!(config.setup_completed(), "the wizard never opens again");
         assert_eq!(config.engine_kind(), Some("podman"));
-        assert_eq!(config.workspace_path(), Some(home.join("Documents").join("QCode")));
+        assert_eq!(config.workspace_path(), Some(home.join("Documents").join("Quvyta").join("Code")));
     }
 
     #[test]
@@ -981,7 +981,7 @@ mod tests {
     #[test]
     fn a_narrow_screen_keeps_the_wizard_usable() {
         let setup = Setup::new(
-            Config::parse_str("code.toml", "language = \"en\"\n"),
+            Config::parse_str("code.conf", "language = \"en\"\n"),
             &dirs(Some(temporary("home"))),
             &gates(EngineCheck::Broken(EngineProblem::NotInstalled), LocationCheck::Unknown),
             host(),

@@ -23,7 +23,7 @@ repository = "https://github.com/quvyta/code"
 readme = "README.md"
 keywords = ["tui", "terminal", "agent", "podman", "docker"]
 categories = ["command-line-utilities", "development-tools"]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -53,4 +53,6 @@ path = "src/bin/quvyta-code.rs"
 
 [dependencies]
 # The terminal tabs and the sign-in flow run a harness in a pseudo-terminal.
-quvyta-framework = { version = "0.1.5", features = ["pty"] }
+quvyta-framework = { version = "0.1.6", features = ["pty"] }
+
+[dev-dependencies]

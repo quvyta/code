@@ -2,8 +2,8 @@
 //!
 //! Five things live here, and each of them is readable without ever panicking:
 //!
-//! - [`HostDirs`] resolves the default workspace location on Linux, macOS and Windows.
-//! - [`Config`] is the application's `code.toml`, checked and repaired by a [`Schema`].
+//! - [`HostDirs`] holds the default workspace location, which the framework works out.
+//! - [`Config`] is the application's `code.conf`, checked and repaired by a [`Schema`].
 //! - [`ProjectId`] turns a display name into a name every file system accepts.
 //! - [`Workspace`] creates and reads the folder tree of the workspace and its projects.
 //! - [`Session`] records which projects and tabs were open, so they can be opened again.
@@ -23,7 +23,7 @@ mod session;
 pub use config::{Config, SetupStep};
 pub use identity::{ProjectId, ProjectIdError};
 pub use layout::{NewProjectError, ProjectEntry, ProjectPaths, Workspace, add_profile};
-pub use paths::{HostDirs, Platform, WORKSPACE_DIR_NAME};
+pub use paths::{APP_TITLE, HostDirs, Platform};
 pub use project::{ProjectFile, ProjectProfile};
 pub use session::{Session, SessionProject, SessionTab, SessionTabKind};
 

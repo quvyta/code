@@ -273,7 +273,7 @@ mod tests {
     fn probing_a_fresh_config_stops_at_the_language_gate() {
         // Nothing after the first gate that falls is asked, so no engine is started and no disk
         // is touched by this test.
-        let gates = Gates::probe(&Config::parse_str("code.toml", ""));
+        let gates = Gates::probe(&Config::parse_str("code.conf", ""));
         assert!(!gates.language);
         assert_eq!(gates.engine, EngineCheck::Unknown);
         assert_eq!(gates.location, LocationCheck::Unknown);
@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn probing_a_config_without_an_engine_stops_at_the_engine_gate() {
-        let gates = Gates::probe(&Config::parse_str("code.toml", "language = \"tr\"\n"));
+        let gates = Gates::probe(&Config::parse_str("code.conf", "language = \"tr\"\n"));
         assert!(gates.language);
         assert_eq!(gates.engine, EngineCheck::Unknown);
         assert_eq!(gates.location, LocationCheck::Unknown);

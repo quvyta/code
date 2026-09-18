@@ -1,18 +1,44 @@
-//! `code.toml`: the application's own settings, on top of the framework's
+//! `code.conf`: the application's own settings, on top of the framework's
 //! [`Settings`](qframe::storage::Settings).
 //!
 //! The [`Schema`] describes every key of the design document, and self-healing is on: a key
 //! nobody knows is removed, a value nothing can read falls back to its default, and each repair
 //! is a located diagnostic. A default is never written to the file, so an untouched
 //! installation keeps an empty config and a changed default reaches every existing one.
+//!
+//! The file sits in the Quvyta family's folder, next to the other applications of the family,
+//! and QCode's other configuration files would go in the `code/` folder beside it:
+//!
+//! ```text
+//! ~/.config/quvyta/
+//!     code.conf       QCode's settings
+//!     code/           its other configuration files
+//! ```
+//!
+//! Earlier versions kept `settings.toml` inside `code/`. That file is moved once, at start,
+//! before the settings are read; a file that cannot be moved without overwriting something
+//! stays where it is and is shown on the settings screen. The session is not a setting: it stays
+//! in the data folder and does not move.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use qframe::diagnostics::Diagnostic;
 use qframe::icons::IconMode;
-use qframe::storage::{Schema, SettingKind, Settings};
+use qframe::storage::{Family, Schema, SettingKind, Settings, config_dir};
 
-use super::ProjectId;
+use super::{Loaded, ProjectId};
+
+/// QCode's id in the family: its settings file is `code.conf` and its other files are under
+/// `code/`.
+pub const APP: &str = "code";
+
+/// The folder under the platform's config directory that held `settings.toml` before. On Linux
+/// it is the family's `code/` folder itself, so only the settings file moves.
+const LEGACY: &str = "quvyta/code";
+
+/// The settings file's name in [`LEGACY`].
+const LEGACY_FILE: &str = "settings.toml";
 
 /// The step of the setup wizard the application stopped at.
 ///
@@ -75,10 +101,27 @@ impl Config {
     /// shortcut, and the full list of projects is one screen away.
     pub const RECENT_LIMIT: usize = 10;
 
-    /// Loads the settings of QCode from the platform config directory.
+    /// Brings the settings over from where earlier versions kept them and reads them from the
+    /// family's folder. The diagnostics are the old files that stayed where they were, each
+    /// with the reason; nothing was overwritten to move them. Without a home folder the settings
+    /// stay in memory and say why.
     #[must_use]
-    pub fn load() -> Self {
-        Self::check(Settings::load("quvyta/code"))
+    pub fn load() -> Loaded<Self> {
+        match Family::QUVYTA.config_dir() {
+            Some(folder) => {
+                let legacy = config_dir(LEGACY).unwrap_or_else(|| folder.join(APP));
+                Self::load_in(&folder, &legacy)
+            }
+            None => Loaded { value: Self::check(Settings::load_member(&Family::QUVYTA, APP)), diagnostics: Vec::new() },
+        }
+    }
+
+    /// [`load`](Self::load) with `folder` as the family's folder and `legacy` as the folder the
+    /// old `settings.toml` may be in, so a test never touches the person's own settings.
+    #[must_use]
+    pub fn load_in(folder: &Path, legacy: &Path) -> Loaded<Self> {
+        let diagnostics = adopt(folder, legacy);
+        Loaded { value: Self::check(Settings::open(folder.join(format!("{APP}.conf")))), diagnostics }
     }
 
     /// Reads the settings from TOML `text`, reporting problems against `file`. Saving does
@@ -92,7 +135,7 @@ impl Config {
         Self { settings: settings.schema(Self::schema()).self_heal(true) }
     }
 
-    /// The shape of `code.toml`: the framework's own keys plus QCode's.
+    /// The shape of `code.conf`: the framework's own keys plus QCode's.
     fn schema() -> Schema {
         Schema::builtin()
             // No default: what QCode speaks when nobody has chosen is the machine's own
@@ -256,6 +299,20 @@ impl Config {
     }
 }
 
+/// Moves the old settings into the family's layout and answers what stayed behind.
+///
+/// Only an old settings file is a reason to look. Where the old folder and `code/` are one
+/// folder under two spellings (macOS, whose file system ignores case, names the family's folder
+/// `Quvyta` and the old one `quvyta`) the framework could take them for two, and would then warn
+/// at every start about files that are already in place; once the settings file has moved
+/// there is nothing more to bring over.
+fn adopt(folder: &Path, legacy: &Path) -> Vec<Diagnostic> {
+    if fs::symlink_metadata(legacy.join(LEGACY_FILE)).is_err() {
+        return Vec::new();
+    }
+    Family::QUVYTA.adopt_in(folder, APP, legacy).diagnostics().to_vec()
+}
+
 /// Whether every entry of a stored recent list is a project identifier.
 ///
 /// The parameter is a `&Vec` rather than a slice because that is the shape
@@ -270,7 +327,7 @@ mod tests {
 
     use super::*;
 
-    const FILE: &str = "code.toml";
+    const FILE: &str = "code.conf";
 
     #[test]
     fn a_fresh_config_writes_nothing_because_defaults_are_not_stored() {
@@ -329,7 +386,7 @@ mod tests {
         assert_eq!(config.engine_kind(), Some("podman"));
         assert_eq!(config.to_toml(), "[engine]\nkind = \"podman\"\n");
         let located = config.diagnostics()[0].location.as_ref().map(ToString::to_string);
-        assert_eq!(located, Some("code.toml:3:1".to_owned()));
+        assert_eq!(located, Some("code.conf:3:1".to_owned()));
     }
 
     #[test]
@@ -399,6 +456,159 @@ mod tests {
         }
         assert_eq!(config.recent_projects().len(), Config::RECENT_LIMIT);
         assert_eq!(config.recent_projects()[0].as_str(), format!("proje{}", Config::RECENT_LIMIT + 4));
+    }
+
+    /// A fresh folder under the system's temporary folder; never the person's own config folder.
+    fn temp(name: &str) -> PathBuf {
+        let dir = crate::testing::scratch(&format!("config-{name}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("folder");
+        dir
+    }
+
+    fn write(path: &Path, text: &str) {
+        fs::create_dir_all(path.parent().expect("parent")).expect("folder");
+        fs::write(path, text).expect("file");
+    }
+
+    fn read(path: &Path) -> String {
+        fs::read_to_string(path).expect("readable")
+    }
+
+    const SETTLED: &str = "[setup]\ncompleted = true\n\n[engine]\nkind = \"docker\"\n\n\
+                           [workspace]\npath = \"/home/ada/Belgeler/QCode\"\n";
+
+    #[test]
+    fn the_old_settings_file_becomes_code_conf_with_every_value() {
+        let folder = temp("same-folder");
+        let legacy = folder.join("code");
+        write(&legacy.join("settings.toml"), SETTLED);
+        write(&legacy.join("settings.toml.bak"), "old backup\n");
+
+        let Loaded { value: config, diagnostics } = Config::load_in(&folder, &legacy);
+
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(read(&folder.join("code.conf")), SETTLED, "moved as it was");
+        assert!(!legacy.join("settings.toml").exists());
+        assert_eq!(read(&legacy.join("settings.toml.bak")), "old backup\n", "the other files stay in code/");
+        assert!(config.is_clean(), "{:?}", config.diagnostics());
+        assert!(config.setup_completed());
+        assert_eq!(config.engine_kind(), Some("docker"));
+        assert_eq!(config.workspace_path(), Some(PathBuf::from("/home/ada/Belgeler/QCode")), "a chosen place stays");
+        assert_eq!(config.settings().path(), Some(folder.join("code.conf").as_path()));
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn a_second_start_moves_nothing_and_reads_the_same() {
+        let folder = temp("again");
+        let legacy = folder.join("code");
+        write(&legacy.join("settings.toml"), SETTLED);
+        let _ = Config::load_in(&folder, &legacy);
+
+        let Loaded { value: config, diagnostics } = Config::load_in(&folder, &legacy);
+
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(read(&folder.join("code.conf")), SETTLED);
+        assert_eq!(config.engine_kind(), Some("docker"));
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn an_existing_code_conf_wins_and_the_old_file_stays_whole_and_is_reported() {
+        let folder = temp("both");
+        let legacy = folder.join("code");
+        write(&legacy.join("settings.toml"), SETTLED);
+        write(&folder.join("code.conf"), "[engine]\nkind = \"podman\"\n");
+
+        let Loaded { value: config, diagnostics } = Config::load_in(&folder, &legacy);
+
+        assert_eq!(read(&legacy.join("settings.toml")), SETTLED, "the old file is never touched");
+        assert_eq!(read(&folder.join("code.conf")), "[engine]\nkind = \"podman\"\n");
+        assert_eq!(config.engine_kind(), Some("podman"));
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics[0].message.contains("settings.toml"), "{}", diagnostics[0]);
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_old_settings_file_that_is_a_link_is_left_alone_and_reported() {
+        let folder = temp("link");
+        let legacy = folder.join("code");
+        write(&folder.join("elsewhere.toml"), SETTLED);
+        fs::create_dir_all(&legacy).expect("folder");
+        std::os::unix::fs::symlink(folder.join("elsewhere.toml"), legacy.join("settings.toml")).expect("link");
+
+        let Loaded { value: config, diagnostics } = Config::load_in(&folder, &legacy);
+
+        assert!(fs::symlink_metadata(legacy.join("settings.toml")).expect("still there").file_type().is_symlink());
+        assert!(!folder.join("code.conf").exists(), "nothing is made up in its place");
+        assert_eq!(config.engine_kind(), None);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn a_fresh_start_writes_nothing_until_a_setting_changes() {
+        let folder = temp("fresh");
+        let legacy = folder.join("code");
+
+        let Loaded { value: mut config, diagnostics } = Config::load_in(&folder, &legacy);
+
+        assert!(diagnostics.is_empty());
+        assert!(config.is_clean(), "{:?}", config.diagnostics());
+        assert!(!folder.join("code.conf").exists());
+        assert!(!legacy.exists());
+        config.set_engine_kind("docker");
+        config.save().expect("saved");
+        assert_eq!(read(&folder.join("code.conf")), "[engine]\nkind = \"docker\"\n");
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn a_damaged_old_file_is_moved_as_it_was_then_healed_with_a_backup() {
+        let folder = temp("damaged");
+        let legacy = folder.join("code");
+        let text = "[engine]\nkind = \"lxc\"\n";
+        write(&legacy.join("settings.toml"), text);
+
+        let Loaded { value: config, diagnostics } = Config::load_in(&folder, &legacy);
+
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(read(&folder.join("code.conf.bak")), text, "what the person wrote is kept");
+        assert!(!config.is_clean());
+        assert_eq!(config.engine_kind(), Some("podman"));
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    /// Run with a config folder of its own, so the move happens where the platform puts the
+    /// family's folder and never in the developer's.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn loading_moves_the_old_file_from_where_earlier_versions_kept_it() {
+        const PRINT: &str = "QCODE_TEST_PRINT_CONFIG";
+        if std::env::var_os(PRINT).is_some() {
+            let Loaded { value: config, diagnostics } = Config::load();
+            let path = config.settings().path().map(|path| path.display().to_string()).unwrap_or_default();
+            println!("file={path}\nengine={:?}\nleft={}", config.engine_kind(), diagnostics.len());
+            return;
+        }
+        let home = temp("xdg");
+        let xdg = home.join("config");
+        write(&xdg.join("quvyta").join("code").join("settings.toml"), SETTLED);
+
+        let printed = crate::testing::in_child(
+            "workspace::config::tests::loading_moves_the_old_file_from_where_earlier_versions_kept_it",
+            &[(PRINT, "1".as_ref()), ("HOME", home.as_os_str()), ("XDG_CONFIG_HOME", xdg.as_os_str())],
+        );
+
+        let file = xdg.join("quvyta").join("code.conf");
+        assert!(printed.contains(&format!("file={}\n", file.display())), "{printed}");
+        assert!(printed.contains("engine=Some(\"docker\")\nleft=0\n"), "{printed}");
+        assert_eq!(read(&file), SETTLED);
+        assert!(!xdg.join("quvyta").join("code").join("settings.toml").exists());
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]

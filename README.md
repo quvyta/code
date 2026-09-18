@@ -131,9 +131,9 @@ While a harness or shell tab has the keyboard, keys go to it, `esc` and `?` incl
 
 | What | Where |
 |---|---|
-| Settings | `settings.toml` in the platform's configuration folder, `~/.config/quvyta/code` on Linux |
+| Settings | `code.conf` in the Quvyta folder of the platform's configuration folder: `~/.config/quvyta/code.conf` on Linux, `~/Library/Application Support/Quvyta/code.conf` on macOS, `%APPDATA%\Quvyta\code.conf` on Windows. Settings from before (`~/.config/quvyta/code/settings.toml`) move there once, at start |
 | Open projects and tabs | `session.toml` in the platform's data folder, `~/.local/share/quvyta/code` on Linux |
-| Workspace | `QCode` in your documents folder by default (`~/Documents/QCode`), or the folder you chose |
+| Workspace | `Quvyta/Code` in your Documents folder by default (`~/Documents/Quvyta/Code`, or `~/Belgeler/Quvyta/Code` where the desktop names it so), or the folder you chose; a folder chosen before stays where it is |
 | Profiles | `Profiles/<profile>.toml` in the workspace |
 | Projects | `Projects/<project>/` in the workspace: `project.qcode`, the code in `Project/`, your material in `Assets/` |
 | Images | `qcode/base` and `qcode/profile/<profile>`, in the engine |
