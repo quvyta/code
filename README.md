@@ -1,5 +1,7 @@
 # qcode
 
+![A project open in qcode: a shell tab beside a Claude Code and an opencode tab, and the panel with the file tree, the project and its containers](https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/project.png)
+
 **quvyta-code** runs coding agent harnesses inside containers, from the terminal. You set up a
 profile once, sign it in, and from then on open that harness in any of your projects in a few
 seconds, moving between harnesses and shells the way you move between tabs. Nothing the harness
@@ -47,6 +49,17 @@ Each harness is installed from its own published package when a profile's image 
 does not ship or change any of them. The interface follows your system language (English and
 Turkish are included) and uses the family's themes, icons, keys and mouse behaviour.
 
+## Screens
+
+<p>
+  <img src="https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/new-tab.png" width="49%" alt="A new tab offering a shell and each profile's earlier conversations">
+  <img src="https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/panel.png" width="49%" alt="The panel with the project's details and its containers">
+</p>
+<p>
+  <img src="https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/home.png" width="49%" alt="The home screen, ready to continue with the projects left open">
+  <img src="https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/projects.png" width="49%" alt="The list of projects">
+</p>
+
 ## Requirements
 
 - **A container engine:** [Podman](https://podman.io/docs/installation) (recommended: rootless,
@@ -63,9 +76,17 @@ and Windows are written in, but have not yet been tried on those systems.
 ## Install
 
 ```sh
+curl -fsSL https://raw.githubusercontent.com/quvyta/quvyta/main/install.sh | sh -s -- code
+```
+
+Or with Cargo:
+
+```sh
 cargo install quvyta-code
 qcode
 ```
+
+If the shell cannot find `qcode`, add `~/.cargo/bin` to your `PATH` (fish: `fish_add_path ~/.cargo/bin`).
 
 The program is installed as `qcode` and also as `quvyta-code`.
 
@@ -79,28 +100,39 @@ The program is installed as `qcode` and also as `quvyta-code`.
    terminal that opens and press **I have signed in**.
 3. **A project.** Open **Projects** and make a new project, empty, from a folder or from a git
    address.
-4. **Tabs.** In the project, open a new tab: a shell in the project's own container, or a harness
-   from any of your profiles. A profile the project does not have yet is added to it the moment
-   you open it, and is written into the project's `project.qcode`. The first time a profile opens
-   in a project, the project is given its own copy of the profile's login. With no profile at all,
-   the list offers **New profile** next to the shell, which leads to the profiles screen.
+4. **Tabs.** In the project, the `+` after the last tab (or `ctrl+t`) opens a new tab at once.
+   It lists the shell of the project's own container and, for every profile, **New chat** and
+   the profile's latest conversations in this project, newest first, with when each was last
+   used. Choosing a conversation opens the harness on it again, where it left off; Claude Code,
+   opencode, Gemini CLI and Codex CLI all resume a conversation this way. A profile the project
+   does not have yet is added to it the moment you open it, and is written into the project's
+   `project.qcode`. With no profile at all, the list offers **New profile**, which leads to the
+   profiles screen.
+5. **Continue.** The rail on the left holds the projects you have open, like the windows of a
+   browser: `+` at its end adds another one, and each can be closed. **Continue** on the home
+   screen brings back the open projects with their tabs as you left them, even after qcode was
+   closed; a tab's container starts when you first switch to that tab.
 
 | Key | What it does |
 |---|---|
 | `←` `→` | Move between tabs (project screen) |
+| `ctrl+t` | Open a new tab |
 | `ctrl+w` | Close the tab |
 | `alt+b` | Show or hide the side panel |
 | `ctrl+p` | Command palette |
 | `esc` | Leave the screen that is open |
+| `ctrl+alt+space` | From a harness or shell tab back to the tab strip |
+| `f1` | The list of every key |
 | `ctrl+q` | Quit |
 
-While a harness or shell tab has the keyboard, keys go to it; `esc` included.
+While a harness or shell tab has the keyboard, keys go to it, `esc` and `?` included; `f1`, `alt+b`, `ctrl+alt+space`, `shift+tab` and `ctrl+q` still reach qcode. The mouse reaches a harness that uses it.
 
 ## Where things live
 
 | What | Where |
 |---|---|
 | Settings | `settings.toml` in the platform's configuration folder, `~/.config/quvyta/code` on Linux |
+| Open projects and tabs | `session.toml` in the platform's data folder, `~/.local/share/quvyta/code` on Linux |
 | Workspace | `QCode` in your documents folder by default (`~/Documents/QCode`), or the folder you chose |
 | Profiles | `Profiles/<profile>.toml` in the workspace |
 | Projects | `Projects/<project>/` in the workspace: `project.qcode`, the code in `Project/`, your material in `Assets/` |

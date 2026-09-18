@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use qframe::prelude::*;
 use qframe::widgets::{
     Button, CopyValue, Field, FileBrowser, FilePicker, FilePickerMsg, Form, FormErrors, LogBuffer, LogLevel, LogLine,
-    LogView, PickMode, RadioGroup, RadioStyle, ScrollView, Spinner, Toast, Wizard,
+    LogView, PickMode, RadioGroup, ScrollView, Spinner, Toast, Wizard,
 };
 
 use crate::engine::EngineKind;
@@ -31,10 +31,6 @@ use crate::workspace::{Config, HostDirs, SetupStep};
 
 use gates::{EngineCheck, EngineProblem, Gates, LocationCheck, LocationProblem};
 use install::{InstallHost, Remedy};
-
-/// The marks of every choice in the wizard: the small square, as on every other screen of
-/// QCode. It is set here by name because the framework's constructor starts from another style.
-const MARK: RadioStyle = RadioStyle::Square;
 
 /// The languages QCode speaks, in the order they are offered.
 const LANGUAGES: [&str; 2] = ["en", "tr"];
@@ -490,7 +486,7 @@ fn language_page(setup: &Setup, ui: &mut View<'_, Msg>) {
     Form::new().label_width(LABEL_WIDTH).show(ui, |form| {
         form.field(Field::new(t!("setup.language")), |ui| {
             let options = LANGUAGES.map(|code| t!(&format!("setup.language-{code}")));
-            ui.add(RadioGroup::new(options).selected(Some(setup.language)).style(MARK).on_select(Msg::Language))
+            ui.add(RadioGroup::new(options).selected(Some(setup.language)).on_select(Msg::Language))
                 .id("setup-language");
         });
     });
@@ -508,8 +504,7 @@ fn engine_page(setup: &Setup, ui: &mut View<'_, Msg>) {
             let field = Field::new(t!("setup.engine")).error(setup.errors.get("setup-engine"));
             form.field(field, |ui| {
                 let options = ENGINES.map(|kind| t!(&format!("setup.engine-{}", kind.name())));
-                ui.add(RadioGroup::new(options).selected(Some(setup.engine)).style(MARK).on_select(Msg::Engine))
-                    .id("setup-engine");
+                ui.add(RadioGroup::new(options).selected(Some(setup.engine)).on_select(Msg::Engine)).id("setup-engine");
             });
         });
         ui.add(Text::new(t!(&format!("setup.{}-note", setup.kind().name()))).role("faint")).fill_width();
@@ -603,7 +598,6 @@ fn location_page(setup: &Setup, ui: &mut View<'_, Msg>) {
             ui.add(
                 RadioGroup::new(options)
                     .selected(Some(setup.place))
-                    .style(MARK)
                     .disabled(setup.default_path.is_none() && setup.place == DEFAULT_PLACE)
                     .on_select(Msg::Place),
             )

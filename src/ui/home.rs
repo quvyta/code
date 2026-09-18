@@ -12,8 +12,9 @@ const MENU_WIDTH: u16 = 34;
 /// A row of the home menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Entry {
-    /// Opens the project used last. Takes the first row when there is one.
-    LastProject,
+    /// Goes back to the projects that were open, the way a browser brings back its windows.
+    /// Takes the first row whenever there is something to go back to.
+    Continue,
     /// Takes the first row while no project has been opened yet.
     NewProject,
     /// All projects.
@@ -30,7 +31,7 @@ impl Entry {
     /// The translated label.
     pub(crate) fn label(self) -> String {
         match self {
-            Self::LastProject => t!("home.last-project"),
+            Self::Continue => t!("home.continue"),
             Self::NewProject => t!("home.new-project"),
             Self::Projects => t!("home.projects"),
             Self::Profiles => t!("home.profiles"),
@@ -42,7 +43,7 @@ impl Entry {
     /// The icon drawn before the label. Both first rows are about a project, so they share one.
     pub(crate) fn icon(self) -> &'static str {
         match self {
-            Self::LastProject | Self::NewProject | Self::Projects => "project",
+            Self::Continue | Self::NewProject | Self::Projects => "project",
             Self::Profiles => "profile",
             Self::Settings => "settings",
             Self::Quit => "power",
@@ -60,26 +61,41 @@ pub enum Msg {
     Select(usize),
 }
 
-/// The home screen's state: which project was used last and where the selection sits.
+/// The home screen's state: which projects "Continue" goes back to and where the selection
+/// sits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Home {
-    recent: Option<String>,
+    open: Vec<String>,
     selected: usize,
 }
 
 impl Home {
-    /// A home screen offering `recent`, the identifier of the project opened last.
+    /// A home screen whose first row goes back to `open`, the names of the projects that were
+    /// open in rail order, or starts a new project when there are none.
     #[must_use]
-    pub fn new(recent: Option<String>) -> Self {
-        Self { recent, selected: 0 }
+    pub fn new(open: Vec<String>) -> Self {
+        Self { open, selected: 0 }
+    }
+
+    /// Takes `open` as the projects "Continue" goes back to, keeping the selection where it is.
+    pub fn set_open(&mut self, open: Vec<String>) {
+        self.open = open;
     }
 
     /// The rows, in order. The first one either continues where the person left off or starts
     /// their first project.
     #[must_use]
     pub fn entries(&self) -> [Entry; 5] {
-        let first = if self.recent.is_some() { Entry::LastProject } else { Entry::NewProject };
+        let first = if self.open.is_empty() { Entry::NewProject } else { Entry::Continue };
         [first, Entry::Projects, Entry::Profiles, Entry::Settings, Entry::Quit]
+    }
+
+    /// What the "Continue" row says beside its label: the first project, and how many more
+    /// there are after it.
+    fn detail(&self) -> Option<String> {
+        let first = self.open.first()?;
+        let n = self.open.len();
+        Some(t!("home.continue-detail", n = n, first = first.as_str(), more = n - 1))
     }
 }
 
@@ -111,8 +127,8 @@ pub fn view(home: &Home, ui: &mut View<'_, AppMsg>) {
     let entries = home.entries();
     let items = entries.into_iter().map(|entry| {
         let item = ListItem::new(entry.label()).icon(entry.icon(), None);
-        match (entry, &home.recent) {
-            (Entry::LastProject, Some(project)) => item.detail(project.clone()),
+        match (entry, home.detail()) {
+            (Entry::Continue, Some(detail)) => item.detail(detail),
             _ => item,
         }
     });
@@ -144,6 +160,7 @@ mod tests {
     use qframe::icons::GlyphMode;
     use qframe::runtime::Harness;
 
+    use super::{Entry, Home};
     use crate::{QCode, testing};
 
     /// A terminal wide enough for the logo and the menu.
@@ -173,7 +190,7 @@ mod tests {
     fn a_recent_project_takes_the_first_row_and_names_itself() {
         let harness = home(Some("firefly"), SIZE.0, SIZE.1);
         let screen = harness.screen();
-        assert!(screen.contains("Last project"), "{screen}");
+        assert!(screen.contains("Continue"), "{screen}");
         assert!(screen.contains("firefly"), "{screen}");
         assert!(!screen.contains("New project"), "{screen}");
     }
@@ -182,7 +199,44 @@ mod tests {
     fn without_a_recent_project_the_menu_offers_a_new_one() {
         let screen = home(None, SIZE.0, SIZE.1).screen();
         assert!(screen.contains("New project"), "{screen}");
-        assert!(!screen.contains("Last project"), "{screen}");
+        assert!(!screen.contains("Continue"), "{screen}");
+    }
+
+    #[test]
+    fn continue_stands_while_there_is_something_to_go_back_to() {
+        let mut one = Home::new(vec!["Firefly".to_owned()]);
+        let mut three = Home::new(vec!["Firefly".to_owned(), "Moth".to_owned(), "Lantern".to_owned()]);
+        assert_eq!(one.entries()[0], Entry::Continue);
+        one.set_open(Vec::new());
+        three.selected = 3;
+        three.set_open(vec!["Moth".to_owned()]);
+        assert_eq!(one.entries()[0], Entry::NewProject, "nothing to go back to is a new project again");
+        assert_eq!(three.selected, 3, "a new list of projects leaves the selection where it was");
+    }
+
+    #[test]
+    fn continue_reads_in_turkish_with_its_count() {
+        let session = testing::scratch("home-session");
+        let _ = std::fs::remove_dir_all(&session);
+        let file = session.join("session.toml");
+        std::fs::create_dir_all(&session).expect("a folder");
+        std::fs::write(
+            &file,
+            "[[project]]\nid = \"firefly\"\n\n[[project]]\nid = \"moth\"\n\n[[project]]\nid = \"lantern\"\n",
+        )
+        .expect("a session file");
+        let workspace = testing::scratch("home-workspace");
+        let app = testing::app(testing::config(&workspace, &[]), &testing::settled(), None).with_session(Some(file));
+        let mut harness = testing::harness(app, SIZE.0, SIZE.1);
+        assert!(
+            harness.screen().contains("Continue") && harness.screen().contains("firefly +2"),
+            "{}",
+            harness.screen()
+        );
+        harness.set_locale("tr").render();
+        let screen = harness.screen();
+        assert!(screen.contains("Devam et") && screen.contains("firefly +2"), "{screen}");
+        let _ = std::fs::remove_dir_all(&session);
     }
 
     #[test]
@@ -250,7 +304,7 @@ mod tests {
             (
                 GlyphMode::Nerd,
                 [
-                    "▌  \u{f1b2} Last project         firefly",
+                    "▌  \u{f1b2} Continue             firefly",
                     "\u{f1b2} Projects",
                     "\u{f007} Profiles",
                     "\u{f013} Settings",
@@ -259,13 +313,13 @@ mod tests {
             ),
             (
                 GlyphMode::Unicode,
-                ["▌  ◈ Last project         firefly", "◈ Projects", "◉ Profiles", "▤ Settings", "○ Quit"],
+                ["▌  ◈ Continue             firefly", "◈ Projects", "◉ Profiles", "▤ Settings", "○ Quit"],
             ),
-            (GlyphMode::Ascii, ["# Last project         firefly", "# Projects", "@ Profiles", "* Settings", "x Quit"]),
+            (GlyphMode::Ascii, ["# Continue             firefly", "# Projects", "@ Profiles", "* Settings", "x Quit"]),
         ] {
             harness.set_glyph_mode(mode).render();
             let screen = harness.screen();
-            let (_, first) = harness.find("Last project").expect("the menu is on screen");
+            let (_, first) = harness.find("Continue").expect("the menu is on screen");
             let first = usize::try_from(first).expect("a row on the screen");
             let rows: Vec<&str> = screen.lines().skip(first).take(5).map(str::trim).collect();
             assert_eq!(rows, expected, "{mode:?}:\n{screen}");
@@ -302,7 +356,7 @@ mod tests {
         let mut harness = home(Some("firefly"), SIZE.0, SIZE.1);
         harness.set_locale("tr").render();
         let screen = harness.screen();
-        for label in ["Son proje", "Projeler", "Profiller", "Ayarlar", "Çıkış", "kapsayıcının"] {
+        for label in ["Devam et", "Projeler", "Profiller", "Ayarlar", "Çıkış", "kapsayıcının"] {
             assert!(screen.contains(label), "`{label}` is missing:\n{screen}");
         }
     }

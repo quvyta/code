@@ -22,7 +22,7 @@ use qframe::prelude::*;
 use qframe::runtime::{Task, TaskEvent, TaskId, TaskOutcome, Tasks};
 use qframe::widgets::{
     EmptyState, Field, FilePicker, FilePickerMsg, Form, FormErrors, LogBuffer, LogLevel, LogLine, LogView, Modal,
-    RadioGroup, RadioStyle, ScrollView, Skeleton, TaskList, TextInput, Toast,
+    RadioGroup, ScrollView, Skeleton, TaskList, TextInput, Toast,
 };
 
 use crate::engine::Engine;
@@ -531,7 +531,6 @@ fn form(projects: &Projects, draft: &Draft, ui: &mut View<'_, Msg>) {
             // pointer looked like a choice of its own.
             ui.add(
                 RadioGroup::new(Source::ALL.map(Source::label))
-                    .style(RadioStyle::Square)
                     .horizontal(true)
                     .selected(Some(draft.source.index()))
                     .on_select(Msg::Source),

@@ -16,6 +16,7 @@ pub mod ui;
 pub mod workspace;
 
 use std::io;
+use std::path::PathBuf;
 
 use qframe::keymap::{KeyChord, Scope};
 use qframe::prelude::*;
@@ -35,7 +36,7 @@ use ui::settings::{Request, Settings as SettingsScreen};
 use ui::setup::Setup;
 use ui::setup::gates::{EngineCheck, Gates};
 use ui::setup::install::InstallHost;
-use workspace::{Config, HostDirs, ProjectFile, ProjectId, ProjectPaths, SetupStep, Workspace};
+use workspace::{Config, HostDirs, Loaded, ProjectFile, ProjectId, ProjectPaths, Session, SetupStep, Workspace};
 
 /// Starts the application: preferences come from the platform's config folder, the text is
 /// compiled in, and the runtime drives the screens until the person leaves.
@@ -122,6 +123,16 @@ pub struct ProjectContents {
     pub profiles: Vec<Profile>,
 }
 
+/// What the projects that were read are for.
+#[derive(Debug, Clone)]
+pub enum Opening {
+    /// One project, picked from the list or opened last: it joins the project screen that is
+    /// open, or opens one of its own.
+    One(ProjectId),
+    /// The projects and tabs of the last session, brought back as they were.
+    Session(Session),
+}
+
 /// Everything that can happen in QCode.
 #[derive(Debug, Clone)]
 pub enum Msg {
@@ -145,8 +156,10 @@ pub enum Msg {
     Help(bool),
     /// The container engine was looked for again, and this is what was found.
     Looked(EngineKind, Result<Box<Engine>, Trouble>),
-    /// The workspace's projects were read, and this one is the one to open.
-    Read(Vec<ProjectContents>, ProjectId),
+    /// The projects to open were read from the workspace.
+    Read(Vec<ProjectContents>, Opening),
+    /// The session file was written, or it was not.
+    SessionSaved(Result<(), String>),
     /// A profile's login was deleted, or it was not.
     SignedOut(Result<(), String>),
     /// A profile's stored login was written into the projects that use it, or it was not.
@@ -169,6 +182,18 @@ pub struct QCode {
     project: Option<ProjectScreen>,
     settings: SettingsScreen,
     help: bool,
+    /// Where the open projects are remembered between runs, or `None` where they are not.
+    session_file: Option<PathBuf>,
+    /// The session as the file holds it, or as it is being written: what "Continue" goes back to
+    /// when no project screen is open, and what a changed screen is compared with.
+    saved: Option<Session>,
+    /// What was wrong with the session file when it was read, said when it is brought back.
+    saved_problems: Vec<qframe::diagnostics::Diagnostic>,
+    /// Whether the session file is being written, so writes never overtake one another.
+    saving: bool,
+    /// Whether the last write failed, so a disk that refuses is said once rather than at every
+    /// change.
+    save_failed: bool,
 }
 
 impl QCode {
@@ -190,7 +215,7 @@ impl QCode {
         };
         let settled = config.setup_completed() && config.workspace_path().is_some();
         let entry = if settled { None } else { gates.entry() };
-        Self::new(config, dirs, host, &gates, found, entry)
+        Self::new(config, dirs, host, &gates, found, entry).with_session(Session::file())
     }
 
     /// The application with every answer already in hand, which is how a test builds one.
@@ -207,7 +232,6 @@ impl QCode {
     ) -> Self {
         let kind = config.engine_kind().and_then(EngineKind::from_name).unwrap_or(EngineKind::Podman);
         let engine = EngineState::new(kind, health(&gates.engine));
-        let recent = config.recent_projects().first().map(|id| id.as_str().to_owned());
         let settings = SettingsScreen::new(&config, engine.clone());
         // Which step the wizard opens on is the gates' answer, never this one: `entry` only
         // says whether there is anything left to ask.
@@ -223,13 +247,70 @@ impl QCode {
             engine,
             found,
             setup,
-            home: Home::new(recent),
+            home: Home::new(Vec::new()),
             projects: None,
             profiles: None,
             project: None,
             settings,
             help: false,
+            session_file: None,
+            saved: None,
+            saved_problems: Vec::new(),
+            saving: false,
+            save_failed: false,
         }
+        .refreshed_home()
+    }
+
+    /// The same application, remembering its open projects in the session file at `path`: the
+    /// file is read now, on the way in like the gates, and written whenever what is open changes.
+    /// `None` keeps nothing between runs.
+    #[must_use]
+    pub fn with_session(mut self, path: Option<PathBuf>) -> Self {
+        let Loaded { value, diagnostics } = match &path {
+            Some(path) => Session::load(path),
+            None => Loaded { value: None, diagnostics: Vec::new() },
+        };
+        self.session_file = path;
+        self.saved = value;
+        self.saved_problems = diagnostics;
+        self.refreshed_home()
+    }
+
+    /// The same application on the project screen `screen`, the way a restored session opens
+    /// it; for a screen built by hand, such as a demonstration's. The screen's first work, reading
+    /// the open project's folder and asking after its containers, starts when
+    /// [`ui::project::Msg::OpenProject`] reaches it.
+    #[must_use]
+    pub fn with_project(mut self, screen: ProjectScreen) -> Self {
+        self.project = Some(screen);
+        self.enter_project();
+        self.refreshed_home()
+    }
+
+    fn refreshed_home(mut self) -> Self {
+        self.refresh_home();
+        self
+    }
+
+    /// Tells the home screen what "Continue" goes back to: the project screen that is open, or
+    /// else the last session, or else — for a session never written — the project opened last.
+    fn refresh_home(&mut self) {
+        let live = self.project.as_ref().map(ProjectScreen::projects).unwrap_or_default();
+        let open: Vec<String> = if !live.is_empty() {
+            live.iter().map(|project| project.name().to_owned()).collect()
+        } else if let Some(saved) = &self.saved {
+            saved.projects.iter().map(|project| project.id.as_str().to_owned()).collect()
+        } else {
+            self.config.recent_projects().first().map(|id| id.as_str().to_owned()).into_iter().collect()
+        };
+        self.home.set_open(open);
+    }
+
+    /// The project screen, once a project has been opened.
+    #[must_use]
+    pub fn project(&self) -> Option<&ProjectScreen> {
+        self.project.as_ref()
     }
 
     /// Which screen is open.
@@ -269,11 +350,26 @@ impl QCode {
             Entry::NewProject => self.show_projects(true),
             Entry::Profiles => self.show_profiles(),
             Entry::Settings => self.show_settings(),
-            Entry::LastProject => match self.config.recent_projects().first().cloned() {
-                Some(id) => self.read_projects(&id),
-                // The row only stands there while a project was opened before.
-                None => self.show_projects(false),
-            },
+            Entry::Continue => self.resume(),
+        }
+    }
+
+    /// Goes back to where the person left off: the project screen as it is when one is open,
+    /// else the last session as the file keeps it, else the project opened last on its own.
+    fn resume(&mut self) -> Command<Msg> {
+        if let Some(screen) = self.project.as_mut().filter(|screen| !screen.projects().is_empty()) {
+            let entered = ui::project::opened(screen).map(Msg::Project);
+            self.router.push(Page::Project);
+            return Command::batch([entered, self.take_focus(), self.reread_profiles()]);
+        }
+        if let Some(saved) = self.saved.clone().filter(|saved| !saved.is_empty()) {
+            let ids = saved.projects.iter().map(|project| project.id.clone()).collect();
+            return self.read_projects(ids, Opening::Session(saved));
+        }
+        match self.config.recent_projects().first().cloned() {
+            Some(id) => self.read_projects(vec![id.clone()], Opening::One(id)),
+            // The row only stands there while there is something to go back to.
+            None => self.show_projects(false),
         }
     }
 
@@ -316,46 +412,142 @@ impl QCode {
         Command::batch([read, self.take_focus()])
     }
 
-    /// Reads every project of the workspace, to open `id` with the others beside it in the rail.
-    fn read_projects(&mut self, id: &ProjectId) -> Command<Msg> {
+    /// Reads the projects `ids` of the workspace, in that order, for `opening`. A project that is
+    /// not there any more is simply not in the answer.
+    fn read_projects(&mut self, ids: Vec<ProjectId>, opening: Opening) -> Command<Msg> {
         let Some(workspace) = self.workspace() else { return self.repair(SetupStep::Location) };
-        let id = id.clone();
         Command::perform(move || {
             let known = workspace.profiles().value;
-            let contents = workspace
-                .projects()
-                .value
-                .into_iter()
-                .filter_map(|entry| entry.file)
-                .map(|file| {
+            let mut files: Vec<ProjectFile> =
+                workspace.projects().value.into_iter().filter_map(|entry| entry.file).collect();
+            let contents = ids
+                .iter()
+                .filter_map(|id| {
+                    let file = files.remove(files.iter().position(|file| file.id == *id)?);
                     let paths = workspace.project_paths(&file.id);
-                    ProjectContents { file, paths, profiles: known.clone() }
+                    Some(ProjectContents { file, paths, profiles: known.clone() })
                 })
                 .collect();
-            Msg::Read(contents, id)
+            Msg::Read(contents, opening)
         })
     }
 
-    /// Shows the projects that were read, with `id` the one the rail has open.
+    /// Opens what was read for `opening`.
+    fn read(&mut self, contents: Vec<ProjectContents>, opening: Opening) -> Command<Msg> {
+        match opening {
+            Opening::One(id) => self.show_project(contents, &id),
+            Opening::Session(session) => self.restore(contents, &session),
+        }
+    }
+
+    /// Opens the project `id`: into the project screen that is open, beside the projects it
+    /// has and without closing anything, or on a screen of its own when none is open.
     fn show_project(&mut self, contents: Vec<ProjectContents>, id: &ProjectId) -> Command<Msg> {
-        let place = contents.iter().position(|project| project.file.id == *id);
-        let Some(place) = place else {
+        let Some(one) = contents.into_iter().find(|project| project.file.id == *id) else {
             // The project is gone from the workspace between the list and the opening of it; the
             // list is the honest answer, and the recent entry that led here goes.
             self.config.forget_project(id);
-            self.home = Home::new(self.config.recent_projects().first().map(|id| id.as_str().to_owned()));
+            self.refresh_home();
             return Command::batch([self.store(), self.show_projects(false)]);
         };
-        let projects =
-            contents.into_iter().map(|one| OpenProject::new(&one.file, one.paths, one.profiles)).collect::<Vec<_>>();
-        let mut screen = ProjectScreen::new(self.found.clone(), self.user, projects);
-        let opened = ui::project::update(&mut screen, ui::project::Msg::OpenProject(place)).map(Msg::Project);
-        let entered = ui::project::opened(&mut screen).map(Msg::Project);
-        self.project = Some(screen);
-        self.router.push(Page::Project);
+        let project = OpenProject::new(&one.file, one.paths, one.profiles);
+        let entered = match self.project.as_mut() {
+            Some(screen) => ui::project::add(screen, project),
+            None => {
+                let mut screen = ProjectScreen::new(self.found.clone(), self.user, vec![project]);
+                let entered = ui::project::opened(&mut screen);
+                self.project = Some(screen);
+                entered
+            }
+        };
+        self.enter_project();
         self.config.remember_project(id);
-        self.home = Home::new(Some(id.as_str().to_owned()));
-        Command::batch([opened, entered, self.take_focus(), self.store()])
+        Command::batch([entered.map(Msg::Project), self.take_focus(), self.store(), self.keep_session()])
+    }
+
+    /// Brings back the projects and tabs of `session` that the workspace still has, and says
+    /// which it no longer has.
+    fn restore(&mut self, contents: Vec<ProjectContents>, session: &Session) -> Command<Msg> {
+        let gone: Vec<&str> = session
+            .projects
+            .iter()
+            .filter(|record| !contents.iter().any(|one| one.file.id == record.id))
+            .map(|record| record.id.as_str())
+            .collect();
+        let mut told = Vec::new();
+        if !gone.is_empty() {
+            let toast = Toast::warning(t!("app.session-gone", n = gone.len())).body(gone.join(", "));
+            told.push(Command::toast(toast));
+        }
+        if let Some(problem) = self.saved_problems.first() {
+            told.push(Command::toast(Toast::warning(t!("app.session-broken")).body(problem.to_string())));
+            self.saved_problems.clear();
+        }
+        if contents.is_empty() {
+            told.push(self.show_projects(false));
+            return Command::batch(told);
+        }
+        let ids: Vec<ProjectId> = contents.iter().map(|one| one.file.id.clone()).collect();
+        let projects: Vec<OpenProject> =
+            contents.into_iter().map(|one| OpenProject::new(&one.file, one.paths, one.profiles)).collect();
+        let mut screen = ProjectScreen::new(self.found.clone(), self.user, projects);
+        for (index, id) in ids.iter().enumerate() {
+            if let Some(record) = session.projects.iter().find(|record| record.id == *id) {
+                screen.restore_tabs(index, record);
+            }
+        }
+        let active = session.active.as_ref().and_then(|active| ids.iter().position(|id| id == active));
+        screen.set_active(active.unwrap_or(0));
+        told.push(ui::project::opened(&mut screen).map(Msg::Project));
+        self.project = Some(screen);
+        self.enter_project();
+        told.extend([self.take_focus(), self.keep_session()]);
+        Command::batch(told)
+    }
+
+    /// Shows the project screen. Coming from the list the project screen itself opened, that is
+    /// a step back to it rather than a second project screen on top of the first.
+    fn enter_project(&mut self) {
+        let history = self.router.history();
+        let under = history.len().checked_sub(2).and_then(|place| history.get(place));
+        if self.page() != Page::Project && under == Some(&Page::Project) {
+            self.router.back();
+        } else {
+            self.router.push(Page::Project);
+        }
+    }
+
+    /// Writes the session file when what is open no longer matches what it holds, off the render
+    /// path, and never while an earlier write is still going: that one's answer asks again.
+    fn keep_session(&mut self) -> Command<Msg> {
+        let Some(screen) = &self.project else { return Command::none() };
+        let snapshot = screen.session();
+        self.refresh_home();
+        if self.saving || self.saved.as_ref() == Some(&snapshot) {
+            return Command::none();
+        }
+        self.saved = Some(snapshot.clone());
+        let Some(path) = self.session_file.clone() else { return Command::none() };
+        self.saving = true;
+        Command::perform(move || Msg::SessionSaved(snapshot.save(&path).map_err(|error| error.to_string())))
+    }
+
+    /// Takes in how a write of the session file went, and writes again when what is open changed
+    /// while it was going.
+    fn session_saved(&mut self, result: Result<(), String>) -> Command<Msg> {
+        self.saving = false;
+        let told = match result {
+            Err(reason) if !self.save_failed => {
+                self.save_failed = true;
+                Command::toast(Toast::warning(t!("app.session-unsaved")).body(reason))
+            }
+            Err(_) => Command::none(),
+            Ok(()) => {
+                self.save_failed = false;
+                Command::none()
+            }
+        };
+        Command::batch([told, self.keep_session()])
     }
 
     /// Runs one step of the setup wizard on its own, which is what the repair strip and the
@@ -397,6 +589,7 @@ impl QCode {
         self.projects = None;
         self.profiles = None;
         self.project = None;
+        self.refresh_home();
         self.settings = SettingsScreen::new(&self.config, self.engine.clone());
         if !self.router.back() {
             self.router.replace(Page::Home);
@@ -426,6 +619,7 @@ impl QCode {
         self.projects = None;
         self.profiles = None;
         self.project = None;
+        self.refresh_home();
         let (command, _) = ui::settings::update(&mut self.settings, ui::settings::Msg::Checked(health));
         command.map(Msg::Settings)
     }
@@ -650,7 +844,7 @@ impl App for QCode {
                 let (command, opened) = ui::projects::update(screen, message);
                 let command = command.map(Msg::Projects);
                 match opened {
-                    Some(id) => Command::batch([command, self.read_projects(&id)]),
+                    Some(id) => Command::batch([command, self.read_projects(vec![id.clone()], Opening::One(id))]),
                     None => command,
                 }
             }
@@ -666,12 +860,23 @@ impl App for QCode {
                 }
             }
             Msg::Project(message) => {
-                let manage = matches!(message, ui::project::Msg::ManageProfiles);
+                // Two things the screen asks for are screens of their own, which only the
+                // application can open.
+                let asked = match message {
+                    ui::project::Msg::ManageProfiles => Some(Page::Profiles),
+                    ui::project::Msg::AddProject => Some(Page::Projects),
+                    _ => None,
+                };
                 let command = match self.project.as_mut() {
                     Some(screen) => ui::project::update(screen, message).map(Msg::Project),
                     None => Command::none(),
                 };
-                if manage { Command::batch([command, self.show_profiles()]) } else { command }
+                let shown = match asked {
+                    Some(Page::Profiles) => self.show_profiles(),
+                    Some(Page::Projects) => self.show_projects(false),
+                    _ => Command::none(),
+                };
+                Command::batch([command, shown, self.keep_session()])
             }
             Msg::Settings(message) => {
                 let (command, request) = ui::settings::update(&mut self.settings, message);
@@ -687,7 +892,8 @@ impl App for QCode {
                 Command::none()
             }
             Msg::Looked(kind, found) => self.looked(kind, found),
-            Msg::Read(contents, id) => self.show_project(contents, &id),
+            Msg::Read(contents, opening) => self.read(contents, opening),
+            Msg::SessionSaved(result) => self.session_saved(result),
             Msg::SignedOut(Ok(())) => Command::toast(Toast::success(t!("settings.signed-out"))),
             Msg::SignedOut(Err(reason)) => Command::toast(Toast::danger(t!("settings.sign-out-failed")).body(reason)),
             Msg::Refreshed(profile, outcome) => Command::toast(refreshed(&profile, outcome)),
@@ -698,10 +904,15 @@ impl App for QCode {
     /// nothing nearer has used it: a focused widget first, so the terminal of a harness tab
     /// keeps its own Esc, and then an open dialog, which closes instead of letting the screen go.
     /// `help` is the framework's own action for the list of keys; the application opens it.
+    /// `new-tab` opens a blank tab and `leave-terminal` takes the keyboard from a harness to the
+    /// tab strip; both only mean something while a project is open.
     fn action(&self, name: &str) -> Option<Msg> {
+        let project_open = self.page() == Page::Project && self.project.as_ref().is_some_and(|s| s.project().is_some());
         match name {
             "back" => Some(Msg::Back),
             "help" => Some(Msg::Help(true)),
+            "new-tab" => project_open.then_some(Msg::Project(ui::project::Msg::NewTab)),
+            "leave-terminal" => project_open.then_some(Msg::Project(ui::project::Msg::LeaveTerminal)),
             _ => None,
         }
     }
@@ -873,8 +1084,9 @@ mod tests {
     use std::time::Duration;
 
     use super::testing::{app, app_with_absent_engine, config, harness, scratch, settled};
-    use super::{Gates, Msg, OpenProject, Page, ProjectScreen, Request, SetupStep};
+    use super::{Gates, Msg, OpenProject, Page, ProjectId, ProjectScreen, Request, SetupStep};
     use crate::profile::SafeName;
+    use crate::ui::project::{Tab, TabState};
     use crate::ui::setup::gates::{EngineCheck, EngineProblem, LocationCheck};
     use crate::workspace::Config;
 
@@ -987,6 +1199,19 @@ mod tests {
         for word in ["tabs", "ctrl w", "close tab", "shift tab", "leave the terminal"] {
             assert!(screen.contains(word), "`{word}` is in the list:\n{screen}");
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_key_list_names_the_way_from_the_harness_to_the_tabs_in_both_languages() {
+        let root = scratch("help-leave");
+        let mut harness = open_project(&root);
+        harness.click_text("Keys");
+        let screen = harness.screen();
+        assert!(screen.contains("ctrl alt space"), "{screen}");
+        assert!(screen.contains("from the harness to the tabs"), "{screen}");
+        harness.set_locale("tr").render();
+        assert!(harness.screen().contains("düzenekten sekmelere geç"), "{}", harness.screen());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1304,5 +1529,265 @@ mod tests {
         assert_eq!(harness.app().page(), Page::Setup, "{}", harness.screen());
         let screen = harness.screen();
         assert!(screen.contains("one workspace folder"), "the location step is the one that opened:\n{screen}");
+    }
+
+    /// A workspace at `root` holding the projects `names`, made afresh.
+    fn workspace_of(root: &std::path::Path, names: &[&str]) -> crate::workspace::Workspace {
+        let _ = std::fs::remove_dir_all(root);
+        let workspace = crate::workspace::Workspace::new(root);
+        for name in names {
+            workspace.create_project(name, qframe::date::Date::today_utc()).expect("the workspace takes a project");
+        }
+        workspace
+    }
+
+    /// The names of the rail of the open project screen, in order.
+    fn rail(harness: &qframe::runtime::Harness<super::QCode>) -> Vec<String> {
+        let screen = harness.app().project.as_ref().expect("a project screen");
+        screen.projects().iter().map(|project| project.name().to_owned()).collect()
+    }
+
+    /// Opens `name` from the list of projects, reached from the home screen.
+    fn open_from_the_list(harness: &mut qframe::runtime::Harness<super::QCode>, name: &str) {
+        harness.click_text("Projects").advance(MOMENT);
+        harness.click_text(name).advance(MOMENT);
+    }
+
+    /// Opens a blank tab on the project screen and chooses a shell in it; the engine of these
+    /// tests is not there, so the tab fails at once and keeps the engine's words.
+    fn open_a_shell(harness: &mut qframe::runtime::Harness<super::QCode>) {
+        use crate::ui::project::{Choice, Msg as Project};
+        harness.send(Msg::Project(Project::NewTab)).advance(MOMENT);
+        let screen = harness.app().project.as_ref().and_then(ProjectScreen::project);
+        let key = screen.and_then(|project| project.active_tab()).map(crate::ui::project::Tab::key);
+        let key = key.expect("the blank tab is open");
+        harness.send(Msg::Project(Project::Choose(key, Choice::Shell))).advance(MOMENT);
+    }
+
+    /// What the tabs of the open project are, in order.
+    fn tab_kinds(harness: &qframe::runtime::Harness<super::QCode>) -> Vec<crate::ui::project::TabKind> {
+        let screen = harness.app().project.as_ref().and_then(ProjectScreen::project);
+        screen.map(|project| project.tabs().iter().map(|tab| tab.kind().clone()).collect()).unwrap_or_default()
+    }
+
+    #[test]
+    fn ctrl_t_opens_a_blank_tab_and_the_key_list_says_so() {
+        use crate::ui::project::TabKind;
+
+        let root = scratch("ctrl-t");
+        workspace_of(&root, &["Alpha"]);
+        let mut harness = harness(app_with_absent_engine(config(&root, &[])), SIZE.0, SIZE.1);
+        harness.press("ctrl+t").advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Home, "away from a project the key means nothing");
+        open_from_the_list(&mut harness, "Alpha");
+        harness.press("ctrl+t").advance(MOMENT);
+        assert_eq!(tab_kinds(&harness), [TabKind::New], "{}", harness.screen());
+        assert!(harness.is_focused("project-choices"), "the blank tab's page has the keyboard");
+        harness.press("ctrl+t").advance(MOMENT);
+        assert_eq!(tab_kinds(&harness), [TabKind::New, TabKind::New], "the page lets the key through");
+
+        harness.press("?");
+        let screen = harness.screen();
+        assert!(screen.contains("open a new tab"), "the key list names it:\n{screen}");
+        assert!(screen.contains("ctrl t"), "{screen}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_project_opened_from_the_list_is_the_only_one_in_the_rail() {
+        let root = scratch("only-one");
+        workspace_of(&root, &["Alpha", "Beta", "Gamma"]);
+        let mut harness = harness(app(config(&root, &[]), &settled(), None), SIZE.0, SIZE.1);
+        open_from_the_list(&mut harness, "Beta");
+        assert_eq!(rail(&harness), ["Beta"], "{}", harness.screen());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_rails_plus_opens_the_list_and_the_pick_joins_the_same_screen() {
+        let root = scratch("rail-add");
+        workspace_of(&root, &["Alpha", "Beta"]);
+        let mut harness = harness(app_with_absent_engine(config(&root, &[])), SIZE.0, SIZE.1);
+        open_from_the_list(&mut harness, "Alpha");
+        open_a_shell(&mut harness);
+        let tab =
+            harness.app().project.as_ref().and_then(ProjectScreen::project).map(|project| project.tabs()[0].key());
+
+        let text = harness.screen();
+        let row = text.lines().position(|line| line.chars().take(4).any(|cell| cell == '+'));
+        let row = i32::try_from(row.expect("the rail carries a plus")).expect("a row");
+        harness.click(1, row).advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Projects, "the plus opens the list:\n{}", harness.screen());
+        harness.click_text("Beta").advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Project, "{}", harness.screen());
+        assert_eq!(rail(&harness), ["Alpha", "Beta"], "the pick joins the screen that was open");
+        harness.send(Msg::Project(crate::ui::project::Msg::OpenProject(0))).advance(MOMENT);
+        let kept =
+            harness.app().project.as_ref().and_then(ProjectScreen::project).map(|project| project.tabs()[0].key());
+        assert_eq!(kept, tab, "and nothing of the first project was closed");
+
+        harness.click_text("Back").advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Projects, "the list is not stacked twice:\n{}", harness.screen());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn continue_goes_back_to_the_live_screen_as_it_was() {
+        let root = scratch("continue-live");
+        workspace_of(&root, &["Alpha", "Beta"]);
+        let mut harness = harness(app_with_absent_engine(config(&root, &[])), SIZE.0, SIZE.1);
+        open_from_the_list(&mut harness, "Alpha");
+        open_a_shell(&mut harness);
+        let before = harness.app().project.as_ref().and_then(ProjectScreen::project).map(|project| {
+            let tab = &project.tabs()[0];
+            (tab.key(), tab.state().clone())
+        });
+        harness.click_text("Back").advance(MOMENT);
+        harness.click_text("Back").advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Home);
+        assert!(harness.screen().contains("Continue"), "{}", harness.screen());
+        assert!(harness.screen().contains("Alpha"), "the row names the open project:\n{}", harness.screen());
+
+        // The list opens another project into the screen that is still live behind the home
+        // screen, rather than a screen of its own.
+        open_from_the_list(&mut harness, "Beta");
+        assert_eq!(rail(&harness), ["Alpha", "Beta"]);
+        harness.press("esc").advance(MOMENT);
+        harness.press("esc").advance(MOMENT);
+        assert!(harness.screen().contains("Alpha +1"), "{}", harness.screen());
+        harness.click_text("Continue").advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Project, "{}", harness.screen());
+        assert_eq!(rail(&harness), ["Alpha", "Beta"]);
+        let open = harness.app().project.as_ref().and_then(ProjectScreen::project).map(OpenProject::name);
+        assert_eq!(open, Some("Beta"), "the project that was open is open again");
+        harness.send(Msg::Project(crate::ui::project::Msg::OpenProject(0))).advance(MOMENT);
+        let after = harness.app().project.as_ref().and_then(ProjectScreen::project).map(|project| {
+            let tab = &project.tabs()[0];
+            (tab.key(), tab.state().clone())
+        });
+        assert_eq!(after, before, "the tab is the same tab, in the state it was left in");
+        harness.click_text("Back").advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Home, "continue came straight from home");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn continue_brings_back_the_saved_session_and_starts_only_the_tab_in_view() {
+        let root = scratch("continue-saved");
+        workspace_of(&root, &["Alpha", "Beta"]);
+        let file = scratch("continue-saved-session").join("session.toml");
+        let _ = std::fs::remove_file(&file);
+        std::fs::create_dir_all(file.parent().expect("a folder")).expect("a folder");
+        let text = "active = \"alpha\"\n\n\
+                    [[project]]\nid = \"beta\"\nactive-tab = 0\n\n\
+                    [[project]]\nid = \"alpha\"\nactive-tab = 1\n\n\
+                    [[project.tab]]\nkind = \"shell\"\nopened = 10\n\n\
+                    [[project.tab]]\nkind = \"shell\"\nconversation = \"c-1\"\nopened = 20\n";
+        std::fs::write(&file, text).expect("a session file");
+        let app = app_with_absent_engine(config(&root, &["beta"])).with_session(Some(file.clone()));
+        let mut harness = harness(app, SIZE.0, SIZE.1);
+        assert!(harness.screen().contains("beta +1"), "{}", harness.screen());
+        harness.click_text("Continue").advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Project, "{}", harness.screen());
+        assert_eq!(rail(&harness), ["Beta", "Alpha"], "the rail's order is the session's");
+        let screen = harness.app().project.as_ref().expect("a project screen");
+        let alpha = screen.project().expect("a project is open");
+        assert_eq!(alpha.name(), "Alpha", "the open project is the session's");
+        let tabs: Vec<(u64, Option<&str>)> =
+            alpha.tabs().iter().map(|tab| (tab.opened(), tab.conversation())).collect();
+        assert_eq!(tabs, [(10, None), (20, Some("c-1"))]);
+        assert_eq!(alpha.active_tab().map(Tab::opened), Some(20), "the open tab is the session's");
+        assert_eq!(alpha.tabs()[0].state(), &TabState::Waiting, "the tab out of view has not started");
+        assert!(
+            matches!(alpha.tabs()[1].state(), TabState::Failed(_)),
+            "the tab in view went to the engine at once: {:?}",
+            alpha.tabs()[1].state()
+        );
+        // Nothing changed, so nothing was written back over the file.
+        assert_eq!(std::fs::read_to_string(&file).ok().as_deref(), Some(text));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn projects_of_the_session_that_are_gone_are_skipped_and_named() {
+        let root = scratch("continue-gone");
+        workspace_of(&root, &["Alpha"]);
+        let file = scratch("continue-gone-session").join("session.toml");
+        std::fs::create_dir_all(file.parent().expect("a folder")).expect("a folder");
+        let text = "[[project]]\nid = \"ghost\"\n\n[[project]]\nid = \"alpha\"\n\n[[project]]\nid = \"wraith\"\n";
+        std::fs::write(&file, text).expect("a session file");
+        let app = app(config(&root, &[]), &settled(), None).with_session(Some(file.clone()));
+        let mut harness = harness(app, SIZE.0, SIZE.1);
+        harness.click_text("Continue").advance(MOMENT);
+        assert_eq!(rail(&harness), ["Alpha"]);
+        let screen = harness.screen();
+        assert!(screen.contains("2 projects of the last session are gone"), "{screen}");
+        assert!(screen.contains("ghost, wraith"), "{screen}");
+        let saved = crate::workspace::Session::load(&file).value.expect("the file is rewritten");
+        assert_eq!(saved.projects.len(), 1, "and it now holds what is open");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn a_broken_session_file_is_read_in_part_and_says_where() {
+        let root = scratch("continue-broken");
+        workspace_of(&root, &["Alpha"]);
+        let file = scratch("continue-broken-session").join("session.toml");
+        std::fs::create_dir_all(file.parent().expect("a folder")).expect("a folder");
+        std::fs::write(&file, "[[project]]\nid = \"alpha\"\nactive-tab = \"x\"\n").expect("a session file");
+        let app = app(config(&root, &[]), &settled(), None).with_session(Some(file.clone()));
+        let mut harness = harness(app, SIZE.0, SIZE.1);
+        harness.click_text("Continue").advance(MOMENT);
+        assert_eq!(rail(&harness), ["Alpha"]);
+        let screen = harness.screen();
+        assert!(screen.contains("Only part of the last session"), "{screen}");
+        assert!(screen.contains("session.toml:3:"), "the toast says where:\n{screen}");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn a_session_file_that_cannot_be_read_falls_back_to_the_last_project() {
+        let root = scratch("continue-unreadable");
+        workspace_of(&root, &["Alpha", "Beta"]);
+        // A folder where the file should be.
+        let file = scratch("continue-unreadable-session");
+        std::fs::create_dir_all(&file).expect("a folder");
+        let app = app(config(&root, &["beta"]), &settled(), None).with_session(Some(file.clone()));
+        let mut harness = harness(app, SIZE.0, SIZE.1);
+        harness.click_text("Continue").advance(MOMENT);
+        assert_eq!(rail(&harness), ["Beta"], "the project opened last, alone");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&file);
+    }
+
+    #[test]
+    fn the_session_is_written_when_what_is_open_changes_and_only_then() {
+        let root = scratch("session-writes");
+        workspace_of(&root, &["Alpha", "Beta"]);
+        let file = scratch("session-writes-file").join("deeper").join("session.toml");
+        let _ = std::fs::remove_dir_all(file.parent().expect("a folder"));
+        let app = app(config(&root, &[]), &settled(), None).with_session(Some(file.clone()));
+        let mut harness = harness(app, SIZE.0, SIZE.1);
+        open_from_the_list(&mut harness, "Alpha");
+        let saved = crate::workspace::Session::load(&file).value.expect("opening a project writes the session");
+        assert_eq!(saved.projects.iter().map(|project| project.id.as_str()).collect::<Vec<_>>(), ["alpha"]);
+
+        std::fs::remove_file(&file).expect("the file is there");
+        harness.send(Msg::Project(crate::ui::project::Msg::TogglePanel(false))).advance(MOMENT);
+        harness.send(Msg::Project(crate::ui::project::Msg::OpenProject(0))).advance(MOMENT);
+        assert!(!file.exists(), "a change that leaves the session as it was writes nothing");
+
+        harness.send(Msg::Project(crate::ui::project::Msg::AddProject)).advance(MOMENT);
+        harness.click_text("Beta").advance(MOMENT);
+        let saved = crate::workspace::Session::load(&file).value.expect("a new project writes it again");
+        assert_eq!(saved.active.as_ref().map(ProjectId::as_str), Some("beta"));
+        harness.send(Msg::Project(crate::ui::project::Msg::CloseProject(1))).advance(MOMENT);
+        let saved = crate::workspace::Session::load(&file).value.expect("closing one writes it again");
+        assert_eq!(saved.projects.len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(file.parent().expect("a folder"));
     }
 }

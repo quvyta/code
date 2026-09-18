@@ -169,7 +169,7 @@ impl LaunchFailure {
     }
 
     /// The failure of an engine command, in the words the person is shown.
-    fn from(error: &EngineError) -> Self {
+    pub(super) fn from(error: &EngineError) -> Self {
         match error {
             EngineError::NotRunnable { command, error } => {
                 Self { command: written(command), output: error.to_string() }

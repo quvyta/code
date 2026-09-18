@@ -1,11 +1,12 @@
 //! The workspace: where QCode's settings, projects and profiles live on disk.
 //!
-//! Four things live here, and each of them is readable without ever panicking:
+//! Five things live here, and each of them is readable without ever panicking:
 //!
 //! - [`HostDirs`] resolves the default workspace location on Linux, macOS and Windows.
 //! - [`Config`] is the application's `code.toml`, checked and repaired by a [`Schema`].
 //! - [`ProjectId`] turns a display name into a name every file system accepts.
 //! - [`Workspace`] creates and reads the folder tree of the workspace and its projects.
+//! - [`Session`] records which projects and tabs were open, so they can be opened again.
 //!
 //! Every loader answers with a [`Loaded`]: the part that could be used, plus a
 //! [`Diagnostic`] for each problem, pointing at the file, line and column where it is.
@@ -17,12 +18,14 @@ mod identity;
 mod layout;
 mod paths;
 mod project;
+mod session;
 
 pub use config::{Config, SetupStep};
 pub use identity::{ProjectId, ProjectIdError};
 pub use layout::{NewProjectError, ProjectEntry, ProjectPaths, Workspace, add_profile};
 pub use paths::{HostDirs, Platform, WORKSPACE_DIR_NAME};
 pub use project::{ProjectFile, ProjectProfile};
+pub use session::{Session, SessionProject, SessionTab, SessionTabKind};
 
 use qframe::diagnostics::Diagnostic;
 

@@ -132,7 +132,7 @@ fn date(table: &Table, key: &str, diagnostics: &mut Vec<Diagnostic>) -> Option<D
 }
 
 /// Writes `text` as a TOML basic string.
-fn quoted(text: &str) -> String {
+pub(super) fn quoted(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
     out.push('"');
     for character in text.chars() {

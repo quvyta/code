@@ -10,9 +10,13 @@ tagline = "Kodlama düzenekleri, hep bir kapsayıcının içinde"
 back = "Geri"
 stopped = "Durduruldu."
 keys = "Tuşlar"
+session-gone = { one = "Son oturumdaki bir proje artık yok", other = "Son oturumdaki {n} proje artık yok" }
+session-broken = "Son oturumun yalnızca bir kısmı okunabildi"
+session-unsaved = "Açık projeler hatırlanamadı"
 
 [home]
-last-project = "Son proje"
+continue = "Devam et"
+continue-detail = { one = "{first}", other = "{first} +{more}" }
 new-project = "Yeni proje"
 projects = "Projeler"
 profiles = "Profiller"
@@ -26,6 +30,8 @@ open = "aç"
 # Labels of QCode's own keymap actions, as the key list shows them.
 [keys]
 back = "bu ekrandan çık"
+new-tab = "yeni sekme aç"
+leave-terminal = "düzenekten sekmelere geç"
 
 
 [setup]
@@ -229,6 +235,8 @@ add-failed = "Profil project.qcode dosyasına yazılamadı"
 no-engine = "Kapsayıcı motoru bulunamadı; hiçbir şey açılamaz. Ayarlardan onarabilirsiniz."
 none.title = "Açık proje yok"
 none.message = "Bir proje açın; sekmeleri, dosyaları ve kapsayıcıları burada görünür."
+none.open = "Proje aç"
+waiting = "Bu sekme henüz başlamadı"
 empty.title = "Açık sekme yok"
 empty.message = "Sekme, ya bu projenin kapsayıcısında bir kabuk ya da profillerinden birinin düzeneğidir."
 starting = "Kapsayıcı açılıyor…"
@@ -238,7 +246,18 @@ ended-code = "Kapsayıcıdaki oturum {code} koduyla kapandı."
 stopped = "Kapsayıcı durdu; bu sekmenin altındaki zemin kalmadı."
 failed = "Motor komutu geri çevirdi."
 tab.shell = "Kabuk"
-tab.adds = "{harness}, bu projeye eklenir"
+choose.title = "Yeni sekmede ne açılsın?"
+choose.shell-detail = "projenin kendi kapsayıcısında"
+choose.section = "{profile} {dot} {harness}"
+choose.section-adds = "{profile} {dot} {harness} {dot} projeye eklenir"
+choose.new-chat = "Yeni sohbet"
+history.untitled = "Adsız sohbet"
+history.today = "bugün {time}"
+history.yesterday = "dün {time}"
+history.show-all = "Tümünü göster {dot} {more} sohbet daha"
+history.none = "Henüz sohbet yok"
+history.reading = "Okunuyor…"
+history.unread = "Sohbetler okunamadı"
 hints.tabs = "sekmeler"
 hints.close = "sekmeyi kapat"
 hints.leave = "terminalden çık"
@@ -344,3 +363,8 @@ repaired = "Ayar dosyası onarıldı"
 repaired-text = "QCode dosyayı okudu ve kullanamadığı yerleri düzeltti. Anladığı hiçbir şey kaybolmadı."
 repaired-dismiss = "Anladım"
 store-failed = "Değişiklik ayar dosyasına yazılamadı: {reason}"
+
+# Framework'ün kendi sözleri, QCode'da daha dar bir anlamda kullanıldıkları yerde: QCode'un tek
+# şeridi projeleri tutar, bu yüzden ekleme satırı sekme değil proje açar.
+[quvyta.tab-rail]
+add = "Proje aç"

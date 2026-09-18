@@ -1,5 +1,9 @@
-//! The project screen: the rail of projects on the left, the tabs of one project on top, the
-//! container's terminal in the middle and the widget panel on the right.
+//! The project screen: the rail of open projects on the left, the tabs of one project on top,
+//! the container's terminal in the middle and the widget panel on the right.
+//!
+//! The rail holds the projects the person opened and nothing else, the way a browser holds its
+//! windows: a project joins it when it is opened from the list, leaves it when it is closed, and
+//! the rail and every tab in it are what "Continue" on the home screen brings back.
 //!
 //! The screen's whole reason for existing is one line of [`ContainerPlan::enter`]: a tab spawns
 //! the engine binary with `exec`, so the program a tab shows always runs inside a container and
@@ -10,7 +14,9 @@
 //! for it, and the application maps both to its own message, so the screen is drawn and tested
 //! without naming anything of the application.
 
+mod blank;
 mod files;
+mod history;
 mod panel;
 mod plan;
 mod tab;
@@ -20,25 +26,32 @@ mod live;
 #[cfg(test)]
 mod tests;
 
+pub use blank::Choice;
 pub use files::{FileEntry, FileTree};
+pub use history::HistoryKey;
 pub use panel::{Panel, PanelWidget};
 pub use plan::{ASSETS_DIR, ContainerPlan, HOME_DIR, KEEP_ALIVE, LaunchFailure, PROJECT_DIR, SHELL};
 pub use tab::{Tab, TabKey, TabKind, TabState};
 
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 
 use qframe::date::Date;
 use qframe::icons::Icons;
 use qframe::keymap::KeyChord;
 use qframe::prelude::*;
+use qframe::runtime::Task;
 use qframe::widgets::{
-    CollapsedMarker, EmptyState, Popover, RailTab, Side, SidePanel, Spinner, TabEdit, TabRail, TabWidth, Terminal,
-    TerminalEvent, TerminalSession, Toast,
+    CollapsedMarker, EmptyState, RailTab, Side, SidePanel, Spinner, TabEdit, TabRail, TabWidth, Terminal,
+    TerminalEvent, TerminalSession, Toast, Tooltip,
 };
 
 use crate::engine::{Container, Engine, EngineCommand, HostUser};
 use crate::profile::Profile;
-use crate::workspace::{ProjectFile, ProjectId, ProjectPaths, add_profile};
+use crate::profile::history::Conversation;
+use crate::workspace::{
+    ProjectFile, ProjectId, ProjectPaths, Session, SessionProject, SessionTab, SessionTabKind, add_profile,
+};
 
 /// Width of the project rail: the framework's collapsed strip, which is the same four cells on
 /// every screen. The rail never gives way to a narrow terminal, because losing it would mean
@@ -56,20 +69,22 @@ const PANEL_MIN: u16 = 18;
 /// Widest the widget panel can be dragged.
 const PANEL_MAX: u16 = 52;
 
-/// What a new tab opens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NewTab {
-    /// A shell in the project's own container.
-    Shell,
-    /// The harness of the project's profile at this position.
-    Profile(usize),
-}
+/// The cells the `+` after the tabs takes: its glyph with the button's air on both sides.
+///
+/// The strip leaves exactly this much room at its end, so when the tabs overflow they scroll
+/// beside the `+` instead of pushing it off the row.
+const NEW_TAB_WIDTH: u16 = 5;
 
 /// Everything that can happen on the project screen.
 #[derive(Debug, Clone)]
 pub enum Msg {
     /// A project of the rail was opened.
     OpenProject(usize),
+    /// A project was closed from the rail, with every tab in it.
+    CloseProject(usize),
+    /// The list of projects was asked for, to open another one beside these. The screen itself
+    /// cannot go there; the application that holds both answers this message.
+    AddProject,
     /// A tab was opened.
     OpenTab(usize),
     /// A tab was closed.
@@ -81,10 +96,23 @@ pub enum Msg {
         /// Where it lands.
         to: usize,
     },
-    /// The chooser of what a new tab opens was shown or dismissed.
-    ShowPicker(bool),
-    /// A new tab was asked for.
-    NewTab(NewTab),
+    /// A blank tab was asked for, to choose in it what it opens.
+    NewTab,
+    /// The keyboard was asked out of the harness, onto the tab strip.
+    LeaveTerminal,
+    /// A row of a blank tab's page was chosen: the blank tab of this key turns into it.
+    Choose(TabKey, Choice),
+    /// The keyboard moved to another row of a blank tab's page.
+    HighlightChoice(usize),
+    /// Every conversation of a profile was asked for on a blank tab's page, not only the newest.
+    ShowAll(HistoryKey),
+    /// A reading of a profile's conversations answered: the reading's number, and the
+    /// conversations newest first or why they could not be read.
+    HistoryRead(HistoryKey, u64, Result<Vec<Conversation>, String>),
+    /// A reading of a profile's conversations, by its number, has run long enough to be noticed.
+    HistorySlow(HistoryKey, u64),
+    /// The indicator of a reading has been on screen long enough to be read.
+    HistorySettled(HistoryKey),
     /// The profiles screen was asked for, to make the first profile. The screen itself cannot go
     /// there; the application that holds both answers this message.
     ManageProfiles,
@@ -94,6 +122,10 @@ pub enum Msg {
     ProfileAdded(String, Result<ProjectFile, String>),
     /// The container of a tab is up, or the engine refused.
     Ready(TabKey, u64, Result<(), LaunchFailure>),
+    /// The container of a new-chat tab brought back from the last session is up, or the engine
+    /// refused; with the profile's conversations when they could be read, to find the one the
+    /// tab was showing.
+    Woken(TabKey, u64, Result<(), LaunchFailure>, Option<Vec<Conversation>>),
     /// A tab's session printed something or ended.
     Output(TabKey, u64, TerminalEvent),
     /// Whether the container of a tab whose session ended is still running.
@@ -151,6 +183,9 @@ pub struct OpenProject {
     carried: Vec<String>,
     tabs: Vec<Tab>,
     active_tab: usize,
+    /// The conversations of each profile, by the profile's name, as the blank tab's page last
+    /// read them.
+    history: HashMap<String, history::Shelf>,
     files: FileTree,
     containers: Vec<Container>,
     container_row: usize,
@@ -178,6 +213,7 @@ impl OpenProject {
             carried,
             tabs: Vec::new(),
             active_tab: 0,
+            history: HashMap::new(),
             files,
             containers: Vec::new(),
             container_row: 0,
@@ -262,31 +298,32 @@ impl OpenProject {
                 .iter()
                 .find(|profile| profile.name.as_str() == name)
                 .map(|profile| ContainerPlan::profile(&self.id, &self.paths, profile)),
+            TabKind::New => None,
         }
     }
 
     /// What a tab of `kind` runs inside its container: a login shell, or the harness of the
-    /// profile with the arguments that let it work without asking.
+    /// profile with the arguments that let it work without asking, opening `conversation` when
+    /// the tab shows one and a new conversation otherwise.
     #[must_use]
-    pub fn program(&self, kind: &TabKind) -> Option<Vec<String>> {
+    pub fn program(&self, kind: &TabKind, conversation: Option<&str>) -> Option<Vec<String>> {
         match kind {
             TabKind::Shell => Some(plan::SHELL.iter().map(|part| (*part).to_owned()).collect()),
             TabKind::Profile(name) => {
                 let profile = self.profiles.iter().find(|profile| profile.name.as_str() == name)?;
-                let harness = profile.harness.record();
-                let mut command = vec![harness.command.to_owned()];
-                command.extend(harness.auto_run.iter().map(|arg| (*arg).to_owned()));
-                Some(command)
+                Some(profile.harness.command_line(conversation))
             }
+            TabKind::New => None,
         }
     }
 
-    /// The label of the tab at `index`: the profile's name, or `Shell` numbered among the shell
-    /// tabs so several of them can be told apart.
+    /// The label of the tab at `index`: the profile's name, `Shell` numbered among the shell tabs
+    /// so several of them can be told apart, or `New tab` while it is blank.
     fn tab_label(&self, index: usize) -> String {
         let Some(tab) = self.tabs.get(index) else { return String::new() };
         match tab.kind() {
             TabKind::Profile(name) => name.clone(),
+            TabKind::New => t!("project.new-tab"),
             TabKind::Shell => {
                 let shell = t!("project.tab.shell");
                 let position = self.tabs[..index].iter().filter(|tab| tab.kind() == &TabKind::Shell).count() + 1;
@@ -310,7 +347,13 @@ pub struct ProjectScreen {
     projects: Vec<OpenProject>,
     active: usize,
     panel: Panel,
-    picker: bool,
+    /// The row the keyboard rests on in a blank tab's page.
+    blank_row: usize,
+    /// The profiles whose every conversation a blank tab's page shows, not only the newest.
+    expanded: HashSet<HistoryKey>,
+    /// The blank tab whose page was shown last, so showing a page again is told apart from
+    /// drawing the same one again.
+    shown_blank: Option<TabKey>,
     next_key: u64,
 }
 
@@ -322,13 +365,92 @@ impl ProjectScreen {
     /// why instead of failing when it is pressed.
     #[must_use]
     pub fn new(engine: Option<Engine>, user: HostUser, projects: Vec<OpenProject>) -> Self {
-        Self { engine, user, projects, active: 0, panel: Panel::default(), picker: false, next_key: 0 }
+        Self {
+            engine,
+            user,
+            projects,
+            active: 0,
+            panel: Panel::default(),
+            blank_row: 0,
+            expanded: HashSet::new(),
+            shown_blank: None,
+            next_key: 0,
+        }
     }
 
     /// The project the rail has open.
     #[must_use]
     pub fn project(&self) -> Option<&OpenProject> {
         self.projects.get(self.active)
+    }
+
+    /// Every project of the rail, in its order.
+    #[must_use]
+    pub fn projects(&self) -> &[OpenProject] {
+        &self.projects
+    }
+
+    /// Opens the project at `index` of the rail, when there is one there.
+    pub fn set_active(&mut self, index: usize) {
+        if index < self.projects.len() {
+            self.active = index;
+        }
+    }
+
+    /// Gives the project at `index` the tabs `record` lists, each waiting to be shown before it
+    /// starts, with the tab the record had open open again.
+    ///
+    /// A profile tab whose profile is gone from the workspace is left out: there is no container
+    /// it could enter, and a tab that can only ever fail is not worth bringing back. A blank tab
+    /// comes back blank; it never had a container.
+    pub fn restore_tabs(&mut self, index: usize, record: &SessionProject) {
+        let Some(project) = self.projects.get_mut(index) else { return };
+        let mut active = 0;
+        for (position, saved) in record.tabs.iter().enumerate() {
+            let kind = match &saved.kind {
+                SessionTabKind::Shell => TabKind::Shell,
+                SessionTabKind::Profile(name) => TabKind::Profile(name.clone()),
+                SessionTabKind::New => TabKind::New,
+            };
+            if kind != TabKind::New && project.plan(&kind).is_none() {
+                continue;
+            }
+            if position <= record.active_tab {
+                active = project.tabs.len();
+            }
+            let key = TabKey(self.next_key);
+            self.next_key += 1;
+            project.tabs.push(Tab::restored(key, kind, saved.opened, saved.conversation.clone()));
+        }
+        project.active_tab = active;
+    }
+
+    /// What is open, in the shape the session file keeps it: the projects in rail order, the one
+    /// that is open, and the tabs of each.
+    #[must_use]
+    pub fn session(&self) -> Session {
+        let projects = self
+            .projects
+            .iter()
+            .map(|project| SessionProject {
+                id: project.id.clone(),
+                active_tab: project.active_tab,
+                tabs: project
+                    .tabs
+                    .iter()
+                    .map(|tab| SessionTab {
+                        kind: match tab.kind() {
+                            TabKind::Shell => SessionTabKind::Shell,
+                            TabKind::Profile(name) => SessionTabKind::Profile(name.clone()),
+                            TabKind::New => SessionTabKind::New,
+                        },
+                        conversation: tab.conversation().map(str::to_owned),
+                        opened: tab.opened(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        Session { active: self.project().map(|project| project.id.clone()), projects }
     }
 
     /// The engine the screen enters containers through.
@@ -353,7 +475,7 @@ impl ProjectScreen {
         let project = self.projects.iter().find(|project| project.tabs.iter().any(|tab| tab.key() == key))?;
         let tab = project.tabs.iter().find(|tab| tab.key() == key)?;
         let plan = project.plan(tab.kind())?;
-        let program = project.program(tab.kind())?;
+        let program = project.program(tab.kind(), tab.conversation())?;
         let parts: Vec<&str> = program.iter().map(String::as_str).collect();
         Some(plan.enter(engine, &parts))
     }
@@ -363,9 +485,32 @@ impl ProjectScreen {
         self.projects.iter_mut().find(|project| project.id.as_str() == id)
     }
 
+    /// What a blank tab's page knows of the conversations of `key`, when its project is open.
+    fn shelf(&mut self, key: &HistoryKey) -> Option<&mut history::Shelf> {
+        Some(self.project_mut(&key.project)?.history.entry(key.profile.clone()).or_default())
+    }
+
     /// The project holding the tab `key`, when one does.
     fn owner_mut(&mut self, key: TabKey) -> Option<&mut OpenProject> {
         self.projects.iter_mut().find(|project| project.tabs.iter().any(|tab| tab.key() == key))
+    }
+}
+
+impl ProjectScreen {
+    /// Attaches `session` to the tab `key` and marks the tab running, which is what the screen
+    /// does itself once a tab's container is up. A program started some other way, such as the
+    /// shell of a demonstration, is shown in the tab the same way.
+    pub fn attach(&mut self, key: TabKey, session: TerminalSession) {
+        if let Some((_, tab)) = self.owner_mut(key).and_then(|project| project.find(key)) {
+            tab.attached(session);
+        }
+    }
+
+    /// The number of the reading of `profile`'s conversations last started in the open project.
+    /// An answer, [`Msg::HistoryRead`], is only taken when it carries this number.
+    #[must_use]
+    pub fn reading(&self, profile: &str) -> u64 {
+        self.project().and_then(|project| project.history.get(profile)).map_or(0, history::Shelf::generation)
     }
 }
 
@@ -374,19 +519,57 @@ impl ProjectScreen {
 ///
 /// The screen never touches the disk or the engine while drawing, so this is the caller's part
 /// of the bargain: run it when the screen is entered, and again when it is returned to.
+///
+/// It also starts the open tab when it was brought back from the last session and has been
+/// waiting to be shown, and reads the conversations a blank tab's page offers when the open tab
+/// is one.
 pub fn opened(screen: &mut ProjectScreen) -> Command<Msg> {
-    Command::batch([load_root(screen), list_containers(screen)])
+    Command::batch([load_root(screen), list_containers(screen), wake(screen), show_page(screen, true)])
+}
+
+/// Adds `project` to the rail and opens it, or only opens it when the rail has it already; the
+/// tabs of every project stay as they are either way.
+pub fn add(screen: &mut ProjectScreen, project: OpenProject) -> Command<Msg> {
+    match screen.projects.iter().position(|open| open.id == project.id) {
+        Some(index) => screen.active = index,
+        None => {
+            screen.projects.push(project);
+            screen.active = screen.projects.len() - 1;
+        }
+    }
+    opened(screen)
 }
 
 /// Applies a message to the screen.
+///
+/// Whatever the message did, a tab that is now in view and was brought back from the last session
+/// starts here: switching to it, closing the tab before it and opening its project all show it.
+/// The same goes for a blank tab's page that comes into view, which reads its conversations.
 pub fn update(screen: &mut ProjectScreen, message: Msg) -> Command<Msg> {
+    // Profiles read again may be new ones, whose conversations the page shown has not read.
+    let profiles = matches!(message, Msg::Profiles(_));
+    let command = apply(screen, message);
+    Command::batch([command, wake(screen), show_page(screen, profiles)])
+}
+
+/// Applies a message to the screen, leaving the start of a waiting tab to [`update`].
+fn apply(screen: &mut ProjectScreen, message: Msg) -> Command<Msg> {
     match message {
         Msg::OpenProject(index) => {
-            if index < screen.projects.len() {
-                screen.active = index;
-            }
+            screen.set_active(index);
             Command::batch([load_root(screen), list_containers(screen)])
         }
+        Msg::CloseProject(index) => {
+            let Some(project) = screen.projects.get_mut(index) else { return Command::none() };
+            for tab in &mut project.tabs {
+                tab.close_session();
+            }
+            TabEdit::Close(index).apply(&mut screen.projects, &mut screen.active);
+            Command::batch([load_root(screen), list_containers(screen)])
+        }
+        // The application opens the list; nothing on this screen changes until a project comes
+        // back from it.
+        Msg::AddProject => Command::none(),
         Msg::OpenTab(index) => {
             if let Some(project) = screen.projects.get_mut(screen.active)
                 && index < project.tabs.len()
@@ -409,15 +592,44 @@ pub fn update(screen: &mut ProjectScreen, message: Msg) -> Command<Msg> {
             }
             Command::none()
         }
-        Msg::ShowPicker(show) => {
-            screen.picker = show;
+        Msg::NewTab => open_blank(screen),
+        // The strip, because from there the arrows switch tabs and Tab reaches the rest of the
+        // screen, the terminal included.
+        Msg::LeaveTerminal => Command::focus(TABS_ID),
+        Msg::Choose(key, choice) => choose(screen, key, choice),
+        Msg::HighlightChoice(row) => {
+            screen.blank_row = row;
             Command::none()
         }
-        Msg::NewTab(what) => open_tab(screen, what),
-        Msg::ManageProfiles => {
-            screen.picker = false;
+        Msg::ShowAll(key) => {
+            screen.expanded.insert(key);
             Command::none()
         }
+        Msg::HistoryRead(key, generation, answer) => {
+            blank::keep_row(screen, |screen| {
+                if let Some(shelf) = screen.shelf(&key) {
+                    shelf.answered(generation, answer);
+                }
+            });
+            Command::none()
+        }
+        Msg::HistorySlow(key, generation) => {
+            let mut shown = false;
+            blank::keep_row(screen, |screen| {
+                shown = screen.shelf(&key).is_some_and(|shelf| shelf.slow(generation));
+            });
+            if shown { after(history::SHOW_AT_LEAST, Msg::HistorySettled(key)) } else { Command::none() }
+        }
+        Msg::HistorySettled(key) => {
+            blank::keep_row(screen, |screen| {
+                if let Some(shelf) = screen.shelf(&key) {
+                    shelf.settled();
+                }
+            });
+            Command::none()
+        }
+        // The application opens the profiles screen; this one stays as it is.
+        Msg::ManageProfiles => Command::none(),
         Msg::Profiles(profiles) => {
             for project in &mut screen.projects {
                 project.set_profiles(profiles.clone());
@@ -436,6 +648,12 @@ pub fn update(screen: &mut ProjectScreen, message: Msg) -> Command<Msg> {
             Err(reason) => Command::toast(Toast::warning(t!("project.add-failed")).body(reason)),
         },
         Msg::Ready(key, run, result) => ready(screen, key, run, &result),
+        Msg::Woken(key, run, result, found) => {
+            if let Some(found) = found {
+                resume_newest(screen, key, run, &found);
+            }
+            ready(screen, key, run, &result)
+        }
         Msg::Output(key, run, event) => output(screen, key, run, event),
         Msg::Checked(key, run, running) => {
             if let Some(project) = screen.owner_mut(key)
@@ -538,30 +756,44 @@ pub fn update(screen: &mut ProjectScreen, message: Msg) -> Command<Msg> {
     }
 }
 
-/// Opens a tab and starts the work that brings its container up.
-fn open_tab(screen: &mut ProjectScreen, what: NewTab) -> Command<Msg> {
-    screen.picker = false;
-    let Some(engine) = screen.engine.clone() else { return Command::none() };
-    let user = screen.user;
+/// Opens a blank tab after the last one and hands its page the keyboard. Nothing starts: the
+/// tab only asks what it should open.
+fn open_blank(screen: &mut ProjectScreen) -> Command<Msg> {
     let key = TabKey(screen.next_key);
     let Some(project) = screen.projects.get_mut(screen.active) else { return Command::none() };
-    let kind = match what {
-        NewTab::Shell => TabKind::Shell,
-        NewTab::Profile(index) => match project.profiles.get(index) {
-            Some(profile) => TabKind::Profile(profile.name.as_str().to_owned()),
-            None => return Command::none(),
-        },
+    screen.next_key += 1;
+    project.tabs.push(Tab::blank(key));
+    project.active_tab = project.tabs.len() - 1;
+    screen.blank_row = 0;
+    screen.expanded.clear();
+    Command::focus(blank::CHOICES_ID)
+}
+
+/// Turns the blank tab `key` into what was chosen on its page, in its own place in the strip,
+/// and starts the work that brings its container up.
+fn choose(screen: &mut ProjectScreen, key: TabKey, choice: Choice) -> Command<Msg> {
+    let Some(engine) = screen.engine.clone() else { return Command::none() };
+    let user = screen.user;
+    let Some(project) = screen.owner_mut(key) else { return Command::none() };
+    let (kind, conversation) = match choice {
+        Choice::Shell => (TabKind::Shell, None),
+        Choice::NewChat(name) => (TabKind::Profile(name), None),
+        Choice::Resume(name, id) => (TabKind::Profile(name), Some(id)),
     };
     let Some(plan) = project.plan(&kind) else { return Command::none() };
+    // A tab that was chosen already is not chosen again: two quick presses open one container.
+    if project.find(key).is_none_or(|(_, tab)| tab.kind() != &TabKind::New) {
+        return Command::none();
+    }
     let record = match &kind {
         TabKind::Profile(name) if !project.carries(name) => record_profile(project, name),
         _ => Command::none(),
     };
-    screen.next_key += 1;
-    project.tabs.push(Tab::new(key, kind));
-    project.active_tab = project.tabs.len() - 1;
+    let Some((_, tab)) = project.find(key) else { return Command::none() };
+    tab.choose(kind, conversation);
+    let run = tab.run();
     Command::batch([
-        Command::perform(move || Msg::Ready(key, 0, plan::ensure_running(&engine, &plan, user))),
+        Command::perform(move || Msg::Ready(key, run, plan::ensure_running(&engine, &plan, user))),
         Command::focus(TERMINAL_ID),
         record,
     ])
@@ -581,6 +813,105 @@ fn record_profile(project: &OpenProject, name: &str) -> Command<Msg> {
         let result = add_profile(&paths, &name, Date::today_utc()).map_err(|problem| problem.to_string());
         Msg::ProfileAdded(id, result)
     })
+}
+
+/// Starts the open tab of the open project when it was brought back from the last session and
+/// is being shown for the first time. Without an engine it keeps waiting, and the middle says why.
+/// A blank tab has no container to start, so it keeps asking what it should open.
+///
+/// A harness tab that was a new chat when the session was recorded has no conversation id: a new
+/// conversation's id is the harness's to make, and it is not known when the tab starts. So once
+/// its container is up the profile's conversations are read, and [`resume_newest`] gives the
+/// tab the one it was most likely showing before its session is spawned.
+fn wake(screen: &mut ProjectScreen) -> Command<Msg> {
+    let Some(engine) = screen.engine.clone() else { return Command::none() };
+    let user = screen.user;
+    let Some(project) = screen.projects.get_mut(screen.active) else { return Command::none() };
+    let Some(tab) = project.tabs.get(project.active_tab) else { return Command::none() };
+    if tab.state() != &TabState::Waiting {
+        return Command::none();
+    }
+    let Some(plan) = project.plan(tab.kind()) else { return Command::none() };
+    let harness = match tab.kind() {
+        TabKind::Profile(name) if tab.conversation().is_none() => {
+            project.profiles.iter().find(|profile| profile.name.as_str() == name).map(|profile| profile.harness)
+        }
+        _ => None,
+    };
+    let Some(tab) = project.tabs.get_mut(project.active_tab) else { return Command::none() };
+    tab.wake();
+    let (key, run) = (tab.key(), tab.run());
+    match harness {
+        None => Command::perform(move || Msg::Ready(key, run, plan::ensure_running(&engine, &plan, user))),
+        Some(harness) => Command::perform(move || {
+            let result = plan::ensure_running(&engine, &plan, user);
+            // Not being able to read only means the tab cannot be matched to its conversation;
+            // it then starts a new one, the way it started last time.
+            let found = result.is_ok().then(|| history::read(&engine, &plan.name, harness).ok()).flatten();
+            Msg::Woken(key, run, result, found)
+        }),
+    }
+}
+
+/// Gives the new-chat tab `key`, woken as `run`, the conversation of `found` it was most likely
+/// showing ([`history::claim`]), so it opens that one and the session file keeps its id from now
+/// on. A tab that was closed, restarted or given a conversation meanwhile is left as it is.
+fn resume_newest(screen: &mut ProjectScreen, key: TabKey, run: u64, found: &[Conversation]) {
+    let Some(project) = screen.owner_mut(key) else { return };
+    let Some((_, tab)) = project.find(key) else { return };
+    if tab.run() != run || !tab.state().is_starting() || tab.conversation().is_some() {
+        return;
+    }
+    let (kind, opened) = (tab.kind().clone(), tab.opened());
+    let taken: Vec<String> = project
+        .tabs
+        .iter()
+        .filter(|other| other.key() != key && other.kind() == &kind)
+        .filter_map(|other| other.conversation().map(str::to_owned))
+        .collect();
+    let taken: Vec<&str> = taken.iter().map(String::as_str).collect();
+    let Some(chosen) = history::claim(found, opened, &taken).map(|conversation| conversation.id.clone()) else {
+        return;
+    };
+    if let Some((_, tab)) = project.find(key) {
+        tab.show_conversation(chosen);
+    }
+}
+
+/// Reads the conversations the page of the open tab offers, when the open tab is blank and its
+/// page has just come into view, or always when `again` asks for it.
+///
+/// Every profile of the project is read at once, each on its own thread, and each keeps the rows
+/// it had on screen until its answer is in.
+fn show_page(screen: &mut ProjectScreen, again: bool) -> Command<Msg> {
+    let showing = screen.project().and_then(OpenProject::active_tab).filter(|tab| tab.kind() == &TabKind::New);
+    let showing = showing.map(Tab::key);
+    let new = showing != screen.shown_blank;
+    screen.shown_blank = showing;
+    if showing.is_none() || !(new || again) {
+        return Command::none();
+    }
+    let Some(engine) = screen.engine.clone() else { return Command::none() };
+    let Some(project) = screen.projects.get_mut(screen.active) else { return Command::none() };
+    let mut commands = Vec::new();
+    for profile in &project.profiles {
+        let key = HistoryKey { project: project.id.as_str().to_owned(), profile: profile.name.as_str().to_owned() };
+        let generation = project.history.entry(key.profile.clone()).or_default().start();
+        let container = ContainerPlan::profile(&project.id, &project.paths, profile).name;
+        let (engine, harness, answer) = (engine.clone(), profile.harness, key.clone());
+        commands.push(Command::perform(move || {
+            Msg::HistoryRead(answer, generation, history::read(&engine, &container, harness))
+        }));
+        commands.push(after(history::SHOW_AFTER, Msg::HistorySlow(key, generation)));
+    }
+    Command::batch(commands)
+}
+
+/// Delivers `message` once `delay` has passed, without holding up anything meanwhile.
+fn after(delay: std::time::Duration, message: Msg) -> Command<Msg> {
+    Command::task(Task::new(t!("project.history.reading"), move |cx| {
+        if cx.sleep(delay) { Ok(message) } else { Err(String::new()) }
+    }))
 }
 
 /// Starts the tab `key` again, from its container upwards.
@@ -698,6 +1029,9 @@ fn container_action(screen: &ProjectScreen, name: &str, again: bool) -> Command<
 /// The name the terminal in the middle is focused by.
 const TERMINAL_ID: &str = "project-terminal";
 
+/// The name the tab strip is focused by.
+const TABS_ID: &str = "project-tabs";
+
 /// The name the control that opens a tab is focused by.
 const NEW_TAB_ID: &str = "project-new-tab";
 
@@ -752,7 +1086,7 @@ pub fn view<P: 'static>(
         .show(ui);
 }
 
-/// The rail of projects down the left.
+/// The rail of open projects down the left, ending in the `+` that opens another one.
 fn rail(screen: &ProjectScreen, ui: &mut View<'_, Msg>) {
     let tabs = screen.projects.iter().map(|project| {
         let running = project.containers.iter().filter(|container| container.state.is_running()).count();
@@ -765,98 +1099,81 @@ fn rail(screen: &ProjectScreen, ui: &mut View<'_, Msg>) {
             .collapsed(true)
             .collapsed_marker(CollapsedMarker::Initial)
             .row_height(RAIL_ROWS)
+            .closable(Msg::CloseProject)
+            .on_add(|| Msg::AddProject)
             .on_select(Msg::OpenProject),
     )
     .fill()
     .id("project-rail");
 }
 
-/// The tab strip and the control that opens a new tab.
+/// The tab strip with the `+` that opens a blank tab right after its last tab, the way a
+/// browser's strip ends; with no tab at all the `+` stands at the top left.
+///
+/// The strip is only as wide as its tabs and leaves room for the `+` at its end, and the `+` is
+/// laid over that room. Once the tabs no longer fit, the strip takes the whole row but that room,
+/// so the tabs scroll with their arrows and the `+` keeps its place at the right end.
 fn header(screen: &ProjectScreen, ui: &mut View<'_, Msg>) {
     let Some(project) = screen.project() else { return };
     let labels: Vec<String> = (0..project.tabs.len()).map(|index| project.tab_label(index)).collect();
-    ui.row(|ui| {
-        ui.add(
-            Tabs::new(labels)
-                .active(project.active_tab)
-                .tab_width(TabWidth::Fit)
-                .closable(Msg::CloseTab)
-                .reorderable(move |from, to| Msg::MoveTab { from, to })
-                .on_select(Msg::OpenTab),
-        )
-        .fill_width()
-        .id("project-tabs");
-        new_tab(screen, project, ui);
-    })
-    .fill_width();
-}
-
-/// The `+` control and the chooser of what a new tab opens.
-fn new_tab(screen: &ProjectScreen, project: &OpenProject, ui: &mut View<'_, Msg>) {
-    let ready = screen.engine.is_some();
-    Popover::new(screen.picker && ready)
-        .on_dismiss(Msg::ShowPicker(false))
-        .anchor(|ui| {
+    // The glyph is the label rather than the icon, so the button stays symmetric: an icon is
+    // always followed by a gap that only makes sense before a word.
+    let plus = ui.env().icons().glyph("add").into_owned();
+    ui.stack(|ui| {
+        ui.row(|ui| {
             ui.add(
-                Button::new(t!("project.new-tab"))
-                    .icon("add")
-                    .disabled(!ready)
-                    .on_press(Msg::ShowPicker(!screen.picker)),
+                Tabs::new(labels)
+                    .active(project.active_tab)
+                    .tab_width(TabWidth::Fit)
+                    .closable(Msg::CloseTab)
+                    .reorderable(move |from, to| Msg::MoveTab { from, to })
+                    .on_select(Msg::OpenTab),
             )
-            .id(NEW_TAB_ID);
+            .id(TABS_ID);
         })
-        .content(|ui| {
-            let mut items = vec![ListItem::new(t!("project.tab.shell")).icon("prompt", None)];
-            items.extend(project.profiles.iter().map(|profile| {
-                let harness = profile.harness.record().display_name;
-                // A profile the project does not carry yet is offered all the same; the row says
-                // that choosing it adds it, so the file changing is no surprise.
-                let detail = if project.carries(profile.name.as_str()) {
-                    harness.to_owned()
-                } else {
-                    t!("project.tab.adds", harness = harness)
-                };
-                ListItem::new(profile.name.as_str().to_owned()).icon("bullet", None).detail(detail)
-            }));
-            let none = project.profiles.is_empty();
-            // With no profile at all, the list says where one is made instead of ending at the
-            // shell, and the row takes the person there.
-            if none {
-                items.push(
-                    ListItem::new(t!("project.make-profile")).icon("add", None).detail(t!("project.no-profiles")),
-                );
-            }
-            ui.add(List::new(items).on_activate(move |index| match index {
-                0 => Msg::NewTab(NewTab::Shell),
-                _ if none => Msg::ManageProfiles,
-                _ => Msg::NewTab(NewTab::Profile(index - 1)),
-            }))
-            .id("project-new-tab-list")
-            .width(Length::Cells(44));
+        .padding(Padding { right: NEW_TAB_WIDTH, ..Padding::default() });
+        ui.add_with(Tooltip::new(t!("project.new-tab")).on_focus(true), |ui| {
+            ui.add(Button::new(plus).on_press(Msg::NewTab)).id(NEW_TAB_ID);
         })
-        .show(ui);
+        .width(Length::Cells(NEW_TAB_WIDTH));
+    })
+    .align(Align::End);
 }
 
 /// What the middle shows: the open tab, or why there is nothing to show.
 fn center(screen: &ProjectScreen, ui: &mut View<'_, Msg>) {
     let Some(project) = screen.project() else {
-        ui.add(EmptyState::new(t!("project.none.title")).icon("inbox").message(t!("project.none.message"))).fill();
+        let open = Button::new(t!("project.none.open")).icon("project").variant("primary").on_press(Msg::AddProject);
+        ui.add(
+            EmptyState::new(t!("project.none.title")).icon("inbox").message(t!("project.none.message")).action(open),
+        )
+        .fill()
+        .id("project-none");
         return;
     };
     let Some(tab) = project.active_tab() else {
-        let mut empty = EmptyState::new(t!("project.empty.title")).icon("inbox");
-        empty = if screen.engine.is_some() {
-            empty
-                .message(t!("project.empty.message"))
-                .action(Button::new(t!("project.new-tab")).variant("primary").on_press(Msg::ShowPicker(true)))
-        } else {
-            empty.message(t!("project.no-engine"))
-        };
-        ui.add(empty).fill().id("project-empty");
+        // Without an engine a blank tab can still be opened: its page shows what there would be
+        // to choose and says why nothing can be.
+        let message = if screen.engine.is_some() { t!("project.empty.message") } else { t!("project.no-engine") };
+        let open = Button::new(t!("project.new-tab")).variant("primary").on_press(Msg::NewTab);
+        ui.add(EmptyState::new(t!("project.empty.title")).icon("inbox").message(message).action(open))
+            .fill()
+            .id("project-empty");
         return;
     };
+    if tab.kind() == &TabKind::New {
+        blank::view(screen, project, tab.key(), ui);
+        return;
+    }
     match tab.state() {
-        TabState::Starting => {
+        // With an engine a waiting tab is started before the frame is drawn, so only a screen
+        // without one ever shows it, and then the reason is what there is to say.
+        TabState::Waiting if screen.engine.is_none() => {
+            ui.add(EmptyState::new(t!("project.waiting")).icon("inbox").message(t!("project.no-engine")))
+                .fill()
+                .id("project-waiting");
+        }
+        TabState::Waiting | TabState::Starting => {
             ui.column(|ui| {
                 ui.add(Spinner::new().label(t!("project.starting")));
             })
@@ -867,7 +1184,7 @@ fn center(screen: &ProjectScreen, ui: &mut View<'_, Msg>) {
         }
         TabState::Running => match tab.session() {
             Some(session) => {
-                ui.add(Terminal::new(session)).fill().id(TERMINAL_ID);
+                ui.add(tab_terminal(session)).fill().id(TERMINAL_ID);
             }
             None => {
                 ui.add(Spinner::new().label(t!("project.starting"))).fill();
@@ -887,6 +1204,19 @@ fn center(screen: &ProjectScreen, ui: &mut View<'_, Msg>) {
     }
 }
 
+/// The terminal of a harness or shell tab.
+///
+/// It hands the program every key but the few that must stay QCode's while a harness has the
+/// keyboard: the key list, the side panel's key and the way out to the tabs. Only keys with
+/// `ctrl` or `alt` and keys that type nothing, such as `f1`, can pass; `?` still types into the
+/// program, because the terminal is where the person writes.
+fn tab_terminal(session: &TerminalSession) -> Terminal {
+    Terminal::new(session)
+        .pass_through(Scope::Global, "help")
+        .pass_through(Scope::Global, "toggle-panel")
+        .pass_through(Scope::App, "leave-terminal")
+}
+
 /// The words for a session that ended by itself.
 fn ended_text(code: Option<u32>) -> String {
     match code {
@@ -901,7 +1231,7 @@ fn stopped(ui: &mut View<'_, Msg>, tab: &Tab, message: &str, detail: Option<&str
     let key = tab.key();
     ui.column(|ui| {
         if let Some(session) = tab.session() {
-            ui.add(Terminal::new(session)).fill().id(TERMINAL_ID);
+            ui.add(tab_terminal(session)).fill().id(TERMINAL_ID);
         }
         ui.column(|ui| {
             ui.add(Text::new(message.to_owned()).role("secondary"));
@@ -919,11 +1249,12 @@ fn stopped(ui: &mut View<'_, Msg>, tab: &Tab, message: &str, detail: Option<&str
     .id("project-stopped");
 }
 
-/// The control that takes the keyboard when the screen opens: the terminal of the open tab, or
-/// the control that opens the first tab while there is none.
+/// The control that takes the keyboard when the screen opens: the terminal of the open tab, the
+/// page of a blank one, or the control that opens the first tab while there is none.
 #[must_use]
 pub fn entry(screen: &ProjectScreen) -> &'static str {
-    match screen.project().and_then(OpenProject::active_tab) {
+    match screen.project().and_then(OpenProject::active_tab).map(Tab::kind) {
+        Some(TabKind::New) => blank::CHOICES_ID,
         Some(_) => TERMINAL_ID,
         None => NEW_TAB_ID,
     }
@@ -931,9 +1262,9 @@ pub fn entry(screen: &ProjectScreen) -> &'static str {
 
 /// The keys of the project screen that are not in the keymap, for the key list.
 ///
-/// A focused terminal hands every key to the program in it but two: `shift+tab`, which leaves
-/// it, and `ctrl+q`. So the list says how to get out of the terminal, after which the rest of
-/// these keys and the key list itself work again.
+/// A focused terminal hands every key to the program in it but a few: `shift+tab`, which leaves
+/// it, `ctrl+q`, and the key list and the side panel's key. So the list says how to get out of
+/// the terminal, after which the rest of these keys work again.
 #[must_use]
 pub fn hints(icons: &Icons) -> Vec<(String, String)> {
     let tab_keys = format!("{}{}", icons.glyph("arrow-left"), icons.glyph("arrow-right"));

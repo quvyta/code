@@ -71,6 +71,27 @@ pub struct Harness {
     pub identity: &'static [&'static str],
     /// The configuration the `recommended` template writes, when the harness reads one.
     pub settings: Option<ConfigFile>,
+    /// How the harness is told to open a conversation it had before, by that conversation's id.
+    pub resume: Resume,
+}
+
+/// How a harness opens an earlier conversation from its command line.
+///
+/// Each form was checked in a throwaway container against the version its record names: the
+/// line [`HarnessKind::command_line`] builds was run with an id no conversation has, and every
+/// harness got past its argument parser to its own "no such conversation" answer (Codex, which
+/// wants a terminal before it looks, got past its parser to that complaint instead). An argument
+/// the parser did not know was refused on the same line, so reaching the lookup is the proof
+/// that the whole line was read as meant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resume {
+    /// An option that takes the id, written after the unattended-mode arguments:
+    /// `claude --dangerously-skip-permissions --resume <id>`.
+    Option(&'static str),
+    /// A subcommand that takes the id, written straight after the program so that the
+    /// unattended-mode arguments are read as the subcommand's own:
+    /// `codex resume --dangerously-bypass-approvals-and-sandbox <id>`.
+    Subcommand(&'static str),
 }
 
 impl HarnessKind {
@@ -98,6 +119,34 @@ impl HarnessKind {
     #[must_use]
     pub fn supports(self, account: AccountKind) -> bool {
         self.record().accounts.contains(&account)
+    }
+
+    /// The program and arguments a tab runs inside the profile's container: the harness in
+    /// unattended mode, opening `conversation` when one is given and a new one otherwise.
+    ///
+    /// An id that [`history::is_safe_id`](super::history::is_safe_id) would not have let through
+    /// is not passed on: a word starting with `-` would be read as an option, so the harness is
+    /// started as if none had been asked for rather than with an argument nobody chose.
+    #[must_use]
+    pub fn command_line(self, conversation: Option<&str>) -> Vec<String> {
+        let record = self.record();
+        let auto_run = record.auto_run.iter().map(|arg| (*arg).to_owned());
+        let mut line = vec![record.command.to_owned()];
+        match conversation.filter(|id| super::history::is_safe_id(id)) {
+            None => line.extend(auto_run),
+            Some(id) => match record.resume {
+                Resume::Option(option) => {
+                    line.extend(auto_run);
+                    line.extend([option.to_owned(), id.to_owned()]);
+                }
+                Resume::Subcommand(command) => {
+                    line.push(command.to_owned());
+                    line.extend(auto_run);
+                    line.push(id.to_owned());
+                }
+            },
+        }
+        line
     }
 }
 
@@ -142,6 +191,11 @@ impl AccountKind {
 /// `~/.claude/.credentials.json` it answers `"loggedIn": true`. `claude doctor` reads the
 /// settings file and names it under `Invalid settings` when it is broken; with the file below
 /// it finds nothing to say.
+///
+/// Resuming, from `code.claude.com/docs/en/cli-reference` (`-r, --resume` takes a session id)
+/// and checked against 2.1.276: `claude --dangerously-skip-permissions --resume <id> --print hi`
+/// with an id no transcript has answers `No conversation found with session ID: <id>`, and with
+/// the id [`history`](super::history) lists for a transcript it goes on to `Not logged in`.
 static CLAUDE_CODE: Harness = Harness {
     id: "claude-code",
     display_name: "Claude Code",
@@ -155,6 +209,7 @@ static CLAUDE_CODE: Harness = Harness {
         path: ".claude/settings.json",
         contents: "{\n  \"permissions\": {\n    \"defaultMode\": \"bypassPermissions\"\n  }\n}\n",
     }),
+    resume: Resume::Option("--resume"),
 };
 
 /// opencode. Install and start command from the opencode documentation (`opencode.ai/docs`), the
@@ -174,6 +229,11 @@ static CLAUDE_CODE: Harness = Harness {
 ///
 /// Free use comes first: opencode starts and works without any login, on the free models it
 /// offers itself, so a profile that signs in to nothing is a complete one here.
+///
+/// Resuming, from `opencode.ai/docs/cli` (`-s, --session` continues a session by id) and
+/// checked against 1.18.31: `opencode --auto --session <id>` with an id no session has answers
+/// `Error: Session not found: <id>`, and with the id [`history`](super::history) lists for a
+/// session made by `opencode run` it opens the interface.
 static OPENCODE: Harness = Harness {
     id: "opencode",
     display_name: "opencode",
@@ -187,6 +247,7 @@ static OPENCODE: Harness = Harness {
         path: ".config/opencode/opencode.json",
         contents: "{\n  \"$schema\": \"https://opencode.ai/config.json\",\n  \"permission\": {\n    \"*\": \"allow\"\n  }\n}\n",
     }),
+    resume: Resume::Option("--session"),
 };
 
 /// Gemini CLI. Install and start command from the project's readme, the argument from
@@ -228,6 +289,13 @@ static OPENCODE: Harness = Harness {
 /// where both halves are the same as where it was written. That is why every container QCode
 /// creates gets the one machine name in [`crate::engine::names::HOSTNAME`], and why the user
 /// inside is always `qcode`; the live test checks the salt is still made of those two.
+///
+/// Resuming, from `geminicli.com/docs/cli/session-management` (`--resume` takes `latest`, an
+/// index or a session id) and checked against 0.60.0, whose `SessionSelector.findSession` in
+/// the bundle matches the argument against each session's `id` before trying it as an index:
+/// `gemini --approval-mode=yolo --resume <id> --prompt hi` with an id the project's
+/// conversations do not have answers `Error resuming session: Invalid session identifier`, and
+/// with the id [`history`](super::history) lists it goes on to ask for an auth method.
 static GEMINI_CLI: Harness = Harness {
     id: "gemini-cli",
     display_name: "Gemini CLI",
@@ -241,6 +309,7 @@ static GEMINI_CLI: Harness = Harness {
         path: ".gemini/settings.json",
         contents: "{\n  \"security\": {\n    \"folderTrust\": {\n      \"enabled\": false\n    }\n  }\n}\n",
     }),
+    resume: Resume::Option("--resume"),
 };
 
 /// Codex CLI. Install and start command from the project's readme, the argument from the source
@@ -260,6 +329,19 @@ static GEMINI_CLI: Harness = Harness {
 /// every command: a wrong value in it is answered with `Error loading configuration`, and with
 /// it in place `codex doctor` reports `unrestricted fs + enabled network · approval Never`
 /// where it reported `restricted fs + restricted network · approval OnRequest` before.
+///
+/// Resuming, from the `resume` subcommand in `codex-rs/cli` of `github.com/openai/codex`
+/// (`codex resume [OPTIONS] [SESSION_ID] [PROMPT]`) and checked against 0.155.0. `codex resume --help` lists
+/// `--dangerously-bypass-approvals-and-sandbox` among the subcommand's own options, so the
+/// argument follows `resume` rather than going before it, where it would be the top-level
+/// command's and reach the resumed session only through however that version hands it down.
+/// `codex resume --dangerously-bypass-approvals-and-sandbox <id>` is parsed and stops at
+/// `Error: stdin is not a terminal`; an unknown argument in the same place is refused with
+/// `error: unexpected argument`. Given a terminal the interface waits for the terminal's answers
+/// before it looks the id up, so the lookup was checked through the same resume code without
+/// one: `codex exec resume <id> hi` answers `no rollout found for thread id <id>` for an unknown
+/// id, and for the id [`history`](super::history) lists it prints `session id: <id>` and goes
+/// on to the model.
 static CODEX: Harness = Harness {
     id: "codex",
     display_name: "Codex",
@@ -273,6 +355,7 @@ static CODEX: Harness = Harness {
         path: ".codex/config.toml",
         contents: "approval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\n",
     }),
+    resume: Resume::Subcommand("resume"),
 };
 
 #[cfg(test)]
@@ -357,6 +440,42 @@ mod tests {
         }
         assert!(!AccountKind::Free.needs_login());
         assert!(AccountKind::Subscription.needs_login() && AccountKind::ApiKey.needs_login());
+    }
+
+    #[test]
+    fn a_new_conversation_is_the_program_in_unattended_mode() {
+        assert_eq!(HarnessKind::ClaudeCode.command_line(None), ["claude", "--dangerously-skip-permissions"]);
+        assert_eq!(HarnessKind::OpenCode.command_line(None), ["opencode", "--auto"]);
+        assert_eq!(HarnessKind::GeminiCli.command_line(None), ["gemini", "--approval-mode=yolo"]);
+        assert_eq!(HarnessKind::Codex.command_line(None), ["codex", "--dangerously-bypass-approvals-and-sandbox"]);
+    }
+
+    #[test]
+    fn an_earlier_conversation_is_opened_the_way_each_harness_takes_it() {
+        let id = "2afe99eb-008a-4542-b160-1aa5b29bb95f";
+        assert_eq!(
+            HarnessKind::ClaudeCode.command_line(Some(id)),
+            ["claude", "--dangerously-skip-permissions", "--resume", id]
+        );
+        assert_eq!(
+            HarnessKind::OpenCode.command_line(Some("ses_f4acc7e75ffeEArYIV9UJooqnn")),
+            ["opencode", "--auto", "--session", "ses_f4acc7e75ffeEArYIV9UJooqnn"]
+        );
+        assert_eq!(HarnessKind::GeminiCli.command_line(Some(id)), ["gemini", "--approval-mode=yolo", "--resume", id]);
+        // The subcommand comes first, so the unattended-mode argument is the subcommand's own.
+        assert_eq!(
+            HarnessKind::Codex.command_line(Some(id)),
+            ["codex", "resume", "--dangerously-bypass-approvals-and-sandbox", id]
+        );
+    }
+
+    #[test]
+    fn an_id_that_could_be_taken_for_an_option_opens_a_new_conversation_instead() {
+        for harness in HarnessKind::ALL {
+            for id in ["--help", "-c", "", "two words", "a;b"] {
+                assert_eq!(harness.command_line(Some(id)), harness.command_line(None), "{harness:?}: {id:?}");
+            }
+        }
     }
 
     #[test]

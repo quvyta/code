@@ -6,6 +6,7 @@
 //! the definition and the facts every harness brings with it; building images and running
 //! containers is the engine's work.
 
+pub mod history;
 pub mod identity;
 
 mod definition;
@@ -13,11 +14,13 @@ mod harness;
 #[cfg(test)]
 mod harness_live;
 #[cfg(test)]
+mod history_live;
+#[cfg(test)]
 mod live;
 mod name;
 mod template;
 
 pub use definition::{Loaded, MountAccess, NetworkMode, Profile};
-pub use harness::{AccountKind, ConfigFile, Harness, HarnessKind};
+pub use harness::{AccountKind, ConfigFile, Harness, HarnessKind, Resume};
 pub use name::SafeName;
 pub use template::Template;

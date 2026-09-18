@@ -25,7 +25,7 @@ use qframe::diagnostics::Diagnostic;
 use qframe::prelude::*;
 use qframe::runtime::Task;
 use qframe::widgets::{
-    Badge, EmptyState, Field, LogBuffer, LogLevel, LogLine, LogView, RadioGroup, RadioStyle, Terminal, TerminalEvent,
+    Badge, EmptyState, Field, LogBuffer, LogLevel, LogLine, LogView, RadioGroup, Terminal, TerminalEvent,
     TerminalSession, TextInput, Toast, Wizard,
 };
 
@@ -54,10 +54,6 @@ const WIZARD_ROWS: u16 = 25;
 /// Rows the application's own header and footer take around this screen, which the screen's
 /// view cannot see but which share the terminal with it.
 const CHROME_ROWS: u16 = 2;
-
-/// How every choice on these pages is marked: the small square, as everywhere in QCode. It is
-/// set by name because the framework's constructor starts from another style.
-const RADIO: RadioStyle = RadioStyle::Square;
 
 /// What was read out of a workspace's `Profiles/` folder.
 #[derive(Debug, Clone, PartialEq)]
@@ -856,7 +852,6 @@ fn draw_harness(draft: &Draft, ui: &mut View<'_, Msg>) {
     ui.add(Text::new(t!("profiles.wizard.harness-lead")).role("secondary")).fill_width();
     ui.add(
         RadioGroup::new(HarnessKind::ALL.map(|harness| harness.record().display_name.to_owned()))
-            .style(RADIO)
             .selected(chosen)
             .on_select(Msg::PickHarness),
     )
@@ -889,10 +884,8 @@ fn draw_harness(draft: &Draft, ui: &mut View<'_, Msg>) {
 fn draw_template(draft: &Draft, ui: &mut View<'_, Msg>) {
     let chosen = Template::ALL.iter().position(|template| *template == draft.template);
     ui.add(Text::new(t!("profiles.wizard.template-lead")).role("secondary")).fill_width();
-    ui.add(
-        RadioGroup::new(Template::ALL.map(template_word)).style(RADIO).selected(chosen).on_select(Msg::PickTemplate),
-    )
-    .id("profile-template");
+    ui.add(RadioGroup::new(Template::ALL.map(template_word)).selected(chosen).on_select(Msg::PickTemplate))
+        .id("profile-template");
     let detail = match draft.template {
         Template::Base => t!("profiles.wizard.template-base-detail"),
         Template::Recommended => t!("profiles.wizard.template-recommended-detail"),
@@ -908,7 +901,6 @@ fn draw_account(draft: &Draft, ui: &mut View<'_, Msg>) {
     ui.add(Text::new(t!("profiles.wizard.account-lead")).role("secondary")).fill_width();
     ui.add(
         RadioGroup::new(offered.iter().map(|account| account_word(*account)))
-            .style(RADIO)
             .selected(chosen)
             .on_select(Msg::PickAccount),
     )
@@ -928,7 +920,6 @@ fn draw_permissions(draft: &Draft, ui: &mut View<'_, Msg>) {
     ui.add(Text::new(t!("profiles.wizard.permissions-assets")).bold());
     ui.add(
         RadioGroup::new(MountAccess::ALL.map(access_word))
-            .style(RADIO)
             .selected(MountAccess::ALL.iter().position(|access| *access == draft.assets))
             .horizontal(true)
             .on_select(Msg::PickAssets),
@@ -937,7 +928,6 @@ fn draw_permissions(draft: &Draft, ui: &mut View<'_, Msg>) {
     ui.add(Text::new(t!("profiles.wizard.permissions-network")).bold());
     ui.add(
         RadioGroup::new(NetworkMode::ALL.map(network_word))
-            .style(RADIO)
             .selected(NetworkMode::ALL.iter().position(|mode| *mode == draft.network))
             .horizontal(true)
             .on_select(Msg::PickNetwork),

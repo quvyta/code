@@ -15,14 +15,18 @@ use qframe::env::{AssetDirs, Env};
 use qframe::icons::GlyphMode;
 use qframe::prelude::*;
 use qframe::runtime::Harness;
-use qframe::widgets::TerminalEvent;
+use qframe::widgets::{TerminalEvent, TerminalSession};
 
 use crate::engine::{Container, ContainerState, Engine, EngineKind, HostUser};
 use crate::profile::{AccountKind, HarnessKind, MountAccess, NetworkMode, Profile, SafeName, Template};
-use crate::workspace::{ProjectFile, ProjectId, ProjectPaths, ProjectProfile};
+use crate::workspace::{
+    ProjectFile, ProjectId, ProjectPaths, ProjectProfile, Session, SessionProject, SessionTab, SessionTabKind,
+};
 
 use super::plan::{PROJECT_DIR, SHELL};
-use super::{Msg, NewTab, OpenProject, PanelWidget, ProjectScreen, Tab, TabKey, TabKind, TabState};
+
+mod history;
+use super::{Choice, Msg, OpenProject, PanelWidget, ProjectScreen, Tab, TabKey, TabKind, TabState};
 
 /// A terminal wide enough for the rail, the tabs, the terminal and the panel.
 const SIZE: (u16, u16) = (110, 32);
@@ -102,8 +106,11 @@ impl App for Framed {
     }
 }
 
+/// QCode's own text and keys, and nothing of the person's.
 fn env() -> Env {
-    Env::load(&AssetDirs { locale_sources: crate::locales(), ..AssetDirs::default() }).expect("the built-in files load")
+    let dirs =
+        AssetDirs { locale_sources: crate::locales(), keymap_source: Some(crate::keymap()), ..AssetDirs::default() };
+    Env::load(&dirs).expect("the built-in files load")
 }
 
 fn profile(name: &str, harness: HarnessKind) -> Profile {
@@ -161,6 +168,31 @@ fn harness(screen: ProjectScreen, width: u16, height: u16) -> Harness<Screen> {
     harness
 }
 
+/// Opens a blank tab and chooses `choice` on its page, the way the `+` and a row of the page do,
+/// without letting the background work run.
+fn open(screen: &mut ProjectScreen, choice: Choice) {
+    apply(screen, Msg::NewTab);
+    let tab = screen.project().and_then(OpenProject::active_tab).map(Tab::key).expect("the blank tab is open");
+    apply(screen, Msg::Choose(tab, choice));
+}
+
+/// The same through a harness, so the background work runs as it would in the application.
+fn open_in(harness: &mut Harness<Screen>, choice: Choice) {
+    harness.send(Msg::NewTab);
+    let tab = harness.app().0.project().and_then(OpenProject::active_tab).map(Tab::key);
+    harness.send(Msg::Choose(tab.expect("the blank tab is open"), choice));
+}
+
+/// The profile of `one_project`, as a choice of a blank tab's page.
+fn claude() -> Choice {
+    Choice::NewChat("claude-sub".to_owned())
+}
+
+/// What the tabs of the open project are, in order.
+fn kinds(screen: &ProjectScreen) -> Vec<TabKind> {
+    screen.project().expect("a project is open").tabs().iter().map(|tab| tab.kind().clone()).collect()
+}
+
 /// The key of the tab at `index` of the open project.
 fn key(screen: &ProjectScreen, index: usize) -> TabKey {
     screen.project().expect("a project is open").tabs()[index].key()
@@ -170,8 +202,8 @@ fn key(screen: &ProjectScreen, index: usize) -> TabKey {
 fn a_tab_opens_inside_a_container_and_never_on_this_machine() {
     let scratch = Scratch::new("inside");
     let mut screen = one_project(&scratch);
-    apply(&mut screen, Msg::NewTab(NewTab::Shell));
-    apply(&mut screen, Msg::NewTab(NewTab::Profile(0)));
+    open(&mut screen, Choice::Shell);
+    open(&mut screen, claude());
 
     let shell = screen.launch_command(key(&screen, 0)).expect("the shell tab has a command");
     let words: Vec<String> = shell.args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
@@ -223,20 +255,160 @@ fn a_screen_with_no_tab_says_what_a_tab_is_and_offers_one() {
     assert!(screen.contains('F'), "the collapsed rail marks the project by its initial:\n{screen}");
 }
 
-#[test]
-fn the_new_tab_chooser_offers_a_shell_and_every_profile() {
-    let scratch = Scratch::new("picker");
-    let mut harness = harness(one_project(&scratch), SIZE.0, SIZE.1);
-    harness.click_text("New tab").advance(Duration::from_millis(300));
-    let text = harness.screen();
-    assert!(text.contains("Shell"), "an empty terminal is the first choice:\n{text}");
-    assert!(text.contains("claude-sub"), "and every profile follows:\n{text}");
-    assert!(text.contains("Claude Code"), "each profile says which harness it runs:\n{text}");
+/// The line of the tab strip, which is the first line of the screen.
+fn strip(harness: &Harness<Screen>) -> String {
+    harness.screen().lines().next().unwrap_or_default().to_owned()
+}
 
-    harness.click_text("claude-sub");
-    let kinds: Vec<TabKind> =
-        harness.app().0.project().expect("a project").tabs().iter().map(|tab| tab.kind().clone()).collect();
-    assert_eq!(kinds, [TabKind::Profile("claude-sub".to_owned())], "the chosen profile is what opened");
+/// The column of the `+` that opens a blank tab, on the line of the tab strip.
+fn plus_column(harness: &Harness<Screen>) -> usize {
+    let line = strip(harness);
+    line.chars().position(|cell| cell == '+').unwrap_or_else(|| panic!("the strip carries a plus:\n{line}"))
+}
+
+#[test]
+fn the_plus_stands_right_after_the_last_tab() {
+    let scratch = Scratch::new("plus-after");
+    let mut screen = one_project(&scratch);
+    open(&mut screen, Choice::Shell);
+    open(&mut screen, claude());
+    let mut harness = harness(screen, SIZE.0, SIZE.1);
+    for mode in [GlyphMode::Unicode, GlyphMode::Ascii] {
+        harness.set_glyph_mode(mode).render();
+        let line: Vec<char> = strip(&harness).chars().collect();
+        let label = "claude-sub".chars().count();
+        let last = line.windows(label).rposition(|cells| cells.iter().collect::<String>() == "claude-sub");
+        let end = last.expect("the last tab is on the strip") + label;
+        let plus = plus_column(&harness);
+        let between: String = line[end..plus].iter().collect();
+        // Only the tab's own close mark and the air of the tab and of the button stand between.
+        assert!(between.chars().all(|cell| cell == ' ' || cell == '×' || cell == 'x'), "{mode:?}: {between:?}");
+        assert!(between.chars().count() <= 8, "the plus follows the tab closely in {mode:?}:\n{}", strip(&harness));
+    }
+}
+
+#[test]
+fn with_no_tab_the_plus_stands_at_the_top_left() {
+    let scratch = Scratch::new("plus-left");
+    let harness = harness(one_project(&scratch), SIZE.0, SIZE.1);
+    let plus = plus_column(&harness);
+    let rail = usize::from(super::RAIL_WIDTH);
+    assert!((rail..rail + usize::from(super::NEW_TAB_WIDTH)).contains(&plus), "{}", harness.screen());
+    let (_, empty_y) = harness.find("No tab is open").expect("the empty state");
+    assert!(empty_y > 0, "above the empty state, at its left edge:\n{}", harness.screen());
+}
+
+#[test]
+fn with_many_tabs_the_plus_keeps_its_place_at_the_right_end() {
+    let scratch = Scratch::new("plus-many");
+    let mut screen = one_project(&scratch);
+    for _ in 0..20 {
+        open(&mut screen, Choice::Shell);
+    }
+    let harness = harness(screen, SIZE.0, SIZE.1);
+    let plus = plus_column(&harness);
+    let (panel, _) = harness.find("Panel").expect("the panel");
+    let panel = usize::try_from(panel).expect("a column");
+    assert!(plus + 12 > panel && plus < panel, "the plus ends the middle column:\n{}", harness.screen());
+    assert!(strip(&harness).contains("Shell 20"), "the open tab, the last one, is in view:\n{}", strip(&harness));
+}
+
+#[test]
+fn the_plus_the_empty_state_and_the_message_open_a_blank_tab_at_once() {
+    let scratch = Scratch::new("blank");
+    let mut harness = harness(one_project(&scratch), SIZE.0, SIZE.1);
+    let plus = i32::try_from(plus_column(&harness)).expect("a column");
+    harness.click(plus, 0).advance(Duration::from_millis(300));
+    assert_eq!(kinds(&harness.app().0), [TabKind::New], "the plus opens a blank tab:\n{}", harness.screen());
+    assert!(harness.is_focused("project-choices"), "and its page has the keyboard");
+
+    harness.send(Msg::CloseTab(0));
+    assert!(harness.screen().contains("No tab is open"), "{}", harness.screen());
+    harness.click_text("New tab").advance(Duration::from_millis(300));
+    assert_eq!(kinds(&harness.app().0), [TabKind::New], "so does the empty state's button");
+
+    harness.send(Msg::NewTab);
+    let open = harness.app().0.project().expect("a project");
+    assert_eq!(kinds(&harness.app().0), [TabKind::New, TabKind::New], "several blank tabs are fine");
+    assert_eq!(open.active_tab().map(Tab::key), Some(open.tabs()[1].key()), "the new one is open");
+    for tab in open.tabs() {
+        assert_eq!(tab.state(), &TabState::Waiting, "nothing started");
+        assert!(harness.app().0.launch_command(tab.key()).is_none(), "and nothing would be spawned");
+    }
+    assert_eq!(strip(&harness).matches("New tab").count(), 2, "{}", strip(&harness));
+}
+
+#[test]
+fn the_page_lists_the_shell_then_a_section_for_every_profile() {
+    let scratch = Scratch::new("page");
+    let written = file("firefly", "Firefly", &["claude-sub"]);
+    let profiles = vec![profile("opencode", HarnessKind::OpenCode), profile("claude-sub", HarnessKind::ClaudeCode)];
+    let screen = ProjectScreen::new(
+        Some(engine()),
+        HostUser::ImageDefault,
+        vec![OpenProject::new(&written, scratch.paths(), profiles)],
+    );
+    let mut harness = harness(screen, SIZE.0, SIZE.1);
+    harness.send(Msg::NewTab);
+    let text = harness.screen();
+    let row = |needle: &str| harness.find(needle).unwrap_or_else(|| panic!("`{needle}` is on the page:\n{text}")).1;
+    assert!(row("What should this tab open?") < row("in the project's own container"), "{text}");
+    let shell = row("in the project's own container");
+    let claude = row("claude-sub • Claude Code");
+    let opencode = row("opencode • opencode • adds to project");
+    assert!(shell < claude && claude < opencode, "the shell, then the carried profile, then the other:\n{text}");
+    let chats: Vec<usize> =
+        text.lines().enumerate().filter(|(_, line)| line.contains("New chat")).map(|(y, _)| y).collect();
+    let (claude, opencode) = (usize::try_from(claude).expect("a row"), usize::try_from(opencode).expect("a row"));
+    assert_eq!(chats, [claude + 1, opencode + 1], "each section starts with a new chat:\n{text}");
+    let (title_x, _) = harness.find("What should this tab open?").expect("the question");
+    assert!(title_x < i32::from(SIZE.0) / 8, "the page reads from the left, not the middle:\n{text}");
+}
+
+#[test]
+fn the_keyboard_walks_the_page_and_enter_chooses() {
+    let scratch = Scratch::new("page-keys");
+    let mut harness = harness(one_project(&scratch), SIZE.0, SIZE.1);
+    harness.send(Msg::NewTab).render();
+    let tab = key(&harness.app().0, 0);
+    harness.press("down");
+    assert_eq!(harness.app().0.blank_row, 3, "the heading and the gap are stepped over");
+    harness.press("enter");
+    assert_eq!(kinds(&harness.app().0), [TabKind::Profile("claude-sub".to_owned())], "{}", harness.screen());
+    assert_eq!(key(&harness.app().0, 0), tab, "the same tab turned into it");
+}
+
+#[test]
+fn choosing_turns_the_same_tab_into_a_shell_or_a_chat_inside_a_container() {
+    let scratch = Scratch::new("choose");
+    let mut screen = one_project(&scratch);
+    open(&mut screen, Choice::Shell);
+    apply(&mut screen, Msg::NewTab);
+    apply(&mut screen, Msg::NewTab);
+    apply(&mut screen, Msg::OpenTab(1));
+    let (first, second) = (key(&screen, 1), key(&screen, 2));
+    assert_eq!(super::entry(&screen), "project-choices", "a blank tab's page takes the keyboard");
+
+    apply(&mut screen, Msg::Choose(first, claude()));
+    apply(&mut screen, Msg::Choose(second, Choice::Shell));
+    assert_eq!(kinds(&screen), [TabKind::Shell, TabKind::Profile("claude-sub".to_owned()), TabKind::Shell]);
+    assert_eq!((key(&screen, 1), key(&screen, 2)), (first, second), "each in its own place");
+    let chosen = &screen.project().expect("a project").tabs()[1];
+    assert!(chosen.state().is_starting(), "its container is being started");
+    assert_eq!(chosen.conversation(), None, "a new chat has no conversation yet");
+    assert!(chosen.opened() > 0, "and was opened now");
+    assert_eq!(super::entry(&screen), "project-terminal");
+
+    let words = |key: TabKey| -> Vec<String> {
+        let command = screen.launch_command(key).expect("a chosen tab has a command");
+        assert_eq!(command.program, Path::new(NO_ENGINE), "only the engine binary is ever started");
+        command.args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect()
+    };
+    assert_eq!(words(first)[..4], ["exec", "--interactive", "--tty", "qcode-firefly-claude-sub"]);
+    assert_eq!(words(second)[..4], ["exec", "--interactive", "--tty", "qcode-firefly-base"]);
+
+    apply(&mut screen, Msg::Choose(first, Choice::Shell));
+    assert_eq!(kinds(&screen)[1], TabKind::Profile("claude-sub".to_owned()), "a chosen tab is not chosen again");
 }
 
 #[test]
@@ -259,7 +431,9 @@ fn a_profile_the_project_does_not_carry_is_offered_and_joins_it_when_opened() {
     assert!(text.contains("opencode"), "a profile of the workspace is offered:\n{text}");
     assert!(text.contains("adds to project"), "and says what choosing it does:\n{text}");
 
-    harness.click_text("opencode").advance(Duration::from_millis(300));
+    // Its new chat is the row under its heading.
+    let (x, y) = harness.find("opencode • opencode").expect("the heading of its section");
+    harness.click(x, y + 1).advance(Duration::from_millis(300));
     let open = harness.app().0.project().expect("a project");
     let kinds: Vec<TabKind> = open.tabs().iter().map(|tab| tab.kind().clone()).collect();
     assert_eq!(kinds, [TabKind::Profile("opencode".to_owned())], "the tab opened");
@@ -283,7 +457,8 @@ fn a_profile_that_could_not_be_recorded_still_opens_and_says_so() {
     );
     let screen = ProjectScreen::new(Some(engine()), HostUser::Ids { uid: 1000, gid: 1000 }, vec![open]);
     let mut harness = harness(screen, SIZE.0, SIZE.1);
-    harness.send(Msg::NewTab(NewTab::Profile(0))).advance(Duration::from_millis(300));
+    open_in(&mut harness, claude());
+    harness.advance(Duration::from_millis(300));
     let open = harness.app().0.project().expect("a project");
     assert_eq!(open.tabs().len(), 1, "the tab opened");
     assert!(!open.carries("claude-sub"));
@@ -291,23 +466,42 @@ fn a_profile_that_could_not_be_recorded_still_opens_and_says_so() {
     assert!(text.contains("could not be recorded"), "{text}");
 }
 
+/// The project screen, remembering whether it asked for the profiles screen, which is the
+/// application's to open.
+struct Watched(ProjectScreen, bool);
+
+impl App for Watched {
+    type Msg = Msg;
+
+    fn update(&mut self, message: Msg) -> Command<Msg> {
+        self.1 |= matches!(message, Msg::ManageProfiles);
+        super::update(&mut self.0, message)
+    }
+
+    fn view(&self, ui: &mut View<'_, Msg>) {
+        super::view(&self.0, ui, std::convert::identity, |_| {}, |_| {});
+    }
+}
+
 #[test]
-fn with_no_profile_at_all_the_chooser_leads_to_the_profiles_screen() {
+fn with_no_profile_at_all_the_page_leads_to_the_profiles_screen() {
     let scratch = Scratch::new("no-profiles");
-    let screen = ProjectScreen::new(
+    let mut screen = ProjectScreen::new(
         Some(engine()),
         HostUser::Ids { uid: 1000, gid: 1000 },
         vec![project("firefly", "Firefly", scratch.paths(), Vec::new())],
     );
-    let mut harness = harness(screen, SIZE.0, SIZE.1);
-    harness.click_text("New tab").advance(Duration::from_millis(300));
+    apply(&mut screen, Msg::NewTab);
+    let mut harness = Harness::with_env(Watched(screen, false), env(), SIZE.0, SIZE.1);
+    harness.set_locale("en").set_glyph_mode(GlyphMode::Unicode).render();
     let text = harness.screen();
     assert!(text.contains("Shell"), "the shell is still there:\n{text}");
-    assert!(text.contains("New profile"), "and the way to a profile beside it:\n{text}");
+    assert!(text.contains("New profile"), "and the way to a profile after it:\n{text}");
+    assert!(text.contains("No profile yet"), "{text}");
 
     harness.click_text("New profile").advance(Duration::from_millis(300));
-    assert!(harness.app().0.project().expect("a project").tabs().is_empty(), "no tab opened");
-    assert!(!harness.app().0.picker, "the chooser closed for the profiles screen");
+    assert!(harness.app().1, "the row asks for the profiles screen");
+    assert_eq!(kinds(&harness.app().0), [TabKind::New], "and the tab stays blank for when the person is back");
 }
 
 #[test]
@@ -343,7 +537,7 @@ fn a_hovered_project_names_itself_beside_the_collapsed_rail() {
 fn a_tab_waiting_for_its_container_says_so() {
     let scratch = Scratch::new("starting");
     let mut screen = one_project(&scratch);
-    apply(&mut screen, Msg::NewTab(NewTab::Shell));
+    open(&mut screen, Choice::Shell);
     assert!(screen.project().expect("a project").tabs()[0].state().is_starting());
     let harness = harness(screen, SIZE.0, SIZE.1);
     let text = harness.screen();
@@ -355,7 +549,7 @@ fn a_tab_waiting_for_its_container_says_so() {
 fn a_container_that_stops_is_named_and_offered_a_restart() {
     let scratch = Scratch::new("stopped");
     let mut screen = one_project(&scratch);
-    apply(&mut screen, Msg::NewTab(NewTab::Shell));
+    open(&mut screen, Choice::Shell);
     let tab = key(&screen, 0);
     // The session ends, and the engine answers that the container under it is gone: that pair is
     // the case the design asks to be named, rather than left as "the shell exited".
@@ -383,7 +577,7 @@ fn an_engine_that_refuses_shows_its_own_words() {
     let scratch = Scratch::new("refused");
     let mut harness = harness(one_project(&scratch), SIZE.0, SIZE.1);
     // The engine binary of these tests cannot be run, so opening a tab really does fail here.
-    harness.send(Msg::NewTab(NewTab::Shell));
+    open_in(&mut harness, Choice::Shell);
     let text = harness.screen();
     assert!(text.contains("The engine refused"), "{text}");
     assert!(text.contains("Start again"), "{text}");
@@ -394,23 +588,40 @@ fn an_engine_that_refuses_shows_its_own_words() {
 }
 
 #[test]
-fn without_an_engine_nothing_pretends_to_open() {
+fn without_an_engine_the_page_is_faint_and_nothing_starts() {
     let scratch = Scratch::new("no-engine");
-    let projects = vec![project("firefly", "Firefly", scratch.paths(), Vec::new())];
-    let screen = ProjectScreen::new(None, HostUser::ImageDefault, projects);
-    let mut harness = harness(screen, SIZE.0, SIZE.1);
+    let shown = |engine: Option<Engine>| {
+        let projects =
+            vec![project("firefly", "Firefly", scratch.paths(), vec![profile("claude-sub", HarnessKind::ClaudeCode)])];
+        let mut harness = harness(ProjectScreen::new(engine, HostUser::ImageDefault, projects), SIZE.0, SIZE.1);
+        harness.click_text("New tab").advance(Duration::from_millis(300));
+        harness
+    };
+    let working = shown(Some(engine()));
+    let mut harness = shown(None);
     let text = harness.screen();
-    assert!(text.contains("No container engine was found"), "{text}");
-    harness.click_text("New tab");
-    assert!(harness.app().0.project().expect("a project").tabs().is_empty(), "a disabled control opens nothing");
+    assert_eq!(kinds(&harness.app().0), [TabKind::New], "the page opens all the same:\n{text}");
+    assert!(text.contains("What should this tab open?"), "{text}");
+    assert!(text.contains("No container engine was found"), "and says why nothing can be chosen:\n{text}");
+    assert!(!working.screen().contains("No container engine was found"), "{}", working.screen());
+    let fg = |harness: &Harness<Screen>| {
+        let (x, y) = harness.find("New chat").expect("the row of a new chat");
+        harness.fg(u16::try_from(x).expect("a column"), u16::try_from(y).expect("a row"))
+    };
+    assert_ne!(fg(&harness), fg(&working), "its rows are faint");
+
+    harness.click_text("Shell").advance(Duration::from_millis(300));
+    harness.click_text("New chat").advance(Duration::from_millis(300));
+    let tab = &harness.app().0.project().expect("a project").tabs()[0];
+    assert_eq!((tab.kind(), tab.state()), (&TabKind::New, &TabState::Waiting), "choosing does nothing");
 }
 
 #[test]
 fn tabs_close_and_move() {
     let scratch = Scratch::new("tabs");
     let mut screen = one_project(&scratch);
-    apply(&mut screen, Msg::NewTab(NewTab::Shell));
-    apply(&mut screen, Msg::NewTab(NewTab::Profile(0)));
+    open(&mut screen, Choice::Shell);
+    open(&mut screen, claude());
     apply(&mut screen, Msg::MoveTab { from: 1, to: 0 });
     let kinds: Vec<TabKind> =
         screen.project().expect("a project").tabs().iter().map(|tab| tab.kind().clone()).collect();
@@ -426,8 +637,8 @@ fn tabs_close_and_move() {
 fn several_shells_are_told_apart() {
     let scratch = Scratch::new("shells");
     let mut screen = one_project(&scratch);
-    apply(&mut screen, Msg::NewTab(NewTab::Shell));
-    apply(&mut screen, Msg::NewTab(NewTab::Shell));
+    open(&mut screen, Choice::Shell);
+    open(&mut screen, Choice::Shell);
     let harness = harness(screen, SIZE.0, SIZE.1);
     let text = harness.screen();
     assert!(text.contains("Shell 1"), "{text}");
@@ -647,7 +858,7 @@ fn the_container_widget_lists_this_projects_containers_and_acts_on_one() {
 fn a_narrow_screen_keeps_the_rail_the_terminal_and_the_panel() {
     let scratch = Scratch::new("narrow");
     let mut screen = one_project(&scratch);
-    apply(&mut screen, Msg::NewTab(NewTab::Shell));
+    open(&mut screen, Choice::Shell);
     let mut harness = harness(screen, 46, 18);
     let text = harness.screen();
     // The framework keeps the terminal a quarter of the width whatever the panel asks for, so
@@ -680,7 +891,7 @@ fn a_closed_panel_gives_its_width_to_the_terminal() {
 fn nothing_is_bracketed_lined_or_framed() {
     let scratch = Scratch::new("aesthetic");
     let mut screen = one_project(&scratch);
-    apply(&mut screen, Msg::NewTab(NewTab::Profile(0)));
+    open(&mut screen, claude());
     let mut harness = harness(screen, SIZE.0, SIZE.1);
     for mode in [GlyphMode::Nerd, GlyphMode::Unicode, GlyphMode::Ascii] {
         harness.set_glyph_mode(mode).render();
@@ -707,8 +918,8 @@ fn ascii_mode_draws_nothing_but_ascii() {
 fn the_keyboard_reaches_the_rail_the_tabs_and_the_panel() {
     let scratch = Scratch::new("keys");
     let mut screen = one_project(&scratch);
-    apply(&mut screen, Msg::NewTab(NewTab::Shell));
-    apply(&mut screen, Msg::NewTab(NewTab::Profile(0)));
+    open(&mut screen, Choice::Shell);
+    open(&mut screen, claude());
     let mut harness = harness(screen, SIZE.0, SIZE.1);
     let (mut rail, mut tabs) = (false, false);
     for _ in 0..12 {
@@ -732,7 +943,7 @@ fn the_keyboard_reaches_the_rail_the_tabs_and_the_panel() {
 fn reduced_motion_keeps_the_screen_working() {
     let scratch = Scratch::new("motion");
     let mut screen = one_project(&scratch);
-    apply(&mut screen, Msg::NewTab(NewTab::Shell));
+    open(&mut screen, Choice::Shell);
     let mut harness = harness(screen, SIZE.0, SIZE.1);
     harness.set_reduced_motion(true).render();
     let text = harness.screen();
@@ -748,4 +959,390 @@ fn turkish_reads_as_turkish() {
     for label in ["Açık sekme yok", "Yeni sekme", "Kapsayıcılar", "Dosyalar"] {
         assert!(text.contains(label), "`{label}` is missing:\n{text}");
     }
+}
+
+/// A screen of the projects `names`, each in a folder of its own, with an engine whose binary
+/// cannot be run. The folders go when the returned scratches are dropped.
+fn several(names: &[(&str, &str)]) -> (ProjectScreen, Vec<Scratch>) {
+    let scratches: Vec<Scratch> = names.iter().map(|(id, _)| Scratch::new(id)).collect();
+    let projects = names
+        .iter()
+        .zip(&scratches)
+        .map(|((id, name), scratch)| {
+            project(id, name, scratch.paths(), vec![profile("claude-sub", HarnessKind::ClaudeCode)])
+        })
+        .collect();
+    (ProjectScreen::new(Some(engine()), HostUser::ImageDefault, projects), scratches)
+}
+
+/// A session of `firefly` with a shell and a profile tab, the profile one open, and `moth` with
+/// one shell; `moth` is the open project.
+fn recorded() -> Session {
+    let id = |text: &str| ProjectId::parse(text).expect("a usable project id");
+    Session {
+        active: Some(id("moth")),
+        projects: vec![
+            SessionProject {
+                id: id("firefly"),
+                active_tab: 1,
+                tabs: vec![
+                    SessionTab { kind: SessionTabKind::Shell, conversation: None, opened: 100 },
+                    SessionTab {
+                        kind: SessionTabKind::Profile("claude-sub".to_owned()),
+                        conversation: Some("c-42".to_owned()),
+                        opened: 200,
+                    },
+                ],
+            },
+            SessionProject {
+                id: id("moth"),
+                active_tab: 0,
+                tabs: vec![SessionTab { kind: SessionTabKind::Shell, conversation: None, opened: 300 }],
+            },
+        ],
+    }
+}
+
+/// The projects of `session` brought back into a screen of those projects, the way the
+/// application does it, without the work the screen asks for being run.
+fn restored(session: &Session) -> (ProjectScreen, Vec<Scratch>) {
+    let (mut screen, scratches) = several(&[("firefly", "Firefly"), ("moth", "Moth")]);
+    for (index, record) in session.projects.iter().enumerate() {
+        screen.restore_tabs(index, record);
+    }
+    screen.set_active(session.active_index());
+    drop(super::opened(&mut screen));
+    (screen, scratches)
+}
+
+fn state(screen: &ProjectScreen, project: usize, tab: usize) -> TabState {
+    screen.projects()[project].tabs()[tab].state().clone()
+}
+
+#[test]
+fn a_restored_screen_is_the_session_it_came_from() {
+    let session = recorded();
+    let (screen, _scratches) = restored(&session);
+    assert_eq!(screen.session(), session, "order, open project, tabs, open tab, conversation and time");
+    assert_eq!(screen.project().map(OpenProject::name), Some("Moth"));
+    let firefly = &screen.projects()[0];
+    assert_eq!(firefly.active_tab().map(Tab::conversation), Some(Some("c-42")));
+    assert_eq!(firefly.tabs()[0].opened(), 100);
+}
+
+#[test]
+fn restored_tabs_wait_until_they_are_shown() {
+    let (mut screen, _scratches) = restored(&recorded());
+    assert_eq!(state(&screen, 1, 0), TabState::Starting, "the tab in view starts at once");
+    assert_eq!(state(&screen, 0, 0), TabState::Waiting, "the ones out of view do not");
+    assert_eq!(state(&screen, 0, 1), TabState::Waiting);
+
+    apply(&mut screen, Msg::OpenProject(0));
+    assert_eq!(state(&screen, 0, 1), TabState::Starting, "opening the project shows its open tab");
+    assert_eq!(state(&screen, 0, 0), TabState::Waiting, "but not the tab beside it");
+
+    apply(&mut screen, Msg::OpenTab(0));
+    assert_eq!(state(&screen, 0, 0), TabState::Starting, "switching to it starts it");
+}
+
+#[test]
+fn closing_the_open_tab_starts_the_waiting_one_that_takes_its_place() {
+    let (mut screen, _scratches) = restored(&recorded());
+    apply(&mut screen, Msg::OpenProject(0));
+    apply(&mut screen, Msg::CloseTab(1));
+    assert_eq!(state(&screen, 0, 0), TabState::Starting);
+}
+
+#[test]
+fn a_restored_tab_whose_profile_is_gone_is_left_out() {
+    let mut session = recorded();
+    session.projects[0].tabs[1].kind = SessionTabKind::Profile("gone".to_owned());
+    let (screen, _scratches) = restored(&session);
+    let firefly = &screen.projects()[0];
+    assert_eq!(firefly.tabs().len(), 1, "only the shell comes back");
+    assert_eq!(firefly.active_tab().map(Tab::opened), Some(100), "and the tab before the lost one is open");
+}
+
+#[test]
+fn without_an_engine_a_restored_tab_waits_and_says_why() {
+    let scratch = Scratch::new("restored-no-engine");
+    let projects = vec![project("firefly", "Firefly", scratch.paths(), Vec::new())];
+    let mut screen = ProjectScreen::new(None, HostUser::ImageDefault, projects);
+    let mut session = recorded();
+    session.projects.truncate(1);
+    session.projects[0].tabs.truncate(1);
+    session.projects[0].active_tab = 0;
+    screen.restore_tabs(0, &session.projects[0]);
+    let harness = harness(screen, SIZE.0, SIZE.1);
+    assert_eq!(state(&harness.app().0, 0, 0), TabState::Waiting);
+    let text = harness.screen();
+    assert!(text.contains("not started yet"), "{text}");
+    assert!(text.contains("No container engine was found"), "{text}");
+}
+
+#[test]
+fn a_project_joins_the_rail_once_and_is_opened_when_it_is_there_already() {
+    let (mut screen, scratches) = several(&[("firefly", "Firefly")]);
+    open(&mut screen, Choice::Shell);
+    let tab = key(&screen, 0);
+    let moth = Scratch::new("moth");
+    drop(super::add(&mut screen, project("moth", "Moth", moth.paths(), Vec::new())));
+    let names: Vec<&str> = screen.projects().iter().map(OpenProject::name).collect();
+    assert_eq!(names, ["Firefly", "Moth"], "it joins at the end of the rail");
+    assert_eq!(screen.project().map(OpenProject::name), Some("Moth"), "and is the one open");
+
+    drop(super::add(&mut screen, project("firefly", "Firefly", scratches[0].paths(), Vec::new())));
+    assert_eq!(screen.projects().len(), 2, "a project already there is not added twice");
+    assert_eq!(screen.project().map(OpenProject::name), Some("Firefly"));
+    assert_eq!(key(&screen, 0), tab, "and its tabs are the ones it had");
+}
+
+#[test]
+fn closing_a_project_ends_its_sessions_and_opens_the_next() {
+    let (mut screen, _scratches) = several(&[("firefly", "Firefly"), ("moth", "Moth"), ("lantern", "Lantern")]);
+    screen.set_active(1);
+    open(&mut screen, Choice::Shell);
+    // A real session on the host, standing in for the one a tab holds in its container, so its
+    // end can be watched for.
+    let session =
+        qframe::widgets::TerminalSession::spawn(std::ffi::OsStr::new("sleep"), &["30"], &std::env::temp_dir())
+            .expect("sleep runs");
+    let watch = session.watch();
+    screen.projects[1].tabs[0].attached(session);
+
+    apply(&mut screen, Msg::CloseProject(1));
+    let names: Vec<&str> = screen.projects().iter().map(OpenProject::name).collect();
+    assert_eq!(names, ["Firefly", "Lantern"]);
+    assert_eq!(screen.project().map(OpenProject::name), Some("Lantern"), "the next project is open");
+    let ended = std::thread::spawn(move || {
+        loop {
+            if let TerminalEvent::Exited(_) = watch.next() {
+                return true;
+            }
+        }
+    });
+    assert!(ended.join().unwrap_or(false), "the tab's session was ended");
+
+    apply(&mut screen, Msg::CloseProject(1));
+    apply(&mut screen, Msg::CloseProject(0));
+    assert!(screen.project().is_none(), "the last one can go too");
+    assert_eq!(screen.session(), Session::default());
+}
+
+#[test]
+fn the_rail_ends_in_a_plus_that_asks_for_the_list_of_projects() {
+    let (screen, _scratches) = several(&[("firefly", "Firefly")]);
+    let mut harness = harness(screen, SIZE.0, SIZE.1);
+    let text = harness.screen();
+    let plus = text.lines().position(|line| line.chars().take(4).any(|cell| cell == '+'));
+    let Some(row) = plus else { panic!("the rail carries a plus:\n{text}") };
+    let row = i32::try_from(row).expect("a row of the screen");
+    harness.hover(1, row);
+    assert!(harness.screen().contains("Open a project"), "its card says what it does:\n{}", harness.screen());
+    harness.set_locale("tr").render();
+    assert!(harness.screen().contains("Proje aç"), "{}", harness.screen());
+}
+
+#[test]
+fn with_no_project_left_the_middle_offers_to_open_one() {
+    let (mut screen, _scratches) = several(&[("firefly", "Firefly")]);
+    apply(&mut screen, Msg::CloseProject(0));
+    let mut harness = harness(screen, SIZE.0, SIZE.1);
+    let text = harness.screen();
+    assert!(text.contains("No project is open"), "{text}");
+    assert!(text.contains("Open a project"), "{text}");
+    for mode in [GlyphMode::Nerd, GlyphMode::Unicode, GlyphMode::Ascii] {
+        harness.set_glyph_mode(mode).render();
+        let text = harness.screen();
+        for forbidden in ['[', ']', '{', '}', '|', '┌', '─', '│'] {
+            assert!(!text.contains(forbidden), "`{forbidden}` in {mode:?}:\n{text}");
+        }
+    }
+    harness.set_glyph_mode(GlyphMode::Ascii).render();
+    assert!(harness.screen().is_ascii(), "{}", harness.screen());
+    harness.set_locale("tr").render();
+    assert!(harness.screen().contains("Proje aç"), "{}", harness.screen());
+}
+
+#[test]
+fn a_blank_tab_comes_back_blank_and_never_starts() {
+    let mut session = recorded();
+    session.projects[1].tabs.push(SessionTab { kind: SessionTabKind::New, conversation: None, opened: 400 });
+    session.projects[1].active_tab = 1;
+    let (mut screen, _scratches) = restored(&session);
+    assert_eq!(screen.session(), session, "a blank tab is kept in the session like any other");
+    assert_eq!(state(&screen, 1, 1), TabState::Waiting, "shown, it still has nothing to start");
+    assert_eq!(super::entry(&screen), "project-choices", "its page takes the keyboard");
+    apply(&mut screen, Msg::OpenTab(0));
+    apply(&mut screen, Msg::OpenTab(1));
+    assert_eq!(state(&screen, 1, 1), TabState::Waiting, "coming back to it starts nothing either");
+    assert!(screen.launch_command(key(&screen, 1)).is_none());
+}
+
+#[test]
+fn the_page_has_no_brackets_or_frames_in_any_glyph_mode_and_reads_as_turkish() {
+    let scratch = Scratch::new("page-look");
+    let open = OpenProject::new(
+        &file("firefly", "Firefly", &["claude-sub"]),
+        scratch.paths(),
+        vec![profile("claude-sub", HarnessKind::ClaudeCode), profile("opencode", HarnessKind::OpenCode)],
+    );
+    let mut screen = ProjectScreen::new(Some(engine()), HostUser::ImageDefault, vec![open]);
+    apply(&mut screen, Msg::NewTab);
+    let mut harness = harness(screen, SIZE.0, SIZE.1);
+    for mode in [GlyphMode::Nerd, GlyphMode::Unicode, GlyphMode::Ascii] {
+        harness.set_glyph_mode(mode).render();
+        let text = harness.screen();
+        for forbidden in ['[', ']', '{', '}', '|', '┌', '─', '│'] {
+            assert!(!text.contains(forbidden), "`{forbidden}` in {mode:?}:\n{text}");
+        }
+        assert!(text.contains("New chat"), "{text}");
+    }
+    let text = harness.screen();
+    assert!(text.is_ascii(), "ASCII draws nothing but ASCII:\n{text}");
+    assert!(text.contains("claude-sub - Claude Code"), "the heading keeps its separator in ASCII:\n{text}");
+
+    harness.set_glyph_mode(GlyphMode::Unicode).set_locale("tr").render();
+    let text = harness.screen();
+    for label in
+        ["Yeni sekmede ne açılsın?", "Kabuk", "projenin kendi kapsayıcısında", "Yeni sohbet", "projeye eklenir"]
+    {
+        assert!(text.contains(label), "`{label}` is missing:\n{text}");
+    }
+    assert!(text.contains("Yeni sekme"), "the tab's own label:\n{text}");
+}
+
+/// The project screen inside an application that turns the key list's action into a message of
+/// its own, the way QCode does, and remembers that it came.
+struct Keyed {
+    screen: ProjectScreen,
+    help: usize,
+}
+
+/// What [`Keyed`] hears: the screen's own messages, or the key list being asked for.
+#[derive(Debug, Clone)]
+enum KeyedMsg {
+    Screen(Msg),
+    Help,
+}
+
+impl App for Keyed {
+    type Msg = KeyedMsg;
+
+    fn update(&mut self, message: KeyedMsg) -> Command<KeyedMsg> {
+        match message {
+            KeyedMsg::Screen(message) => super::update(&mut self.screen, message).map(KeyedMsg::Screen),
+            KeyedMsg::Help => {
+                self.help += 1;
+                Command::none()
+            }
+        }
+    }
+
+    fn view(&self, ui: &mut View<'_, KeyedMsg>) {
+        super::view(&self.screen, ui, KeyedMsg::Screen, |_| {}, |_| {});
+    }
+
+    fn action(&self, name: &str) -> Option<KeyedMsg> {
+        match name {
+            "help" => Some(KeyedMsg::Help),
+            "leave-terminal" => Some(KeyedMsg::Screen(Msg::LeaveTerminal)),
+            _ => None,
+        }
+    }
+}
+
+/// A screen whose one tab is a running shell tab, attached to `script` run by `sh` on this
+/// machine in place of a container: what the terminal does with keys and the mouse is the same
+/// whatever runs in it.
+fn running(scratch: &Scratch, script: &str) -> (ProjectScreen, TerminalSession) {
+    let mut screen = one_project(scratch);
+    open(&mut screen, Choice::Shell);
+    let key = key(&screen, 0);
+    let session =
+        TerminalSession::spawn("/bin/sh".as_ref(), &["-c", script], Path::new("/")).expect("a terminal for the shell");
+    let (_, tab) = screen.owner_mut(key).and_then(|project| project.find(key)).expect("the tab is open");
+    tab.attached(session.clone());
+    (screen, session)
+}
+
+/// Waits until the program's screen, as the harness draws it, shows `text`.
+fn wait_for(harness: &mut Harness<Keyed>, text: &str) {
+    let started = std::time::Instant::now();
+    while !harness.render().screen().contains(text) {
+        assert!(started.elapsed() < Duration::from_secs(10), "{}", harness.screen());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A harness of [`Keyed`] with the terminal of the running tab focused.
+fn keyed(screen: ProjectScreen) -> Harness<Keyed> {
+    let mut harness = Harness::with_env(Keyed { screen, help: 0 }, env(), SIZE.0, SIZE.1);
+    harness.set_locale("en").set_glyph_mode(GlyphMode::Unicode);
+    wait_for(&mut harness, "ready");
+    for _ in 0..16 {
+        if harness.is_focused("project-terminal") {
+            break;
+        }
+        harness.press("tab");
+    }
+    assert!(harness.is_focused("project-terminal"), "{}", harness.screen());
+    harness
+}
+
+#[test]
+fn a_focused_harness_lets_the_key_list_and_the_panel_key_through_but_types_a_question_mark() {
+    let scratch = Scratch::new("pass-through");
+    // The program shows, in hex, the first four bytes it receives.
+    let (screen, session) = running(&scratch, "stty raw -echo; printf 'ready '; head -c 4 | od -An -tx1");
+    let mut harness = keyed(screen);
+    assert!(harness.app().screen.panel().is_open(), "the panel starts open");
+
+    harness.press("f1");
+    assert_eq!(harness.app().help, 1, "f1 opens the key list from inside the harness");
+    harness.press("alt+b");
+    assert!(!harness.app().screen.panel().is_open(), "the panel's key closes it from inside the harness");
+    assert!(harness.is_focused("project-terminal"), "and the harness keeps the keyboard");
+
+    harness.press("?").type_text("abc");
+    wait_for(&mut harness, "3f 61 62 63");
+    assert_eq!(harness.app().help, 1, "`?` is typed into the program, not taken for the key list");
+    session.kill();
+}
+
+#[test]
+fn a_click_on_a_harness_that_asks_for_the_mouse_reaches_it() {
+    let scratch = Scratch::new("mouse");
+    // The program turns on mouse reporting in the SGR encoding and shows, in hex, the first
+    // three bytes it receives: a report starts with ESC [ <.
+    let script = "stty raw -echo; printf '\\033[?1000h\\033[?1006hready '; head -c 3 | od -An -tx1";
+    let (screen, session) = running(&scratch, script);
+    let mut harness = keyed(screen);
+    let (x, y) = harness.find("ready").expect("the program's screen is drawn");
+    harness.click(x + 1, y);
+    wait_for(&mut harness, "1b 5b 3c");
+    session.kill();
+}
+
+#[test]
+fn ctrl_alt_space_takes_the_keyboard_from_the_harness_to_the_tabs() {
+    let scratch = Scratch::new("leave-terminal");
+    // The program shows, in hex, the first four bytes it receives: the chord must not be one.
+    let (screen, session) = running(&scratch, "stty raw -echo; printf 'ready '; head -c 4 | od -An -tx1");
+    let mut harness = keyed(screen);
+
+    harness.press("ctrl+alt+space");
+    assert!(harness.is_focused("project-tabs"), "the tab strip has the keyboard:\n{}", harness.screen());
+    harness.press("ctrl+alt+space");
+    assert!(harness.is_focused("project-tabs"), "away from the harness the key keeps it there");
+
+    for _ in 0..16 {
+        if harness.is_focused("project-terminal") {
+            break;
+        }
+        harness.press("tab");
+    }
+    harness.type_text("abcd");
+    wait_for(&mut harness, "61 62 63 64");
+    session.kill();
 }

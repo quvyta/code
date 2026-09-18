@@ -9,9 +9,13 @@ tagline = "Coding harnesses, always inside a container"
 back = "Back"
 stopped = "It was stopped."
 keys = "Keys"
+session-gone = { one = "A project of the last session is gone", other = "{n} projects of the last session are gone" }
+session-broken = "Only part of the last session could be read"
+session-unsaved = "The open projects could not be remembered"
 
 [home]
-last-project = "Last project"
+continue = "Continue"
+continue-detail = { one = "{first}", other = "{first} +{more}" }
 new-project = "New project"
 projects = "Projects"
 profiles = "Profiles"
@@ -25,6 +29,8 @@ open = "open"
 # Labels of QCode's own keymap actions, as the key list shows them.
 [keys]
 back = "leave this screen"
+new-tab = "open a new tab"
+leave-terminal = "from the harness to the tabs"
 
 
 [setup]
@@ -228,6 +234,8 @@ add-failed = "The profile could not be recorded in project.qcode"
 no-engine = "No container engine was found, so nothing can be opened. Repair it in Settings."
 none.title = "No project is open"
 none.message = "Open a project and its tabs, files and containers appear here."
+none.open = "Open a project"
+waiting = "This tab has not started yet"
 empty.title = "No tab is open"
 empty.message = "A tab is a shell in this project's container, or a harness from one of its profiles."
 starting = "Starting the container…"
@@ -237,7 +245,18 @@ ended-code = "The session in the container ended with code {code}."
 stopped = "The container stopped, so this tab lost its ground."
 failed = "The engine refused."
 tab.shell = "Shell"
-tab.adds = "{harness}, adds to project"
+choose.title = "What should this tab open?"
+choose.shell-detail = "in the project's own container"
+choose.section = "{profile} {dot} {harness}"
+choose.section-adds = "{profile} {dot} {harness} {dot} adds to project"
+choose.new-chat = "New chat"
+history.untitled = "Untitled chat"
+history.today = "today {time}"
+history.yesterday = "yesterday {time}"
+history.show-all = "Show all {dot} {more} more"
+history.none = "No chats yet"
+history.reading = "Reading…"
+history.unread = "The chats could not be read"
 hints.tabs = "tabs"
 hints.close = "close tab"
 hints.leave = "leave the terminal"
@@ -343,3 +362,8 @@ repaired = "The settings file was repaired"
 repaired-text = "QCode read the file and put back what it could not use. Nothing it understood was lost."
 repaired-dismiss = "Got it"
 store-failed = "The change was not written to the settings file: {reason}"
+
+# The framework's own words, where QCode means something narrower by them: the one rail of
+# QCode holds projects, so its add row opens a project rather than a tab.
+[quvyta.tab-rail]
+add = "Open a project"

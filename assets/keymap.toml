@@ -7,10 +7,18 @@
 
 [app]
 back = "esc"
+# A blank tab on the project screen, the way a browser opens one. A focused terminal keeps the
+# key for the program inside it.
+new-tab = "ctrl+t"
+# From a harness back to QCode: the keyboard moves to the tab strip, where the arrows switch tabs
+# and Tab walks on. Terminals do not report a lone ctrl+alt tap without losing AltGr characters
+# such as `@` on a Turkish keyboard; this is the nearest chord every terminal sends as it is.
+leave-terminal = "ctrl+alt+space"
 
 # The list of every key. `?` is the framework's own key for it; F1 is the key help has
 # everywhere else, and it still works while a text field has the keyboard and takes `?` as text.
-# A harness tab's terminal takes both for the program inside it; there the hint in the corner is
-# clicked, or `shift+tab` leaves the terminal first.
+# A harness tab's terminal keeps `?` for the program inside it, since it is typed text, and lets
+# F1 through, as it does the side panel's key. The sign-in terminal on the profiles screen takes
+# both; there the hint in the corner is clicked, or `shift+tab` leaves the terminal first.
 [global]
 help = ["?", "f1"]
