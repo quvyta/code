@@ -396,6 +396,21 @@ fn steps(state: Option<&ContainerState>) -> Steps {
 ///
 /// When the engine cannot be started, or refuses to start the container or to run the script.
 pub fn read(engine: &Engine, container: &str, harness: HarnessKind) -> Result<Vec<Conversation>, EngineError> {
+    read_starting(engine, container, harness, &mut || {})
+}
+
+/// [`read`], calling `started` when the container was stopped and had to be started for it, so
+/// the caller can note a container QCode left running.
+///
+/// # Errors
+///
+/// When the engine cannot be started, or refuses to start the container or to run the script.
+pub fn read_starting(
+    engine: &Engine,
+    container: &str,
+    harness: HarnessKind,
+    started: &mut dyn FnMut(),
+) -> Result<Vec<Conversation>, EngineError> {
     let reading = reading(engine, container, harness);
     // Both engines answer a name they do not know with an error rather than with a state.
     let state = capture(&reading.state).ok().map(|word| ContainerState::parse(&word));
@@ -404,6 +419,7 @@ pub fn read(engine: &Engine, container: &str, harness: HarnessKind) -> Result<Ve
         Steps::List => {}
         Steps::StartThenList => {
             capture(&reading.start)?;
+            started();
         }
     }
     Ok(parse(&capture(&reading.list)?))

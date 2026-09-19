@@ -1,12 +1,14 @@
 //! The workspace: where QCode's settings, projects and profiles live on disk.
 //!
-//! Five things live here, and each of them is readable without ever panicking:
+//! Six things live here, and each of them is readable without ever panicking:
 //!
 //! - [`HostDirs`] holds the default workspace location, which the framework works out.
 //! - [`Config`] is the application's `code.conf`, checked and repaired by a [`Schema`].
 //! - [`ProjectId`] turns a display name into a name every file system accepts.
 //! - [`Workspace`] creates and reads the folder tree of the workspace and its projects.
 //! - [`Session`] records which projects and tabs were open, so they can be opened again.
+//! - [`Registry`] records the containers QCode started, so they can be stopped once no QCode is
+//!   open.
 //!
 //! Every loader answers with a [`Loaded`]: the part that could be used, plus a
 //! [`Diagnostic`] for each problem, pointing at the file, line and column where it is.
@@ -14,13 +16,15 @@
 //! [`Schema`]: qframe::storage::Schema
 
 mod config;
+mod containers;
 mod identity;
 mod layout;
 mod paths;
 mod project;
 mod session;
 
-pub use config::{Config, SetupStep};
+pub use config::{Config, OnClose, SetupStep};
+pub use containers::{PREFIX, Registered, Registry};
 pub use identity::{ProjectId, ProjectIdError};
 pub use layout::{NewProjectError, ProjectEntry, ProjectPaths, Workspace, add_profile};
 pub use paths::{APP_TITLE, HostDirs, Platform};

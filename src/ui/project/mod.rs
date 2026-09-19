@@ -15,11 +15,13 @@
 //! without naming anything of the application.
 
 mod blank;
+mod file_ops;
 mod files;
 mod history;
 mod panel;
 mod plan;
 mod tab;
+mod watch;
 
 #[cfg(test)]
 mod live;
@@ -27,7 +29,8 @@ mod live;
 mod tests;
 
 pub use blank::Choice;
-pub use files::{FileEntry, FileTree};
+pub use file_ops::{Change, FileError, NameProblem};
+pub use files::{DocumentTrouble, FileEntry, FileMsg, FileTree, NameFor, Naming};
 pub use history::HistoryKey;
 pub use panel::{Panel, PanelWidget};
 pub use plan::{ASSETS_DIR, ContainerPlan, HOME_DIR, KEEP_ALIVE, LaunchFailure, PROJECT_DIR, SHELL};
@@ -41,16 +44,20 @@ use qframe::icons::Icons;
 use qframe::keymap::KeyChord;
 use qframe::prelude::*;
 use qframe::runtime::Task;
+use qframe::storage::FolderChange;
 use qframe::widgets::{
-    CollapsedMarker, EmptyState, RailTab, Side, SidePanel, Spinner, TabEdit, TabRail, TabWidth, Terminal,
-    TerminalEvent, TerminalSession, Toast, Tooltip,
+    CollapsedMarker, EmptyState, Markdown, RailTab, ScrollView, Side, SidePanel, Spinner, TabEdit, TabRail, TabWidth,
+    Terminal, TerminalEvent, TerminalSession, Toast,
 };
 
-use crate::engine::{Container, Engine, EngineCommand, HostUser};
+use std::path::{Path, PathBuf};
+
+use crate::base::apps::{self, Editor, FileKind};
+use crate::engine::{Container, Engine, EngineCommand, EngineKind, HostUser};
 use crate::profile::Profile;
 use crate::profile::history::Conversation;
 use crate::workspace::{
-    ProjectFile, ProjectId, ProjectPaths, Session, SessionProject, SessionTab, SessionTabKind, add_profile,
+    ProjectFile, ProjectId, ProjectPaths, Registry, Session, SessionProject, SessionTab, SessionTabKind, add_profile,
 };
 
 /// Width of the project rail: the framework's collapsed strip, which is the same four cells on
@@ -68,12 +75,6 @@ const PANEL_WIDTH: u16 = 32;
 const PANEL_MIN: u16 = 18;
 /// Widest the widget panel can be dragged.
 const PANEL_MAX: u16 = 52;
-
-/// The cells the `+` after the tabs takes: its glyph with the button's air on both sides.
-///
-/// The strip leaves exactly this much room at its end, so when the tabs overflow they scroll
-/// beside the `+` instead of pushing it off the row.
-const NEW_TAB_WIDTH: u16 = 5;
 
 /// Everything that can happen on the project screen.
 #[derive(Debug, Clone)]
@@ -100,6 +101,8 @@ pub enum Msg {
     NewTab,
     /// The keyboard was asked out of the harness, onto the tab strip.
     LeaveTerminal,
+    /// The keyboard was asked back into the open tab's harness, from wherever it was.
+    EnterTerminal,
     /// A row of a blank tab's page was chosen: the blank tab of this key turns into it.
     Choose(TabKey, Choice),
     /// The keyboard moved to another row of a blank tab's page.
@@ -153,12 +156,26 @@ pub enum Msg {
     AddWidget(PanelWidget),
     /// A widget was taken off the panel.
     RemoveWidget(PanelWidget),
-    /// An entry of the file tree was selected.
+    /// The cursor of the file tree moved to an entry; what is selected comes as
+    /// [`FileMsg::Choose`].
     SelectFile(String),
     /// A folder of the file tree was opened or closed.
     ExpandFile(String, bool),
     /// A folder of a project's file tree was read.
     FolderRead(String, String, Result<Vec<FileEntry>, String>),
+    /// Something happened to the files of the file tree.
+    Files(FileMsg),
+    /// Other programs changed folders a project's tree shows: the project's id, the number of
+    /// the watch that saw it, and what changed.
+    FilesChanged(String, u64, Vec<FolderChange>),
+    /// A file of the file tree was opened: Enter or a click on it.
+    OpenFile(String),
+    /// A file was asked for in the editor, from the Markdown tab that shows it.
+    EditFile(String),
+    /// The file the tab of this key opens is not in the project any more.
+    Missing(TabKey, u64),
+    /// The document a Markdown tab shows was read, or could not be.
+    DocumentRead(TabKey, u64, Result<String, DocumentTrouble>),
     /// A row of the container widget was selected.
     SelectContainer(usize),
     /// The container widget was asked for the engine's current answer.
@@ -171,6 +188,21 @@ pub enum Msg {
     RestartContainer(String),
     /// An engine command on a container finished.
     ContainerActed(Result<(), LaunchFailure>),
+    /// A container QCode started could not be noted cleanly in the list of the containers it
+    /// started; the message that came with the start follows.
+    Noted(Noting, Box<Msg>),
+}
+
+/// What went wrong noting a container QCode started, so that it can be stopped once no QCode is
+/// open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Noting {
+    /// The list could not be written: the container is not in it, and may keep running after
+    /// QCode closes. The machine's words.
+    Unwritten(String),
+    /// The list was damaged; what could be read of it was kept along with the new name. Where
+    /// it was damaged.
+    Repaired(String),
 }
 
 /// One project the rail can switch to, with its own tabs and its own panel content.
@@ -187,6 +219,8 @@ pub struct OpenProject {
     /// read them.
     history: HashMap<String, history::Shelf>,
     files: FileTree,
+    /// Whether the folders the tree shows are watched for changes other programs make.
+    live: watch::Live,
     containers: Vec<Container>,
     container_row: usize,
     container_error: Option<LaunchFailure>,
@@ -215,6 +249,7 @@ impl OpenProject {
             active_tab: 0,
             history: HashMap::new(),
             files,
+            live: watch::Live::Off,
             containers: Vec::new(),
             container_row: 0,
             container_error: None,
@@ -288,11 +323,15 @@ impl OpenProject {
         &self.containers
     }
 
-    /// The container a tab of `kind` enters.
+    /// The container a tab of `kind` enters. A picture and a file in the editor are opened in
+    /// the project's own container, the one its shell runs in; a Markdown document needs none.
     #[must_use]
     pub fn plan(&self, kind: &TabKind) -> Option<ContainerPlan> {
         match kind {
-            TabKind::Shell => Some(ContainerPlan::base(self.id.as_str(), &self.paths)),
+            TabKind::Shell | TabKind::Image(_) | TabKind::Editor(_) => {
+                Some(ContainerPlan::base(self.id.as_str(), &self.paths))
+            }
+            TabKind::Markdown(_) => None,
             TabKind::Profile(name) => self
                 .profiles
                 .iter()
@@ -302,18 +341,21 @@ impl OpenProject {
         }
     }
 
-    /// What a tab of `kind` runs inside its container: a login shell, or the harness of the
+    /// What a tab of `kind` runs inside its container: a login shell, the harness of the
     /// profile with the arguments that let it work without asking, opening `conversation` when
-    /// the tab shows one and a new conversation otherwise.
+    /// the tab shows one and a new conversation otherwise, chafa drawing a picture, or `editor`
+    /// on a file.
     #[must_use]
-    pub fn program(&self, kind: &TabKind, conversation: Option<&str>) -> Option<Vec<String>> {
+    pub fn program(&self, kind: &TabKind, conversation: Option<&str>, editor: Editor) -> Option<Vec<String>> {
         match kind {
             TabKind::Shell => Some(plan::SHELL.iter().map(|part| (*part).to_owned()).collect()),
             TabKind::Profile(name) => {
                 let profile = self.profiles.iter().find(|profile| profile.name.as_str() == name)?;
                 Some(profile.harness.command_line(conversation))
             }
-            TabKind::New => None,
+            TabKind::Image(file) => Some(apps::picture(&inside_container(file))),
+            TabKind::Editor(file) => Some(editor.command(&inside_container(file))),
+            TabKind::New | TabKind::Markdown(_) => None,
         }
     }
 
@@ -324,6 +366,7 @@ impl OpenProject {
         match tab.kind() {
             TabKind::Profile(name) => name.clone(),
             TabKind::New => t!("project.new-tab"),
+            TabKind::Image(file) | TabKind::Markdown(file) | TabKind::Editor(file) => files::name(file).to_owned(),
             TabKind::Shell => {
                 let shell = t!("project.tab.shell");
                 let position = self.tabs[..index].iter().filter(|tab| tab.kind() == &TabKind::Shell).count() + 1;
@@ -337,6 +380,12 @@ impl OpenProject {
     fn find(&mut self, key: TabKey) -> Option<(usize, &mut Tab)> {
         self.tabs.iter_mut().enumerate().find(|(_, tab)| tab.key() == key)
     }
+}
+
+/// Where the project's file `key` is inside a container: under [`PROJECT_DIR`], which is the
+/// project's own folder mounted.
+fn inside_container(key: &str) -> String {
+    format!("{PROJECT_DIR}/{key}")
 }
 
 /// The project screen.
@@ -354,7 +403,21 @@ pub struct ProjectScreen {
     /// The blank tab whose page was shown last, so showing a page again is told apart from
     /// drawing the same one again.
     shown_blank: Option<TabKey>,
+    /// The Markdown tab that was shown last, so a document is read again when it comes back into
+    /// view and not on every frame it stays there.
+    shown_document: Option<TabKey>,
+    /// The editor a file opens in.
+    editor: Editor,
     next_key: u64,
+    /// Whether the open project's folders are watched, so the tree follows the disk.
+    live: bool,
+    /// The number the last folder watch was given.
+    last_watch: u64,
+    /// Where the containers this screen starts are noted, so they can be stopped once no QCode
+    /// is open; `None` notes nothing.
+    registry: Option<PathBuf>,
+    /// Whether a problem with that list was said already: it is said once, not at every tab.
+    registry_told: bool,
 }
 
 impl ProjectScreen {
@@ -374,8 +437,34 @@ impl ProjectScreen {
             blank_row: 0,
             expanded: HashSet::new(),
             shown_blank: None,
+            shown_document: None,
+            editor: Editor::default(),
             next_key: 0,
+            live: false,
+            last_watch: 0,
+            registry: None,
+            registry_told: false,
         }
+    }
+
+    /// The same screen following the disk when `live` is true: the folders the open project's
+    /// tree shows are watched, and what other programs change in them shows at once.
+    ///
+    /// It is off unless asked for because a watch waits for the disk on a background thread, and
+    /// a test harness runs background work in line, where that wait would never end. Tests of
+    /// the watch take its batches by hand instead.
+    #[must_use]
+    pub fn watching(mut self, live: bool) -> Self {
+        self.live = live;
+        self
+    }
+
+    /// The same screen, noting every container it starts in the list at `path`, which is what
+    /// lets them be stopped once no QCode is open. `None` notes nothing.
+    #[must_use]
+    pub fn with_registry(mut self, path: Option<PathBuf>) -> Self {
+        self.registry = path;
+        self
     }
 
     /// The project the rail has open.
@@ -390,6 +479,18 @@ impl ProjectScreen {
         &self.projects
     }
 
+    /// Makes `editor` the one a file opens in from now on. Tabs already open keep the editor
+    /// they started with until they are opened again.
+    pub fn set_editor(&mut self, editor: Editor) {
+        self.editor = editor;
+    }
+
+    /// The editor a file opens in.
+    #[must_use]
+    pub fn editor(&self) -> Editor {
+        self.editor
+    }
+
     /// Opens the project at `index` of the rail, when there is one there.
     pub fn set_active(&mut self, index: usize) {
         if index < self.projects.len() {
@@ -402,7 +503,9 @@ impl ProjectScreen {
     ///
     /// A profile tab whose profile is gone from the workspace is left out: there is no container
     /// it could enter, and a tab that can only ever fail is not worth bringing back. A blank tab
-    /// comes back blank; it never had a container.
+    /// comes back blank; it never had a container. A tab of one of the project's files comes back
+    /// whether or not the file is still there, and says so when it is shown; one whose path
+    /// climbs out of the project is left out, because nothing QCode wrote would name one.
     pub fn restore_tabs(&mut self, index: usize, record: &SessionProject) {
         let Some(project) = self.projects.get_mut(index) else { return };
         let mut active = 0;
@@ -411,8 +514,16 @@ impl ProjectScreen {
                 SessionTabKind::Shell => TabKind::Shell,
                 SessionTabKind::Profile(name) => TabKind::Profile(name.clone()),
                 SessionTabKind::New => TabKind::New,
+                SessionTabKind::Image(file) => TabKind::Image(file.clone()),
+                SessionTabKind::Markdown(file) => TabKind::Markdown(file.clone()),
+                SessionTabKind::Editor(file) => TabKind::Editor(file.clone()),
             };
-            if kind != TabKind::New && project.plan(&kind).is_none() {
+            let usable = match &kind {
+                TabKind::New => true,
+                TabKind::Image(file) | TabKind::Markdown(file) | TabKind::Editor(file) => files::is_inside(file),
+                TabKind::Shell | TabKind::Profile(_) => project.plan(&kind).is_some(),
+            };
+            if !usable {
                 continue;
             }
             if position <= record.active_tab {
@@ -443,6 +554,9 @@ impl ProjectScreen {
                             TabKind::Shell => SessionTabKind::Shell,
                             TabKind::Profile(name) => SessionTabKind::Profile(name.clone()),
                             TabKind::New => SessionTabKind::New,
+                            TabKind::Image(file) => SessionTabKind::Image(file.clone()),
+                            TabKind::Markdown(file) => SessionTabKind::Markdown(file.clone()),
+                            TabKind::Editor(file) => SessionTabKind::Editor(file.clone()),
                         },
                         conversation: tab.conversation().map(str::to_owned),
                         opened: tab.opened(),
@@ -475,7 +589,7 @@ impl ProjectScreen {
         let project = self.projects.iter().find(|project| project.tabs.iter().any(|tab| tab.key() == key))?;
         let tab = project.tabs.iter().find(|tab| tab.key() == key)?;
         let plan = project.plan(tab.kind())?;
-        let program = project.program(tab.kind(), tab.conversation())?;
+        let program = project.program(tab.kind(), tab.conversation(), self.editor)?;
         let parts: Vec<&str> = program.iter().map(String::as_str).collect();
         Some(plan.enter(engine, &parts))
     }
@@ -524,7 +638,8 @@ impl ProjectScreen {
 /// waiting to be shown, and reads the conversations a blank tab's page offers when the open tab
 /// is one.
 pub fn opened(screen: &mut ProjectScreen) -> Command<Msg> {
-    Command::batch([load_root(screen), list_containers(screen), wake(screen), show_page(screen, true)])
+    let command = Command::batch([load_root(screen), list_containers(screen), wake(screen), show_page(screen, true)]);
+    Command::batch([command, follow_disk(screen)])
 }
 
 /// Adds `project` to the rail and opens it, or only opens it when the rail has it already; the
@@ -549,7 +664,22 @@ pub fn update(screen: &mut ProjectScreen, message: Msg) -> Command<Msg> {
     // Profiles read again may be new ones, whose conversations the page shown has not read.
     let profiles = matches!(message, Msg::Profiles(_));
     let command = apply(screen, message);
-    Command::batch([command, wake(screen), show_page(screen, profiles)])
+    Command::batch([command, wake(screen), show_page(screen, profiles), reread(screen), follow_disk(screen)])
+}
+
+/// Keeps the open project's watch on the folders its tree shows, whatever the message changed
+/// about them, and lets the watches of the other projects go: their trees are not on screen, and
+/// they are read again when they are opened.
+fn follow_disk(screen: &mut ProjectScreen) -> Command<Msg> {
+    let mut commands = Vec::new();
+    for (index, project) in screen.projects.iter_mut().enumerate() {
+        if screen.live && index == screen.active {
+            commands.push(watch::follow(project, &mut screen.last_watch));
+        } else {
+            watch::stop(project);
+        }
+    }
+    Command::batch(commands)
 }
 
 /// Applies a message to the screen, leaving the start of a waiting tab to [`update`].
@@ -596,6 +726,12 @@ fn apply(screen: &mut ProjectScreen, message: Msg) -> Command<Msg> {
         // The strip, because from there the arrows switch tabs and Tab reaches the rest of the
         // screen, the terminal included.
         Msg::LeaveTerminal => Command::focus(TABS_ID),
+        // Only a tab with a terminal on it has somewhere to go back into; on a blank or a
+        // Markdown tab the key does nothing rather than send the keyboard nowhere.
+        Msg::EnterTerminal => {
+            let terminal = screen.project().and_then(OpenProject::active_tab).and_then(Tab::session).is_some();
+            if terminal { Command::focus(TERMINAL_ID) } else { Command::none() }
+        }
         Msg::Choose(key, choice) => choose(screen, key, choice),
         Msg::HighlightChoice(row) => {
             screen.blank_row = row;
@@ -703,7 +839,7 @@ fn apply(screen: &mut ProjectScreen, message: Msg) -> Command<Msg> {
         }
         Msg::SelectFile(key) => {
             if let Some(project) = screen.projects.get_mut(screen.active) {
-                project.files.select(&key);
+                project.files.move_cursor(&key);
             }
             Command::none()
         }
@@ -718,6 +854,30 @@ fn apply(screen: &mut ProjectScreen, message: Msg) -> Command<Msg> {
             if let Some(project) = screen.project_mut(&project) {
                 project.files.read(&key, entries);
             }
+            Command::none()
+        }
+        Msg::Files(message) => files::update(screen, message),
+        Msg::FilesChanged(id, run, batch) => match screen.project_mut(&id) {
+            Some(project) => watch::changed(project, run, batch),
+            None => Command::none(),
+        },
+        Msg::OpenFile(key) => open_file(screen, &key),
+        Msg::EditFile(key) => {
+            if !files::is_inside(&key) {
+                return Command::none();
+            }
+            open_tab(screen, TabKind::Editor(key))
+        }
+        Msg::Missing(key, run) => {
+            if let Some((_, tab)) = screen.owner_mut(key).and_then(|project| project.find(key))
+                && tab.run() == run
+            {
+                tab.settled(TabState::Missing);
+            }
+            Command::none()
+        }
+        Msg::DocumentRead(key, run, answer) => {
+            document_read(screen, key, run, answer);
             Command::none()
         }
         Msg::SelectContainer(index) => {
@@ -743,6 +903,19 @@ fn apply(screen: &mut ProjectScreen, message: Msg) -> Command<Msg> {
         }
         Msg::StopContainer(name) => container_action(screen, &name, false),
         Msg::RestartContainer(name) => container_action(screen, &name, true),
+        Msg::Noted(noting, message) => {
+            let told = if screen.registry_told {
+                Command::none()
+            } else {
+                screen.registry_told = true;
+                let toast = match noting {
+                    Noting::Unwritten(reason) => Toast::warning(t!("project.registry-unwritten")).body(reason),
+                    Noting::Repaired(place) => Toast::warning(t!("project.registry-repaired")).body(place),
+                };
+                Command::toast(toast)
+            };
+            Command::batch([told, update(screen, *message)])
+        }
         Msg::ContainerActed(result) => {
             let refresh = list_containers(screen);
             match result {
@@ -774,6 +947,7 @@ fn open_blank(screen: &mut ProjectScreen) -> Command<Msg> {
 fn choose(screen: &mut ProjectScreen, key: TabKey, choice: Choice) -> Command<Msg> {
     let Some(engine) = screen.engine.clone() else { return Command::none() };
     let user = screen.user;
+    let registry = screen.registry.clone();
     let Some(project) = screen.owner_mut(key) else { return Command::none() };
     let (kind, conversation) = match choice {
         Choice::Shell => (TabKind::Shell, None),
@@ -793,7 +967,9 @@ fn choose(screen: &mut ProjectScreen, key: TabKey, choice: Choice) -> Command<Ms
     tab.choose(kind, conversation);
     let run = tab.run();
     Command::batch([
-        Command::perform(move || Msg::Ready(key, run, plan::ensure_running(&engine, &plan, user))),
+        Command::perform(move || {
+            start(registry.as_deref(), &engine, &plan, user, |result| Msg::Ready(key, run, result))
+        }),
         Command::focus(TERMINAL_ID),
         record,
     ])
@@ -824,14 +1000,25 @@ fn record_profile(project: &OpenProject, name: &str) -> Command<Msg> {
 /// its container is up the profile's conversations are read, and [`resume_newest`] gives the
 /// tab the one it was most likely showing before its session is spawned.
 fn wake(screen: &mut ProjectScreen) -> Command<Msg> {
-    let Some(engine) = screen.engine.clone() else { return Command::none() };
-    let user = screen.user;
     let Some(project) = screen.projects.get_mut(screen.active) else { return Command::none() };
-    let Some(tab) = project.tabs.get(project.active_tab) else { return Command::none() };
+    let Some(tab) = project.tabs.get_mut(project.active_tab) else { return Command::none() };
     if tab.state() != &TabState::Waiting {
         return Command::none();
     }
+    // A Markdown document is read from the disk by QCode itself, so it opens with or without an
+    // engine.
+    if let TabKind::Markdown(file) = tab.kind() {
+        let file = file.clone();
+        tab.wake();
+        let (key, run) = (tab.key(), tab.run());
+        return read_document(project, key, run, &file);
+    }
+    let Some(engine) = screen.engine.clone() else { return Command::none() };
+    let user = screen.user;
+    let registry = screen.registry.clone();
+    let Some(tab) = project.tabs.get(project.active_tab) else { return Command::none() };
     let Some(plan) = project.plan(tab.kind()) else { return Command::none() };
+    let file = tab.kind().file().map(|file| project.files.path(file));
     let harness = match tab.kind() {
         TabKind::Profile(name) if tab.conversation().is_none() => {
             project.profiles.iter().find(|profile| profile.name.as_str() == name).map(|profile| profile.harness)
@@ -842,13 +1029,16 @@ fn wake(screen: &mut ProjectScreen) -> Command<Msg> {
     tab.wake();
     let (key, run) = (tab.key(), tab.run());
     match harness {
-        None => Command::perform(move || Msg::Ready(key, run, plan::ensure_running(&engine, &plan, user))),
+        None => bring_up(engine, plan, user, key, run, file, registry),
         Some(harness) => Command::perform(move || {
-            let result = plan::ensure_running(&engine, &plan, user);
-            // Not being able to read only means the tab cannot be matched to its conversation;
-            // it then starts a new one, the way it started last time.
-            let found = result.is_ok().then(|| history::read(&engine, &plan.name, harness).ok()).flatten();
-            Msg::Woken(key, run, result, found)
+            start(registry.as_deref(), &engine, &plan, user, |result| {
+                // Not being able to read only means the tab cannot be matched to its
+                // conversation; it then starts a new one, the way it started last time. The
+                // container is up by now, so reading it starts nothing.
+                let found =
+                    result.is_ok().then(|| history::read(&engine, &plan.name, harness, &mut || {}).ok()).flatten();
+                Msg::Woken(key, run, result, found)
+            })
         }),
     }
 }
@@ -892,15 +1082,21 @@ fn show_page(screen: &mut ProjectScreen, again: bool) -> Command<Msg> {
         return Command::none();
     }
     let Some(engine) = screen.engine.clone() else { return Command::none() };
+    let registry = screen.registry.clone();
     let Some(project) = screen.projects.get_mut(screen.active) else { return Command::none() };
     let mut commands = Vec::new();
     for profile in &project.profiles {
         let key = HistoryKey { project: project.id.as_str().to_owned(), profile: profile.name.as_str().to_owned() };
         let generation = project.history.entry(key.profile.clone()).or_default().start();
         let container = ContainerPlan::profile(&project.id, &project.paths, profile).name;
-        let (engine, harness, answer) = (engine.clone(), profile.harness, key.clone());
+        let (engine, harness, answer, registry) = (engine.clone(), profile.harness, key.clone(), registry.clone());
         commands.push(Command::perform(move || {
-            Msg::HistoryRead(answer, generation, history::read(&engine, &container, harness))
+            // Reading a stopped container starts it and leaves it running for the tab that opens
+            // a conversation from it, so it is noted like any container QCode starts.
+            let mut started = false;
+            let read = history::read(&engine, &container, harness, &mut || started = true);
+            let message = Msg::HistoryRead(answer, generation, read);
+            if started { noted(registry.as_deref(), engine.kind(), &container, message) } else { message }
         }));
         commands.push(after(history::SHOW_AFTER, Msg::HistorySlow(key, generation)));
     }
@@ -914,17 +1110,161 @@ fn after(delay: std::time::Duration, message: Msg) -> Command<Msg> {
     }))
 }
 
-/// Starts the tab `key` again, from its container upwards.
+/// Starts the tab `key` again, from its container upwards; a Markdown tab reads its file again.
 fn restart_tab(screen: &mut ProjectScreen, key: TabKey) -> Command<Msg> {
-    let Some(engine) = screen.engine.clone() else { return Command::none() };
+    let engine = screen.engine.clone();
     let user = screen.user;
+    let registry = screen.registry.clone();
     let Some(project) = screen.owner_mut(key) else { return Command::none() };
     let Some((_, tab)) = project.find(key) else { return Command::none() };
+    let kind = tab.kind().clone();
+    if let TabKind::Markdown(file) = &kind {
+        tab.restarting();
+        let run = tab.run();
+        return read_document(project, key, run, file);
+    }
+    let Some(engine) = engine else { return Command::none() };
     tab.restarting();
     let run = tab.run();
-    let kind = tab.kind().clone();
     let Some(plan) = project.plan(&kind) else { return Command::none() };
-    Command::perform(move || Msg::Ready(key, run, plan::ensure_running(&engine, &plan, user)))
+    let file = kind.file().map(|file| project.files.path(file));
+    bring_up(engine, plan, user, key, run, file, registry)
+}
+
+/// Brings the container of `plan` up for the tab `key` in its run `run`, on a background thread.
+///
+/// A tab that opens one of the project's files first looks for the file at `file` on this
+/// machine: an editor started on a file that is gone would open an empty one of that name and
+/// save it back, which is not what the tab promised, so the tab says the file is gone instead.
+fn bring_up(
+    engine: Engine,
+    plan: ContainerPlan,
+    user: HostUser,
+    key: TabKey,
+    run: u64,
+    file: Option<PathBuf>,
+    registry: Option<PathBuf>,
+) -> Command<Msg> {
+    Command::perform(move || {
+        if file.is_some_and(|file| !file.exists()) {
+            return Msg::Missing(key, run);
+        }
+        start(registry.as_deref(), &engine, &plan, user, |result| Msg::Ready(key, run, result))
+    })
+}
+
+/// Brings the container of `plan` up and notes it in `registry` when it is up, then hands the
+/// outcome to `answer` for the message it becomes.
+///
+/// A container that was running already is noted too: it is one of QCode's, and a list that
+/// lost its name — to another QCode writing at the same moment, or to a damaged file — gets it
+/// back the next time a tab opens in it. Runs engine commands and writes the disk, so it belongs
+/// on a background thread.
+fn start(
+    registry: Option<&Path>,
+    engine: &Engine,
+    plan: &ContainerPlan,
+    user: HostUser,
+    answer: impl FnOnce(Result<(), LaunchFailure>) -> Msg,
+) -> Msg {
+    let result = plan::ensure_running(engine, plan, user);
+    let up = result.is_ok();
+    let message = answer(result);
+    if up { noted(registry, engine.kind(), &plan.name, message) } else { message }
+}
+
+/// Notes in the list at `registry` that QCode started the container `name` in `engine`, and
+/// hands `message` on — wrapped with what went wrong, when something did.
+pub(super) fn noted(registry: Option<&Path>, engine: EngineKind, name: &str, message: Msg) -> Msg {
+    let Some(path) = registry else { return message };
+    let noting = match Registry::record(path, name, engine) {
+        Ok(problems) => match problems.first() {
+            None => return message,
+            Some(problem) => Noting::Repaired(problem.to_string()),
+        },
+        Err(error) => Noting::Unwritten(format!("{}: {error}", path.display())),
+    };
+    Msg::Noted(noting, Box::new(message))
+}
+
+/// Reads the document of the Markdown tab `key`, in its run `run`, on a background thread.
+fn read_document(project: &OpenProject, key: TabKey, run: u64, file: &str) -> Command<Msg> {
+    let path = project.files.path(file);
+    let root = project.files.root().to_path_buf();
+    Command::perform(move || Msg::DocumentRead(key, run, files::read_document(&path, &root)))
+}
+
+/// Takes what reading a Markdown tab's document answered. A tab that was restarted or closed
+/// meanwhile is left alone.
+fn document_read(screen: &mut ProjectScreen, key: TabKey, run: u64, answer: Result<String, DocumentTrouble>) {
+    let Some((_, tab)) = screen.owner_mut(key).and_then(|project| project.find(key)) else { return };
+    if tab.run() != run {
+        return;
+    }
+    match answer {
+        Ok(text) => tab.read(text),
+        Err(DocumentTrouble::Missing) => tab.settled(TabState::Missing),
+        Err(DocumentTrouble::Outside) => {
+            let file = tab.kind().file().unwrap_or_default().to_owned();
+            tab.settled(TabState::Unreadable(t!("project.file.outside", file = file)));
+        }
+        Err(DocumentTrouble::Unreadable(reason)) => tab.settled(TabState::Unreadable(reason)),
+    }
+}
+
+/// Reads the open Markdown tab's document again when the tab comes back into view, so a change
+/// made in the editor meanwhile is what it shows. The text it had stays on screen until the new
+/// one is in.
+fn reread(screen: &mut ProjectScreen) -> Command<Msg> {
+    let Some(project) = screen.projects.get(screen.active) else {
+        screen.shown_document = None;
+        return Command::none();
+    };
+    let showing = project.active_tab().filter(|tab| matches!(tab.kind(), TabKind::Markdown(_)));
+    let key = showing.map(Tab::key);
+    let again = key.is_some() && key != screen.shown_document;
+    screen.shown_document = key;
+    match showing {
+        Some(tab) if again && tab.state() == &TabState::Running => {
+            let file = tab.kind().file().unwrap_or_default().to_owned();
+            read_document(project, tab.key(), tab.run(), &file)
+        }
+        _ => Command::none(),
+    }
+}
+
+/// Opens the file `key` of the open project's tree in the built-in app its name calls for, or
+/// says that none opens it yet.
+fn open_file(screen: &mut ProjectScreen, key: &str) -> Command<Msg> {
+    if !files::is_inside(key) {
+        return Command::none();
+    }
+    let kind = match apps::classify(files::name(key)) {
+        FileKind::Image => TabKind::Image(key.to_owned()),
+        FileKind::Markdown => TabKind::Markdown(key.to_owned()),
+        FileKind::Text => TabKind::Editor(key.to_owned()),
+        FileKind::Unknown => {
+            return Command::toast(Toast::info(t!("project.file.no-app")).body(files::name(key).to_owned()));
+        }
+    };
+    open_tab(screen, kind)
+}
+
+/// Shows the tab of `kind` in the open project: the one already open when there is one, since a
+/// click on a file in the tree opens it and a second click should not open it twice, or a new
+/// tab after the last one. The new tab waits to be started, which [`update`] does at once.
+fn open_tab(screen: &mut ProjectScreen, kind: TabKind) -> Command<Msg> {
+    let key = TabKey(screen.next_key);
+    let Some(project) = screen.projects.get_mut(screen.active) else { return Command::none() };
+    let focus = if matches!(kind, TabKind::Markdown(_)) { DOCUMENT_ID } else { TERMINAL_ID };
+    if let Some(index) = project.tabs.iter().position(|tab| tab.kind() == &kind) {
+        project.active_tab = index;
+        return Command::focus(focus);
+    }
+    screen.next_key += 1;
+    project.tabs.push(Tab::waiting(key, kind));
+    project.active_tab = project.tabs.len() - 1;
+    Command::focus(focus)
 }
 
 /// Attaches a session to a tab whose container came up, or tells it why it did not.
@@ -987,10 +1327,14 @@ fn output(screen: &mut ProjectScreen, key: TabKey, run: u64, event: TerminalEven
     }
 }
 
-/// Reads the root of the open project's file tree, when it has not been read yet.
+/// Reads the root of the open project's file tree the first time, and every folder it shows
+/// again after that: the files may have changed while the screen was away.
 fn load_root(screen: &mut ProjectScreen) -> Command<Msg> {
     let Some(project) = screen.projects.get_mut(screen.active) else { return Command::none() };
-    if project.files.children(files::ROOT).is_some() || !project.files.start_reading(files::ROOT) {
+    if project.files.children(files::ROOT).is_some() {
+        return files::refresh(project);
+    }
+    if !project.files.start_reading(files::ROOT) {
         return Command::none();
     }
     read_folder(project, files::ROOT)
@@ -1019,21 +1363,27 @@ fn list_containers(screen: &mut ProjectScreen) -> Command<Msg> {
 /// Stops a container, or stops and starts it again.
 fn container_action(screen: &ProjectScreen, name: &str, again: bool) -> Command<Msg> {
     let Some(engine) = screen.engine.clone() else { return Command::none() };
+    let registry = screen.registry.clone();
     let name = name.to_owned();
     Command::perform(move || {
-        let result = if again { plan::restart(&engine, &name) } else { plan::stop(&engine, &name) };
-        Msg::ContainerActed(result)
+        if !again {
+            return Msg::ContainerActed(plan::stop(&engine, &name));
+        }
+        let result = plan::restart(&engine, &name);
+        let up = result.is_ok();
+        let message = Msg::ContainerActed(result);
+        if up { noted(registry.as_deref(), engine.kind(), &name, message) } else { message }
     })
 }
 
 /// The name the terminal in the middle is focused by.
 const TERMINAL_ID: &str = "project-terminal";
 
-/// The name the tab strip is focused by.
-const TABS_ID: &str = "project-tabs";
+/// The name the document of a Markdown tab is focused by.
+const DOCUMENT_ID: &str = "project-document";
 
-/// The name the control that opens a tab is focused by.
-const NEW_TAB_ID: &str = "project-new-tab";
+/// The name the tab strip is focused by; with no tab its `+` is the whole strip, and the focus.
+const TABS_ID: &str = "project-tabs";
 
 /// Draws the project screen for an application whose messages are `P`: `wrap` turns the screen's
 /// own messages into the application's, `above` draws what the application puts over the tabs
@@ -1107,37 +1457,25 @@ fn rail(screen: &ProjectScreen, ui: &mut View<'_, Msg>) {
     .id("project-rail");
 }
 
-/// The tab strip with the `+` that opens a blank tab right after its last tab, the way a
+/// The tab strip, ending in the `+` that opens a blank tab right after its last tab, the way a
 /// browser's strip ends; with no tab at all the `+` stands at the top left.
 ///
-/// The strip is only as wide as its tabs and leaves room for the `+` at its end, and the `+` is
-/// laid over that room. Once the tabs no longer fit, the strip takes the whole row but that room,
-/// so the tabs scroll with their arrows and the `+` keeps its place at the right end.
+/// The strip places the `+` itself: it keeps the button's room while laying out the tabs, so the
+/// `+` follows the last tab while they fit and keeps its place at the right end once they scroll.
 fn header(screen: &ProjectScreen, ui: &mut View<'_, Msg>) {
     let Some(project) = screen.project() else { return };
     let labels: Vec<String> = (0..project.tabs.len()).map(|index| project.tab_label(index)).collect();
-    // The glyph is the label rather than the icon, so the button stays symmetric: an icon is
-    // always followed by a gap that only makes sense before a word.
-    let plus = ui.env().icons().glyph("add").into_owned();
-    ui.stack(|ui| {
-        ui.row(|ui| {
-            ui.add(
-                Tabs::new(labels)
-                    .active(project.active_tab)
-                    .tab_width(TabWidth::Fit)
-                    .closable(Msg::CloseTab)
-                    .reorderable(move |from, to| Msg::MoveTab { from, to })
-                    .on_select(Msg::OpenTab),
-            )
-            .id(TABS_ID);
-        })
-        .padding(Padding { right: NEW_TAB_WIDTH, ..Padding::default() });
-        ui.add_with(Tooltip::new(t!("project.new-tab")).on_focus(true), |ui| {
-            ui.add(Button::new(plus).on_press(Msg::NewTab)).id(NEW_TAB_ID);
-        })
-        .width(Length::Cells(NEW_TAB_WIDTH));
-    })
-    .align(Align::End);
+    ui.add(
+        Tabs::new(labels)
+            .active(project.active_tab)
+            .tab_width(TabWidth::Fit)
+            .closable(Msg::CloseTab)
+            .reorderable(move |from, to| Msg::MoveTab { from, to })
+            .on_select(Msg::OpenTab)
+            .on_add(|| Msg::NewTab),
+    )
+    .fill_width()
+    .id(TABS_ID);
 }
 
 /// What the middle shows: the open tab, or why there is nothing to show.
@@ -1165,6 +1503,12 @@ fn center(screen: &ProjectScreen, ui: &mut View<'_, Msg>) {
         blank::view(screen, project, tab.key(), ui);
         return;
     }
+    if let TabKind::Markdown(file) = tab.kind() {
+        document(tab, file, ui);
+        return;
+    }
+    let image = matches!(tab.kind(), TabKind::Image(_));
+    let restart = t!("project.restart");
     match tab.state() {
         // With an engine a waiting tab is started before the frame is drawn, so only a screen
         // without one ever shows it, and then the reason is what there is to say.
@@ -1182,16 +1526,22 @@ fn center(screen: &ProjectScreen, ui: &mut View<'_, Msg>) {
             .justify(Align::Center)
             .id("project-starting");
         }
+        TabState::Running | TabState::Ended { .. } if image => picture(tab, ui),
         TabState::Running => match tab.session() {
             Some(session) => {
-                ui.add(tab_terminal(session)).fill().id(TERMINAL_ID);
+                terminal(ui, session);
             }
             None => {
                 ui.add(Spinner::new().label(t!("project.starting"))).fill();
             }
         },
-        TabState::Ended { code } => stopped(ui, tab, &ended_text(*code), None),
-        TabState::Stopped => stopped(ui, tab, &t!("project.stopped"), None),
+        // Leaving the editor is how a file is closed, so that is what the tab says, and the way
+        // back opens the same file again.
+        TabState::Ended { .. } if matches!(tab.kind(), TabKind::Editor(_)) => {
+            stopped(ui, tab, &t!("project.file.closed"), None, t!("project.file.reopen"));
+        }
+        TabState::Ended { code } => stopped(ui, tab, &ended_text(*code), None, restart),
+        TabState::Stopped => stopped(ui, tab, &t!("project.stopped"), None, restart),
         TabState::Failed(failure) => {
             // A failure of the machine itself has no engine command to show above its words.
             let detail = if failure.command.is_empty() {
@@ -1199,8 +1549,96 @@ fn center(screen: &ProjectScreen, ui: &mut View<'_, Msg>) {
             } else {
                 format!("{}\n{}", failure.command, failure.output)
             };
-            stopped(ui, tab, &t!("project.failed"), Some(&detail));
+            stopped(ui, tab, &t!("project.failed"), Some(&detail), restart);
         }
+        TabState::Missing | TabState::Unreadable(_) => file_trouble(tab, ui),
+    }
+}
+
+/// A picture drawn in the tab: what chafa drew, which stays when chafa is done, and under it a
+/// quiet way to draw it again once the tab has changed size. A picture that could not be drawn
+/// says so beside it; one that was drawn says nothing, because a picture that is there needs no
+/// note that the program drawing it has finished.
+fn picture(tab: &Tab, ui: &mut View<'_, Msg>) {
+    let key = tab.key();
+    let failed = matches!(tab.state(), TabState::Ended { code: Some(code) } if *code != 0);
+    ui.column(|ui| {
+        match tab.session() {
+            Some(session) => {
+                terminal(ui, session);
+            }
+            None if tab.state() == &TabState::Running => {
+                ui.add(Spinner::new().label(t!("project.starting"))).fill();
+            }
+            None => {
+                ui.spacer();
+            }
+        }
+        ui.row(|ui| {
+            if failed {
+                ui.add(Text::new(t!("project.file.not-drawn")).role("secondary"));
+            }
+            ui.spacer();
+            ui.add(Button::new(t!("project.file.redraw")).on_press(Msg::Restart(key))).id("project-redraw");
+        })
+        .gap(2)
+        .padding(Padding { left: 1, right: 1, ..Padding::default() })
+        .fill_width();
+    })
+    .fill()
+    .id("project-picture");
+}
+
+/// A Markdown tab: the document, with the way to change it in the editor above it.
+fn document(tab: &Tab, file: &str, ui: &mut View<'_, Msg>) {
+    match (tab.state(), tab.document()) {
+        (TabState::Missing | TabState::Unreadable(_), _) => file_trouble(tab, ui),
+        // Read again while it is shown, the text it had stays until the new one is in.
+        (_, Some(text)) => {
+            let edit = Msg::EditFile(file.to_owned());
+            ui.column(|ui| {
+                ui.row(|ui| {
+                    ui.add(Text::new(file.to_owned()).role("faint").no_wrap());
+                    ui.spacer();
+                    ui.add(Button::new(t!("project.file.edit")).on_press(edit)).id("project-edit");
+                })
+                .gap(2)
+                .padding(Padding { left: 2, right: 1, ..Padding::default() })
+                .fill_width();
+                ui.add_with(ScrollView::new(), |ui| {
+                    ui.column(|ui| {
+                        ui.add(Markdown::new(text)).fill_width();
+                    })
+                    .padding(Padding::symmetric(0, 2))
+                    .fill_width();
+                })
+                .fill()
+                .id(DOCUMENT_ID);
+            })
+            .gap(1)
+            .fill()
+            .id("project-document-page");
+        }
+        (_, None) => {
+            ui.column(|ui| {
+                ui.add(Spinner::new().label(t!("project.file.reading")));
+            })
+            .fill()
+            .align(Align::Center)
+            .justify(Align::Center)
+            .id("project-reading");
+        }
+    }
+}
+
+/// A tab whose file is gone or cannot be read, with the way to look for it again.
+fn file_trouble(tab: &Tab, ui: &mut View<'_, Msg>) {
+    let file = tab.kind().file().unwrap_or_default().to_owned();
+    match tab.state() {
+        TabState::Unreadable(reason) => {
+            stopped(ui, tab, &t!("project.file.unreadable"), Some(reason), t!("project.file.try-again"));
+        }
+        _ => stopped(ui, tab, &t!("project.file.missing", file = file), None, t!("project.file.try-again")),
     }
 }
 
@@ -1217,6 +1655,16 @@ fn tab_terminal(session: &TerminalSession) -> Terminal {
         .pass_through(Scope::App, "leave-terminal")
 }
 
+/// Puts a tab's terminal on screen.
+///
+/// The key that leaves it is answered here, by the terminal's own node: while the keyboard is in
+/// the terminal the key goes to the tab strip, and anywhere else it reaches the application,
+/// which sends it back in. The runtime looks at where the keyboard is when the key arrives, so a
+/// click or Tab that moved it is never a press lost.
+fn terminal(ui: &mut View<'_, Msg>, session: &TerminalSession) {
+    ui.add(tab_terminal(session)).fill().id(TERMINAL_ID).on_action(Scope::App, "leave-terminal", Msg::LeaveTerminal);
+}
+
 /// The words for a session that ended by itself.
 fn ended_text(code: Option<u32>) -> String {
     match code {
@@ -1227,19 +1675,18 @@ fn ended_text(code: Option<u32>) -> String {
 
 /// A tab that is not running: what happened, the engine's own words when there are any, and the
 /// way back. The last screen of the session stays above it while there is one.
-fn stopped(ui: &mut View<'_, Msg>, tab: &Tab, message: &str, detail: Option<&str>) {
+fn stopped(ui: &mut View<'_, Msg>, tab: &Tab, message: &str, detail: Option<&str>, again: String) {
     let key = tab.key();
     ui.column(|ui| {
         if let Some(session) = tab.session() {
-            ui.add(tab_terminal(session)).fill().id(TERMINAL_ID);
+            terminal(ui, session);
         }
         ui.column(|ui| {
             ui.add(Text::new(message.to_owned()).role("secondary"));
             if let Some(detail) = detail {
                 ui.add(Text::new(detail.to_owned()).role("faint")).selectable(true);
             }
-            ui.add(Button::new(t!("project.restart")).variant("primary").on_press(Msg::Restart(key)))
-                .id("project-restart");
+            ui.add(Button::new(again).variant("primary").on_press(Msg::Restart(key))).id("project-restart");
         })
         .gap(1)
         .padding(Padding::symmetric(1, 2))
@@ -1250,14 +1697,23 @@ fn stopped(ui: &mut View<'_, Msg>, tab: &Tab, message: &str, detail: Option<&str
 }
 
 /// The control that takes the keyboard when the screen opens: the terminal of the open tab, the
-/// page of a blank one, or the control that opens the first tab while there is none.
+/// page of a blank one, or the strip's `+` that opens the first tab while there is none.
 #[must_use]
 pub fn entry(screen: &ProjectScreen) -> &'static str {
     match screen.project().and_then(OpenProject::active_tab).map(Tab::kind) {
         Some(TabKind::New) => blank::CHOICES_ID,
+        Some(TabKind::Markdown(_)) => DOCUMENT_ID,
         Some(_) => TERMINAL_ID,
-        None => NEW_TAB_ID,
+        None => TABS_ID,
     }
+}
+
+/// What Esc means on the project screen before it means leaving it: while an entry of the file
+/// tree is cut, Esc lets it stay where it is. The application asks this when Esc reaches it,
+/// which is only after every nearer widget and dialog passed it on.
+#[must_use]
+pub fn escape(screen: &ProjectScreen) -> Option<Msg> {
+    screen.project().filter(|project| !project.files.cut().is_empty()).map(|_| Msg::Files(FileMsg::DropCut))
 }
 
 /// The keys of the project screen that are not in the keymap, for the key list.

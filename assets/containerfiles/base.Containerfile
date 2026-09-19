@@ -1,7 +1,7 @@
 # The image every QCode container starts from: a project's plain shell runs in it, a git clone
 # runs in it, and every profile image is built on top of it.
 #
-# Nothing is here that a harness does not need. Each block says why it is here.
+# Nothing is here that a harness or a built-in app does not need. Each block says why it is here.
 
 # Debian trixie with the current Node LTS, from the Node project's own image.
 #
@@ -16,9 +16,9 @@
 # opencode publishes musl builds. Alpine would be the smaller image and the wrong one.
 #
 # The slim variant, because the full one carries a build toolchain no harness uses. The image
-# comes to about 360 MB, of which Node is the larger half; it is pulled once per machine and
-# every profile image shares it. The tag is a major version, not a digest, so rebuilding the
-# image is how a machine takes Debian's and Node's security updates.
+# comes to about 480 MB with the built-in apps below, of which Node is the largest part; it is
+# pulled once per machine and every profile image shares it. The tag is a major version, not a
+# digest, so rebuilding the image is how a machine takes Debian's and Node's security updates.
 FROM docker.io/library/node:24-trixie-slim
 
 # git, because a project can be made by cloning and because harnesses read and write history
@@ -27,6 +27,24 @@ FROM docker.io/library/node:24-trixie-slim
 # `apt-get install` that will never run here.
 RUN apt-get update \
  && apt-get install --yes --no-install-recommends ca-certificates git \
+ && rm -rf /var/lib/apt/lists/*
+
+# The built-in apps: what a file opened from the file tree runs in, in a tab, inside the
+# project's own container rather than on the machine QCode runs on.
+#
+# nano, because it is the editor a text file opens in unless the person chose otherwise, and it
+# needs nothing explained. vim, the full package rather than vim-tiny, because the person who
+# chooses vim over nano expects its syntax colours, and vim-tiny has none. chafa, because the
+# terminal a tab draws in shows no kitty or sixel pictures, so an image is drawn in coloured
+# character cells, and chafa is what does that well. unzip, zip, xz-utils, bzip2 and 7zip,
+# because an archive in the project is opened and made from the shell tab, and a slim Debian
+# can do neither for the common formats.
+#
+# Together they add about 120 MB to the image, most of it vim's runtime files (syntax, indent
+# and help for every language) and the image decoders chafa reads png, jpeg, webp, gif and avif
+# with. Recommended packages stay out, as above: nothing here needs them.
+RUN apt-get update \
+ && apt-get install --yes --no-install-recommends nano vim chafa unzip zip xz-utils bzip2 7zip \
  && rm -rf /var/lib/apt/lists/*
 
 # The user the image belongs to.

@@ -20,11 +20,12 @@ use std::path::PathBuf;
 use qframe::diagnostics::{Diagnostic, Severity};
 use qframe::icons::IconMode;
 use qframe::prelude::*;
-use qframe::widgets::{ScrollView, Segmented, Select, SettingRow, SettingsList, Spinner, Switch};
+use qframe::widgets::{ScrollView, Segmented, Select, SettingRow, SettingsList, SettingsRows, Spinner, Switch, Toast};
 
+use crate::base::apps::Editor;
 use crate::engine::EngineKind;
 use crate::profile::SafeName;
-use crate::workspace::Config;
+use crate::workspace::{Config, OnClose, Platform};
 
 use engine::{EngineState, Gate, Health};
 use identity::ProfileIdentity;
@@ -50,7 +51,7 @@ const ENGINES: [EngineKind; 2] = [EngineKind::Podman, EngineKind::Docker];
 
 /// What the settings screen asks the application to do, because it reaches past the screen.
 ///
-/// The first five are choices already applied to the running application and only waiting to be
+/// The first five and the editor are choices already applied to the running application and only waiting to be
 /// written down. The rest are work only the layers that own it can do: the setup wizard's steps
 /// and the engine's volumes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +66,8 @@ pub enum Request {
     ReducedMotion(bool),
     /// Store the container engine and look for it again.
     Engine(EngineKind),
+    /// Store the editor a file opens in, and open files in it from now on.
+    Editor(Editor),
     /// Run the setup wizard's engine step on its own. This is what the repair strip asks for.
     OpenEngineStep,
     /// Run the setup wizard's location step on its own, to move the workspace somewhere else.
@@ -73,6 +76,41 @@ pub enum Request {
     RefreshIdentity(SafeName),
     /// Delete the profile's credentials volume. Confirmed.
     SignOut(SafeName),
+    /// Store what happens to the containers once no QCode is open.
+    OnClose(OnClose),
+    /// Install the background service.
+    InstallService,
+    /// Remove the background service.
+    RemoveService,
+}
+
+/// What the settings screen shows about the background service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceRow {
+    /// This system gets no service, and the row says why: Windows gives QCode no lock to tell
+    /// when the last QCode closes, so there containers are not stopped at all.
+    Unsupported,
+    /// The service can be installed or removed.
+    Ready {
+        /// Whether its files are in place.
+        installed: bool,
+        /// Whether installing or removing it is under way.
+        busy: bool,
+    },
+}
+
+impl ServiceRow {
+    /// The row for a machine of `platform`: `installed` is whether the service's files are
+    /// there, or `None` where there is nowhere to put them — a machine with no home, which gets
+    /// no row at all.
+    #[must_use]
+    pub fn of(platform: Platform, installed: Option<bool>) -> Option<Self> {
+        match (platform, installed) {
+            (Platform::Windows, _) => Some(Self::Unsupported),
+            (_, None) => None,
+            (_, Some(installed)) => Some(Self::Ready { installed, busy: false }),
+        }
+    }
 }
 
 /// What can happen on the settings screen.
@@ -92,6 +130,8 @@ pub enum Msg {
     ReduceMotion(bool),
     /// An engine was chosen.
     Engine(EngineKind),
+    /// An editor was chosen.
+    Editor(Editor),
     /// A profile was chosen.
     Profile(usize),
     /// Refreshing the chosen profile's login was asked for; the question follows.
@@ -106,12 +146,25 @@ pub enum Msg {
     ReadLeftBehind,
     /// The application stored the last change, or could not.
     Stored(Result<(), String>),
+    /// What happens to the containers once no QCode is open was chosen.
+    OnClose(OnClose),
+    /// Installing or removing the background service finished: which of the two it was, whether
+    /// the service's files are there now, and the words of what failed.
+    ServiceDone {
+        /// Whether it was installing rather than removing.
+        installing: bool,
+        /// Whether the service's files are in place now.
+        installed: bool,
+        /// What failed, in the words of the command that failed.
+        result: Result<(), String>,
+    },
 }
 
 /// The settings screen's state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     engine: EngineState,
+    editor: Editor,
     workspace: Option<PathBuf>,
     repairs: Vec<Diagnostic>,
     repairs_read: bool,
@@ -119,6 +172,8 @@ pub struct Settings {
     profiles: Option<Vec<ProfileIdentity>>,
     chosen: usize,
     failure: Option<String>,
+    on_close: OnClose,
+    service: Option<ServiceRow>,
 }
 
 impl Settings {
@@ -128,6 +183,7 @@ impl Settings {
     pub fn new(config: &Config, engine: EngineState) -> Self {
         Self {
             engine,
+            editor: config.editor(),
             workspace: config.workspace_path(),
             repairs: config.diagnostics().to_vec(),
             repairs_read: false,
@@ -135,7 +191,22 @@ impl Settings {
             profiles: None,
             chosen: 0,
             failure: None,
+            on_close: config.on_close(),
+            service: None,
         }
+    }
+
+    /// The same screen, showing the background service as `row` says; `None` shows no row.
+    #[must_use]
+    pub fn with_service(mut self, row: Option<ServiceRow>) -> Self {
+        self.service = row;
+        self
+    }
+
+    /// What the screen shows about the background service.
+    #[must_use]
+    pub fn service(&self) -> Option<ServiceRow> {
+        self.service
     }
 
     /// The same screen, also reporting `files`: the settings files of an earlier version that
@@ -208,6 +279,10 @@ pub fn update(screen: &mut Settings, message: Msg) -> (Command<Msg>, Option<Requ
             screen.engine = EngineState::new(kind, Health::Checking);
             (Command::none(), Some(Request::Engine(kind)))
         }
+        Msg::Editor(editor) => {
+            screen.editor = editor;
+            (Command::none(), Some(Request::Editor(editor)))
+        }
         Msg::Profile(index) => {
             if index < screen.profiles.as_ref().map_or(0, Vec::len) {
                 screen.chosen = index;
@@ -216,14 +291,44 @@ pub fn update(screen: &mut Settings, message: Msg) -> (Command<Msg>, Option<Requ
         }
         Msg::AskRefresh => (ask(screen, false), None),
         Msg::AskSignOut => (ask(screen, true), None),
-        Msg::Request(request) => (Command::none(), Some(request)),
+        Msg::Request(request) => {
+            if matches!(request, Request::InstallService | Request::RemoveService) {
+                match &mut screen.service {
+                    // A second press while the first is under way asks for nothing.
+                    Some(ServiceRow::Ready { busy: busy @ false, .. }) => *busy = true,
+                    _ => return (Command::none(), None),
+                }
+            }
+            (Command::none(), Some(request))
+        }
+        Msg::OnClose(choice) => {
+            screen.on_close = choice;
+            (Command::none(), Some(Request::OnClose(choice)))
+        }
+        Msg::ServiceDone { installing, installed, result } => {
+            if let Some(ServiceRow::Ready { .. }) = screen.service {
+                screen.service = Some(ServiceRow::Ready { installed, busy: false });
+            }
+            let told = match result {
+                Ok(()) => Command::none(),
+                Err(reason) => {
+                    let title = if installing {
+                        t!("settings.service-install-failed")
+                    } else {
+                        t!("settings.service-remove-failed")
+                    };
+                    Command::toast(Toast::danger(title).body(reason))
+                }
+            };
+            (told, None)
+        }
         Msg::ReadRepairs => {
             screen.repairs_read = true;
-            (Command::none(), None)
+            (Command::focus(entry(screen)), None)
         }
         Msg::ReadLeftBehind => {
             screen.left_behind.clear();
-            (Command::none(), None)
+            (Command::focus(entry(screen)), None)
         }
         Msg::Stored(stored) => {
             screen.failure = stored.err();
@@ -342,6 +447,41 @@ pub fn view(screen: &Settings, ui: &mut View<'_, Msg>) {
                         }
                     });
 
+                    let choices = OnClose::ALL.map(|choice| t!(&format!("settings.on-close-{}", choice.key())));
+                    let chosen = OnClose::ALL.iter().position(|choice| *choice == screen.on_close).unwrap_or(0);
+                    // Where nothing can tell that the last QCode closed, the choice is kept for
+                    // the file's sake but the row says plainly that it changes nothing here.
+                    let about = if screen.service == Some(ServiceRow::Unsupported) {
+                        t!("settings.on-close-windows")
+                    } else {
+                        t!("settings.on-close-text")
+                    };
+                    list.row(SettingRow::new(t!("settings.on-close")).description(about), |ui| {
+                        ui.add(
+                            Segmented::new(choices)
+                                .selected(chosen)
+                                .on_select(|index| Msg::OnClose(OnClose::ALL[index])),
+                        )
+                        .id("on-close");
+                    });
+                    if let Some(row) = screen.service {
+                        service_row(list, row);
+                    }
+
+                    list.heading(t!("settings.apps"));
+                    // The program's own name is the label: it is what the person knows it by, in
+                    // every language.
+                    let names = Editor::ALL.map(Editor::key);
+                    let chosen = Editor::ALL.iter().position(|editor| *editor == screen.editor).unwrap_or(0);
+                    list.row(SettingRow::new(t!("settings.editor")).description(t!("settings.editor-text")), |ui| {
+                        ui.add(
+                            Segmented::new(names)
+                                .selected(chosen)
+                                .on_select(move |index| Msg::Editor(Editor::ALL[index])),
+                        )
+                        .id("editor");
+                    });
+
                     list.heading(t!("settings.workspace"));
                     let folder = screen
                         .workspace
@@ -383,6 +523,30 @@ pub fn view(screen: &Settings, ui: &mut View<'_, Msg>) {
         .justify(Align::Center);
     })
     .fill();
+}
+
+/// The row of the background service: what it does and whether it is there, with the button
+/// that installs or removes it.
+fn service_row(list: &mut SettingsRows<'_, Msg>, row: ServiceRow) {
+    let description = match row {
+        ServiceRow::Unsupported => t!("settings.service-windows"),
+        ServiceRow::Ready { installed: true, .. } => t!("settings.service-installed"),
+        ServiceRow::Ready { installed: false, .. } => t!("settings.service-not-installed"),
+    };
+    list.row(SettingRow::new(t!("settings.service")).description(description), |ui| match row {
+        ServiceRow::Unsupported => {}
+        ServiceRow::Ready { busy: true, .. } => {
+            ui.add(Spinner::new());
+        }
+        ServiceRow::Ready { installed, busy: false } => {
+            let (label, request) = if installed {
+                (t!("settings.service-remove"), Request::RemoveService)
+            } else {
+                (t!("settings.service-install"), Request::InstallService)
+            };
+            ui.add(Button::new(label).on_press(Msg::Request(request))).id("service");
+        }
+    });
 }
 
 /// A report the settings screen stands at its top, one line per diagnostic.
@@ -435,9 +599,19 @@ fn report(which: &Report, lines: &[Diagnostic], ui: &mut View<'_, Msg>) {
 
 /// The control that takes the keyboard when the screen opens: the list of settings, so the
 /// arrow keys walk it from the first key the person presses.
+///
+/// A report that stands above the list comes first: it is news the person has not read, and the
+/// list is taller than a small terminal, so focusing the list would scroll the report out of
+/// sight. Its dismiss button takes the keyboard instead, and dismissing it hands the keyboard on.
 #[must_use]
-pub fn entry() -> &'static str {
-    "settings"
+pub fn entry(screen: &Settings) -> &'static str {
+    if !screen.left_behind.is_empty() {
+        Report::LEFT_BEHIND.id
+    } else if !screen.repairs_read && !screen.repairs.is_empty() {
+        Report::REPAIRS.id
+    } else {
+        "settings"
+    }
 }
 
 /// The keys of the settings screen that are not in the keymap, for the key list.
@@ -555,9 +729,11 @@ mod tests {
     use qframe::icons::GlyphMode;
 
     use super::testing;
+    use crate::base::apps::Editor;
     use crate::engine::EngineKind;
     use crate::ui::settings::Request;
     use crate::ui::settings::engine::{Health, Trouble};
+    use crate::workspace::{OnClose, Platform};
 
     const SIZE: (u16, u16) = (100, 34);
 
@@ -734,6 +910,31 @@ mod tests {
     }
 
     #[test]
+    fn the_editor_is_chosen_among_the_built_in_apps_and_nano_comes_first() {
+        let mut harness = testing::host(testing::screen(EngineKind::Podman, Health::Working), SIZE.0, SIZE.1);
+        let screen = harness.screen();
+        for label in ["BUILT-IN APPS", "Editor", "nano", "vim"] {
+            assert!(screen.contains(label), "`{label}` is missing:\n{screen}");
+        }
+        harness.send(testing::wrap(super::Msg::Editor(Editor::Vim))).render();
+        assert_eq!(harness.app().asked, [Request::Editor(Editor::Vim)]);
+        assert_eq!(harness.app().screen.editor, Editor::Vim);
+
+        // A settings file that chose vim opens the screen on vim.
+        let screen = testing::from_config("[apps]\neditor = \"vim\"\n", EngineKind::Podman, Health::Working);
+        assert_eq!(screen.editor, Editor::Vim);
+    }
+
+    #[test]
+    fn the_built_in_apps_are_named_in_turkish() {
+        let mut harness = testing::host(testing::screen(EngineKind::Podman, Health::Working), SIZE.0, 40);
+        harness.send(testing::wrap(super::Msg::Language("tr".to_owned()))).render();
+        let screen = harness.screen();
+        assert!(screen.contains("YERLEŞİK UYGULAMALAR"), "{screen}");
+        assert!(screen.contains("Düzenleyici"), "{screen}");
+    }
+
+    #[test]
     fn reduced_motion_leaves_the_screen_working() {
         let mut harness = testing::host(testing::screen(EngineKind::Podman, Health::Working), SIZE.0, SIZE.1);
         harness.set_reduced_motion(true).render();
@@ -747,6 +948,110 @@ mod tests {
         let screen = harness.screen();
         assert!(screen.is_ascii(), "{screen}");
         assert!(screen.contains("Container engine"), "{screen}");
+    }
+
+    /// A settings screen showing the background service as `row` says, tall enough to show it.
+    fn with_service(row: Option<super::ServiceRow>) -> qframe::runtime::Harness<testing::Host> {
+        testing::host(testing::screen(EngineKind::Podman, Health::Working).with_service(row), SIZE.0, 44)
+    }
+
+    #[test]
+    fn the_service_is_offered_where_it_can_be_installed_and_fits_in_both_languages() {
+        for platform in [Platform::Linux, Platform::MacOs] {
+            let row = super::ServiceRow::of(platform, Some(false));
+            assert_eq!(row, Some(super::ServiceRow::Ready { installed: false, busy: false }));
+        }
+        let mut harness = with_service(super::ServiceRow::of(Platform::Linux, Some(false)));
+        let screen = harness.screen();
+        assert!(screen.contains("Background service"), "{screen}");
+        assert!(screen.contains("Install"), "{screen}");
+        harness.set_locale("tr").render();
+        let screen = harness.screen();
+        assert!(!screen.contains('…'), "every word fits:\n{screen}");
+        assert!(screen.contains("Arka plan servisi"), "{screen}");
+        assert!(screen.contains("Kur"), "{screen}");
+    }
+
+    #[test]
+    fn windows_is_told_that_it_has_no_service_and_that_nothing_is_stopped_there() {
+        assert_eq!(super::ServiceRow::of(Platform::Windows, None), Some(super::ServiceRow::Unsupported));
+        let mut harness = with_service(Some(super::ServiceRow::Unsupported));
+        let screen = harness.screen();
+        assert!(screen.contains("Not available on Windows"), "{screen}");
+        assert!(screen.contains("containers keep running"), "the choice says it has no effect:\n{screen}");
+        assert!(!screen.contains("Install"), "{screen}");
+        harness.set_locale("tr").render();
+        let screen = harness.screen();
+        assert!(!screen.contains('…'), "every word fits:\n{screen}");
+        assert!(screen.contains("Windows'ta yok"), "{screen}");
+        assert!(screen.contains("açık kalır"), "{screen}");
+    }
+
+    #[test]
+    fn a_machine_with_nowhere_to_put_the_service_shows_no_row() {
+        assert_eq!(super::ServiceRow::of(Platform::Linux, None), None);
+        let screen = with_service(None).screen();
+        assert!(!screen.contains("Background service"), "{screen}");
+    }
+
+    #[test]
+    fn installing_asks_once_waits_and_says_what_failed_in_the_commands_words() {
+        let row = super::ServiceRow::of(Platform::Linux, Some(false));
+        let mut harness = with_service(row);
+        assert!(harness.screen().contains("Not installed"), "{}", harness.screen());
+        harness.click_text("Install");
+        harness.send(testing::wrap(super::Msg::Request(Request::InstallService)));
+        assert_eq!(harness.app().asked, [Request::InstallService], "a second press while it works asks for nothing");
+        assert_eq!(harness.app().screen.service(), Some(super::ServiceRow::Ready { installed: false, busy: true }));
+
+        let failed = super::Msg::ServiceDone {
+            installing: true,
+            installed: false,
+            result: Err("systemctl --user daemon-reload: Failed to connect to bus".to_owned()),
+        };
+        harness.send(testing::wrap(failed));
+        harness.advance(std::time::Duration::from_millis(300));
+        let screen = harness.screen();
+        assert!(screen.contains("could not be installed"), "{screen}");
+        assert!(
+            screen.contains("daemon-reload: Failed to") && screen.contains("connect to bus"),
+            "the command's own words:\n{screen}"
+        );
+        assert!(screen.contains("Install"), "the button is back:\n{screen}");
+    }
+
+    #[test]
+    fn an_installed_service_offers_to_be_removed() {
+        let mut harness = with_service(super::ServiceRow::of(Platform::Linux, Some(true)));
+        let screen = harness.screen();
+        assert!(screen.contains("Installed;"), "{screen}");
+        harness.click_text("Remove");
+        assert_eq!(harness.app().asked, [Request::RemoveService]);
+        let done = super::Msg::ServiceDone { installing: false, installed: false, result: Ok(()) };
+        harness.send(testing::wrap(done)).render();
+        assert!(harness.screen().contains("Not installed"), "{}", harness.screen());
+    }
+
+    #[test]
+    fn what_happens_to_the_containers_on_close_is_a_choice_of_two() {
+        let mut harness = with_service(None);
+        let screen = harness.screen();
+        for words in ["When QCode closes", "Stop", "Keep running"] {
+            assert!(screen.contains(words), "`{words}` is missing:\n{screen}");
+        }
+        harness.click_text("Keep running");
+        assert_eq!(harness.app().asked, [Request::OnClose(OnClose::Keep)]);
+        harness.set_locale("tr").render();
+        let screen = harness.screen();
+        for words in ["QCode kapanınca", "Durdurulsun", "Açık kalsın"] {
+            assert!(screen.contains(words), "`{words}` is missing:\n{screen}");
+        }
+    }
+
+    #[test]
+    fn a_stored_choice_to_keep_them_running_is_the_one_shown() {
+        let screen = testing::from_config("[containers]\non-close = \"keep\"\n", EngineKind::Podman, Health::Working);
+        assert_eq!(screen.on_close, OnClose::Keep);
     }
 
     #[test]

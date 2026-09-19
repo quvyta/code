@@ -23,6 +23,25 @@ pub enum TabKind {
     /// A blank tab asking what it should open. It has no container and never starts one; the
     /// choice turns it into one of the others in place.
     New,
+    /// A picture of the project, drawn by chafa in the project's own container. The text is the
+    /// file's key in the file tree: its path inside `Project/`, written with `/`.
+    Image(String),
+    /// A Markdown document of the project, read from the disk and shown by QCode itself, with no
+    /// container at all.
+    Markdown(String),
+    /// A file of the project, open in the chosen editor in the project's own container.
+    Editor(String),
+}
+
+impl TabKind {
+    /// The key of the project's file the tab opens, when it opens one.
+    #[must_use]
+    pub fn file(&self) -> Option<&str> {
+        match self {
+            Self::Image(file) | Self::Markdown(file) | Self::Editor(file) => Some(file),
+            Self::Shell | Self::Profile(_) | Self::New => None,
+        }
+    }
 }
 
 /// Where a tab stands.
@@ -37,7 +56,8 @@ pub enum TabState {
     Waiting,
     /// The container is being created or started; nothing is attached yet.
     Starting,
-    /// A session is attached to the running container.
+    /// A session is attached to the running container; for a Markdown tab, which has neither,
+    /// the document is read and shown.
     Running,
     /// The program inside the container ended, and the container is still up.
     Ended {
@@ -49,6 +69,10 @@ pub enum TabState {
     Stopped,
     /// The engine refused, and said why.
     Failed(LaunchFailure),
+    /// The file the tab opens is not in the project any more.
+    Missing,
+    /// The file the tab opens could not be read, for this reason.
+    Unreadable(String),
 }
 
 impl TabState {
@@ -62,7 +86,7 @@ impl TabState {
     /// restart, so its restart is never offered.
     #[must_use]
     pub fn can_restart(&self) -> bool {
-        matches!(self, Self::Ended { .. } | Self::Stopped | Self::Failed(_))
+        matches!(self, Self::Ended { .. } | Self::Stopped | Self::Failed(_) | Self::Missing | Self::Unreadable(_))
     }
 }
 
@@ -77,6 +101,8 @@ pub struct Tab {
     /// The harness conversation the tab shows, when it is known.
     conversation: Option<String>,
     session: Option<TerminalSession>,
+    /// The text of a Markdown tab's file, as it was last read.
+    document: Option<String>,
     /// Counts the sessions this tab has started, so the watch of a session that was replaced by
     /// a restart is recognised and ignored.
     run: u64,
@@ -87,7 +113,16 @@ impl Tab {
     #[must_use]
     pub fn new(key: TabKey, kind: TabKind) -> Self {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs());
-        Self { key, kind, state: TabState::Starting, opened: now, conversation: None, session: None, run: 0 }
+        Self {
+            key,
+            kind,
+            state: TabState::Starting,
+            opened: now,
+            conversation: None,
+            session: None,
+            document: None,
+            run: 0,
+        }
     }
 
     /// A blank tab opened now, waiting for the person to choose what it opens.
@@ -96,11 +131,19 @@ impl Tab {
         Self { state: TabState::Waiting, ..Self::new(key, TabKind::New) }
     }
 
+    /// A tab of `kind` opened now that waits to be started, which the screen does as soon as it
+    /// is shown. A tab of one of the project's files is opened this way, so it starts exactly
+    /// the way a tab brought back from the last session does.
+    #[must_use]
+    pub fn waiting(key: TabKey, kind: TabKind) -> Self {
+        Self { state: TabState::Waiting, ..Self::new(key, kind) }
+    }
+
     /// A tab of `kind` brought back from the last session, as it was recorded: opened at
     /// `opened` and showing `conversation`. It waits to be shown before it starts anything.
     #[must_use]
     pub fn restored(key: TabKey, kind: TabKind, opened: u64, conversation: Option<String>) -> Self {
-        Self { key, kind, state: TabState::Waiting, opened, conversation, session: None, run: 0 }
+        Self { opened, conversation, ..Self::waiting(key, kind) }
     }
 
     /// The tab's identity.
@@ -139,6 +182,12 @@ impl Tab {
         self.session.as_ref()
     }
 
+    /// The text of a Markdown tab's file, once it has been read.
+    #[must_use]
+    pub fn document(&self) -> Option<&str> {
+        self.document.as_deref()
+    }
+
     /// Which session of this tab is the current one.
     #[must_use]
     pub fn run(&self) -> u64 {
@@ -174,6 +223,12 @@ impl Tab {
     /// Attaches `session` and marks the tab as running.
     pub fn attached(&mut self, session: TerminalSession) {
         self.session = Some(session);
+        self.state = TabState::Running;
+    }
+
+    /// Takes the text of a Markdown tab's file and shows it.
+    pub fn read(&mut self, text: String) {
+        self.document = Some(text);
         self.state = TabState::Running;
     }
 

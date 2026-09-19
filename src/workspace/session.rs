@@ -27,7 +27,15 @@
 //! [[project.tab]]
 //! kind = "new"
 //! opened = 1758197300
+//!
+//! [[project.tab]]
+//! kind = "markdown"
+//! file = "guide/harbour.md"
+//! opened = 1758197400
 //! ```
+//!
+//! A tab that opens one of the project's files — `image`, `markdown` or `editor` — names the file
+//! by its path inside `Project/`, written with `/`.
 
 use std::fmt::Write as _;
 use std::io;
@@ -55,6 +63,13 @@ pub enum SessionTabKind {
     Profile(String),
     /// A blank tab, still asking what it should open.
     New,
+    /// A picture of the project, drawn in the project's own container, by its path inside
+    /// `Project/`.
+    Image(String),
+    /// A Markdown document of the project, shown by QCode itself.
+    Markdown(String),
+    /// A file of the project, open in the chosen editor in the project's own container.
+    Editor(String),
 }
 
 /// One tab of a saved session.
@@ -165,6 +180,15 @@ impl Session {
                     SessionTabKind::Profile(name) => {
                         let _ = write!(out, "kind = \"profile\"\nprofile = {}\n", quoted(name));
                     }
+                    SessionTabKind::Image(file) => {
+                        let _ = write!(out, "kind = \"image\"\nfile = {}\n", quoted(file));
+                    }
+                    SessionTabKind::Markdown(file) => {
+                        let _ = write!(out, "kind = \"markdown\"\nfile = {}\n", quoted(file));
+                    }
+                    SessionTabKind::Editor(file) => {
+                        let _ = write!(out, "kind = \"editor\"\nfile = {}\n", quoted(file));
+                    }
                 }
                 if let Some(conversation) = &tab.conversation {
                     let _ = writeln!(out, "conversation = {}", quoted(conversation));
@@ -191,8 +215,9 @@ impl Session {
 /// What a `session.toml` holds.
 fn shape() -> Shape {
     let tab = Shape::new()
-        .required("kind", ValueKind::choice(["shell", "profile", "new"]))
+        .required("kind", ValueKind::choice(["shell", "profile", "new", "image", "markdown", "editor"]))
         .optional("profile", ValueKind::text())
+        .optional("file", ValueKind::text())
         .optional("conversation", ValueKind::text())
         .required("opened", ValueKind::integer());
     let project =
@@ -235,6 +260,19 @@ fn session_tab(entry: &Table, diagnostics: &mut Vec<Diagnostic>) -> Option<Sessi
     let kind = match entry.text("kind")? {
         "shell" => SessionTabKind::Shell,
         "new" => SessionTabKind::New,
+        kind @ ("image" | "markdown" | "editor") => {
+            let Some(file) = entry.text("file") else {
+                let at = entry.value_location("kind").cloned();
+                diagnostics.push(Diagnostic::warning(at, format!("an {kind} tab names no `file`; it is skipped")));
+                return None;
+            };
+            let file = file.to_owned();
+            match kind {
+                "image" => SessionTabKind::Image(file),
+                "markdown" => SessionTabKind::Markdown(file),
+                _ => SessionTabKind::Editor(file),
+            }
+        }
         _ => match entry.text("profile") {
             Some(name) => SessionTabKind::Profile(name.to_owned()),
             None => {
@@ -286,6 +324,21 @@ mod tests {
                             opened: 1_758_197_000,
                         },
                         SessionTab { kind: SessionTabKind::New, conversation: None, opened: 1_758_197_300 },
+                        SessionTab {
+                            kind: SessionTabKind::Image("art/logo \"one\".png".to_owned()),
+                            conversation: None,
+                            opened: 1_758_197_400,
+                        },
+                        SessionTab {
+                            kind: SessionTabKind::Markdown("guide/harbour.md".to_owned()),
+                            conversation: None,
+                            opened: 1_758_197_500,
+                        },
+                        SessionTab {
+                            kind: SessionTabKind::Editor("src/main.rs".to_owned()),
+                            conversation: None,
+                            opened: 1_758_197_600,
+                        },
                     ],
                 },
                 SessionProject { id: id("moth"), active_tab: 0, tabs: Vec::new() },
@@ -357,6 +410,19 @@ mod tests {
         assert_eq!(moth.tabs[0].kind, SessionTabKind::Profile("opencode".to_owned()));
         assert_eq!(moth.tabs[0].opened, 0, "a time before the epoch is unknown");
         assert_eq!(moth.active_tab, 0, "an active tab past the end falls back to the first");
+    }
+
+    #[test]
+    fn a_file_tab_without_its_file_is_skipped_with_its_place() {
+        let text = "[[project]]\nid = \"moth\"\n\n\
+                    [[project.tab]]\nkind = \"markdown\"\nopened = 1\n\n\
+                    [[project.tab]]\nkind = \"editor\"\nfile = \"notes.txt\"\nopened = 2\n";
+        let read = Session::parse(NAME, text);
+        let places: Vec<String> = read.diagnostics.iter().map(located).collect();
+        assert_eq!(places, ["session.toml:5:8"], "{:?}", read.diagnostics);
+        let tabs = &read.value.projects[0].tabs;
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0].kind, SessionTabKind::Editor("notes.txt".to_owned()));
     }
 
     #[test]

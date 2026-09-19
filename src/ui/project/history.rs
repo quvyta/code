@@ -123,11 +123,16 @@ impl Shelf {
 }
 
 /// Reads `harness`'s conversations out of the container `container`, in the words a row can
-/// show when it cannot.
+/// show when it cannot; `started` is called when the container had to be started for it.
 ///
 /// This runs engine commands and waits for them, so it belongs on a background thread.
-pub(super) fn read(engine: &Engine, container: &str, harness: HarnessKind) -> Result<Vec<Conversation>, String> {
-    history::read(engine, container, harness).map_err(|error| reason(&LaunchFailure::from(&error)))
+pub(super) fn read(
+    engine: &Engine,
+    container: &str,
+    harness: HarnessKind,
+    started: &mut dyn FnMut(),
+) -> Result<Vec<Conversation>, String> {
+    history::read_starting(engine, container, harness, started).map_err(|error| reason(&LaunchFailure::from(&error)))
 }
 
 /// The first line of what the engine said, short enough for the detail of a row; the command

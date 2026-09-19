@@ -1,4 +1,4 @@
-//! QCode runs coding agent harnesses inside containers, never on the machine itself.
+//! QCode runs coding harnesses inside containers, never on the machine itself.
 //!
 //! The crate carries the application: its state, the messages that change it and the screens
 //! that draw it. The `qcode` and `quvyta-code` commands are thin wrappers around [`QCode`].
@@ -12,10 +12,11 @@
 pub mod base;
 pub mod engine;
 pub mod profile;
+pub mod service;
 pub mod ui;
 pub mod workspace;
 
-use std::io;
+use std::io::{self, Write as _};
 use std::path::PathBuf;
 
 use qframe::keymap::{KeyChord, Scope};
@@ -27,16 +28,19 @@ use engine::run::capture;
 use engine::{Engine, EngineKind, HostUser, detect};
 use profile::identity::{RefreshError, Refreshed};
 use profile::{Profile, SafeName};
+use service::units::ServiceHost;
 use ui::home::{Entry, Home};
 use ui::profiles::Profiles;
 use ui::project::{OpenProject, ProjectScreen};
 use ui::projects::Projects;
 use ui::settings::engine::{EngineState, Health, Trouble};
-use ui::settings::{Request, Settings as SettingsScreen};
+use ui::settings::{Request, ServiceRow, Settings as SettingsScreen};
 use ui::setup::Setup;
 use ui::setup::gates::{EngineCheck, Gates};
 use ui::setup::install::InstallHost;
-use workspace::{Config, HostDirs, Loaded, ProjectFile, ProjectId, ProjectPaths, Session, SetupStep, Workspace};
+use workspace::{
+    Config, HostDirs, Loaded, Platform, ProjectFile, ProjectId, ProjectPaths, Registry, Session, SetupStep, Workspace,
+};
 
 /// Starts the application: preferences come from the platform's config folder, the text is
 /// compiled in, and the runtime drives the screens until the person leaves.
@@ -50,14 +54,47 @@ use workspace::{Config, HostDirs, Loaded, ProjectFile, ProjectId, ProjectPaths, 
 /// Returns the terminal's error when the screen cannot be taken over or restored.
 pub fn run() -> io::Result<()> {
     let Loaded { value: config, diagnostics: left_behind } = Config::load();
+    let places = service::Places::detect();
+    let text = || std::sync::Arc::new(service::translator(config.settings().language().as_deref()));
+    // The setting as it is on disk when the containers are about to be stopped, which may be long
+    // after this QCode started and after another one changed it.
+    let on_close = || Config::load().value.on_close();
+    let engine_for = |kind: EngineKind| detect(kind).ok();
+    // The background service starts the same binary with one word, and it has no screen: it
+    // waits for the last QCode to close, answers in the language the person chose and exits.
+    if std::env::args_os().nth(1).is_some_and(|arg| arg == service::units::REAPER_ARG) {
+        return qframe::i18n::scope(text(), || match &places {
+            Some(places) => {
+                let mut engines = service::Engines { engine_for: &engine_for, run: &mut capture };
+                service::reaper(&mut io::stdout(), places, &on_close, &mut engines)
+            }
+            None => writeln!(io::stdout(), "{}", t!("reaper.nowhere")),
+        });
+    }
+    // Held until this QCode is done, so the service and every other QCode know it is open.
+    // Windows has no lock to hold, and there nothing is stopped on close.
+    let open = places.and_then(|places| service::Open::hold(places).ok());
     let settings = config.settings().clone();
-    let app = QCode::start(config, HostDirs::detect(), InstallHost::detect()).with_left_behind(left_behind);
+    let app = QCode::start(config.clone(), HostDirs::detect(), InstallHost::detect()).with_left_behind(left_behind);
     let (keys, bindings) = keymap();
     let mut runtime = Runtime::new(app).settings(&settings).keymap_source(keys, bindings);
     for (file, text) in locales() {
         runtime = runtime.locale_source(file, text);
     }
-    runtime.run()
+    let ran = runtime.run();
+    // The screen is given back by now, so what the last QCode stopped is said on the terminal
+    // the person started it from.
+    let closed = open.map_or(Ok(()), |open| {
+        let mut engines = service::Engines { engine_for: &engine_for, run: &mut capture };
+        let reaped = open.close(&on_close, &mut engines)?;
+        qframe::i18n::scope(text(), || match reaped {
+            Some(reaped @ (service::stop::Reaped::Done(_) | service::stop::Reaped::Broken(_))) => {
+                service::report(&reaped).iter().try_for_each(|line| writeln!(io::stdout(), "{line}"))
+            }
+            Some(service::stop::Reaped::Kept) | None => Ok(()),
+        })
+    });
+    ran.and(closed)
 }
 
 /// The application's own locale files, compiled in so an installed program carries its text with
@@ -194,6 +231,13 @@ pub struct QCode {
     /// Whether the last write failed, so a disk that refuses is said once rather than at every
     /// change.
     save_failed: bool,
+    /// Whether the project screen's file tree follows the disk; see [`ProjectScreen::watching`].
+    live_files: bool,
+    /// Where the containers QCode starts are noted, so they can be stopped once no QCode is
+    /// open, or `None` where nothing is noted.
+    registry: Option<PathBuf>,
+    /// Where the background service's files go on this machine, or `None` where it gets none.
+    service: Option<ServiceHost>,
 }
 
 impl QCode {
@@ -215,7 +259,11 @@ impl QCode {
         };
         let settled = config.setup_completed() && config.workspace_path().is_some();
         let entry = if settled { None } else { gates.entry() };
-        Self::new(config, dirs, host, &gates, found, entry).with_session(Session::file())
+        Self::new(config, dirs, host, &gates, found, entry)
+            .with_session(Session::file())
+            .with_registry(Registry::file())
+            .with_service(ServiceHost::detect(), Platform::host())
+            .following_files()
     }
 
     /// The application with every answer already in hand, which is how a test builds one.
@@ -258,6 +306,9 @@ impl QCode {
             saved_problems: Vec::new(),
             saving: false,
             save_failed: false,
+            live_files: false,
+            registry: None,
+            service: None,
         }
         .refreshed_home()
     }
@@ -283,6 +334,33 @@ impl QCode {
         self.saved = value;
         self.saved_problems = diagnostics;
         self.refreshed_home()
+    }
+
+    /// The same application with the project screen's file tree following the disk. A test's
+    /// application leaves it off, because its harness would wait for the disk forever.
+    fn following_files(mut self) -> Self {
+        self.live_files = true;
+        self
+    }
+
+    /// The same application, noting every container it starts in the list at `path`, so that
+    /// they can be stopped once no QCode is open. `None` notes nothing.
+    #[must_use]
+    pub fn with_registry(mut self, path: Option<PathBuf>) -> Self {
+        self.registry = path;
+        self
+    }
+
+    /// The same application, offering the background service whose files go where `host` says
+    /// on a machine of `platform`. Whether it is installed is read from the disk now, on the way
+    /// in; `None` offers no service.
+    #[must_use]
+    pub fn with_service(mut self, host: Option<ServiceHost>, platform: Platform) -> Self {
+        let installed = host.as_ref().map(ServiceHost::is_installed);
+        let row = ServiceRow::of(platform, installed);
+        self.settings = self.settings.with_service(row);
+        self.service = host;
+        self
     }
 
     /// The same application on the project screen `screen`, the way a restored session opens
@@ -345,7 +423,7 @@ impl QCode {
             Page::Projects => None,
             Page::Profiles => self.profiles.as_ref().and_then(ui::profiles::entry),
             Page::Project => self.project.as_ref().map(ui::project::entry),
-            Page::Settings => Some(ui::settings::entry()),
+            Page::Settings => Some(ui::settings::entry(&self.settings)),
         };
         control.map_or_else(Command::none, Command::focus)
     }
@@ -462,7 +540,10 @@ impl QCode {
         let entered = match self.project.as_mut() {
             Some(screen) => ui::project::add(screen, project),
             None => {
-                let mut screen = ProjectScreen::new(self.found.clone(), self.user, vec![project]);
+                let mut screen = ProjectScreen::new(self.found.clone(), self.user, vec![project])
+                    .with_registry(self.registry.clone())
+                    .watching(self.live_files);
+                screen.set_editor(self.config.editor());
                 let entered = ui::project::opened(&mut screen);
                 self.project = Some(screen);
                 entered
@@ -498,7 +579,10 @@ impl QCode {
         let ids: Vec<ProjectId> = contents.iter().map(|one| one.file.id.clone()).collect();
         let projects: Vec<OpenProject> =
             contents.into_iter().map(|one| OpenProject::new(&one.file, one.paths, one.profiles)).collect();
-        let mut screen = ProjectScreen::new(self.found.clone(), self.user, projects);
+        let mut screen = ProjectScreen::new(self.found.clone(), self.user, projects)
+            .with_registry(self.registry.clone())
+            .watching(self.live_files);
+        screen.set_editor(self.config.editor());
         for (index, id) in ids.iter().enumerate() {
             if let Some(record) = session.projects.iter().find(|record| record.id == *id) {
                 screen.restore_tabs(index, record);
@@ -598,8 +682,10 @@ impl QCode {
         self.profiles = None;
         self.project = None;
         self.refresh_home();
+        let service = self.settings.service();
         let left_behind = self.settings.left_behind().to_vec();
-        self.settings = SettingsScreen::new(&self.config, self.engine.clone()).with_left_behind(left_behind);
+        self.settings =
+            SettingsScreen::new(&self.config, self.engine.clone()).with_service(service).with_left_behind(left_behind);
         if !self.router.back() {
             self.router.replace(Page::Home);
         }
@@ -656,10 +742,23 @@ impl QCode {
                 self.config.set_engine_kind(kind.name());
                 Command::batch([self.store(), self.look()])
             }
+            Request::Editor(editor) => {
+                self.config.set_editor(editor);
+                if let Some(screen) = self.project.as_mut() {
+                    screen.set_editor(editor);
+                }
+                self.store()
+            }
             Request::OpenEngineStep => self.repair(SetupStep::Engine),
             Request::OpenLocationStep => self.repair(SetupStep::Location),
             Request::SignOut(profile) => self.sign_out(&profile),
             Request::RefreshIdentity(profile) => self.refresh_identity(&profile),
+            Request::OnClose(choice) => {
+                self.config.set_on_close(choice);
+                self.store()
+            }
+            Request::InstallService => self.change_service(true),
+            Request::RemoveService => self.change_service(false),
         }
     }
 
@@ -727,6 +826,19 @@ impl QCode {
             let done = profile::identity::refresh_all(&engine, &profile, &projects, user);
             Ok(Msg::Refreshed(profile, done))
         }))
+    }
+
+    /// Installs or removes the background service on a task thread, and tells the settings screen
+    /// how it went. This is the one place QCode changes the person's service manager, and it is
+    /// reached only from the button that says so.
+    fn change_service(&self, installing: bool) -> Command<Msg> {
+        let Some(host) = self.service.clone() else { return Command::none() };
+        Command::perform(move || {
+            let steps = if installing { host.install() } else { host.uninstall() };
+            let result = service::units::perform(&steps, &mut service::units::run_host);
+            let installed = host.is_installed();
+            Msg::Settings(ui::settings::Msg::ServiceDone { installing, installed, result })
+        })
     }
 
     /// Writes the settings file, off the render path, and tells the settings screen how it went.
@@ -912,16 +1024,25 @@ impl App for QCode {
     /// Turns a keymap action into a message. `back` is Esc, which reaches here only when
     /// nothing nearer has used it: a focused widget first, so the terminal of a harness tab
     /// keeps its own Esc, and then an open dialog, which closes instead of letting the screen go.
+    /// On the project screen an entry of the file tree that waits to be pasted is let go first.
     /// `help` is the framework's own action for the list of keys; the application opens it.
-    /// `new-tab` opens a blank tab and `leave-terminal` takes the keyboard from a harness to the
-    /// tab strip; both only mean something while a project is open.
+    /// `new-tab` opens a blank tab and `leave-terminal` takes the keyboard back into the open
+    /// tab's harness; both only mean something while a project is open.
     fn action(&self, name: &str) -> Option<Msg> {
         let project_open = self.page() == Page::Project && self.project.as_ref().is_some_and(|s| s.project().is_some());
         match name {
-            "back" => Some(Msg::Back),
+            "back" => Some(
+                self.project
+                    .as_ref()
+                    .filter(|_| self.page() == Page::Project)
+                    .and_then(ui::project::escape)
+                    .map_or(Msg::Back, Msg::Project),
+            ),
             "help" => Some(Msg::Help(true)),
             "new-tab" => project_open.then_some(Msg::Project(ui::project::Msg::NewTab)),
-            "leave-terminal" => project_open.then_some(Msg::Project(ui::project::Msg::LeaveTerminal)),
+            // Inside a terminal the terminal's own node answers this key and leaves; here it
+            // arrives only from outside one, so it goes back in.
+            "leave-terminal" => project_open.then_some(Msg::Project(ui::project::Msg::EnterTerminal)),
             _ => None,
         }
     }
@@ -1074,6 +1195,24 @@ pub(crate) mod testing {
     /// one environment between all its threads; a child with its own is how a test sees where
     /// QCode puts things on a machine it describes, without touching the person's folders.
     pub fn in_child(name: &str, vars: &[(&str, &std::ffi::OsStr)]) -> String {
+        let output = child_command(name, vars).output().expect("the test binary runs");
+        let printed = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(output.status.success(), "{printed}{}", String::from_utf8_lossy(&output.stderr));
+        printed
+    }
+
+    /// [`in_child`] started and left running, for a test that acts on the child while it lives:
+    /// a lock it holds is released only when it exits.
+    pub fn spawn_child(name: &str, vars: &[(&str, &std::ffi::OsStr)]) -> std::process::Child {
+        child_command(name, vars)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the test binary runs")
+    }
+
+    /// The test binary, set to run only the test `name`, as [`in_child`] describes.
+    fn child_command(name: &str, vars: &[(&str, &std::ffi::OsStr)]) -> std::process::Command {
         let exe = std::env::current_exe().expect("the test binary");
         let mut command = std::process::Command::new(exe);
         command.args([name, "--exact", "--nocapture", "--test-threads=1"]);
@@ -1081,10 +1220,7 @@ pub(crate) mod testing {
             command.env_remove(var);
         }
         command.envs(vars.iter().copied());
-        let output = command.output().expect("the test binary runs");
-        let printed = String::from_utf8_lossy(&output.stdout).into_owned();
-        assert!(output.status.success(), "{printed}{}", String::from_utf8_lossy(&output.stderr));
-        printed
+        command
     }
 
     /// QCode's own text and keys, and nothing of the person's.
@@ -1239,9 +1375,9 @@ mod tests {
         harness.click_text("Keys");
         let screen = harness.screen();
         assert!(screen.contains("ctrl alt space"), "{screen}");
-        assert!(screen.contains("from the harness to the tabs"), "{screen}");
+        assert!(screen.contains("between the harness and the tabs"), "{screen}");
         harness.set_locale("tr").render();
-        assert!(harness.screen().contains("düzenekten sekmelere geç"), "{}", harness.screen());
+        assert!(harness.screen().contains("düzenek ile sekmeler arasında geç"), "{}", harness.screen());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1307,13 +1443,22 @@ mod tests {
 
         let loaded = Config::load_in(&folder, &legacy);
         let app = app(loaded.value, &settled(), None).with_left_behind(loaded.diagnostics);
-        let mut harness = harness(app, SIZE.0, SIZE.1);
+        // Tall enough for the report and every row of the page under it, so its title is not
+        // scrolled away to keep the settings list in view.
+        let mut harness = harness(app, SIZE.0, 40);
         assert_eq!(harness.app().page(), Page::Home);
         harness.click_text("Settings");
 
         let screen = harness.screen();
         assert!(screen.contains("Some old settings files stayed where they were"), "{screen}");
         assert!(screen.contains("settings.toml"), "{screen}");
+        // The report has the keyboard, so the list below it does not scroll it out of sight.
+        assert!(harness.is_focused("left-behind-read"), "{screen}");
+
+        harness.press("enter").advance(MOMENT);
+        let screen = harness.screen();
+        assert!(!screen.contains("Some old settings files stayed where they were"), "{screen}");
+        assert!(harness.is_focused("settings"), "the list takes the keyboard once the report is read");
         let _ = std::fs::remove_dir_all(&folder);
     }
 
@@ -1550,6 +1695,28 @@ mod tests {
         harness.click_text("Firefly").advance(MOMENT);
         assert_eq!(harness.app().page(), Page::Project);
         assert!(harness.screen().contains("Back"), "the way out is on screen:\n{}", harness.screen());
+        harness.press("esc").advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Projects, "{}", harness.screen());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn escape_first_lets_a_cut_file_stay_and_only_then_leaves_the_project_screen() {
+        let root = scratch("escape-cut");
+        let _ = std::fs::remove_dir_all(&root);
+        let workspace = crate::workspace::Workspace::new(&root);
+        workspace.create_project("Firefly", qframe::date::Date::today_utc()).expect("the workspace takes a project");
+        let mut harness = harness(app(config(&root, &[]), &settled(), None), SIZE.0, SIZE.1);
+        harness.click_text("Projects").advance(MOMENT);
+        harness.click_text("Firefly").advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Project);
+        harness.send(Msg::Project(crate::ui::project::Msg::Files(crate::ui::project::FileMsg::Cut(
+            "notes.txt".to_owned(),
+        ))));
+        harness.press("esc").advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Project, "the first Esc only lets the cut go");
+        let cut = harness.app().project.as_ref().and_then(|screen| screen.project()).map(|p| p.files().cut().len());
+        assert_eq!(cut, Some(0));
         harness.press("esc").advance(MOMENT);
         assert_eq!(harness.app().page(), Page::Projects, "{}", harness.screen());
         let _ = std::fs::remove_dir_all(&root);
@@ -1857,5 +2024,47 @@ mod tests {
         assert_eq!(saved.projects.len(), 1);
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(file.parent().expect("a folder"));
+    }
+
+    #[test]
+    fn the_on_close_choice_is_stored_and_the_default_is_not_written() {
+        use crate::workspace::OnClose;
+        let root = scratch("on-close");
+        let mut harness = harness(app(config(&root, &[]), &settled(), None), SIZE.0, SIZE.1);
+        harness.send(Msg::Settings(crate::ui::settings::Msg::OnClose(OnClose::Keep)));
+        assert_eq!(harness.app().config.on_close(), OnClose::Keep);
+        assert!(harness.app().config.to_toml().contains("[containers]\non-close = \"keep\""));
+        harness.send(Msg::Settings(crate::ui::settings::Msg::OnClose(OnClose::Stop)));
+        assert_eq!(harness.app().config.on_close(), OnClose::Stop);
+        assert!(!harness.app().config.to_toml().contains("containers"), "{}", harness.app().config.to_toml());
+    }
+
+    #[test]
+    fn the_service_row_follows_the_machine_and_what_is_installed_on_it() {
+        use crate::service::units::ServiceHost;
+        use crate::ui::settings::ServiceRow;
+        use crate::workspace::Platform;
+        let root = scratch("service-row");
+        let _ = std::fs::remove_dir_all(&root);
+        let host = ServiceHost {
+            platform: Platform::Linux,
+            units: root.join("systemd"),
+            registry: root.join("containers.toml"),
+            program: root.join("qcode"),
+            uid: Some(1000),
+        };
+        let linux = app(config(&root, &[]), &settled(), None).with_service(Some(host.clone()), Platform::Linux);
+        assert_eq!(linux.settings.service(), Some(ServiceRow::Ready { installed: false, busy: false }));
+        // The files alone say it is installed: they are read from the disk on the way in. They
+        // are written here by hand; pressing the button would run the machine's service manager.
+        for (path, text) in host.files() {
+            std::fs::create_dir_all(path.parent().expect("a folder")).expect("folder");
+            std::fs::write(path, text).expect("written");
+        }
+        let installed = app(config(&root, &[]), &settled(), None).with_service(Some(host), Platform::Linux);
+        assert_eq!(installed.settings.service(), Some(ServiceRow::Ready { installed: true, busy: false }));
+        let windows = app(config(&root, &[]), &settled(), None).with_service(None, Platform::Windows);
+        assert_eq!(windows.settings.service(), Some(ServiceRow::Unsupported));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

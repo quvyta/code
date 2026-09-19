@@ -2,7 +2,7 @@
 
 ![A project open in qcode: a shell tab beside a Claude Code and an opencode tab, and the panel with the file tree, the project and its containers](https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/project.png)
 
-**quvyta-code** runs coding agent harnesses inside containers, from the terminal. You set up a
+**quvyta-code** runs coding harnesses inside containers, from the terminal. You set up a
 profile once, sign it in, and from then on open that harness in any of your projects in a few
 seconds, moving between harnesses and shells the way you move between tabs. Nothing the harness
 runs ever runs on your machine itself. qcode is part of the Quvyta family of terminal
@@ -30,8 +30,13 @@ source under the MIT licence.
   profile later, and the profile can be signed out.
 - **Projects.** A project starts empty, from a copy of a folder, or from a git address (the clone
   runs inside a container, so git does not have to be installed on your machine). The project
-  screen has tabs for shells and harnesses, and a side panel with the project's files, its details
-  and its containers, which can be stopped and restarted from there.
+  screen has tabs for shells, harnesses and files, and a side panel with the project's files, its
+  details and its containers, which can be stopped and restarted from there.
+- **Built-in apps.** A file opened from the file tree opens in a tab of its own, in the project's
+  base container, so nothing is installed on your machine for it. See [Built-in apps](#built-in-apps).
+- **Containers stop when you are done.** When the last QCode closes, the containers it started
+  are stopped, and an optional background service does the same after a crash. See
+  [When QCode closes](#when-qcode-closes).
 - **Podman or Docker.** Either engine works. qcode finds it, tells you when it is missing or not
   running, and shows the command that installs or starts it. It never installs anything and never
   raises its own rights.
@@ -58,6 +63,10 @@ Turkish are included) and uses the family's themes, icons, keys and mouse behavi
 <p>
   <img src="https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/home.png" width="49%" alt="The home screen, ready to continue with the projects left open">
   <img src="https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/projects.png" width="49%" alt="The list of projects">
+</p>
+<p>
+  <img src="https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/apps.png" width="49%" alt="The project's README read in a Markdown tab, opened from the file tree">
+  <img src="https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/files.png" width="49%" alt="Three files selected in the file tree, with the menu that cuts or deletes them">
 </p>
 
 ## Requirements
@@ -115,17 +124,102 @@ The program is installed as `qcode` and also as `quvyta-code`.
 
 | Key | What it does |
 |---|---|
-| `←` `→` | Move between tabs (project screen) |
+| `←` `→` (or `h` `l`) | Move between tabs, while the tab strip has the keyboard |
+| `ctrl+shift+←` `ctrl+shift+→` | Move the open tab left or right |
 | `ctrl+t` | Open a new tab |
 | `ctrl+w` | Close the tab |
+| `ctrl+alt+space` | Inside a harness or shell tab: leave it for the tab strip. Anywhere else on the project screen: go back into the open tab's terminal |
 | `alt+b` | Show or hide the side panel |
+| `tab` `shift+tab` | Move to the next or previous control; `shift+tab` also leaves a terminal |
 | `ctrl+p` | Command palette |
 | `esc` | Leave the screen that is open |
-| `ctrl+alt+space` | From a harness or shell tab back to the tab strip |
-| `f1` | The list of every key |
+| `?` or `f1` | The list of every key |
 | `ctrl+q` | Quit |
 
+In the file tree of the side panel:
+
+| Key | What it does |
+|---|---|
+| `↑` `↓` | Move between entries |
+| `→` (or `l`) | Open a folder, or step into it when it is open |
+| `←` (or `h`) | Close a folder, or step up to the folder above |
+| `enter` | Open a folder, or open a file in a tab |
+| `space` | Add the entry to the selection, or take it out |
+| `shift+↑` `shift+↓` | Select a range of entries |
+| `shift+f10` or the menu key | The entry's context menu |
+
 While a harness or shell tab has the keyboard, keys go to it, `esc` and `?` included; `f1`, `alt+b`, `ctrl+alt+space`, `shift+tab` and `ctrl+q` still reach qcode. The mouse reaches a harness that uses it.
+
+## Built-in apps
+
+Every project has one small container of its own, the base container, which is also where the
+shell tab runs. It starts the first time something needs it, so a session that opens no shell and
+no file starts nothing. A file chosen in the file tree (`enter` or a click) opens in a new
+tab named after the file; choosing it again goes back to that tab.
+
+| File | Opens in |
+|---|---|
+| Text: `txt`, source code, configuration and data files, and files such as `README`, `LICENSE`, `Makefile` or `Dockerfile` | The editor chosen in **Settings**, **Built-in apps**: `nano` (the default) or `vim`. When the editor exits, the tab offers to open the file again |
+| Markdown: `md`, `markdown` | qcode itself, as a formatted page with no container at all. **Edit** above the page opens the same file in the editor |
+| Pictures: `png`, `jpg`, `jpeg`, `gif`, `webp` | `chafa`, which draws the picture in the tab with full colour. **Redraw** draws it again at the tab's new size |
+
+Other kinds of files (sound, PDF, office documents, archives) have no app yet; choosing one says
+so. The base image also carries `unzip`, `zip`, `xz`, `bzip2` and `7z`, ready in the shell tab.
+Every program runs inside the container, on the file's path there, and is handed that path as one
+word, never through a shell. Open file tabs come back with **Continue** like any other tab; a file
+that has gone since is reported in its tab.
+
+## File manager
+
+The file tree of the side panel is also a file manager. It works on the project's own folder
+directly on your machine, so it needs no container and works with no engine running.
+
+- **Context menu.** Right-click an entry, or select it and press `shift+f10` or the menu key. On a
+  folder: **New file**, **New folder**, **Rename**, **Cut**, **Paste here** (once something is cut)
+  and **Delete**. On a file: **Rename**, **Cut** and **Delete**. The first row of the tree is the
+  project folder itself; its menu has **New file**, **New folder**, **Paste here** and **Refresh**.
+  With several entries selected, the menu cuts or deletes all of them.
+- **Names** are asked for in a small dialog and checked as you type: not empty, no `/`, not `.` or
+  `..`, and not a name the folder already has. A rename opens with the name before its extension
+  selected.
+- **Moving** is **Cut**, then **Paste here** on the folder it goes to. A cut entry is drawn faded
+  until it is pasted; `esc` or **Cancel the move** in the menu lets it stay. A folder cannot go
+  into itself, and nothing is ever written over: when the target already has that name, nothing
+  moves and the reason is shown.
+- **Deleting** asks first and cannot be undone; for a folder the question says that everything in
+  it goes too.
+- **Several entries.** `ctrl`+click adds or removes an entry, `shift`+click selects a range, and
+  `shift` with the arrow keys extends it; `space` adds or removes the entry under the cursor and
+  `esc` goes back to one. Cut, paste, delete and dragging act on all of them.
+- **Dragging** entries onto a folder, or onto the project folder's row, moves them there.
+- **Live.** The tree follows the disk: the folders on screen are watched, and when something
+  changes in one, by qcode, a harness or any other program, only that folder is read again.
+  Nothing is read on a timer. Where the system has no watch to give (so far, anywhere but Linux),
+  the tree is read again after qcode's own changes, when you come back to the screen, and on
+  **Refresh**.
+
+A link inside the project is handled as an entry of its own: deleting or moving it touches the
+link, never what it points to.
+
+## When QCode closes
+
+**Settings**, **When QCode closes** decides what the containers QCode started do once no QCode is
+open any more: **Stop** (the default) or **Keep running**. Stopped containers are not removed;
+the same container starts again the next time it is needed. Only containers QCode itself started
+are ever stopped; one you run by hand, or another program's, is never touched.
+
+Several QCodes can be open at once. When the last one closes normally, it stops the containers
+itself and says which on the terminal it was started from.
+
+**The background service** covers what a normal close cannot: a QCode that crashed or whose
+terminal was killed. It is optional, and **Settings**, **Background service** installs and removes
+it. On Linux it is a systemd user path unit that watches the list of the containers QCode
+started; on macOS it is a launchd job that watches the same file. It runs only when that list
+changes, then waits, without polling and without using the processor, until no QCode is open,
+applies the setting, and exits. On a day QCode is never opened it never runs.
+
+On Windows there is no background service, and the last QCode to close cannot tell it is the last,
+so the containers keep running; Settings says so.
 
 ## Where things live
 
@@ -133,6 +227,8 @@ While a harness or shell tab has the keyboard, keys go to it, `esc` and `?` incl
 |---|---|
 | Settings | `code.conf` in the Quvyta folder of the platform's configuration folder: `~/.config/quvyta/code.conf` on Linux, `~/Library/Application Support/Quvyta/code.conf` on macOS, `%APPDATA%\Quvyta\code.conf` on Windows. Settings from before (`~/.config/quvyta/code/settings.toml`) move there once, at start |
 | Open projects and tabs | `session.toml` in the platform's data folder, `~/.local/share/quvyta/code` on Linux |
+| Containers QCode started | `containers.toml` in the same data folder, with `instances.lock`, which every open QCode holds |
+| Background service | `~/.config/systemd/user/qcode-reaper.service` and `qcode-reaper.path` on Linux, `~/Library/LaunchAgents/io.quvyta.code.reaper.plist` on macOS, while it is installed |
 | Workspace | `Quvyta/Code` in your Documents folder by default (`~/Documents/Quvyta/Code`, or `~/Belgeler/Quvyta/Code` where the desktop names it so), or the folder you chose; a folder chosen before stays where it is |
 | Profiles | `Profiles/<profile>.toml` in the workspace |
 | Projects | `Projects/<project>/` in the workspace: `project.qcode`, the code in `Project/`, your material in `Assets/` |

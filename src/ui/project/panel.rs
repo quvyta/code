@@ -1,11 +1,15 @@
 //! The widget panel on the right: which widgets it carries, in what order, and what they show.
 
 use qframe::prelude::*;
-use qframe::widgets::{ContextItem, ContextMenu, Popover, Section, Spinner, Tooltip, Tree, TreeNode, WidgetDock};
+use qframe::widgets::{
+    ContextItem, ContextMenu, Field, Form, FormErrors, Modal, Popover, Section, Spinner, TextInput, Tooltip, Tree,
+    TreeNode, WidgetDock,
+};
 
 use crate::engine::ContainerState;
 
-use super::files::{self, FileTree};
+use super::file_ops::{is_within, stem};
+use super::files::{self, FileMsg, FileTree, NameFor};
 use super::{Msg, OpenProject, ProjectScreen};
 
 /// A widget the panel can carry.
@@ -194,6 +198,9 @@ pub(super) fn view(screen: &ProjectScreen, ui: &mut View<'_, Msg>) {
         })
         .fill_width();
         dock(screen, ui);
+        if let Some(project) = screen.project() {
+            naming(project.files(), ui);
+        }
     })
     .gap(1)
     .padding(Padding::symmetric(1, 1))
@@ -288,16 +295,166 @@ fn files_widget(project: &OpenProject, ui: &mut View<'_, Msg>) {
         ui.add(Text::new(problem.to_owned()).role("faint")).selectable(true);
         return;
     }
+    let cut = tree.cut().to_vec();
+    let folders = tree.folder_keys();
+    let chosen = tree.chosen().to_vec();
+    let accepts = folders.clone();
     ui.add(
-        Tree::new(nodes(tree, files::ROOT))
+        Tree::new([root_node(project, tree)])
             .selected(tree.selected())
-            .empty_text(t!("project.files.empty"))
             .on_select(move |key| Msg::SelectFile(key.to_owned()))
-            .on_expand(move |key, open| Msg::ExpandFile(key.to_owned(), open)),
+            // Enter or a click on a file opens it in a tab; on a folder they open the folder,
+            // which the tree does itself. Space and the modified clicks choose instead.
+            .on_activate(move |key| Msg::OpenFile(key.to_owned()))
+            .multi_select(tree.chosen(), |keys| Msg::Files(FileMsg::Choose(keys)))
+            .droppable(|drop| Msg::Files(FileMsg::Drop(drop)), move |key| key == files::ROOT || accepts.contains(key))
+            .on_expand(move |key, open| Msg::ExpandFile(key.to_owned(), open))
+            .context_menu(move |key| {
+                // The tree keeps the selection when the click is on one of its rows and makes the
+                // row the selection otherwise, so the menu acts on what the click was on.
+                let many = files::targets(&chosen, key).len();
+                if many > 1 {
+                    many_menu(key, many, !cut.is_empty())
+                } else if key == files::ROOT || folders.contains(key) {
+                    folder_menu(key, &cut)
+                } else {
+                    file_menu(key, !cut.is_empty())
+                }
+            }),
     )
     .fill()
-    .id("project-files");
+    .id(FILES_ID);
 }
+
+/// The project folder itself, as the one row at the top of the tree.
+///
+/// It is a row rather than nothing so the folder has a place of its own: its menu makes entries
+/// and pastes at the top, reached by a right click or by selecting it and pressing the menu key
+/// like any other row. A tree that is only as tall as its rows has no empty part below them to
+/// click, so the row is the one way the mouse and the keyboard reach the folder alike.
+fn root_node(project: &OpenProject, tree: &FileTree) -> TreeNode {
+    let entries = nodes(tree, files::ROOT);
+    let mut root = TreeNode::new(files::ROOT, project.name().to_owned()).icon("project", None);
+    if entries.is_empty() {
+        root = root.detail(t!("project.files.empty"));
+    }
+    root.expandable(true).expanded(tree.is_open(files::ROOT)).children(entries)
+}
+
+/// The name the file tree is focused by.
+pub(super) const FILES_ID: &str = "project-files";
+
+/// The name the field of the naming dialog is focused by.
+pub(super) const NAME_ID: &str = "project-files-name";
+
+/// The menu of a folder, or of the project folder itself when `key` is the root: what can be made
+/// in it and, while something is cut, pasting it here. A folder cannot take itself or a folder
+/// that holds it, so pasting there is shown but cannot be chosen.
+fn folder_menu(key: &str, cut: &[String]) -> Vec<ContextItem<Msg>> {
+    let message = |message: FileMsg| Msg::Files(message);
+    let mut items = vec![
+        ContextItem::new(t!("project.files.new-file"), message(FileMsg::NewFile(key.to_owned()))),
+        ContextItem::new(t!("project.files.new-folder"), message(FileMsg::NewFolder(key.to_owned()))),
+    ];
+    let root = key == files::ROOT;
+    if !root {
+        items.push(ContextItem::gap());
+        items.push(ContextItem::new(t!("project.files.rename"), message(FileMsg::Rename(key.to_owned()))));
+        items.push(ContextItem::new(t!("project.files.cut"), message(FileMsg::Cut(key.to_owned()))));
+    }
+    if !cut.is_empty() {
+        let paste = ContextItem::new(t!("project.files.paste"), message(FileMsg::Paste(key.to_owned())));
+        items.push(paste.disabled(cut.iter().any(|cut| is_within(key, cut))));
+        items.push(ContextItem::new(t!("project.files.drop-cut"), message(FileMsg::DropCut)));
+    }
+    items.push(ContextItem::gap());
+    if root {
+        items.push(ContextItem::new(t!("project.files.refresh"), message(FileMsg::Refresh)));
+    } else {
+        items.push(ContextItem::new(t!("project.files.delete"), message(FileMsg::Delete(key.to_owned()))).danger(true));
+    }
+    items
+}
+
+/// The menu of a file.
+fn file_menu(key: &str, cutting: bool) -> Vec<ContextItem<Msg>> {
+    let message = |message: FileMsg| Msg::Files(message);
+    let mut items = vec![
+        ContextItem::new(t!("project.files.rename"), message(FileMsg::Rename(key.to_owned()))),
+        ContextItem::new(t!("project.files.cut"), message(FileMsg::Cut(key.to_owned()))),
+    ];
+    if cutting {
+        items.push(ContextItem::new(t!("project.files.drop-cut"), message(FileMsg::DropCut)));
+    }
+    items.push(ContextItem::gap());
+    items.push(ContextItem::new(t!("project.files.delete"), message(FileMsg::Delete(key.to_owned()))).danger(true));
+    items
+}
+
+/// The menu of a row that is one of `count` selected entries: what can be done to all of them at
+/// once. A name is given to one entry at a time, so renaming is not offered.
+fn many_menu(key: &str, count: usize, cutting: bool) -> Vec<ContextItem<Msg>> {
+    let message = |message: FileMsg| Msg::Files(message);
+    let mut items =
+        vec![ContextItem::new(t!("project.files.cut-many", n = count), message(FileMsg::Cut(key.to_owned())))];
+    if cutting {
+        items.push(ContextItem::new(t!("project.files.drop-cut"), message(FileMsg::DropCut)));
+    }
+    items.push(ContextItem::gap());
+    items.push(
+        ContextItem::new(t!("project.files.delete-many", n = count), message(FileMsg::Delete(key.to_owned())))
+            .danger(true),
+    );
+    items
+}
+
+/// The dialog that asks for a name, while one is asked for. It waits for an answer rather than
+/// sitting beside the tree: the name is all there is to do until it is given or dropped.
+fn naming(tree: &FileTree, ui: &mut View<'_, Msg>) {
+    let Some(naming) = tree.naming() else { return };
+    let (title, confirm) = match &naming.purpose {
+        NameFor::File => (t!("project.files.new-file-title"), t!("project.files.create")),
+        NameFor::Folder => (t!("project.files.new-folder-title"), t!("project.files.create")),
+        NameFor::Rename(key) => {
+            (t!("project.files.rename-title", name = super::file_ops::name_of(key)), t!("project.files.rename-do"))
+        }
+    };
+    let close = Msg::Files(FileMsg::CloseNaming);
+    let dialog = Modal::new()
+        .title(title)
+        .width(NAMING_WIDTH)
+        .on_close(close.clone())
+        .action(Button::new(t!("project.files.cancel")).on_press(close))
+        .action(Button::new(confirm).variant("primary").on_press(Msg::Files(FileMsg::Submit)));
+    let mut errors = FormErrors::new();
+    if let Some(problem) = tree.naming_problem() {
+        errors.set(NAME_ID, problem.message());
+    }
+    let value = naming.value.clone();
+    // A rename selects the name without its extension, so typing gives a new name and keeps the
+    // kind of file; a new entry starts empty and has nothing to select.
+    let selection = match &naming.purpose {
+        NameFor::Rename(key) => Some(stem(&value, tree.is_folder(key))),
+        NameFor::File | NameFor::Folder => None,
+    };
+    ui.add_with(dialog, |ui| {
+        Form::new().show(ui, |fields| {
+            fields.field(Field::new(t!("project.files.name-label")).error(errors.get(NAME_ID)), |ui| {
+                let mut input = TextInput::new(value)
+                    .invalid(errors.has(NAME_ID))
+                    .on_change(|value| Msg::Files(FileMsg::Name(value)))
+                    .on_submit(|_| Msg::Files(FileMsg::Submit));
+                if let Some(range) = selection {
+                    input = input.select_on_focus(range);
+                }
+                ui.add(input).id(NAME_ID).fill_width();
+            });
+        });
+    });
+}
+
+/// Width of the naming dialog, in cells: room for a long file name without covering the screen.
+const NAMING_WIDTH: u16 = 48;
 
 /// The nodes below the folder `key`, as far as the tree has been read.
 fn nodes(tree: &FileTree, key: &str) -> Vec<TreeNode> {
@@ -307,7 +464,9 @@ fn nodes(tree: &FileTree, key: &str) -> Vec<TreeNode> {
         .map(|entry| {
             let child = files::child_key(key, &entry.name);
             let icon = if entry.folder { "folder" } else { "file" };
-            let mut node = TreeNode::new(child.clone(), entry.name.clone()).icon(icon, None);
+            // What was cut is drawn faint until it is pasted or let go, with everything in it.
+            let cut = tree.is_cut(&child);
+            let mut node = TreeNode::new(child.clone(), entry.name.clone()).icon(icon, None).faint(cut);
             if entry.folder {
                 let open = tree.is_open(&child);
                 node = node.expandable(true).expanded(open).loading(tree.is_loading(&child));

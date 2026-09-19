@@ -25,7 +25,10 @@ use crate::workspace::{
 
 use super::plan::{PROJECT_DIR, SHELL};
 
+mod files;
 mod history;
+mod registry;
+mod watch;
 use super::{Choice, Msg, OpenProject, PanelWidget, ProjectScreen, Tab, TabKey, TabKind, TabState};
 
 /// A terminal wide enough for the rail, the tabs, the terminal and the panel.
@@ -293,7 +296,7 @@ fn with_no_tab_the_plus_stands_at_the_top_left() {
     let harness = harness(one_project(&scratch), SIZE.0, SIZE.1);
     let plus = plus_column(&harness);
     let rail = usize::from(super::RAIL_WIDTH);
-    assert!((rail..rail + usize::from(super::NEW_TAB_WIDTH)).contains(&plus), "{}", harness.screen());
+    assert!((rail..rail + 3).contains(&plus), "{}", harness.screen());
     let (_, empty_y) = harness.find("No tab is open").expect("the empty state");
     assert!(empty_y > 0, "above the empty state, at its left edge:\n{}", harness.screen());
 }
@@ -336,6 +339,26 @@ fn the_plus_the_empty_state_and_the_message_open_a_blank_tab_at_once() {
         assert!(harness.app().0.launch_command(tab.key()).is_none(), "and nothing would be spawned");
     }
     assert_eq!(strip(&harness).matches("New tab").count(), 2, "{}", strip(&harness));
+}
+
+#[test]
+fn the_keyboard_reaches_the_plus_from_the_tabs_it_ends() {
+    let scratch = Scratch::new("plus-keys");
+    let mut screen = one_project(&scratch);
+    open(&mut screen, Choice::Shell);
+    let mut harness = harness(screen, SIZE.0, SIZE.1);
+    harness.set_reduced_motion(true).render();
+    for _ in 0..8 {
+        if harness.is_focused("project-tabs") {
+            break;
+        }
+        harness.press("tab");
+    }
+    assert!(harness.is_focused("project-tabs"), "the strip takes the keyboard:\n{}", harness.screen());
+    // The `+` is the strip's second stop, so Tab from the tabs lands on it and Enter presses it.
+    harness.press("tab").press("enter").advance(Duration::from_millis(300));
+    assert_eq!(kinds(&harness.app().0), [TabKind::Shell, TabKind::New], "{}", harness.screen());
+    assert!(harness.is_focused("project-choices"), "the new tab's page has the keyboard");
 }
 
 #[test]
@@ -817,7 +840,7 @@ fn the_panel_runs_from_the_top_row_to_the_bottom_one() {
 
     // Folding and widening still reach the screen through the application's messages.
     for _ in 0..8 {
-        if harness.is_focused("project-new-tab") {
+        if harness.is_focused("project-tabs") {
             break;
         }
         harness.press("tab");
@@ -1246,7 +1269,7 @@ impl App for Keyed {
     fn action(&self, name: &str) -> Option<KeyedMsg> {
         match name {
             "help" => Some(KeyedMsg::Help),
-            "leave-terminal" => Some(KeyedMsg::Screen(Msg::LeaveTerminal)),
+            "leave-terminal" => Some(KeyedMsg::Screen(Msg::EnterTerminal)),
             _ => None,
         }
     }
@@ -1325,7 +1348,7 @@ fn a_click_on_a_harness_that_asks_for_the_mouse_reaches_it() {
 }
 
 #[test]
-fn ctrl_alt_space_takes_the_keyboard_from_the_harness_to_the_tabs() {
+fn ctrl_alt_space_takes_the_keyboard_between_the_harness_and_the_tabs() {
     let scratch = Scratch::new("leave-terminal");
     // The program shows, in hex, the first four bytes it receives: the chord must not be one.
     let (screen, session) = running(&scratch, "stty raw -echo; printf 'ready '; head -c 4 | od -An -tx1");
@@ -1334,14 +1357,14 @@ fn ctrl_alt_space_takes_the_keyboard_from_the_harness_to_the_tabs() {
     harness.press("ctrl+alt+space");
     assert!(harness.is_focused("project-tabs"), "the tab strip has the keyboard:\n{}", harness.screen());
     harness.press("ctrl+alt+space");
-    assert!(harness.is_focused("project-tabs"), "away from the harness the key keeps it there");
+    assert!(harness.is_focused("project-terminal"), "the same key goes back into the harness");
 
-    for _ in 0..16 {
-        if harness.is_focused("project-terminal") {
-            break;
-        }
-        harness.press("tab");
-    }
+    // However the keyboard left the harness, by Tab here, the key finds its way back.
+    harness.press("shift+tab");
+    assert!(!harness.is_focused("project-terminal"), "shift+tab leaves the harness");
+    harness.press("ctrl+alt+space");
+    assert!(harness.is_focused("project-terminal"), "back from wherever the keyboard was");
+
     harness.type_text("abcd");
     wait_for(&mut harness, "61 62 63 64");
     session.kill();

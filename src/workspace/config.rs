@@ -28,6 +28,7 @@ use qframe::icons::IconMode;
 use qframe::storage::{Family, Schema, SettingKind, Settings, config_dir};
 
 use super::{Loaded, ProjectId};
+use crate::base::apps::Editor;
 
 /// QCode's id in the family: its settings file is `code.conf` and its other files are under
 /// `code/`.
@@ -75,6 +76,35 @@ impl SetupStep {
     }
 }
 
+/// What happens to QCode's containers once no QCode is open any more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnClose {
+    /// They are stopped, not removed: the next QCode starts the same containers again.
+    Stop,
+    /// They are left running.
+    Keep,
+}
+
+impl OnClose {
+    /// Both choices, in the order the settings screen offers them.
+    pub const ALL: [Self; 2] = [Self::Stop, Self::Keep];
+
+    /// How the choice is written in the config file.
+    #[must_use]
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Keep => "keep",
+        }
+    }
+
+    /// The choice a config file's `containers.on-close` names, if it names one.
+    #[must_use]
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|choice| choice.key() == key)
+    }
+}
+
 /// QCode's settings file.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -96,6 +126,10 @@ impl Config {
     const WORKSPACE: &'static str = "workspace.path";
     /// The key of the recently opened projects.
     const RECENT: &'static str = "projects.recent";
+    /// The key of what happens to the containers once no QCode is open.
+    const ON_CLOSE: &'static str = "containers.on-close";
+    /// The key of the editor a text file opens in.
+    const EDITOR: &'static str = "apps.editor";
 
     /// How many projects the recent list keeps. Beyond a screenful the list stops being a
     /// shortcut, and the full list of projects is one screen away.
@@ -152,6 +186,10 @@ impl Config {
             // default: an absent workspace means "the wizard has not run", not "the default one".
             .optional(Self::WORKSPACE, SettingKind::check(|path: &String| Path::new(path).is_absolute()))
             .optional(Self::RECENT, SettingKind::check(is_id_list))
+            // Stopping is the default because a container left running holds memory the person
+            // never sees again; keeping them running is the choice of someone who wants that.
+            .choice(Self::ON_CLOSE, OnClose::ALL.map(OnClose::key), OnClose::Stop.key())
+            .choice(Self::EDITOR, Editor::ALL.map(Editor::key), Editor::default().key())
     }
 
     /// Every problem found while reading the file, including every repair that was made.
@@ -262,6 +300,25 @@ impl Config {
         path.is_absolute() && self.settings.set(Self::WORKSPACE, path.display().to_string())
     }
 
+    /// What happens to QCode's containers once no QCode is open, stopping them until the person
+    /// says otherwise.
+    #[must_use]
+    pub fn on_close(&self) -> OnClose {
+        self.settings.get::<String>(Self::ON_CLOSE).and_then(|key| OnClose::from_key(&key)).unwrap_or(OnClose::Stop)
+    }
+
+    /// Records what happens to the containers once no QCode is open. Answers whether anything
+    /// changed.
+    ///
+    /// Choosing the default takes the key out of the file rather than writing the default in,
+    /// so a later change of the default reaches this installation too.
+    pub fn set_on_close(&mut self, choice: OnClose) -> bool {
+        match choice {
+            OnClose::Stop => self.settings.remove(Self::ON_CLOSE),
+            OnClose::Keep => self.settings.set(Self::ON_CLOSE, choice.key().to_owned()),
+        }
+    }
+
     /// The projects that were opened last, newest first.
     #[must_use]
     pub fn recent_projects(&self) -> Vec<ProjectId> {
@@ -292,6 +349,23 @@ impl Config {
         } else {
             self.settings.set(Self::RECENT, recent);
         }
+    }
+
+    /// The editor a text file opens in; nano until the person chooses otherwise.
+    #[must_use]
+    pub fn editor(&self) -> Editor {
+        self.settings.get::<String>(Self::EDITOR).and_then(|key| Editor::from_key(&key)).unwrap_or_default()
+    }
+
+    /// Records the editor a text file opens in. Answers whether anything changed.
+    ///
+    /// Choosing nano again takes the key out rather than writing the default down, so the file
+    /// of a person who went back to the default is the file of one who never left it.
+    pub fn set_editor(&mut self, editor: Editor) -> bool {
+        if editor != Editor::default() {
+            return self.settings.set(Self::EDITOR, editor.key().to_owned());
+        }
+        self.settings.remove(Self::EDITOR)
     }
 
     fn recent_ids(&self) -> Vec<String> {
@@ -609,6 +683,51 @@ mod tests {
         assert_eq!(read(&file), SETTLED);
         assert!(!xdg.join("quvyta").join("code").join("settings.toml").exists());
         let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn containers_are_stopped_on_close_until_the_person_says_otherwise() {
+        let mut config = Config::parse_str(FILE, "");
+        assert_eq!(config.on_close(), OnClose::Stop);
+        config.set_on_close(OnClose::Stop);
+        assert_eq!(config.to_toml(), "", "the default is not written down");
+        assert!(config.set_on_close(OnClose::Keep));
+        assert_eq!(config.to_toml(), "[containers]\non-close = \"keep\"\n");
+        let stored = Config::parse_str(FILE, &config.to_toml());
+        assert!(stored.is_clean(), "{:?}", stored.diagnostics());
+        assert_eq!(stored.on_close(), OnClose::Keep);
+        config.set_on_close(OnClose::Stop);
+        assert_eq!(config.to_toml(), "", "going back to the default takes the key out again");
+    }
+
+    #[test]
+    fn an_on_close_choice_nobody_knows_falls_back_to_stopping() {
+        let config = Config::parse_str(FILE, "[containers]\non-close = \"pause\"\n");
+        assert_eq!(config.on_close(), OnClose::Stop);
+        assert_eq!(config.diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn the_editor_is_nano_until_another_is_chosen_and_nano_is_never_written() {
+        let mut config = Config::parse_str(FILE, "");
+        assert_eq!(config.editor(), Editor::Nano);
+        assert!(config.set_editor(Editor::Vim));
+        assert_eq!(config.to_toml(), "[apps]\neditor = \"vim\"\n");
+        let stored = Config::parse_str(FILE, &config.to_toml());
+        assert!(stored.is_clean(), "{:?}", stored.diagnostics());
+        assert_eq!(stored.editor(), Editor::Vim);
+
+        let mut config = stored;
+        config.set_editor(Editor::Nano);
+        assert_eq!(config.editor(), Editor::Nano);
+        assert_eq!(config.to_toml(), "", "the default is not written down");
+    }
+
+    #[test]
+    fn an_editor_the_image_does_not_carry_falls_back_to_nano() {
+        let config = Config::parse_str(FILE, "[apps]\neditor = \"emacs\"\n");
+        assert_eq!(config.editor(), Editor::Nano);
+        assert_eq!(config.diagnostics().len(), 1);
     }
 
     #[test]

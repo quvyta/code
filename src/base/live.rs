@@ -18,6 +18,7 @@
 
 use std::path::{Path, PathBuf};
 
+use super::apps::{PROGRAMS, picture};
 use super::paths::{ASSETS_DIR, HOME_DIR, KEEP_ALIVE, OPEN_HOME, PROJECT_DIR};
 use super::{Outcome, Presence, containerfile, ensure, presence};
 use crate::engine::names::HOSTNAME;
@@ -249,6 +250,92 @@ fn a_repository_is_cloned_inside_the_container() {
             ),
         );
         assert_eq!(run_in(&engine, &format!("cat {PROJECT_DIR}/cloned/hello.txt")).trim(), "merhaba");
+
+        clear(&engine);
+    }
+}
+
+/// A 4 × 2 picture in the PNG format, written by hand so the test needs no image crate: 8-bit
+/// RGB rows, each after a filter byte of 0, in one stored deflate block, which a PNG decoder
+/// reads like any other.
+fn png() -> Vec<u8> {
+    fn crc(bytes: &[u8]) -> u32 {
+        let mut crc = u32::MAX;
+        for byte in bytes {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 { (crc >> 1) ^ 0xedb8_8320 } else { crc >> 1 };
+            }
+        }
+        !crc
+    }
+    fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        out.extend_from_slice(&u32::try_from(data.len()).unwrap_or(0).to_be_bytes());
+        let mut body = kind.to_vec();
+        body.extend_from_slice(data);
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&crc(&body).to_be_bytes());
+    }
+    let (width, height) = (4_u32, 2_u32);
+    let mut raw = Vec::new();
+    for y in 0..height {
+        raw.push(0);
+        for x in 0..width {
+            // A band of colour, so the drawing cannot come out blank.
+            let shade = u8::try_from(x * 60 + y * 40).unwrap_or(u8::MAX);
+            raw.extend_from_slice(&[200, shade, 255 - shade]);
+        }
+    }
+    let (mut a, mut b) = (1_u32, 0_u32);
+    for byte in &raw {
+        a = (a + u32::from(*byte)) % 65_521;
+        b = (b + a) % 65_521;
+    }
+    let length = u16::try_from(raw.len()).unwrap_or(0);
+    let mut zlib = vec![0x78, 0x01, 0x01];
+    zlib.extend_from_slice(&length.to_le_bytes());
+    zlib.extend_from_slice(&(!length).to_le_bytes());
+    zlib.extend_from_slice(&raw);
+    zlib.extend_from_slice(&((b << 16) | a).to_be_bytes());
+
+    let mut header = Vec::new();
+    header.extend_from_slice(&width.to_be_bytes());
+    header.extend_from_slice(&height.to_be_bytes());
+    header.extend_from_slice(&[8, 2, 0, 0, 0]);
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    chunk(&mut out, b"IHDR", &header);
+    chunk(&mut out, b"IDAT", &zlib);
+    chunk(&mut out, b"IEND", &[]);
+    out
+}
+
+#[test]
+#[ignore = "needs a container engine; run with QCODE_CONTAINER_TESTS=1"]
+fn the_built_in_apps_answer_and_a_picture_is_drawn() {
+    // A file opened from the file tree runs one of these in the project's container. A program
+    // the image does not really carry would fail only when the person opens a file, so every one
+    // is asked here, and a picture is drawn with the very words a tab uses.
+    for engine in engines() {
+        clear(&engine);
+        let scratch = Scratch::new("apps");
+        build(&engine, TEST_BASE, &containerfile(), &scratch);
+        let project = scratch.dir("Project");
+        std::fs::write(project.join("band of colour.png"), png()).expect("the picture is written");
+        start(&engine, TEST_BASE, &project, &scratch.dir("Assets"));
+
+        for program in PROGRAMS {
+            let answer = capture(&engine.exec_without_terminal(&Exec { container: CONTAINER, command: program }));
+            assert!(answer.is_ok(), "{:?}: `{}` does not answer: {answer:?}", engine.kind(), program.join(" "));
+        }
+
+        let command = picture(&format!("{PROJECT_DIR}/band of colour.png"));
+        let parts: Vec<&str> = command.iter().map(String::as_str).collect();
+        let drawn = capture(&engine.exec_without_terminal(&Exec { container: CONTAINER, command: &parts }))
+            .unwrap_or_else(|error| panic!("{:?}: the picture is not drawn: {error:?}", engine.kind()));
+        // Without a terminal chafa falls back to a view of its own; what matters is that it read
+        // the file and drew it in coloured cells.
+        assert!(drawn.contains("\u{1b}[38;2;"), "{:?}: no full colour in {drawn:?}", engine.kind());
+        assert!(drawn.lines().count() > 1, "{:?}: {drawn:?}", engine.kind());
 
         clear(&engine);
     }
