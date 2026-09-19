@@ -22,6 +22,7 @@ use qframe::icons::IconMode;
 use qframe::prelude::*;
 use qframe::widgets::{ScrollView, Segmented, Select, SettingRow, SettingsList, SettingsRows, Spinner, Switch, Toast};
 
+use crate::backup::BackupEvery;
 use crate::base::apps::Editor;
 use crate::engine::EngineKind;
 use crate::profile::SafeName;
@@ -78,6 +79,8 @@ pub enum Request {
     SignOut(SafeName),
     /// Store what happens to the containers once no QCode is open.
     OnClose(OnClose),
+    /// Store how often the open projects are backed up, and back them up that often from now on.
+    BackupEvery(BackupEvery),
     /// Install the background service.
     InstallService,
     /// Remove the background service.
@@ -148,6 +151,8 @@ pub enum Msg {
     Stored(Result<(), String>),
     /// What happens to the containers once no QCode is open was chosen.
     OnClose(OnClose),
+    /// How often the open projects are backed up was chosen.
+    BackupEvery(BackupEvery),
     /// Installing or removing the background service finished: which of the two it was, whether
     /// the service's files are there now, and the words of what failed.
     ServiceDone {
@@ -173,6 +178,7 @@ pub struct Settings {
     chosen: usize,
     failure: Option<String>,
     on_close: OnClose,
+    backup_every: BackupEvery,
     service: Option<ServiceRow>,
 }
 
@@ -192,6 +198,7 @@ impl Settings {
             chosen: 0,
             failure: None,
             on_close: config.on_close(),
+            backup_every: config.backup_every(),
             service: None,
         }
     }
@@ -304,6 +311,10 @@ pub fn update(screen: &mut Settings, message: Msg) -> (Command<Msg>, Option<Requ
         Msg::OnClose(choice) => {
             screen.on_close = choice;
             (Command::none(), Some(Request::OnClose(choice)))
+        }
+        Msg::BackupEvery(choice) => {
+            screen.backup_every = choice;
+            (Command::none(), Some(Request::BackupEvery(choice)))
         }
         Msg::ServiceDone { installing, installed, result } => {
             if let Some(ServiceRow::Ready { .. }) = screen.service {
@@ -467,6 +478,20 @@ pub fn view(screen: &Settings, ui: &mut View<'_, Msg>) {
                     if let Some(row) = screen.service {
                         service_row(list, row);
                     }
+
+                    list.heading(t!("settings.backup"));
+                    let choices = BackupEvery::ALL.map(|choice| t!(&format!("settings.backup-every-{}", choice.key())));
+                    let chosen = BackupEvery::ALL.iter().position(|choice| *choice == screen.backup_every);
+                    let row =
+                        SettingRow::new(t!("settings.backup-every")).description(t!("settings.backup-every-text"));
+                    list.row(row, |ui| {
+                        ui.add(
+                            Segmented::new(choices)
+                                .selected(chosen.unwrap_or(0))
+                                .on_select(|index| Msg::BackupEvery(BackupEvery::ALL[index])),
+                        )
+                        .id("backup-every");
+                    });
 
                     list.heading(t!("settings.apps"));
                     // The program's own name is the label: it is what the person knows it by, in
@@ -729,6 +754,7 @@ mod tests {
     use qframe::icons::GlyphMode;
 
     use super::testing;
+    use crate::backup::BackupEvery;
     use crate::base::apps::Editor;
     use crate::engine::EngineKind;
     use crate::ui::settings::Request;
@@ -1046,6 +1072,35 @@ mod tests {
         for words in ["QCode kapanınca", "Durdurulsun", "Açık kalsın"] {
             assert!(screen.contains(words), "`{words}` is missing:\n{screen}");
         }
+    }
+
+    #[test]
+    fn how_often_open_projects_are_backed_up_is_a_choice_of_four() {
+        let mut harness = with_service(None);
+        let screen = harness.screen();
+        for words in ["BACKUP", "Back up open projects", "Off", "5 min", "15 min", "1 hour"] {
+            assert!(screen.contains(words), "`{words}` is missing:\n{screen}");
+        }
+        harness.click_text("5 min");
+        harness.click_text("Off");
+        assert_eq!(
+            harness.app().asked,
+            [Request::BackupEvery(BackupEvery::Five), Request::BackupEvery(BackupEvery::Off)]
+        );
+        harness.set_locale("tr").render();
+        let screen = harness.screen();
+        assert!(!screen.contains('…'), "every word fits:\n{screen}");
+        for words in ["YEDEK", "Açık projeleri yedekle", "Kapalı", "5 dk", "15 dk", "1 saat"] {
+            assert!(screen.contains(words), "`{words}` is missing:\n{screen}");
+        }
+    }
+
+    #[test]
+    fn a_stored_interval_is_the_one_shown() {
+        let screen = testing::from_config("[backup]\nevery = \"1h\"\n", EngineKind::Podman, Health::Working);
+        assert_eq!(screen.backup_every, BackupEvery::Hour);
+        let screen = testing::from_config("", EngineKind::Podman, Health::Working);
+        assert_eq!(screen.backup_every, BackupEvery::Fifteen, "fifteen minutes until the person chooses");
     }
 
     #[test]

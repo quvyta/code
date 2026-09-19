@@ -13,7 +13,7 @@
 
 use std::path::Path;
 
-use crate::base::paths::{BACKUP_DIR, PROJECT_DIR};
+use crate::base::paths::{ASSETS_DIR, BACKUP_DIR, PROJECT_DIR};
 use crate::engine::names::BASE_IMAGE;
 use crate::engine::{Access, Engine, EngineCommand, HostUser, Mount, MountSource, Network, RunOnce};
 use crate::workspace::ProjectPaths;
@@ -21,8 +21,42 @@ use crate::workspace::ProjectPaths;
 use super::place::Place;
 use super::{Entry, Reason, SnapshotId};
 
-/// The name of the git folder the project's snapshots are kept in, inside `Backup/`.
-pub(super) const PROJECT_GIT: &str = "Project.git";
+/// A folder of the project that is backed up, each into a git folder of its own inside
+/// `Backup/`: they are backed up and brought back apart, and one's history says nothing of the
+/// other's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Tree {
+    /// `Project/`, the project's own files.
+    Project,
+    /// `Assets/`, backed up only when the project asks for it.
+    Assets,
+}
+
+impl Tree {
+    /// The name of the git folder its snapshots are kept in, inside `Backup/`.
+    pub(super) fn git(self) -> &'static str {
+        match self {
+            Self::Project => "Project.git",
+            Self::Assets => "Assets.git",
+        }
+    }
+
+    /// Where it is on the machine.
+    pub(super) fn source(self, paths: &ProjectPaths) -> &Path {
+        match self {
+            Self::Project => &paths.project,
+            Self::Assets => &paths.assets,
+        }
+    }
+
+    /// Where the job sees it, the same place the project's containers see it.
+    fn target(self) -> &'static str {
+        match self {
+            Self::Project => PROJECT_DIR,
+            Self::Assets => ASSETS_DIR,
+        }
+    }
+}
 
 /// The lines every script starts with: stop at the first failure, take the backup's git
 /// folder (`$1`) and the project (`$2`) off the arguments, and make `g` git pointed at both.
@@ -35,6 +69,9 @@ macro_rules! preamble {
          -c advice.addEmbeddedRepo=false -c gc.autoDetach=false \"$@\"; }\n"
     };
 }
+
+// The conversations backup runs git the same way, on another tree.
+pub(super) use preamble;
 
 /// Takes a snapshot. `$1` is the whole exclude file, `$2` the commit message.
 ///
@@ -78,62 +115,71 @@ const HISTORY: &str = concat!(
 /// snapshot does not have is left where it is, never deleted.
 const RESTORE: &str = concat!(preamble!(), "g checkout --quiet --overlay \"$1\" -- \"$2\"\n");
 
-/// The command that takes a snapshot of the project, leaving out every line of `exclude`.
+/// The command that takes a snapshot of `tree`, leaving out every line of `exclude`.
 pub(super) fn snapshot(
     engine: &Engine,
     paths: &ProjectPaths,
+    tree: Tree,
     user: HostUser,
     exclude: &str,
     reason: Reason,
 ) -> EngineCommand {
-    one_off(engine, paths, user, Access::ReadOnly, SNAPSHOT, &[exclude, reason.message()])
+    one_off(engine, paths, tree, user, Access::ReadOnly, SNAPSHOT, &[exclude, reason.message()])
 }
 
-/// The command that lists the snapshots, or the ones that changed `file`.
-pub(super) fn history(engine: &Engine, paths: &ProjectPaths, user: HostUser, file: Option<&Place>) -> EngineCommand {
+/// The command that lists the snapshots of `tree`, or the ones that changed `file`.
+pub(super) fn history(
+    engine: &Engine,
+    paths: &ProjectPaths,
+    tree: Tree,
+    user: HostUser,
+    file: Option<&Place>,
+) -> EngineCommand {
     let file: Vec<&str> = file.map(Place::as_str).into_iter().collect();
-    one_off(engine, paths, user, Access::ReadOnly, HISTORY, &file)
+    one_off(engine, paths, tree, user, Access::ReadOnly, HISTORY, &file)
 }
 
-/// The command that brings `what` back from the snapshot `id`, `None` for the whole project.
+/// The command that brings `what` of `tree` back from the snapshot `id`, `None` for all of it.
 pub(super) fn restore(
     engine: &Engine,
     paths: &ProjectPaths,
+    tree: Tree,
     user: HostUser,
     id: &SnapshotId,
     what: Option<&Place>,
 ) -> EngineCommand {
     let what = what.map_or(".", Place::as_str);
-    one_off(engine, paths, user, Access::ReadWrite, RESTORE, &[id.as_str(), what])
+    one_off(engine, paths, tree, user, Access::ReadWrite, RESTORE, &[id.as_str(), what])
 }
 
-/// A one-off container of the base image with the project and its backup, and no network:
-/// nothing a backup does needs one.
+/// A one-off container of the base image with `tree` and the backup, and no network: nothing a
+/// backup does needs one.
 ///
-/// It starts in the project, because git reads the paths it is given as relative to where it
-/// is, and a path relative to anywhere else would be outside the tree it looks at.
+/// It starts in the tree, because git reads the paths it is given as relative to where it is,
+/// and a path relative to anywhere else would be outside the tree it looks at.
 fn one_off(
     engine: &Engine,
     paths: &ProjectPaths,
+    tree: Tree,
     user: HostUser,
-    project: Access,
+    access: Access,
     script: &str,
     args: &[&str],
 ) -> EngineCommand {
     let backup = paths.backup();
     let mounts = [
-        Mount { source: MountSource::Path(&paths.project), target: Path::new(PROJECT_DIR), access: project },
+        Mount { source: MountSource::Path(tree.source(paths)), target: Path::new(tree.target()), access },
         Mount { source: MountSource::Path(&backup), target: Path::new(BACKUP_DIR), access: Access::ReadWrite },
     ];
-    let git_dir = format!("{BACKUP_DIR}/{PROJECT_GIT}");
-    let mut command = vec!["sh", "-c", script, "sh", &git_dir, PROJECT_DIR];
+    let git_dir = format!("{BACKUP_DIR}/{}", tree.git());
+    let mut command = vec!["sh", "-c", script, "sh", &git_dir, tree.target()];
     command.extend_from_slice(args);
     engine.run_once(&RunOnce {
         image: BASE_IMAGE,
         mounts: &mounts,
         network: Network::None,
         user,
-        workdir: Some(Path::new(PROJECT_DIR)),
+        workdir: Some(Path::new(tree.target())),
         command: &command,
     })
 }
@@ -185,7 +231,7 @@ pub(super) fn read_history(output: &str) -> Vec<Entry> {
 
 #[cfg(test)]
 mod tests {
-    use super::{HISTORY, RESTORE, SNAPSHOT, history, read_history, read_snapshot, restore, snapshot};
+    use super::{HISTORY, RESTORE, SNAPSHOT, Tree, history, read_history, read_snapshot, restore, snapshot};
     use crate::backup::place::Place;
     use crate::backup::{Entry, Reason, SnapshotId};
     use crate::engine::{Engine, EngineCommand, EngineKind, HostUser};
@@ -243,22 +289,22 @@ mod tests {
 
     #[test]
     fn a_snapshot_reads_the_project_and_writes_only_the_backup() {
-        let command = snapshot(&podman(), &paths(), ME, "/data\n", Reason::Scheduled);
+        let command = snapshot(&podman(), &paths(), Tree::Project, ME, "/data\n", Reason::Scheduled);
         assert_eq!(command.program, Path::new("/usr/bin/podman"));
         let mut expected = container("ro", SNAPSHOT);
         expected.extend(["/data\n".to_owned(), "backup".to_owned()]);
         assert_eq!(args(&command), expected);
-        let before = snapshot(&podman(), &paths(), ME, "", Reason::BeforeRestore);
+        let before = snapshot(&podman(), &paths(), Tree::Project, ME, "", Reason::BeforeRestore);
         assert_eq!(args(&before).last().map(String::as_str), Some("before restore"));
     }
 
     #[test]
     fn the_history_names_a_path_only_when_it_is_asked_for_one() {
-        assert_eq!(args(&history(&podman(), &paths(), ME, None)), container("ro", HISTORY));
+        assert_eq!(args(&history(&podman(), &paths(), Tree::Project, ME, None)), container("ro", HISTORY));
         let file = Place::new("src/main.rs").expect("a path");
         let mut expected = container("ro", HISTORY);
         expected.push("src/main.rs".to_owned());
-        assert_eq!(args(&history(&podman(), &paths(), ME, Some(&file))), expected);
+        assert_eq!(args(&history(&podman(), &paths(), Tree::Project, ME, Some(&file))), expected);
     }
 
     #[test]
@@ -266,11 +312,32 @@ mod tests {
         let id = SnapshotId::parse(ID).expect("an id");
         let mut expected = container("rw", RESTORE);
         expected.extend([ID.to_owned(), ".".to_owned()]);
-        assert_eq!(args(&restore(&podman(), &paths(), ME, &id, None)), expected);
+        assert_eq!(args(&restore(&podman(), &paths(), Tree::Project, ME, &id, None)), expected);
         let file = Place::new("src/main.rs").expect("a path");
         let mut expected = container("rw", RESTORE);
         expected.extend([ID.to_owned(), "src/main.rs".to_owned()]);
-        assert_eq!(args(&restore(&podman(), &paths(), ME, &id, Some(&file))), expected);
+        assert_eq!(args(&restore(&podman(), &paths(), Tree::Project, ME, &id, Some(&file))), expected);
+    }
+
+    #[test]
+    fn the_assets_are_read_only_to_a_snapshot_and_written_only_by_a_restore() {
+        let mounted = |command: &EngineCommand| {
+            let words = args(command);
+            let at = words.iter().position(|word| word == "--volume").expect("a mount");
+            (words[at + 1].clone(), words[at + 5].clone(), words[words.len() - 3..].to_vec())
+        };
+        let command = snapshot(&podman(), &paths(), Tree::Assets, ME, "", Reason::Scheduled);
+        let (volume, workdir, _) = mounted(&command);
+        assert_eq!(volume, "/home/me/QCode/Projects/p/Assets:/work/Assets:ro,z");
+        assert_eq!(workdir, "/work/Assets");
+        assert!(args(&command).contains(&"/work/Backup/Assets.git".to_owned()), "{:?}", args(&command));
+
+        let id = SnapshotId::parse(ID).expect("an id");
+        let (volume, _, tail) = mounted(&restore(&podman(), &paths(), Tree::Assets, ME, &id, None));
+        assert_eq!(volume, "/home/me/QCode/Projects/p/Assets:/work/Assets:rw,z");
+        assert_eq!(tail, ["/work/Assets", ID, "."]);
+        let (volume, ..) = mounted(&history(&podman(), &paths(), Tree::Assets, ME, None));
+        assert!(volume.ends_with(":ro,z"), "{volume}");
     }
 
     #[test]

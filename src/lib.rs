@@ -32,7 +32,7 @@ use profile::{Profile, SafeName};
 use service::units::ServiceHost;
 use ui::home::{Entry, Home};
 use ui::profiles::Profiles;
-use ui::project::{OpenProject, ProjectScreen};
+use ui::project::{Farewell, OpenProject, ProjectScreen};
 use ui::projects::Projects;
 use ui::settings::engine::{EngineState, Health, Trouble};
 use ui::settings::{Request, ServiceRow, Settings as SettingsScreen};
@@ -86,13 +86,21 @@ pub fn run() -> io::Result<()> {
     // Windows has no lock to hold, and there nothing is stopped on close.
     let open = places.and_then(|places| service::Open::hold(places).ok());
     let settings = config.settings().clone();
-    let app = QCode::start(config.clone(), HostDirs::detect(), InstallHost::detect()).with_left_behind(left_behind);
+    let farewell = Farewell::default();
+    let app = QCode::start(config.clone(), HostDirs::detect(), InstallHost::detect())
+        .with_left_behind(left_behind)
+        .with_farewell(farewell.clone());
     let (keys, bindings) = keymap();
     let mut runtime = Runtime::new(app).settings(&settings).keymap_source(keys, bindings);
     for (file, text) in locales() {
         runtime = runtime.locale_source(file, text);
     }
     let ran = runtime.run();
+    // The projects are backed up before their containers may be stopped, and a backup that
+    // failed is the one thing said about it: one that worked needs no word on the way out.
+    let leaving = farewell.take();
+    let say = |lines: Vec<String>| lines.iter().try_for_each(|line| writeln!(io::stdout(), "{line}"));
+    let backed = leaving.as_ref().map_or(Ok(()), |leaving| qframe::i18n::scope(text(), || say(leaving.back_up())));
     // The screen is given back by now, so what the last QCode stopped is said on the terminal
     // the person started it from.
     let closed = open.map_or(Ok(()), |open| {
@@ -105,7 +113,11 @@ pub fn run() -> io::Result<()> {
             Some(service::stop::Reaped::Kept) | None => Ok(()),
         })
     });
-    ran.and(closed)
+    // A harness that keeps its conversations in a database is backed up only once its container
+    // has stopped, which is now when this QCode stopped it.
+    let stopped =
+        leaving.as_ref().map_or(Ok(()), |leaving| qframe::i18n::scope(text(), || say(leaving.back_up_stopped())));
+    ran.and(backed).and(closed).and(stopped)
 }
 
 /// The application's own locale files, compiled in so an installed program carries its text with
@@ -200,6 +212,8 @@ pub enum Msg {
     Settings(ui::settings::Msg),
     /// Leave the screen that is open and go back to the one before it.
     Back,
+    /// Leave QCode, however that was asked for.
+    Quit,
     /// The list of every key was opened or closed.
     Help(bool),
     /// The container engine was looked for again, and this is what was found.
@@ -249,6 +263,9 @@ pub struct QCode {
     registry: Option<PathBuf>,
     /// Where the background service's files go on this machine, or `None` where it gets none.
     service: Option<ServiceHost>,
+    /// Where the projects open as QCode quits are left, to be backed up once the screen is
+    /// given back.
+    farewell: Farewell,
 }
 
 impl QCode {
@@ -320,6 +337,7 @@ impl QCode {
             live_files: false,
             registry: None,
             service: None,
+            farewell: Farewell::default(),
         }
         .refreshed_home()
     }
@@ -359,6 +377,14 @@ impl QCode {
     #[must_use]
     pub fn with_registry(mut self, path: Option<PathBuf>) -> Self {
         self.registry = path;
+        self
+    }
+
+    /// The same application, leaving in `farewell` the projects that are open as it quits, so
+    /// that they can be backed up once the runtime is done with it.
+    #[must_use]
+    pub fn with_farewell(mut self, farewell: Farewell) -> Self {
+        self.farewell = farewell;
         self
     }
 
@@ -442,7 +468,7 @@ impl QCode {
     /// Opens a row of the home menu.
     fn open(&mut self, entry: Entry) -> Command<Msg> {
         match entry {
-            Entry::Quit => Command::quit(),
+            Entry::Quit => self.quit(),
             Entry::Projects => self.show_projects(false),
             Entry::NewProject => self.show_projects(true),
             Entry::Profiles => self.show_profiles(),
@@ -553,6 +579,7 @@ impl QCode {
             None => {
                 let mut screen = ProjectScreen::new(self.found.clone(), self.user, vec![project])
                     .with_registry(self.registry.clone())
+                    .backing_up(self.config.backup_every())
                     .watching(self.live_files);
                 screen.set_editor(self.config.editor());
                 let entered = ui::project::opened(&mut screen);
@@ -592,6 +619,7 @@ impl QCode {
             contents.into_iter().map(|one| OpenProject::new(&one.file, one.paths, one.profiles)).collect();
         let mut screen = ProjectScreen::new(self.found.clone(), self.user, projects)
             .with_registry(self.registry.clone())
+            .backing_up(self.config.backup_every())
             .watching(self.live_files);
         screen.set_editor(self.config.editor());
         for (index, id) in ids.iter().enumerate() {
@@ -768,6 +796,16 @@ impl QCode {
                 self.config.set_on_close(choice);
                 self.store()
             }
+            Request::BackupEvery(choice) => {
+                self.config.set_backup_every(choice);
+                let applied = match self.project.as_mut() {
+                    Some(screen) => {
+                        ui::project::update(screen, ui::project::Msg::BackupEvery(choice)).map(Msg::Project)
+                    }
+                    None => Command::none(),
+                };
+                Command::batch([applied, self.store()])
+            }
             Request::InstallService => self.change_service(true),
             Request::RemoveService => self.change_service(false),
         }
@@ -850,6 +888,13 @@ impl QCode {
             let installed = host.is_installed();
             Msg::Settings(ui::settings::Msg::ServiceDone { installing, installed, result })
         })
+    }
+
+    /// Leaves the projects that are open where [`run`] finds them once the screen is given back,
+    /// and quits.
+    fn quit(&self) -> Command<Msg> {
+        self.farewell.keep(self.project.as_ref().and_then(ui::project::leaving));
+        Command::quit()
     }
 
     /// Writes the settings file, off the render path, and tells the settings screen how it went.
@@ -966,6 +1011,17 @@ impl App for QCode {
         }
     }
 
+    /// Every way out passes through the same quit as the menu's, so that the projects open then
+    /// are backed up however QCode was left.
+    fn before_quit(&self) -> Option<Msg> {
+        Some(Msg::Quit)
+    }
+
+    /// Asks nothing, so a hangup, whose terminal is gone, is answered the same way.
+    fn terminating(&self, _cause: qframe::runtime::Termination) -> Option<Msg> {
+        Some(Msg::Quit)
+    }
+
     fn update(&mut self, msg: Msg) -> Command<Msg> {
         match msg {
             Msg::Home(message) => ui::home::update(&mut self.home, message),
@@ -1019,6 +1075,7 @@ impl App for QCode {
                 }
             }
             Msg::Back => self.leave(),
+            Msg::Quit => self.quit(),
             Msg::Help(open) => {
                 self.help = open;
                 Command::none()
@@ -1747,6 +1804,51 @@ mod tests {
         let screen = harness.screen();
         assert!(screen.contains("could not be refreshed"), "{screen}");
         assert!(!screen.contains("not part of QCode"), "{screen}");
+    }
+
+    #[test]
+    fn the_projects_open_as_qcode_quits_are_left_to_be_backed_up() {
+        let root = scratch("farewell");
+        workspace_of(&root, &["Alpha", "Beta"]);
+        let farewell = super::Farewell::default();
+        let app = app_with_absent_engine(config(&root, &[])).with_farewell(farewell.clone());
+        let mut harness = harness(app, SIZE.0, SIZE.1);
+        open_from_the_list(&mut harness, "Alpha");
+        harness.send(Msg::Project(crate::ui::project::Msg::AddProject)).advance(MOMENT);
+        harness.click_text("Beta").advance(MOMENT);
+        harness.press("ctrl+q");
+        assert!(harness.quit_requested());
+        let left = farewell.take().expect("the open projects were left behind");
+        assert_eq!(left.names(), ["Alpha", "Beta"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn quitting_from_the_menu_leaves_them_too_and_nothing_when_none_is_open() {
+        let farewell = super::Farewell::default();
+        let app = app_with_absent_engine(config(&scratch("farewell-none"), &[])).with_farewell(farewell.clone());
+        let mut harness = harness(app, SIZE.0, SIZE.1);
+        harness.click_text("Quit");
+        assert!(harness.quit_requested());
+        assert_eq!(farewell.take(), None, "no project was open");
+    }
+
+    #[test]
+    fn a_new_interval_reaches_the_open_projects_at_once() {
+        use crate::backup::BackupEvery;
+
+        let root = scratch("backup-every");
+        workspace_of(&root, &["Alpha"]);
+        let mut harness = harness(app_with_absent_engine(config(&root, &[])), SIZE.0, SIZE.1);
+        open_from_the_list(&mut harness, "Alpha");
+        let every = |harness: &qframe::runtime::Harness<super::QCode>| {
+            harness.app().project.as_ref().map(ProjectScreen::backup_every)
+        };
+        assert_eq!(every(&harness), Some(BackupEvery::Fifteen));
+        harness.send(Msg::Settings(crate::ui::settings::Msg::BackupEvery(BackupEvery::Hour))).advance(MOMENT);
+        assert_eq!(every(&harness), Some(BackupEvery::Hour));
+        assert_eq!(harness.app().config.backup_every(), BackupEvery::Hour, "and it is stored");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

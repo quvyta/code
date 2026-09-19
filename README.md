@@ -240,7 +240,9 @@ directly on your machine, so it needs no container and works with no engine runn
   folder: **New file**, **New folder**, **Rename**, **Cut**, **Paste here** (once something is cut)
   and **Delete**. On a file: **Rename**, **Cut** and **Delete**. The first row of the tree is the
   project folder itself; its menu has **New file**, **New folder**, **Paste here** and **Refresh**.
-  With several entries selected, the menu cuts or deletes all of them.
+  With several entries selected, the menu cuts or deletes all of them. Folders and files also
+  offer **Don't back up** (or **Back up again**), and files **Earlier versions**; see
+  [Backups](#backups).
 - **Names** are asked for in a small dialog and checked as you type: not empty, no `/`, not `.` or
   `..`, and not a name the folder already has. A rename opens with the name before its extension
   selected.
@@ -262,6 +264,47 @@ directly on your machine, so it needs no container and works with no engine runn
 
 A link inside the project is handled as an entry of its own: deleting or moving it touches the
 link, never what it points to.
+
+## Backups
+
+qcode keeps copies of every open project's `Project/` folder in `Backup/`, next to it in the
+project's own folder, so the backup moves and is copied with the project.
+
+- **How often.** Every 15 minutes while the project is open, once more when you close it from the
+  rail, and once more when qcode quits. **Settings**, **Back up open projects** chooses **Off**,
+  **5 min**, **15 min** or **1 hour**. A round in which nothing changed writes nothing.
+- **How.** Each backup is a git commit in `Backup/Project.git`, made by git in a short-lived
+  container of the base image, so nothing runs on your machine and your machine needs no git.
+  Your own repository inside `Project/`, if you have one, is never touched, and what your
+  `.gitignore` leaves out stays out.
+- **Leaving things out.** Right-click a folder or a file in the file tree and choose
+  **Don't back up**; **Back up again** takes it back in. The list is kept in `project.qcode`.
+  Left-out entries are drawn faded with a coloured icon, and the **Project** part of the side panel
+  names them.
+- **Assets.** `Assets/` is left out unless you turn on **Back up Assets too** in the **Project**
+  part of the side panel. It is then backed up in every round into `Backup/Assets.git`, apart
+  from the project, and the choice is kept in `project.qcode`.
+- **Conversations.** Each round also backs up the conversations of every profile whose tab was
+  open since the round before, each profile into `Backup/Conversations/<profile>.git`. Only the
+  harness's conversation files are taken, never its login. opencode keeps its conversations in a
+  database, so they are backed up only while its container is stopped: when qcode quits and
+  stops it.
+- **Bringing things back.** **Backups** in the **Project** part of the side panel lists every
+  backup with its time and how many files it changed; choose one to bring the project back to it.
+  **Earlier versions** in a file's menu does the same for that one file. The choice at the top of
+  the list switches it to the assets, when they are backed up, or to a profile's conversations.
+  qcode asks first, then backs up how things are now, so bringing something back can be undone
+  the same way. Nothing is deleted: a file made after that backup stays where it is.
+  Conversations are brought back only while the profile's container is stopped; if it runs, qcode
+  offers to stop it first.
+- **What it is for.** A backup protects against a wrong delete, a change that breaks things or a
+  harness scattering files. It sits on the same disk as the project, so it does not protect
+  against losing the disk.
+
+The **Project** part of the side panel also shows when the last backup was made and how much
+`Backup/` holds. If a backup fails, qcode says so once for that project, not at every round.
+
+![The list of a project's backups, the newest taken just before a restore, with the choice of the project's files, its assets or a profile's conversations above it](https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/backups.png)
 
 ## When QCode closes
 
@@ -294,6 +337,7 @@ so the containers keep running; Settings says so.
 | Workspace | `Quvyta/Code` in your Documents folder by default (`~/Documents/Quvyta/Code`, or `~/Belgeler/Quvyta/Code` where the desktop names it so), or the folder you chose; a folder chosen before stays where it is |
 | Profiles | `Profiles/<profile>.toml` in the workspace |
 | Projects | `Projects/<project>/` in the workspace: `project.qcode`, the code in `Project/`, your material in `Assets/` |
+| Backups | `Projects/<project>/Backup/` in the workspace: `Project.git`, the backups of `Project/`; `Assets.git`, those of `Assets/` when it is backed up; `Conversations/<profile>.git`, each profile's conversations; and the lock files that keep two QCodes from backing up the same thing at once |
 | Images | `qcode/base` and `qcode/profile/<profile>`, in the engine |
 | Logins | engine volumes: `qcode-cred-<profile>` for the profile, `qcode-home-<project>-<profile>` for each project's copy |
 

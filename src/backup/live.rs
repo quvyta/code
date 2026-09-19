@@ -15,7 +15,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::{Reason, Restored, Snapshot, history, restore, restore_file, snapshot};
+use super::{
+    Reason, Restored, Snapshot, assets_history, history, restore, restore_assets, restore_file, snapshot,
+    snapshot_assets,
+};
 use crate::engine::{Engine, EngineKind, HostUser, detect};
 use crate::workspace::ProjectPaths;
 
@@ -152,5 +155,47 @@ fn a_project_is_backed_up_and_brought_back_without_losing_a_newer_file() {
         assert!(matches!(one, Restored::Done { .. }), "{one:?}");
         assert_eq!(scratch.read("README.md"), "third\n");
         assert!(Path::new(&scratch.file("src/main.rs")).is_file());
+    }
+}
+
+#[test]
+#[ignore = "needs a container engine; run with QCODE_CONTAINER_TESTS=1"]
+fn the_assets_are_backed_up_apart_and_brought_back_without_losing_a_newer_file() {
+    for engine in engines() {
+        let user = HostUser::current().expect("the current user");
+        let scratch = Scratch::new(&engine);
+        let paths = scratch.paths();
+        let asset = |name: &str| paths.assets.join(name);
+        fs::create_dir_all(asset("icons")).expect("an assets folder");
+        fs::write(asset("icons/sun.svg"), "<svg>sun</svg>\n").expect("an asset");
+        fs::write(asset("photo.jpg"), "first\n").expect("an asset");
+
+        let first = snapshot_assets(&engine, &paths, user).unwrap_or_else(|error| panic!("{engine:?}: {error:?}"));
+        let first_id = made(&first).to_owned();
+        let git_dir = paths.backup().join("Assets.git");
+        assert!(git_dir.is_dir(), "the assets have a git folder of their own");
+        assert!(!paths.backup().join("Project.git").exists(), "the project's backup is not touched");
+        assert_eq!(snapshot_assets(&engine, &paths, user).expect("a second round"), Snapshot::Unchanged);
+
+        fs::write(asset("photo.jpg"), "second\n").expect("a changed asset");
+        fs::write(asset("new.png"), "made after the first snapshot\n").expect("a new asset");
+        let listed = assets_history(&engine, &paths, user).expect("the list");
+        assert_eq!(listed.iter().map(|entry| entry.id.as_str()).collect::<Vec<_>>(), [&first_id]);
+
+        let first = listed[0].id.clone();
+        let restored = restore_assets(&engine, &paths, user, &first).expect("restored");
+        let Restored::Done { before } = restored else { panic!("the lock was free: {restored:?}") };
+        made(&before);
+        assert_eq!(fs::read_to_string(asset("photo.jpg")).expect("the asset"), "first\n", "the asset came back");
+        assert_eq!(
+            fs::read_to_string(asset("new.png")).expect("the newer asset"),
+            "made after the first snapshot\n",
+            "a newer file was deleted"
+        );
+        let listed = assets_history(&engine, &paths, user).expect("the list");
+        assert_eq!(
+            listed.iter().map(|entry| entry.reason).collect::<Vec<_>>(),
+            [Reason::BeforeRestore, Reason::Scheduled]
+        );
     }
 }

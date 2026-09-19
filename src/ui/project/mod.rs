@@ -14,6 +14,7 @@
 //! for it, and the application maps both to its own message, so the screen is drawn and tested
 //! without naming anything of the application.
 
+mod backups;
 mod blank;
 mod file_ops;
 mod files;
@@ -28,6 +29,7 @@ mod live;
 #[cfg(test)]
 mod tests;
 
+pub use backups::{BackupOf, BackupTrouble, Farewell, Leaving, Part, leaving};
 pub use blank::Choice;
 pub use file_ops::{Change, FileError, NameProblem};
 pub use files::{DocumentTrouble, FileEntry, FileMsg, FileTree, NameFor, Naming};
@@ -52,6 +54,8 @@ use qframe::widgets::{
 
 use std::path::{Path, PathBuf};
 
+use crate::backup::conversations::Brought;
+use crate::backup::{BackupEvery, Entry, Snapshot, SnapshotId};
 use crate::base::apps::{self, Editor, FileKind};
 use crate::engine::{Container, Engine, EngineCommand, EngineKind, HostUser};
 use crate::profile::Profile;
@@ -191,6 +195,74 @@ pub enum Msg {
     /// A container QCode started could not be noted cleanly in the list of the containers it
     /// started; the message that came with the start follows.
     Noted(Noting, Box<Msg>),
+    /// It is time to back a project up: the project's id and the number of the timer that went
+    /// off.
+    BackupDue(String, u64),
+    /// A backup of a project finished.
+    BackedUp {
+        /// The project's id.
+        project: String,
+        /// Its name, to say a failure by after the project has left the rail.
+        name: String,
+        /// What came of the project's own snapshot.
+        made: Result<Snapshot, BackupTrouble>,
+        /// The other parts of the round that could not be backed up, and why.
+        missed: Vec<(Part, BackupTrouble)>,
+    },
+    /// The newest backup of a project was asked after: the project's id and when it was made, or
+    /// `None` when there is none or the backup could not be asked.
+    NewestBackup(String, Option<i64>),
+    /// How often the open projects are backed up was changed.
+    BackupEvery(BackupEvery),
+    /// What a project's backup leaves out was written into its `project.qcode`: the project's
+    /// id, and the list as the file now holds it or why it could not be written.
+    SkipWritten(String, Result<Vec<String>, String>),
+    /// How much a project's `Backup/` holds was read: the project's id and the bytes.
+    BackupSize(String, u64),
+    /// The backup of the open project was asked to take `Assets/` too, or no longer to.
+    BackupAssets(bool),
+    /// Whether a project's backup takes its assets was written into its `project.qcode`: the
+    /// project's id, and the choice as the file now holds it or why it could not be written.
+    AssetsWritten(String, Result<bool, String>),
+    /// The list of the open project's backups was asked for, or of the earlier versions of the
+    /// file of this key.
+    ShowBackups(Option<String>),
+    /// The list of backups was read: the number of the reading, and the backups newest first
+    /// or why they could not be read.
+    BackupsRead(u64, Result<Vec<Entry>, BackupTrouble>),
+    /// A reading of the list of backups, by its number, has run long enough to be noticed.
+    BackupsSlow(u64),
+    /// The indicator of a reading of the list has been on screen long enough to be read.
+    BackupsSettled(u64),
+    /// The keyboard moved to another row of the list of backups.
+    HighlightBackup(usize),
+    /// The backup at this row of the list was chosen; the person is asked first.
+    ChooseBackup(usize),
+    /// The list of backups was made one of what it offers, at this position: the project's own
+    /// files or a profile's conversations.
+    BackupsOf(usize),
+    /// The person said yes to bringing this backup back.
+    RestoreBackup(SnapshotId),
+    /// The person said yes to stopping the profile's container and then bringing this backup of
+    /// its conversations back.
+    StopAndRestore(SnapshotId),
+    /// The person said no to bringing a backup back.
+    KeepBackup,
+    /// The list of backups was closed.
+    CloseBackups,
+    /// Bringing a backup back finished.
+    Restored {
+        /// The project's id.
+        project: String,
+        /// Its name, to say what came back by.
+        name: String,
+        /// What was brought back.
+        of: BackupOf,
+        /// The file that was brought back, or `None` for all of it.
+        file: Option<String>,
+        /// What came of it.
+        done: Result<Brought, BackupTrouble>,
+    },
 }
 
 /// What went wrong noting a container QCode started, so that it can be stopped once no QCode is
@@ -225,6 +297,12 @@ pub struct OpenProject {
     container_row: usize,
     container_error: Option<LaunchFailure>,
     busy: bool,
+    /// When the project was backed up last, and when it is backed up next.
+    backup: backups::State,
+    /// The folders and files inside the project its backup leaves out, as its file lists them.
+    skip: Vec<String>,
+    /// Whether its backup takes `Assets/` too, as its file says.
+    assets: bool,
 }
 
 impl OpenProject {
@@ -254,6 +332,9 @@ impl OpenProject {
             container_row: 0,
             container_error: None,
             busy: false,
+            backup: backups::State::default(),
+            skip: file.backup_skip.clone(),
+            assets: file.backup_assets,
         };
         project.set_profiles(profiles);
         project
@@ -315,6 +396,18 @@ impl OpenProject {
     #[must_use]
     pub fn files(&self) -> &FileTree {
         &self.files
+    }
+
+    /// The folders and files inside the project its backup leaves out.
+    #[must_use]
+    pub fn backup_skip(&self) -> &[String] {
+        &self.skip
+    }
+
+    /// Whether the project's backup takes `Assets/` too.
+    #[must_use]
+    pub fn backs_up_assets(&self) -> bool {
+        self.assets
     }
 
     /// The containers of this project, as the engine last listed them.
@@ -418,6 +511,14 @@ pub struct ProjectScreen {
     registry: Option<PathBuf>,
     /// Whether a problem with that list was said already: it is said once, not at every tab.
     registry_told: bool,
+    /// How often the open projects are backed up.
+    backup_every: BackupEvery,
+    /// The number the last backup timer was given.
+    last_timer: u64,
+    /// The list of backups, while it is open.
+    listing: Option<backups::Listing>,
+    /// The number the last reading of a list of backups was given.
+    last_listing: u64,
 }
 
 impl ProjectScreen {
@@ -444,6 +545,10 @@ impl ProjectScreen {
             last_watch: 0,
             registry: None,
             registry_told: false,
+            backup_every: BackupEvery::default(),
+            last_timer: 0,
+            listing: None,
+            last_listing: 0,
         }
     }
 
@@ -465,6 +570,19 @@ impl ProjectScreen {
     pub fn with_registry(mut self, path: Option<PathBuf>) -> Self {
         self.registry = path;
         self
+    }
+
+    /// The same screen, backing its projects up as often as `every` says.
+    #[must_use]
+    pub fn backing_up(mut self, every: BackupEvery) -> Self {
+        self.backup_every = every;
+        self
+    }
+
+    /// How often the open projects are backed up.
+    #[must_use]
+    pub fn backup_every(&self) -> BackupEvery {
+        self.backup_every
     }
 
     /// The project the rail has open.
@@ -626,6 +744,13 @@ impl ProjectScreen {
     pub fn reading(&self, profile: &str) -> u64 {
         self.project().and_then(|project| project.history.get(profile)).map_or(0, history::Shelf::generation)
     }
+
+    /// The number of the reading of the list of backups last started. An answer,
+    /// [`Msg::BackupsRead`], is only taken when it carries this number.
+    #[must_use]
+    pub fn backups_reading(&self) -> u64 {
+        self.listing.as_ref().map_or(0, |_| self.last_listing)
+    }
 }
 
 /// The work the screen needs the moment it is shown: reading the open project's folder and
@@ -639,7 +764,7 @@ impl ProjectScreen {
 /// is one.
 pub fn opened(screen: &mut ProjectScreen) -> Command<Msg> {
     let command = Command::batch([load_root(screen), list_containers(screen), wake(screen), show_page(screen, true)]);
-    Command::batch([command, follow_disk(screen)])
+    Command::batch([command, follow_disk(screen), backups::keep(screen)])
 }
 
 /// Adds `project` to the rail and opens it, or only opens it when the rail has it already; the
@@ -664,7 +789,8 @@ pub fn update(screen: &mut ProjectScreen, message: Msg) -> Command<Msg> {
     // Profiles read again may be new ones, whose conversations the page shown has not read.
     let profiles = matches!(message, Msg::Profiles(_));
     let command = apply(screen, message);
-    Command::batch([command, wake(screen), show_page(screen, profiles), reread(screen), follow_disk(screen)])
+    let kept = Command::batch([reread(screen), follow_disk(screen), backups::keep(screen)]);
+    Command::batch([command, wake(screen), show_page(screen, profiles), kept])
 }
 
 /// Keeps the open project's watch on the folders its tree shows, whatever the message changed
@@ -690,12 +816,13 @@ fn apply(screen: &mut ProjectScreen, message: Msg) -> Command<Msg> {
             Command::batch([load_root(screen), list_containers(screen)])
         }
         Msg::CloseProject(index) => {
+            let backed = backups::closing(screen, index);
             let Some(project) = screen.projects.get_mut(index) else { return Command::none() };
             for tab in &mut project.tabs {
                 tab.close_session();
             }
             TabEdit::Close(index).apply(&mut screen.projects, &mut screen.active);
-            Command::batch([load_root(screen), list_containers(screen)])
+            Command::batch([backed, load_root(screen), list_containers(screen)])
         }
         // The application opens the list; nothing on this screen changes until a project comes
         // back from it.
@@ -915,6 +1042,52 @@ fn apply(screen: &mut ProjectScreen, message: Msg) -> Command<Msg> {
                 Command::toast(toast)
             };
             Command::batch([told, update(screen, *message)])
+        }
+        Msg::BackupDue(id, run) => backups::due(screen, &id, run),
+        Msg::BackedUp { project, name, made, missed } => backups::backed_up(screen, &project, &name, &made, &missed),
+        Msg::NewestBackup(id, at) => {
+            backups::newest(screen, &id, at);
+            Command::none()
+        }
+        Msg::SkipWritten(id, written) => backups::skip_written(screen, &id, written),
+        Msg::BackupAssets(on) => match screen.projects.get(screen.active) {
+            Some(project) => backups::set_assets(project, on),
+            None => Command::none(),
+        },
+        Msg::AssetsWritten(id, written) => backups::assets_written(screen, &id, written),
+        Msg::BackupSize(id, bytes) => {
+            backups::sized(screen, &id, bytes);
+            Command::none()
+        }
+        Msg::ShowBackups(file) => backups::show(screen, file),
+        Msg::BackupsRead(reading, found) => backups::read(screen, reading, found),
+        Msg::BackupsSlow(reading) => backups::slow(screen, reading),
+        Msg::BackupsSettled(reading) => {
+            backups::settled(screen, reading);
+            Command::none()
+        }
+        Msg::HighlightBackup(row) => {
+            backups::highlight(screen, row);
+            Command::none()
+        }
+        Msg::ChooseBackup(row) => backups::choose(screen, row),
+        Msg::BackupsOf(index) => backups::switch(screen, index),
+        Msg::RestoreBackup(id) => backups::restore(screen, id, false),
+        Msg::StopAndRestore(id) => backups::restore(screen, id, true),
+        Msg::KeepBackup => {
+            backups::declined(screen);
+            Command::none()
+        }
+        Msg::CloseBackups => {
+            backups::close(screen);
+            Command::none()
+        }
+        Msg::Restored { project, name, of, file, done } => {
+            backups::restored(screen, &project, &name, &of, file.as_deref(), &done)
+        }
+        Msg::BackupEvery(every) => {
+            backups::set_every(screen, every);
+            Command::none()
         }
         Msg::ContainerActed(result) => {
             let refresh = list_containers(screen);

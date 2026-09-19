@@ -416,6 +416,9 @@ pub enum FileMsg {
     DeleteConfirmed(Vec<String>),
     /// The open folders were asked to be read again.
     Refresh,
+    /// The entry of this key, with the rest of the selection when it is part of it, was asked to
+    /// be left out of the project's backup, or taken into it again when `false`.
+    LeaveOut(String, bool),
     /// The name in the dialog changed.
     Name(String),
     /// The name in the dialog was confirmed.
@@ -463,6 +466,10 @@ pub(super) fn update(screen: &mut ProjectScreen, message: FileMsg) -> Command<Ms
             run_each(project, keys, |root, key| (key.to_owned(), file_ops::delete(root, key)))
         }
         FileMsg::Refresh => refresh(project),
+        FileMsg::LeaveOut(key, out) => {
+            let keys = project.files.targets(&key);
+            super::backups::leave_out(project, keys, out)
+        }
         FileMsg::Name(value) => {
             if let Some(naming) = &mut project.files.naming {
                 naming.value = value;

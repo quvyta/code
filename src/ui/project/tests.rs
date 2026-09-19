@@ -25,6 +25,7 @@ use crate::workspace::{
 
 use super::plan::{PROJECT_DIR, SHELL};
 
+mod backups;
 mod files;
 mod history;
 mod registry;

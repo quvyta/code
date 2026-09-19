@@ -338,6 +338,42 @@ impl HarnessKind {
             Self::Codex => CODEX,
         }
     }
+
+    /// Where this harness keeps its conversations, relative to the home directory: the folders
+    /// and files the scripts above read, and nothing beside them.
+    ///
+    /// This is what a backup of a profile's conversations takes, and it is a list of what may
+    /// go rather than of what may not: the backup is a plain folder on the machine, and a new
+    /// harness version that puts its login somewhere new would slip past a list of what to
+    /// leave out, never past this one. opencode's list is its database and the two journals
+    /// SQLite keeps beside it, because the three only make one database together.
+    #[must_use]
+    pub fn conversation_paths(self) -> &'static [&'static str] {
+        match self {
+            Self::ClaudeCode => &[".claude/projects"],
+            Self::OpenCode => &[
+                ".local/share/opencode/opencode.db",
+                ".local/share/opencode/opencode.db-wal",
+                ".local/share/opencode/opencode.db-shm",
+            ],
+            Self::GeminiCli => &[".gemini/tmp", ".gemini/projects.json"],
+            Self::Codex => &[".codex/sessions", ".codex/session_index.jsonl"],
+        }
+    }
+
+    /// The database this harness keeps its conversations in, when it keeps them in one, relative
+    /// to the home directory. Its journals are the same path with `-wal` and `-shm` after it.
+    ///
+    /// A database copied while the harness writes to it can be a torn copy, and its journal only
+    /// fits the database it was written with; so a harness with one is only backed up and
+    /// brought back while it is stopped.
+    #[must_use]
+    pub fn conversation_database(self) -> Option<&'static str> {
+        match self {
+            Self::OpenCode => Some(".local/share/opencode/opencode.db"),
+            Self::ClaudeCode | Self::GeminiCli | Self::Codex => None,
+        }
+    }
 }
 
 /// The commands that read a harness's conversations out of a project's container for its
@@ -558,6 +594,31 @@ mod tests {
         assert!(HarnessKind::OpenCode.history_script().contains("'session', 'list', '--format', 'json'"));
         assert!(HarnessKind::GeminiCli.history_script().contains("'projects.json'"));
         assert!(HarnessKind::Codex.history_script().contains("'session_index.jsonl'"));
+    }
+
+    #[test]
+    fn a_conversation_backup_takes_where_the_scripts_read_and_never_a_login() {
+        assert!(HarnessKind::ClaudeCode.history_script().contains("'.claude', 'projects'"));
+        assert!(HarnessKind::GeminiCli.history_script().contains("'.gemini'") && GEMINI_CLI.contains("'tmp'"));
+        assert!(HarnessKind::Codex.history_script().contains("'.codex'") && CODEX.contains("'sessions'"));
+        for harness in HarnessKind::ALL {
+            let paths = harness.conversation_paths();
+            assert!(!paths.is_empty(), "{harness:?}");
+            for path in paths {
+                assert!(!path.starts_with('/') && !path.starts_with('~') && !path.starts_with('-'), "{path}");
+                assert!(!path.split('/').any(|part| part == ".." || part == "." || part.is_empty()), "{path}");
+                for login in harness.record().identity {
+                    let inside = |outer: &str, inner: &str| inner == outer || inner.starts_with(&format!("{outer}/"));
+                    assert!(!inside(path, login) && !inside(login, path), "{harness:?}: {path} and {login}");
+                }
+            }
+            if let Some(database) = harness.conversation_database() {
+                for journal in ["", "-wal", "-shm"] {
+                    assert!(paths.contains(&format!("{database}{journal}").as_str()), "{harness:?}: {journal}");
+                }
+            }
+        }
+        assert_eq!(HarnessKind::OpenCode.conversation_database(), Some(".local/share/opencode/opencode.db"));
     }
 
     #[test]

@@ -26,7 +26,9 @@ mod session;
 pub use config::{Config, OnClose, SetupStep};
 pub use containers::{PREFIX, Registered, Registry};
 pub use identity::{ProjectId, ProjectIdError};
-pub use layout::{NewProjectError, ProjectEntry, ProjectPaths, Workspace, add_profile};
+pub use layout::{
+    NewProjectError, ProjectEntry, ProjectPaths, Workspace, add_profile, set_backup_assets, set_backup_skip,
+};
 pub use paths::{APP_TITLE, HostDirs, Platform};
 pub use project::{ProjectFile, ProjectProfile};
 pub use session::{Session, SessionProject, SessionTab, SessionTabKind};

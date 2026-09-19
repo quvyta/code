@@ -5,6 +5,17 @@ Every release of quvyta-code, newest first. The format follows
 [Semantic Versioning](https://semver.org/); while the version starts with 0, a minor release may
 change files qcode writes, and the notes say so when it does.
 
+## 0.1.6 - 2026-09-19
+
+### Added
+
+- Project backups. Every open project's `Project/` folder is backed up into `Backup/Project.git`, next to the project, every 15 minutes (5 minutes, 1 hour or off in **Settings**), when it is closed and when qcode quits. git runs in a short-lived container of the base image, so the machine needs no git, and a person's own repository in `Project/` is never touched.
+- **Backups** in the side panel lists every backup and brings the project back to one after asking; **Earlier versions** in a file's menu does the same for one file. How things were just before is backed up first, and nothing is deleted.
+- **Don't back up** in the file tree leaves a folder or a file out; the list is kept in `project.qcode`.
+- **Back up Assets too** in the side panel backs `Assets/` up apart, into `Backup/Assets.git`.
+- Each profile's conversations in a project are backed up into `Backup/Conversations/<profile>.git`, only the harness's conversation files and never its login, and can be brought back while the profile's container is stopped.
+- The side panel shows when the last backup was made and how much `Backup/` holds.
+
 ## 0.1.5 - 2026-09-19
 
 ### Changed

@@ -5,7 +5,9 @@
 //! Projects/<project>/
 //!   Backup/
 //!     Project.git/     the snapshots, git's own folder with no working tree
-//!     backup.lock      held while a snapshot or a restore runs
+//!     Assets.git/      the snapshots of `Assets/`, when the project asks for them
+//!     backup.lock      held while a snapshot or a restore of the project runs
+//!     assets.lock      held while one of `Assets/` runs
 //! ```
 //!
 //! The backup sits beside the project, so it moves and is copied with it. It guards against a
@@ -21,6 +23,7 @@
 //! Everything public here runs engine commands and waits for them, so it belongs on a
 //! background thread.
 
+pub mod conversations;
 mod job;
 #[cfg(test)]
 mod live;
@@ -39,8 +42,15 @@ use crate::engine::run::{EngineError, capture};
 use crate::engine::{Engine, HostUser};
 use crate::workspace::ProjectPaths;
 
-/// The name of the lock file inside `Backup/`.
+use job::Tree;
+
+/// The name of the lock file of the project's own snapshots inside `Backup/`.
 const LOCK: &str = "backup.lock";
+
+/// The name of the lock file of the snapshots of `Assets/` inside `Backup/`. It is a lock of its
+/// own because a round that found the project's lock taken by a restore would skip the assets
+/// as covered when nothing covers them.
+const ASSETS_LOCK: &str = "assets.lock";
 
 /// How often an open project is backed up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -221,7 +231,7 @@ pub fn snapshot(
 ) -> Result<Snapshot, BackupError> {
     let exclude = place::exclude_file(&place::places(skip).map_err(BackupError::Place)?);
     let Some(_lock) = hold(paths)? else { return Ok(Snapshot::Busy) };
-    take(engine, paths, user, &exclude, Reason::Scheduled)
+    take(engine, paths, Tree::Project, user, &exclude, Reason::Scheduled)
 }
 
 /// The snapshots of the project, newest first; those that changed `file` when one is named.
@@ -238,10 +248,68 @@ pub fn history(
     file: Option<&str>,
 ) -> Result<Vec<Entry>, BackupError> {
     let file = file.map(Place::new).transpose().map_err(BackupError::Place)?;
-    if !paths.backup().join(job::PROJECT_GIT).is_dir() {
+    list(engine, paths, Tree::Project, user, file.as_ref())
+}
+
+/// Backs `Assets/` up, into a git folder of its own. A project without the folder has nothing to
+/// back up, and no container is started to say so.
+///
+/// Nothing is left out but what an `Assets/.gitignore` names: the person asked for the assets.
+///
+/// # Errors
+///
+/// A `Backup/` that cannot be made, and the engine's or git's own words when the job fails.
+pub fn snapshot_assets(engine: &Engine, paths: &ProjectPaths, user: HostUser) -> Result<Snapshot, BackupError> {
+    if !paths.assets.is_dir() {
+        return Ok(Snapshot::Unchanged);
+    }
+    let Some(_lock) = hold_at(paths, ASSETS_LOCK)? else { return Ok(Snapshot::Busy) };
+    take(engine, paths, Tree::Assets, user, "", Reason::Scheduled)
+}
+
+/// The snapshots of `Assets/`, newest first. Assets never backed up have none, and no container
+/// is started to say so.
+///
+/// # Errors
+///
+/// The engine's or git's own words when the listing fails.
+pub fn assets_history(engine: &Engine, paths: &ProjectPaths, user: HostUser) -> Result<Vec<Entry>, BackupError> {
+    list(engine, paths, Tree::Assets, user, None)
+}
+
+/// Brings every file of the snapshot `id` back into `Assets/`, after a snapshot of how it is
+/// now. Nothing is deleted, as in [`restore`]; a folder that is gone is made again to hold them.
+///
+/// # Errors
+///
+/// As [`snapshot_assets`], `Assets/` that cannot be made, and the engine's or git's own words
+/// when the restore fails.
+pub fn restore_assets(
+    engine: &Engine,
+    paths: &ProjectPaths,
+    user: HostUser,
+    id: &SnapshotId,
+) -> Result<Restored, BackupError> {
+    std::fs::create_dir_all(&paths.assets).map_err(BackupError::Host)?;
+    let Some(_lock) = hold_at(paths, ASSETS_LOCK)? else { return Ok(Restored::Busy) };
+    let before = take(engine, paths, Tree::Assets, user, "", Reason::BeforeRestore)?;
+    capture(&job::restore(engine, paths, Tree::Assets, user, id, None))?;
+    Ok(Restored::Done { before })
+}
+
+/// The snapshots of `tree`, or those that changed `file` of it; none, without a container, when
+/// it was never backed up.
+fn list(
+    engine: &Engine,
+    paths: &ProjectPaths,
+    tree: Tree,
+    user: HostUser,
+    file: Option<&Place>,
+) -> Result<Vec<Entry>, BackupError> {
+    if !paths.backup().join(tree.git()).is_dir() {
         return Ok(Vec::new());
     }
-    let output = capture(&job::history(engine, paths, user, file.as_ref()))?;
+    let output = capture(&job::history(engine, paths, tree, user, file))?;
     Ok(job::read_history(&output))
 }
 
@@ -295,21 +363,46 @@ fn bring_back(
 ) -> Result<Restored, BackupError> {
     let exclude = place::exclude_file(&place::places(skip).map_err(BackupError::Place)?);
     let Some(_lock) = hold(paths)? else { return Ok(Restored::Busy) };
-    let before = take(engine, paths, user, &exclude, Reason::BeforeRestore)?;
-    capture(&job::restore(engine, paths, user, id, what))?;
+    let before = take(engine, paths, Tree::Project, user, &exclude, Reason::BeforeRestore)?;
+    capture(&job::restore(engine, paths, Tree::Project, user, id, what))?;
     Ok(Restored::Done { before })
 }
 
-/// Runs a snapshot job, with the lock already held.
+/// How much `Backup/` holds on the disk, in bytes: every file under it, each counted once. A
+/// project never backed up holds nothing. A file that goes while it is counted is not counted;
+/// a symbolic link counts as itself, never as what it points to.
+///
+/// Reads the machine's disk and nothing else, but a large backup takes a moment, so it belongs
+/// on a background thread.
+#[must_use]
+pub fn size(paths: &ProjectPaths) -> u64 {
+    let mut total = 0;
+    let mut folders = vec![paths.backup()];
+    while let Some(folder) = folders.pop() {
+        let Ok(entries) = std::fs::read_dir(&folder) else { continue };
+        for entry in entries.flatten() {
+            let Ok(meta) = std::fs::symlink_metadata(entry.path()) else { continue };
+            if meta.is_dir() {
+                folders.push(entry.path());
+            } else {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
+/// Runs a snapshot job of `tree`, with its lock already held.
 fn take(
     engine: &Engine,
     paths: &ProjectPaths,
+    tree: Tree,
     user: HostUser,
     exclude: &str,
     reason: Reason,
 ) -> Result<Snapshot, BackupError> {
     base::ensure(engine, &|| false, &mut |_| {}).map_err(BackupError::Base)?;
-    let output = capture(&job::snapshot(engine, paths, user, exclude, reason))?;
+    let output = capture(&job::snapshot(engine, paths, tree, user, exclude, reason))?;
     Ok(match job::read_snapshot(&output).map_err(BackupError::Answer)? {
         Some((id, at)) => Snapshot::Made { id, at },
         None => Snapshot::Unchanged,
@@ -324,9 +417,14 @@ type Held = Option<InstanceLock>;
 /// Where the platform has no advisory lock (Windows) the job goes on without one; there git's
 /// own `index.lock` stops a second one, which then fails that round instead of skipping it.
 fn hold(paths: &ProjectPaths) -> Result<Option<Held>, BackupError> {
+    hold_at(paths, LOCK)
+}
+
+/// Makes `Backup/` and takes the lock `name` in it, as [`hold`] does.
+fn hold_at(paths: &ProjectPaths, name: &str) -> Result<Option<Held>, BackupError> {
     let backup = paths.backup();
     std::fs::create_dir_all(&backup).map_err(BackupError::Host)?;
-    lock(&backup.join(LOCK))
+    lock(&backup.join(name))
 }
 
 /// Takes the lock at `path`, as [`hold`] describes.
@@ -341,7 +439,10 @@ fn lock(path: &Path) -> Result<Option<Held>, BackupError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BackupError, BackupEvery, Reason, Snapshot, SnapshotId, history, hold, snapshot};
+    use super::{
+        BackupError, BackupEvery, Reason, Snapshot, SnapshotId, assets_history, history, hold, size, snapshot,
+        snapshot_assets,
+    };
     use crate::engine::{Engine, EngineKind, HostUser};
     use crate::workspace::ProjectPaths;
     use std::path::PathBuf;
@@ -424,6 +525,26 @@ mod tests {
         let scratch = Scratch::new("history");
         assert_eq!(history(&missing(), &scratch.paths(), ME, None).expect("nothing to ask"), []);
         assert!(matches!(history(&missing(), &scratch.paths(), ME, Some("/etc")), Err(BackupError::Place(_))));
+    }
+
+    #[test]
+    fn the_size_of_the_backup_is_every_file_under_it() {
+        let scratch = Scratch::new("size");
+        let paths = scratch.paths();
+        assert_eq!(size(&paths), 0, "never backed up");
+        std::fs::create_dir_all(paths.backup().join("Project.git").join("objects")).expect("a folder");
+        std::fs::write(paths.backup().join("backup.lock"), "").expect("a file");
+        std::fs::write(paths.backup().join("Project.git").join("HEAD"), "0123456789").expect("a file");
+        std::fs::write(paths.backup().join("Project.git").join("objects").join("pack"), [0; 1000]).expect("a file");
+        assert_eq!(size(&paths), 1010);
+    }
+
+    #[test]
+    fn a_project_without_assets_or_their_backup_starts_no_container() {
+        let scratch = Scratch::new("assets");
+        assert_eq!(snapshot_assets(&missing(), &scratch.paths(), ME).expect("nothing to take"), Snapshot::Unchanged);
+        assert!(!scratch.paths().backup().exists(), "Backup/ was made for nothing");
+        assert_eq!(assets_history(&missing(), &scratch.paths(), ME).expect("nothing to ask"), []);
     }
 
     #[cfg(unix)]

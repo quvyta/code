@@ -1,4 +1,5 @@
-//! `project.qcode`: what a project is called, when it was made and which profiles it carries.
+//! `project.qcode`: what a project is called, when it was made, which profiles it carries, what
+//! its backup leaves out and whether it takes the assets too.
 //!
 //! The file is a [`Document`](qframe::document::Document): the framework checks the shape and
 //! reports every problem with its line and column, and what only qcode can judge — whether the
@@ -12,6 +13,7 @@ use qframe::diagnostics::Diagnostic;
 use qframe::document::{Document, Shape, Table, ValueKind};
 
 use super::{Loaded, ProjectId};
+use crate::backup::{Place, PlaceProblem};
 
 /// One profile a project carries, as `project.qcode` records it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,13 +35,26 @@ pub struct ProjectFile {
     pub created: Option<Date>,
     /// The profiles the project carries, in the order the file lists them.
     pub profiles: Vec<ProjectProfile>,
+    /// The folders and files inside `Project/` its backup leaves out, each a path inside the
+    /// project written with `/`, in the order the file lists them.
+    pub backup_skip: Vec<String>,
+    /// Whether its backup takes `Assets/` too. Off unless the file says so: assets are often
+    /// large and kept elsewhere as well.
+    pub backup_assets: bool,
 }
 
 impl ProjectFile {
     /// A project made today with no profiles yet.
     #[must_use]
     pub fn new(id: ProjectId, name: impl Into<String>, created: Date) -> Self {
-        Self { id, name: name.into(), created: Some(created), profiles: Vec::new() }
+        Self {
+            id,
+            name: name.into(),
+            created: Some(created),
+            profiles: Vec::new(),
+            backup_skip: Vec::new(),
+            backup_assets: false,
+        }
     }
 
     /// Reads a `project.qcode`, reporting problems against `file`.
@@ -85,7 +100,9 @@ impl ProjectFile {
                 Some(ProjectProfile { name, added: date(entry, "added", &mut diagnostics) })
             })
             .collect();
-        Loaded { value: Some(Self { id, name, created, profiles }), diagnostics }
+        let backup_skip = skip_list(root, &mut diagnostics);
+        let backup_assets = root.table("backup").and_then(|backup| backup.flag("assets")).unwrap_or(false);
+        Loaded { value: Some(Self { id, name, created, profiles, backup_skip, backup_assets }), diagnostics }
     }
 
     /// The file as it is written to disk.
@@ -103,6 +120,14 @@ impl ProjectFile {
                 let _ = writeln!(out, "added = {}", quoted(&added.to_string()));
             }
         }
+        // The table's own key comes before its entries: TOML reads a key written after an
+        // entry's header as the entry's.
+        if self.backup_assets {
+            out.push_str("\n[backup]\nassets = true\n");
+        }
+        for path in &self.backup_skip {
+            let _ = write!(out, "\n[[backup.skip]]\npath = {}\n", quoted(path));
+        }
         out
     }
 }
@@ -110,13 +135,48 @@ impl ProjectFile {
 /// What a `project.qcode` holds. Dates are declared as text: the document checks the type, and
 /// the calendar is checked here, where a day that does not exist is a warning rather than a
 /// reason to lose the project.
+///
+/// What the backup leaves out is a `[[backup.skip]]` entry per path rather than one list of
+/// text: an entry has its own place in the file, so a path that is not one is reported at its
+/// own line and the others are still used.
 fn shape() -> Shape {
     let profile = Shape::new().required("name", ValueKind::text()).optional("added", ValueKind::text());
+    let backup = Shape::new()
+        .optional("assets", ValueKind::flag())
+        .entries("skip", Shape::new().required("path", ValueKind::text()));
     Shape::new()
         .required("id", ValueKind::text())
         .optional("name", ValueKind::text())
         .optional("created", ValueKind::text())
         .entries("profile", profile)
+        .table("backup", backup)
+}
+
+/// The paths the backup leaves out, each once, as the backup names them. One that is not a path
+/// inside the project is reported and skipped: handed to the backup it would stop every round.
+fn skip_list(root: &Table, diagnostics: &mut Vec<Diagnostic>) -> Vec<String> {
+    let mut skip: Vec<String> = Vec::new();
+    let entries = root.table("backup").map(|backup| backup.entries("skip")).unwrap_or_default();
+    // An entry without a path was reported by the document as missing its required key.
+    for (entry, path) in entries.iter().filter_map(|entry| Some((entry, entry.text("path")?))) {
+        match Place::new(path) {
+            Ok(place) if skip.iter().any(|known| known == place.as_str()) => {}
+            Ok(place) => skip.push(place.as_str().to_owned()),
+            Err(bad) => {
+                let why = match bad.problem {
+                    PlaceProblem::Empty => "it names nothing",
+                    PlaceProblem::Absolute => "it starts outside the project",
+                    PlaceProblem::Outside => "a `.` or `..` part leaves the project",
+                    PlaceProblem::LineBreak => "it holds a line break",
+                };
+                let at = entry.value_location("path").cloned();
+                let message =
+                    format!("`backup.skip` path {} is not inside the project: {why}; it is ignored", quoted(path));
+                diagnostics.push(Diagnostic::warning(at, message));
+            }
+        }
+    }
+    skip
 }
 
 /// Reads the day under `key`, reporting a value that is not one and answering `None`.
@@ -246,6 +306,63 @@ mod tests {
         let read = ProjectFile::parse(FILE, "id = \"proje\"\nname = \"Proje\"\nprofile = 3\n");
         assert!(read.value.expect("usable").profiles.is_empty());
         assert_eq!(located(&read.diagnostics[0]), "project.qcode:3:11");
+    }
+
+    #[test]
+    fn what_the_backup_leaves_out_reads_back_the_same_and_is_not_written_when_empty() {
+        let mut file = ProjectFile::new(
+            ProjectId::parse("proje").expect("an id"),
+            "Proje",
+            Date::new(2026, 9, 19).expect("a day"),
+        );
+        assert!(!file.to_toml().contains("backup"), "nothing left out, nothing written");
+        file.backup_skip = vec!["data".to_owned(), "out/big file".to_owned()];
+        let text = file.to_toml();
+        assert!(
+            text.ends_with("\n[[backup.skip]]\npath = \"data\"\n\n[[backup.skip]]\npath = \"out/big file\"\n"),
+            "{text}"
+        );
+        let read = ProjectFile::parse(FILE, &text);
+        assert!(read.is_clean(), "{:?}", read.diagnostics);
+        assert_eq!(read.value, Some(file));
+    }
+
+    #[test]
+    fn the_assets_switch_is_written_only_when_on_and_reads_back_beside_the_skip_list() {
+        let mut file = ProjectFile::new(
+            ProjectId::parse("proje").expect("an id"),
+            "Proje",
+            Date::new(2026, 9, 19).expect("a day"),
+        );
+        file.backup_skip = vec!["data".to_owned()];
+        assert!(!file.to_toml().contains("assets"), "off is the default and is not written");
+        file.backup_assets = true;
+        let text = file.to_toml();
+        assert!(text.contains("\n[backup]\nassets = true\n\n[[backup.skip]]\npath = \"data\"\n"), "{text}");
+        let read = ProjectFile::parse(FILE, &text);
+        assert!(read.is_clean(), "{:?}", read.diagnostics);
+        assert_eq!(read.value, Some(file));
+
+        let read = ProjectFile::parse(FILE, "id = \"proje\"\n\n[backup]\nassets = \"yes\"\n");
+        assert!(!read.value.expect("usable").backup_assets, "a value that is not a flag is not guessed at");
+        assert_eq!(located(&read.diagnostics[0]), "project.qcode:4:10");
+    }
+
+    #[test]
+    fn a_left_out_path_that_is_not_inside_the_project_is_reported_and_the_rest_is_used() {
+        let text = "id = \"proje\"\nname = \"Proje\"\n\n\
+                    [[backup.skip]]\npath = \"../home\"\n\n\
+                    [[backup.skip]]\npath = \"data/\"\n\n\
+                    [[backup.skip]]\npath = \"data\"\n\n\
+                    [[backup.skip]]\npath = \"/etc\"\n\n\
+                    [[backup.skip]]\n";
+        let read = ProjectFile::parse(FILE, text);
+        assert_eq!(read.value.expect("usable").backup_skip, ["data"], "written as the backup names it, once");
+        let mut places: Vec<String> = read.diagnostics.iter().map(located).collect();
+        places.sort();
+        assert_eq!(places, ["project.qcode:14:8", "project.qcode:16:1", "project.qcode:5:8"], "{:?}", read.diagnostics);
+        let climbing = read.diagnostics.iter().find(|d| located(d) == "project.qcode:5:8").expect("reported");
+        assert!(climbing.message.contains("leaves the project"), "{}", climbing.message);
     }
 
     #[test]

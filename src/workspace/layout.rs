@@ -24,6 +24,7 @@ use qframe::date::Date;
 use qframe::diagnostics::Diagnostic;
 use qframe::storage::atomic_write;
 
+use crate::backup::Place;
 use crate::profile::Profile;
 
 use super::{Loaded, ProjectFile, ProjectId, ProjectIdError, ProjectProfile};
@@ -339,17 +340,76 @@ fn write_project_at(paths: &ProjectPaths, file: &ProjectFile) -> Result<(), Diag
 ///
 /// A diagnostic when the file cannot be read, names no usable project, or cannot be written.
 pub fn add_profile(paths: &ProjectPaths, name: &str, added: Date) -> Result<ProjectFile, Diagnostic> {
-    let text = fs::read_to_string(&paths.file).map_err(|error| blocked(&paths.file, &error))?;
-    let read = ProjectFile::parse(PROJECT_FILE, &text);
-    let Some(mut file) = read.value else {
-        let reason = read.diagnostics.first().map_or_else(|| "no usable project".to_owned(), ToString::to_string);
-        return Err(Diagnostic::error(None, format!("{}: {reason}", paths.file.display())));
-    };
+    let mut file = read_project_at(paths)?;
     if !file.profiles.iter().any(|carried| carried.name == name) {
         file.profiles.push(ProjectProfile { name: name.to_owned(), added: Some(added) });
         write_project_at(paths, &file)?;
     }
     Ok(file)
+}
+
+/// Records in the project at `paths` that its backup leaves `keys` out, or takes them in again
+/// when `skip` is false, and answers with the file as it now stands.
+///
+/// Like [`add_profile`], the file is read again first, so a change made to it meanwhile is kept.
+/// A path already inside a folder that is left out is not added again, and leaving a folder out
+/// drops the entries inside it, which it covers from then on. Taking a path in again takes in
+/// only that path: a file inside a folder that stays left out stays out with it. The file is
+/// written only when the list changed.
+///
+/// # Errors
+///
+/// A key that is not a path inside the project, and a `project.qcode` that cannot be read, names
+/// no project or cannot be written.
+pub fn set_backup_skip(paths: &ProjectPaths, keys: &[String], skip: bool) -> Result<ProjectFile, Diagnostic> {
+    let mut places = Vec::new();
+    for key in keys {
+        let place = Place::new(key).map_err(|bad| {
+            Diagnostic::error(None, format!("`{}` is not a path inside the project: {:?}", bad.path, bad.problem))
+        })?;
+        places.push(place.as_str().to_owned());
+    }
+    let mut file = read_project_at(paths)?;
+    let before = file.backup_skip.clone();
+    let inside = |path: &str, folder: &str| path.strip_prefix(folder).is_some_and(|rest| rest.starts_with('/'));
+    for place in places {
+        if !skip {
+            file.backup_skip.retain(|known| *known != place);
+        } else if !file.backup_skip.iter().any(|known| *known == place || inside(&place, known)) {
+            file.backup_skip.retain(|known| !inside(known, &place));
+            file.backup_skip.push(place);
+        }
+    }
+    if file.backup_skip != before {
+        write_project_at(paths, &file)?;
+    }
+    Ok(file)
+}
+
+/// Records in the project at `paths` whether its backup takes `Assets/` too, and answers with the
+/// file as it now stands. The file is read again first, as for [`set_backup_skip`], and written
+/// only when the choice changed.
+///
+/// # Errors
+///
+/// A `project.qcode` that cannot be read, names no project or cannot be written.
+pub fn set_backup_assets(paths: &ProjectPaths, assets: bool) -> Result<ProjectFile, Diagnostic> {
+    let mut file = read_project_at(paths)?;
+    if file.backup_assets != assets {
+        file.backup_assets = assets;
+        write_project_at(paths, &file)?;
+    }
+    Ok(file)
+}
+
+/// The project file at `paths` as it is on disk now.
+fn read_project_at(paths: &ProjectPaths) -> Result<ProjectFile, Diagnostic> {
+    let text = fs::read_to_string(&paths.file).map_err(|error| blocked(&paths.file, &error))?;
+    let read = ProjectFile::parse(PROJECT_FILE, &text);
+    read.value.ok_or_else(|| {
+        let reason = read.diagnostics.first().map_or_else(|| "no usable project".to_owned(), ToString::to_string);
+        Diagnostic::error(None, format!("{}: {reason}", paths.file.display()))
+    })
 }
 
 /// The diagnostic for a path the file system would not let this program use.
@@ -574,6 +634,50 @@ mod tests {
         // Adding it again changes nothing, not even the day it was first added.
         let again = add_profile(&paths, "claude-sub", Date::new(2026, 9, 19).expect("a real date")).expect("fine");
         assert_eq!(again, added);
+        fs::remove_dir_all(&root).expect("cleaned up");
+    }
+
+    #[test]
+    fn what_the_backup_leaves_out_is_written_into_the_file_as_it_stands_now() {
+        let root = scratch("skip");
+        let workspace = Workspace::new(&root);
+        let file = workspace.create_project("Proje", today()).expect("writable");
+        let paths = workspace.project_paths(&file.id);
+        let keys = |keys: &[&str]| keys.iter().map(|key| (*key).to_owned()).collect::<Vec<_>>();
+
+        let out = set_backup_skip(&paths, &keys(&["data/raw", "out"]), true).expect("writable");
+        assert_eq!(out.backup_skip, ["data/raw", "out"]);
+        // Changed by hand meanwhile: the hand's change is kept.
+        add_profile(&paths, "claude-sub", today()).expect("writable");
+        let out = set_backup_skip(&paths, &keys(&["data", "out/big"]), true).expect("writable");
+        assert_eq!(out.backup_skip, ["out", "data"], "the folder covers what was inside it, and what `out` covers");
+        assert_eq!(out.profiles.len(), 1, "the profile added meanwhile is still there");
+        assert_eq!(workspace.read_project(&file.id).value, Some(out.clone()), "and it is on disk");
+
+        let back = set_backup_skip(&paths, &keys(&["out", "data/raw"]), false).expect("writable");
+        assert_eq!(back.backup_skip, ["data"], "a path inside a folder still left out stays out with it");
+        assert!(set_backup_skip(&paths, &keys(&["../elsewhere"]), true).is_err(), "only paths inside the project");
+        assert_eq!(workspace.read_project(&file.id).value, Some(back));
+        fs::remove_dir_all(&root).expect("cleaned up");
+    }
+
+    #[test]
+    fn the_assets_switch_is_written_into_the_file_as_it_stands_now() {
+        let root = scratch("assets");
+        let workspace = Workspace::new(&root);
+        let file = workspace.create_project("Proje", today()).expect("writable");
+        let paths = workspace.project_paths(&file.id);
+        let on = set_backup_assets(&paths, true).expect("writable");
+        assert!(on.backup_assets);
+        // Changed by hand meanwhile: the hand's change is kept.
+        set_backup_skip(&paths, &["data".to_owned()], true).expect("writable");
+        let off = set_backup_assets(&paths, false).expect("writable");
+        assert!(!off.backup_assets);
+        assert_eq!(off.backup_skip, ["data"]);
+        assert_eq!(workspace.read_project(&file.id).value, Some(off));
+        assert!(!fs::read_to_string(&paths.file).expect("the file").contains("assets"), "off is not written");
+        let missing = workspace.project_paths(&ProjectId::parse("yok").expect("an id"));
+        assert!(set_backup_assets(&missing, true).is_err());
         fs::remove_dir_all(&root).expect("cleaned up");
     }
 

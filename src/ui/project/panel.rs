@@ -1,9 +1,10 @@
 //! The widget panel on the right: which widgets it carries, in what order, and what they show.
 
+use qframe::date::DateTime;
 use qframe::prelude::*;
 use qframe::widgets::{
-    ContextItem, ContextMenu, Field, Form, FormErrors, Modal, Popover, Section, Spinner, TextInput, Tooltip, Tree,
-    TreeNode, WidgetDock,
+    ContextItem, ContextMenu, Field, Form, FormErrors, Modal, Popover, Section, Spinner, Switch, TextInput, Tooltip,
+    Tree, TreeNode, WidgetDock,
 };
 
 use crate::engine::ContainerState;
@@ -201,6 +202,7 @@ pub(super) fn view(screen: &ProjectScreen, ui: &mut View<'_, Msg>) {
         if let Some(project) = screen.project() {
             naming(project.files(), ui);
         }
+        super::backups::view(screen, ui);
     })
     .gap(1)
     .padding(Padding::symmetric(1, 1))
@@ -276,14 +278,14 @@ fn dock(screen: &ProjectScreen, ui: &mut View<'_, Msg>) {
 fn body(screen: &ProjectScreen, widget: PanelWidget, ui: &mut View<'_, Msg>) {
     let Some(project) = screen.project() else { return };
     match widget {
-        PanelWidget::Files => files_widget(project, ui),
+        PanelWidget::Files => files_widget(project, screen.engine().is_some(), ui),
         PanelWidget::Info => info_widget(screen, project, ui),
         PanelWidget::Containers => containers_widget(screen, project, ui),
     }
 }
 
-/// The project's own files.
-fn files_widget(project: &OpenProject, ui: &mut View<'_, Msg>) {
+/// The project's own files; with `engine` their earlier versions can be looked for too.
+fn files_widget(project: &OpenProject, engine: bool, ui: &mut View<'_, Msg>) {
     let tree = project.files();
     if tree.children(files::ROOT).is_none() && tree.error().is_none() {
         // An unread folder is not an empty one, so it never says "empty" before it is known.
@@ -298,6 +300,7 @@ fn files_widget(project: &OpenProject, ui: &mut View<'_, Msg>) {
     let cut = tree.cut().to_vec();
     let folders = tree.folder_keys();
     let chosen = tree.chosen().to_vec();
+    let skip = project.backup_skip().to_vec();
     let accepts = folders.clone();
     ui.add(
         Tree::new([root_node(project, tree)])
@@ -312,13 +315,18 @@ fn files_widget(project: &OpenProject, ui: &mut View<'_, Msg>) {
             .context_menu(move |key| {
                 // The tree keeps the selection when the click is on one of its rows and makes the
                 // row the selection otherwise, so the menu acts on what the click was on.
-                let many = files::targets(&chosen, key).len();
-                if many > 1 {
-                    many_menu(key, many, !cut.is_empty())
+                let targets = files::targets(&chosen, key);
+                let backup = backup_item(key, &targets, &skip);
+                if targets.len() > 1 {
+                    many_menu(key, targets.len(), !cut.is_empty(), backup.into_iter().collect())
                 } else if key == files::ROOT || folders.contains(key) {
-                    folder_menu(key, &cut)
+                    folder_menu(key, &cut, backup.into_iter().collect())
                 } else {
-                    file_menu(key, !cut.is_empty())
+                    // Earlier versions are read out of the backup in a container.
+                    let versions =
+                        ContextItem::new(t!("project.files.versions"), Msg::ShowBackups(Some(key.to_owned())))
+                            .disabled(!engine);
+                    file_menu(key, !cut.is_empty(), std::iter::once(versions).chain(backup).collect())
                 }
             }),
     )
@@ -333,7 +341,7 @@ fn files_widget(project: &OpenProject, ui: &mut View<'_, Msg>) {
 /// like any other row. A tree that is only as tall as its rows has no empty part below them to
 /// click, so the row is the one way the mouse and the keyboard reach the folder alike.
 fn root_node(project: &OpenProject, tree: &FileTree) -> TreeNode {
-    let entries = nodes(tree, files::ROOT);
+    let entries = nodes(tree, files::ROOT, project.backup_skip());
     let mut root = TreeNode::new(files::ROOT, project.name().to_owned()).icon("project", None);
     if entries.is_empty() {
         root = root.detail(t!("project.files.empty"));
@@ -347,10 +355,36 @@ pub(super) const FILES_ID: &str = "project-files";
 /// The name the field of the naming dialog is focused by.
 pub(super) const NAME_ID: &str = "project-files-name";
 
+/// The item that leaves the entries `targets`, asked for on the row `key`, out of the backup of a
+/// project that leaves `skip` out, or takes them in again when every one of them is left out by
+/// name. An entry inside a folder that is left out goes with its folder, so it offers neither;
+/// the project folder itself is not among `targets` and offers neither either.
+///
+/// Unlike cutting and deleting, the item does not count what it acts on: it is undone as easily
+/// as it is done, and the menu stays narrow enough to leave the names below it readable.
+fn backup_item(key: &str, targets: &[String], skip: &[String]) -> Option<ContextItem<Msg>> {
+    let message = |out: bool| Msg::Files(FileMsg::LeaveOut(key.to_owned(), out));
+    if !targets.is_empty() && targets.iter().all(|target| skip.contains(target)) {
+        return Some(ContextItem::new(t!("project.files.back-up"), message(false)));
+    }
+    if targets.iter().all(|target| super::backups::is_left_out(skip, target)) {
+        return None;
+    }
+    Some(ContextItem::new(t!("project.files.leave-out"), message(true)))
+}
+
+/// Puts the items of `backup`, when there are any, into a menu as a group of their own.
+fn add_backup(items: &mut Vec<ContextItem<Msg>>, backup: Vec<ContextItem<Msg>>) {
+    if !backup.is_empty() {
+        items.push(ContextItem::gap());
+        items.extend(backup);
+    }
+}
+
 /// The menu of a folder, or of the project folder itself when `key` is the root: what can be made
 /// in it and, while something is cut, pasting it here. A folder cannot take itself or a folder
 /// that holds it, so pasting there is shown but cannot be chosen.
-fn folder_menu(key: &str, cut: &[String]) -> Vec<ContextItem<Msg>> {
+fn folder_menu(key: &str, cut: &[String], backup: Vec<ContextItem<Msg>>) -> Vec<ContextItem<Msg>> {
     let message = |message: FileMsg| Msg::Files(message);
     let mut items = vec![
         ContextItem::new(t!("project.files.new-file"), message(FileMsg::NewFile(key.to_owned()))),
@@ -367,6 +401,7 @@ fn folder_menu(key: &str, cut: &[String]) -> Vec<ContextItem<Msg>> {
         items.push(paste.disabled(cut.iter().any(|cut| is_within(key, cut))));
         items.push(ContextItem::new(t!("project.files.drop-cut"), message(FileMsg::DropCut)));
     }
+    add_backup(&mut items, backup);
     items.push(ContextItem::gap());
     if root {
         items.push(ContextItem::new(t!("project.files.refresh"), message(FileMsg::Refresh)));
@@ -377,7 +412,7 @@ fn folder_menu(key: &str, cut: &[String]) -> Vec<ContextItem<Msg>> {
 }
 
 /// The menu of a file.
-fn file_menu(key: &str, cutting: bool) -> Vec<ContextItem<Msg>> {
+fn file_menu(key: &str, cutting: bool, backup: Vec<ContextItem<Msg>>) -> Vec<ContextItem<Msg>> {
     let message = |message: FileMsg| Msg::Files(message);
     let mut items = vec![
         ContextItem::new(t!("project.files.rename"), message(FileMsg::Rename(key.to_owned()))),
@@ -386,6 +421,7 @@ fn file_menu(key: &str, cutting: bool) -> Vec<ContextItem<Msg>> {
     if cutting {
         items.push(ContextItem::new(t!("project.files.drop-cut"), message(FileMsg::DropCut)));
     }
+    add_backup(&mut items, backup);
     items.push(ContextItem::gap());
     items.push(ContextItem::new(t!("project.files.delete"), message(FileMsg::Delete(key.to_owned()))).danger(true));
     items
@@ -393,13 +429,14 @@ fn file_menu(key: &str, cutting: bool) -> Vec<ContextItem<Msg>> {
 
 /// The menu of a row that is one of `count` selected entries: what can be done to all of them at
 /// once. A name is given to one entry at a time, so renaming is not offered.
-fn many_menu(key: &str, count: usize, cutting: bool) -> Vec<ContextItem<Msg>> {
+fn many_menu(key: &str, count: usize, cutting: bool, backup: Vec<ContextItem<Msg>>) -> Vec<ContextItem<Msg>> {
     let message = |message: FileMsg| Msg::Files(message);
     let mut items =
         vec![ContextItem::new(t!("project.files.cut-many", n = count), message(FileMsg::Cut(key.to_owned())))];
     if cutting {
         items.push(ContextItem::new(t!("project.files.drop-cut"), message(FileMsg::DropCut)));
     }
+    add_backup(&mut items, backup);
     items.push(ContextItem::gap());
     items.push(
         ContextItem::new(t!("project.files.delete-many", n = count), message(FileMsg::Delete(key.to_owned())))
@@ -456,8 +493,12 @@ fn naming(tree: &FileTree, ui: &mut View<'_, Msg>) {
 /// Width of the naming dialog, in cells: room for a long file name without covering the screen.
 const NAMING_WIDTH: u16 = 48;
 
-/// The nodes below the folder `key`, as far as the tree has been read.
-fn nodes(tree: &FileTree, key: &str) -> Vec<TreeNode> {
+/// The theme colour of the icon of an entry the backup leaves out.
+const LEFT_OUT_TONE: &str = "warning";
+
+/// The nodes below the folder `key`, as far as the tree has been read, in a project whose backup
+/// leaves `skip` out.
+fn nodes(tree: &FileTree, key: &str, skip: &[String]) -> Vec<TreeNode> {
     let Some(entries) = tree.children(key) else { return Vec::new() };
     entries
         .iter()
@@ -465,13 +506,19 @@ fn nodes(tree: &FileTree, key: &str) -> Vec<TreeNode> {
             let child = files::child_key(key, &entry.name);
             let icon = if entry.folder { "folder" } else { "file" };
             // What was cut is drawn faint until it is pasted or let go, with everything in it.
+            // What the backup leaves out is faint too, with everything in it, and its icon takes
+            // the warning tone so the two are told apart; the project widget names it in words.
+            // A word beside the row would not do: the panel is narrow, and the tree gives a
+            // detail its room before the name.
             let cut = tree.is_cut(&child);
-            let mut node = TreeNode::new(child.clone(), entry.name.clone()).icon(icon, None).faint(cut);
+            let out = super::backups::is_left_out(skip, &child);
+            let tone = out.then_some(LEFT_OUT_TONE);
+            let mut node = TreeNode::new(child.clone(), entry.name.clone()).icon(icon, tone).faint(cut || out);
             if entry.folder {
                 let open = tree.is_open(&child);
                 node = node.expandable(true).expanded(open).loading(tree.is_loading(&child));
                 if open {
-                    node = node.children(nodes(tree, &child));
+                    node = node.children(nodes(tree, &child, skip));
                 }
             }
             node
@@ -493,6 +540,9 @@ fn info_widget(screen: &ProjectScreen, project: &OpenProject, ui: &mut View<'_, 
             project.profiles().iter().filter(|profile| project.carries(profile.name.as_str())).count().to_string(),
         ),
         (t!("project.info.engine"), engine),
+        (t!("project.info.backup"), super::backups::last_text(screen, project, DateTime::now_local())),
+        (t!("project.info.left-out"), super::backups::left_out_text(project)),
+        (t!("project.info.backup-size"), super::backups::size_text(project)),
     ];
     ui.column(|ui| {
         for (label, value) in rows {
@@ -501,6 +551,11 @@ fn info_widget(screen: &ProjectScreen, project: &OpenProject, ui: &mut View<'_, 
     })
     .fill_width()
     .selectable(true);
+    ui.add(Switch::new(project.backs_up_assets()).label(t!("project.backup.assets")).on_toggle(Msg::BackupAssets))
+        .id("project-backup-assets");
+    // The backups are read in a container, so without an engine there is no list to open.
+    let backups = Button::new(t!("project.backup.list")).disabled(screen.engine().is_none());
+    ui.add(backups.on_press(Msg::ShowBackups(None))).id("project-backups-open");
 }
 
 /// The project's containers, and the way to stop and restart them.
