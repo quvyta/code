@@ -29,7 +29,7 @@ use qframe::storage::{Family, Schema, SettingKind, Settings, config_dir};
 
 use super::{Loaded, ProjectId};
 use crate::backup::BackupEvery;
-use crate::base::apps::Editor;
+use crate::base::apps::{Editor, Sound};
 
 /// QCode's id in the family: its settings file is `code.conf` and its other files are under
 /// `code/`.
@@ -133,6 +133,8 @@ impl Config {
     const BACKUP_EVERY: &'static str = "backup.every";
     /// The key of the editor a text file opens in.
     const EDITOR: &'static str = "apps.editor";
+    /// The key of what opening a sound does.
+    const SOUND: &'static str = "apps.sound";
 
     /// How many projects the recent list keeps. Beyond a screenful the list stops being a
     /// shortcut, and the full list of projects is one screen away.
@@ -194,6 +196,7 @@ impl Config {
             .choice(Self::ON_CLOSE, OnClose::ALL.map(OnClose::key), OnClose::Stop.key())
             .choice(Self::BACKUP_EVERY, BackupEvery::ALL.map(BackupEvery::key), BackupEvery::default().key())
             .choice(Self::EDITOR, Editor::ALL.map(Editor::key), Editor::default().key())
+            .choice(Self::SOUND, Sound::ALL.map(Sound::key), Sound::default().key())
     }
 
     /// Every problem found while reading the file, including every repair that was made.
@@ -389,6 +392,22 @@ impl Config {
             return self.settings.set(Self::EDITOR, editor.key().to_owned());
         }
         self.settings.remove(Self::EDITOR)
+    }
+
+    /// What opening a sound does; it plays until the person chooses otherwise.
+    #[must_use]
+    pub fn sound(&self) -> Sound {
+        self.settings.get::<String>(Self::SOUND).and_then(|key| Sound::from_key(&key)).unwrap_or_default()
+    }
+
+    /// Records what opening a sound does. Answers whether anything changed.
+    ///
+    /// Playing is the default and is taken out rather than written down, as with the editor.
+    pub fn set_sound(&mut self, sound: Sound) -> bool {
+        if sound != Sound::default() {
+            return self.settings.set(Self::SOUND, sound.key().to_owned());
+        }
+        self.settings.remove(Self::SOUND)
     }
 
     fn recent_ids(&self) -> Vec<String> {
@@ -771,6 +790,25 @@ mod tests {
         let config = Config::parse_str(FILE, "[apps]\neditor = \"emacs\"\n");
         assert_eq!(config.editor(), Editor::Nano);
         assert_eq!(config.diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn sounds_play_until_details_are_chosen_and_playing_is_never_written() {
+        let mut config = Config::parse_str(FILE, "");
+        assert_eq!(config.sound(), Sound::Play);
+        assert!(config.set_sound(Sound::Details));
+        assert_eq!(config.to_toml(), "[apps]\nsound = \"details\"\n");
+        let stored = Config::parse_str(FILE, &config.to_toml());
+        assert!(stored.is_clean(), "{:?}", stored.diagnostics());
+        assert_eq!(stored.sound(), Sound::Details);
+
+        let mut config = stored;
+        config.set_sound(Sound::Play);
+        assert_eq!(config.sound(), Sound::Play);
+        assert_eq!(config.to_toml(), "", "the default is not written down");
+        let unknown = Config::parse_str(FILE, "[apps]\nsound = \"loud\"\n");
+        assert_eq!(unknown.sound(), Sound::Play);
+        assert_eq!(unknown.diagnostics().len(), 1);
     }
 
     #[test]

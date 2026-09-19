@@ -1,8 +1,11 @@
 //! One tab of the project screen: what it opens, where it stands, and the session it draws.
 
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use qframe::widgets::TerminalSession;
+
+use crate::base::apps::Quiet;
 
 use super::plan::LaunchFailure;
 
@@ -31,6 +34,15 @@ pub enum TabKind {
     Markdown(String),
     /// A file of the project, open in the chosen editor in the project's own container.
     Editor(String),
+    /// A PDF of the project: its text, taken out in the project's own container and shown by
+    /// QCode, or one of its pages drawn there as a picture.
+    Pdf(String),
+    /// A word processor's document of the project: its text, taken out in the project's own
+    /// container and shown by QCode.
+    Office(String),
+    /// A sound of the project: played in a container of its own made for it, or, when it
+    /// cannot or should not play, described.
+    Sound(String),
 }
 
 impl TabKind {
@@ -38,9 +50,31 @@ impl TabKind {
     #[must_use]
     pub fn file(&self) -> Option<&str> {
         match self {
-            Self::Image(file) | Self::Markdown(file) | Self::Editor(file) => Some(file),
+            Self::Image(file)
+            | Self::Markdown(file)
+            | Self::Editor(file)
+            | Self::Pdf(file)
+            | Self::Office(file)
+            | Self::Sound(file) => Some(file),
             Self::Shell | Self::Profile(_) | Self::New => None,
         }
+    }
+}
+
+/// Where a PDF tab stands among its pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pages {
+    /// How many pages the document has, as its text counted them.
+    pub count: usize,
+    /// The page drawn, or the one that is drawn next; counted from 1.
+    pub page: usize,
+    /// Whether the tab draws the page rather than showing the text.
+    pub drawn: bool,
+}
+
+impl Default for Pages {
+    fn default() -> Self {
+        Self { count: 1, page: 1, drawn: false }
     }
 }
 
@@ -101,8 +135,19 @@ pub struct Tab {
     /// The harness conversation the tab shows, when it is known.
     conversation: Option<String>,
     session: Option<TerminalSession>,
-    /// The text of a Markdown tab's file, as it was last read.
+    /// The text of a Markdown tab's file, as it was last read, or the text taken out of a PDF.
     document: Option<String>,
+    /// Whether that text was cut short, being too long to show whole.
+    partial: bool,
+    /// Where a PDF tab stands among its pages.
+    pages: Pages,
+    /// Why a sound tab shows the sound's details rather than playing it, once it is known.
+    quiet: Option<Quiet>,
+    /// The sound server's socket on this machine, once a sound tab found one to play through.
+    socket: Option<PathBuf>,
+    /// Whether a sound tab waits to be asked before it plays: a tab brought back from the last
+    /// session does, because opening QCode again is not asking to hear the sound again.
+    held: bool,
     /// Counts the sessions this tab has started, so the watch of a session that was replaced by
     /// a restart is recognised and ignored.
     run: u64,
@@ -121,6 +166,11 @@ impl Tab {
             conversation: None,
             session: None,
             document: None,
+            partial: false,
+            pages: Pages::default(),
+            quiet: None,
+            socket: None,
+            held: false,
             run: 0,
         }
     }
@@ -188,6 +238,57 @@ impl Tab {
         self.document.as_deref()
     }
 
+    /// Whether the text the tab shows was cut short.
+    #[must_use]
+    pub fn is_partial(&self) -> bool {
+        self.partial
+    }
+
+    /// Where a PDF tab stands among its pages.
+    #[must_use]
+    pub fn pages(&self) -> Pages {
+        self.pages
+    }
+
+    /// Moves a PDF tab to `pages`.
+    pub fn turn(&mut self, pages: Pages) {
+        self.pages = pages;
+    }
+
+    /// Why a sound tab shows the sound's details rather than playing it.
+    #[must_use]
+    pub fn quiet(&self) -> Option<Quiet> {
+        self.quiet
+    }
+
+    /// Records why a sound tab shows the sound's details.
+    pub fn keep_quiet(&mut self, why: Quiet) {
+        self.quiet = Some(why);
+    }
+
+    /// The sound server's socket a sound tab plays through.
+    #[must_use]
+    pub fn socket(&self) -> Option<&Path> {
+        self.socket.as_deref()
+    }
+
+    /// Records the socket a sound tab plays through, and that it plays rather than describes.
+    pub fn play_through(&mut self, socket: PathBuf) {
+        self.socket = Some(socket);
+        self.quiet = None;
+    }
+
+    /// Whether a sound tab waits to be asked before it plays.
+    #[must_use]
+    pub fn is_held(&self) -> bool {
+        self.held
+    }
+
+    /// Makes a sound tab wait to be asked before it plays, or lets it play.
+    pub fn hold(&mut self, held: bool) {
+        self.held = held;
+    }
+
     /// Which session of this tab is the current one.
     #[must_use]
     pub fn run(&self) -> u64 {
@@ -226,9 +327,11 @@ impl Tab {
         self.state = TabState::Running;
     }
 
-    /// Takes the text of a Markdown tab's file and shows it.
-    pub fn read(&mut self, text: String) {
+    /// Takes the text of a Markdown tab's file, or of a PDF, and shows it; `partial` says it
+    /// was cut short.
+    pub fn read(&mut self, text: String, partial: bool) {
         self.document = Some(text);
+        self.partial = partial;
         self.state = TabState::Running;
     }
 

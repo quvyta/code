@@ -55,7 +55,7 @@ mod tests {
     use crate::ui::settings::testing::{self, Host};
 
     /// A terminal wide enough for the strip and the settings underneath.
-    const SIZE: (u16, u16) = (100, 30);
+    const SIZE: (u16, u16) = (100, 32);
 
     fn host(kind: EngineKind, health: Health, width: u16, height: u16) -> Harness<Host> {
         testing::host(testing::screen(kind, health), width, height)

@@ -161,7 +161,7 @@ impl LaunchFailure {
     ///
     /// A build context that could not be written has no engine command behind it, so the
     /// command is left empty and only the machine's words are shown.
-    fn base(failure: &base::Failure) -> Self {
+    pub(super) fn base(failure: &base::Failure) -> Self {
         match failure {
             base::Failure::Host(error) => Self { command: String::new(), output: error.to_string() },
             base::Failure::Engine(error) => Self::from(error),

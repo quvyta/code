@@ -21,7 +21,9 @@ mod files;
 mod history;
 mod panel;
 mod plan;
+mod sound;
 mod tab;
+mod viewer;
 mod watch;
 
 #[cfg(test)]
@@ -36,7 +38,8 @@ pub use files::{DocumentTrouble, FileEntry, FileMsg, FileTree, NameFor, Naming};
 pub use history::HistoryKey;
 pub use panel::{Panel, PanelWidget};
 pub use plan::{ASSETS_DIR, ContainerPlan, HOME_DIR, KEEP_ALIVE, LaunchFailure, PROJECT_DIR, SHELL};
-pub use tab::{Tab, TabKey, TabKind, TabState};
+pub use tab::{Pages, Tab, TabKey, TabKind, TabState};
+pub use viewer::{MOST_TEXT, Taken};
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -56,8 +59,8 @@ use std::path::{Path, PathBuf};
 
 use crate::backup::conversations::Brought;
 use crate::backup::{BackupEvery, Entry, Snapshot, SnapshotId};
-use crate::base::apps::{self, Editor, FileKind};
-use crate::engine::{Container, Engine, EngineCommand, EngineKind, HostUser};
+use crate::base::apps::{self, Editor, FileKind, Quiet, Sound};
+use crate::engine::{Container, Engine, EngineCommand, EngineKind, Exec, HostUser};
 use crate::profile::Profile;
 use crate::profile::history::Conversation;
 use crate::workspace::{
@@ -180,6 +183,19 @@ pub enum Msg {
     Missing(TabKey, u64),
     /// The document a Markdown tab shows was read, or could not be.
     DocumentRead(TabKey, u64, Result<String, DocumentTrouble>),
+    /// The text of the file a tab shows was taken out in the container, or could not be.
+    TextRead(TabKey, u64, Result<Taken, LaunchFailure>),
+    /// A page of the PDF the tab of this key shows was asked for as a picture, counted from 1,
+    /// or with `None` its text again.
+    Page(TabKey, Option<usize>),
+    /// The sound of a tab can be played through the sound server's socket at this path, or the
+    /// base image it plays in could not be made.
+    Playable(TabKey, u64, Result<PathBuf, LaunchFailure>),
+    /// The details of the sound of a tab were read, or could not be, and why they are shown
+    /// rather than the sound played.
+    Described(TabKey, u64, Quiet, Result<Taken, LaunchFailure>),
+    /// The containers of sound tabs that were closed while playing were taken away.
+    Silenced,
     /// A row of the container widget was selected.
     SelectContainer(usize),
     /// The container widget was asked for the engine's current answer.
@@ -416,15 +432,17 @@ impl OpenProject {
         &self.containers
     }
 
-    /// The container a tab of `kind` enters. A picture and a file in the editor are opened in
-    /// the project's own container, the one its shell runs in; a Markdown document needs none.
+    /// The container a tab of `kind` enters. A picture, a file in the editor, a PDF and an
+    /// office document are opened in the project's own container, the one its shell runs in; a
+    /// Markdown document needs none, and a sound plays in a container made for it each time it
+    /// plays, which no tab enters.
     #[must_use]
     pub fn plan(&self, kind: &TabKind) -> Option<ContainerPlan> {
         match kind {
-            TabKind::Shell | TabKind::Image(_) | TabKind::Editor(_) => {
+            TabKind::Shell | TabKind::Image(_) | TabKind::Editor(_) | TabKind::Pdf(_) | TabKind::Office(_) => {
                 Some(ContainerPlan::base(self.id.as_str(), &self.paths))
             }
-            TabKind::Markdown(_) => None,
+            TabKind::Markdown(_) | TabKind::Sound(_) => None,
             TabKind::Profile(name) => self
                 .profiles
                 .iter()
@@ -434,21 +452,22 @@ impl OpenProject {
         }
     }
 
-    /// What a tab of `kind` runs inside its container: a login shell, the harness of the
-    /// profile with the arguments that let it work without asking, opening `conversation` when
-    /// the tab shows one and a new conversation otherwise, chafa drawing a picture, or `editor`
-    /// on a file.
+    /// What `tab` runs inside its container: a login shell, the harness of the profile with the
+    /// arguments that let it work without asking, opening the tab's conversation when it shows
+    /// one and a new conversation otherwise, chafa drawing a picture or a page of a PDF, or
+    /// `editor` on a file. A PDF whose text is shown runs nothing in a terminal.
     #[must_use]
-    pub fn program(&self, kind: &TabKind, conversation: Option<&str>, editor: Editor) -> Option<Vec<String>> {
-        match kind {
+    pub fn program(&self, tab: &Tab, editor: Editor) -> Option<Vec<String>> {
+        match tab.kind() {
             TabKind::Shell => Some(plan::SHELL.iter().map(|part| (*part).to_owned()).collect()),
             TabKind::Profile(name) => {
                 let profile = self.profiles.iter().find(|profile| profile.name.as_str() == name)?;
-                Some(profile.harness.command_line(conversation))
+                Some(profile.harness.command_line(tab.conversation()))
             }
             TabKind::Image(file) => Some(apps::picture(&inside_container(file))),
             TabKind::Editor(file) => Some(editor.command(&inside_container(file))),
-            TabKind::New | TabKind::Markdown(_) => None,
+            TabKind::Pdf(file) if tab.pages().drawn => Some(apps::pdf_page(&inside_container(file), tab.pages().page)),
+            TabKind::New | TabKind::Markdown(_) | TabKind::Pdf(_) | TabKind::Office(_) | TabKind::Sound(_) => None,
         }
     }
 
@@ -459,7 +478,12 @@ impl OpenProject {
         match tab.kind() {
             TabKind::Profile(name) => name.clone(),
             TabKind::New => t!("project.new-tab"),
-            TabKind::Image(file) | TabKind::Markdown(file) | TabKind::Editor(file) => files::name(file).to_owned(),
+            TabKind::Image(file)
+            | TabKind::Markdown(file)
+            | TabKind::Editor(file)
+            | TabKind::Pdf(file)
+            | TabKind::Office(file)
+            | TabKind::Sound(file) => files::name(file).to_owned(),
             TabKind::Shell => {
                 let shell = t!("project.tab.shell");
                 let position = self.tabs[..index].iter().filter(|tab| tab.kind() == &TabKind::Shell).count() + 1;
@@ -501,6 +525,10 @@ pub struct ProjectScreen {
     shown_document: Option<TabKey>,
     /// The editor a file opens in.
     editor: Editor,
+    /// What opening a sound does.
+    sound: Sound,
+    /// This machine's runtime folder, where the sound server's socket is looked for.
+    runtime: Option<PathBuf>,
     next_key: u64,
     /// Whether the open project's folders are watched, so the tree follows the disk.
     live: bool,
@@ -540,6 +568,8 @@ impl ProjectScreen {
             shown_blank: None,
             shown_document: None,
             editor: Editor::default(),
+            sound: Sound::default(),
+            runtime: std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
             next_key: 0,
             live: false,
             last_watch: 0,
@@ -609,6 +639,26 @@ impl ProjectScreen {
         self.editor
     }
 
+    /// Makes `sound` what opening a sound does from now on. A sound tab already open keeps what
+    /// it does until it is started again.
+    pub fn set_sound(&mut self, sound: Sound) {
+        self.sound = sound;
+    }
+
+    /// What opening a sound does.
+    #[must_use]
+    pub fn sound(&self) -> Sound {
+        self.sound
+    }
+
+    /// The same screen, looking for the sound server's socket in `runtime` rather than in the
+    /// runtime folder this process was given.
+    #[must_use]
+    pub fn hearing_in(mut self, runtime: Option<PathBuf>) -> Self {
+        self.runtime = runtime;
+        self
+    }
+
     /// Opens the project at `index` of the rail, when there is one there.
     pub fn set_active(&mut self, index: usize) {
         if index < self.projects.len() {
@@ -635,10 +685,18 @@ impl ProjectScreen {
                 SessionTabKind::Image(file) => TabKind::Image(file.clone()),
                 SessionTabKind::Markdown(file) => TabKind::Markdown(file.clone()),
                 SessionTabKind::Editor(file) => TabKind::Editor(file.clone()),
+                SessionTabKind::Pdf(file) => TabKind::Pdf(file.clone()),
+                SessionTabKind::Office(file) => TabKind::Office(file.clone()),
+                SessionTabKind::Sound(file) => TabKind::Sound(file.clone()),
             };
             let usable = match &kind {
                 TabKind::New => true,
-                TabKind::Image(file) | TabKind::Markdown(file) | TabKind::Editor(file) => files::is_inside(file),
+                TabKind::Image(file)
+                | TabKind::Markdown(file)
+                | TabKind::Editor(file)
+                | TabKind::Pdf(file)
+                | TabKind::Office(file)
+                | TabKind::Sound(file) => files::is_inside(file),
                 TabKind::Shell | TabKind::Profile(_) => project.plan(&kind).is_some(),
             };
             if !usable {
@@ -649,7 +707,10 @@ impl ProjectScreen {
             }
             let key = TabKey(self.next_key);
             self.next_key += 1;
-            project.tabs.push(Tab::restored(key, kind, saved.opened, saved.conversation.clone()));
+            let mut tab = Tab::restored(key, kind, saved.opened, saved.conversation.clone());
+            // Opening QCode again is not asking to hear a sound again.
+            tab.hold(matches!(tab.kind(), TabKind::Sound(_)));
+            project.tabs.push(tab);
         }
         project.active_tab = active;
     }
@@ -675,6 +736,9 @@ impl ProjectScreen {
                             TabKind::Image(file) => SessionTabKind::Image(file.clone()),
                             TabKind::Markdown(file) => SessionTabKind::Markdown(file.clone()),
                             TabKind::Editor(file) => SessionTabKind::Editor(file.clone()),
+                            TabKind::Pdf(file) => SessionTabKind::Pdf(file.clone()),
+                            TabKind::Office(file) => SessionTabKind::Office(file.clone()),
+                            TabKind::Sound(file) => SessionTabKind::Sound(file.clone()),
                         },
                         conversation: tab.conversation().map(str::to_owned),
                         opened: tab.opened(),
@@ -706,10 +770,27 @@ impl ProjectScreen {
         let engine = self.engine.as_ref()?;
         let project = self.projects.iter().find(|project| project.tabs.iter().any(|tab| tab.key() == key))?;
         let tab = project.tabs.iter().find(|tab| tab.key() == key)?;
+        if let TabKind::Sound(_) = tab.kind() {
+            return sound::play_command(engine, self.user, project, tab, tab.socket()?);
+        }
         let plan = project.plan(tab.kind())?;
-        let program = project.program(tab.kind(), tab.conversation(), self.editor)?;
+        let program = project.program(tab, self.editor)?;
         let parts: Vec<&str> = program.iter().map(String::as_str).collect();
         Some(plan.enter(engine, &parts))
+    }
+
+    /// The command that takes the text out of the file the tab `key` shows, which is always the
+    /// engine running a program in the project's own container, without a terminal; `None` for a
+    /// tab that shows no such text.
+    #[must_use]
+    pub fn read_command(&self, key: TabKey) -> Option<EngineCommand> {
+        let engine = self.engine.as_ref()?;
+        let project = self.projects.iter().find(|project| project.tabs.iter().any(|tab| tab.key() == key))?;
+        let tab = project.tabs.iter().find(|tab| tab.key() == key)?;
+        let plan = project.plan(tab.kind())?;
+        let program = viewer::text_command(tab.kind())?;
+        let parts: Vec<&str> = program.iter().map(String::as_str).collect();
+        Some(engine.exec_without_terminal(&Exec { container: &plan.name, command: &parts }))
     }
 
     /// The project of `id`, when the screen has it open.
@@ -817,12 +898,16 @@ fn apply(screen: &mut ProjectScreen, message: Msg) -> Command<Msg> {
         }
         Msg::CloseProject(index) => {
             let backed = backups::closing(screen, index);
+            let silenced = match screen.projects.get(index) {
+                Some(project) => sound::silence(screen, project, &project.tabs.iter().collect::<Vec<_>>()),
+                None => Command::none(),
+            };
             let Some(project) = screen.projects.get_mut(index) else { return Command::none() };
             for tab in &mut project.tabs {
                 tab.close_session();
             }
             TabEdit::Close(index).apply(&mut screen.projects, &mut screen.active);
-            Command::batch([backed, load_root(screen), list_containers(screen)])
+            Command::batch([backed, silenced, load_root(screen), list_containers(screen)])
         }
         // The application opens the list; nothing on this screen changes until a project comes
         // back from it.
@@ -836,12 +921,18 @@ fn apply(screen: &mut ProjectScreen, message: Msg) -> Command<Msg> {
             Command::none()
         }
         Msg::CloseTab(index) => {
+            let silenced = match screen.project() {
+                Some(project) => {
+                    sound::silence(screen, project, &project.tabs.get(index).into_iter().collect::<Vec<_>>())
+                }
+                None => Command::none(),
+            };
             let Some(project) = screen.projects.get_mut(screen.active) else { return Command::none() };
             if let Some(tab) = project.tabs.get_mut(index) {
                 tab.close_session();
             }
             TabEdit::Close(index).apply(&mut project.tabs, &mut project.active_tab);
-            Command::none()
+            silenced
         }
         Msg::MoveTab { from, to } => {
             if let Some(project) = screen.projects.get_mut(screen.active) {
@@ -1007,6 +1098,11 @@ fn apply(screen: &mut ProjectScreen, message: Msg) -> Command<Msg> {
             document_read(screen, key, run, answer);
             Command::none()
         }
+        Msg::TextRead(key, run, answer) => viewer::text_read(screen, key, run, answer),
+        Msg::Page(key, page) => viewer::show_page(screen, key, page),
+        Msg::Playable(key, run, answer) => sound::playable(screen, key, run, answer),
+        Msg::Described(key, run, why, answer) => sound::described(screen, key, run, why, answer),
+        Msg::Silenced => Command::none(),
         Msg::SelectContainer(index) => {
             if let Some(project) = screen.projects.get_mut(screen.active) {
                 project.container_row = index;
@@ -1186,9 +1282,24 @@ fn wake(screen: &mut ProjectScreen) -> Command<Msg> {
         let (key, run) = (tab.key(), tab.run());
         return read_document(project, key, run, &file);
     }
+    if screen.engine.is_none() {
+        return Command::none();
+    }
+    if let TabKind::Sound(_) = tab.kind() {
+        tab.wake();
+        let (key, run) = (tab.key(), tab.run());
+        return sound::hear(screen, key, run);
+    }
+    // A PDF shows its text first, which is read rather than run in a terminal.
+    if viewer::text_command(tab.kind()).is_some() && !viewer::draws(tab) {
+        tab.wake();
+        let (key, run) = (tab.key(), tab.run());
+        return viewer::take_text(screen, key, run);
+    }
     let Some(engine) = screen.engine.clone() else { return Command::none() };
     let user = screen.user;
     let registry = screen.registry.clone();
+    let Some(project) = screen.projects.get_mut(screen.active) else { return Command::none() };
     let Some(tab) = project.tabs.get(project.active_tab) else { return Command::none() };
     let Some(plan) = project.plan(tab.kind()) else { return Command::none() };
     let file = tab.kind().file().map(|file| project.files.path(file));
@@ -1297,8 +1408,21 @@ fn restart_tab(screen: &mut ProjectScreen, key: TabKey) -> Command<Msg> {
         return read_document(project, key, run, file);
     }
     let Some(engine) = engine else { return Command::none() };
+    // A sound is met again from the start: the settings or the machine may have changed, and a
+    // tab brought back from the last session has now been asked to play.
+    if let TabKind::Sound(_) = &kind {
+        tab.restarting();
+        tab.hold(false);
+        let run = tab.run();
+        return sound::hear(screen, key, run);
+    }
+    // A PDF whose text could not be read reads it again; one showing a page draws it again.
+    let reads = viewer::text_command(&kind).is_some() && !viewer::draws(tab);
     tab.restarting();
     let run = tab.run();
+    if reads {
+        return viewer::take_text(screen, key, run);
+    }
     let Some(plan) = project.plan(&kind) else { return Command::none() };
     let file = kind.file().map(|file| project.files.path(file));
     bring_up(engine, plan, user, key, run, file, registry)
@@ -1375,7 +1499,7 @@ fn document_read(screen: &mut ProjectScreen, key: TabKey, run: u64, answer: Resu
         return;
     }
     match answer {
-        Ok(text) => tab.read(text),
+        Ok(text) => tab.read(text, false),
         Err(DocumentTrouble::Missing) => tab.settled(TabState::Missing),
         Err(DocumentTrouble::Outside) => {
             let file = tab.kind().file().unwrap_or_default().to_owned();
@@ -1416,6 +1540,9 @@ fn open_file(screen: &mut ProjectScreen, key: &str) -> Command<Msg> {
         FileKind::Image => TabKind::Image(key.to_owned()),
         FileKind::Markdown => TabKind::Markdown(key.to_owned()),
         FileKind::Text => TabKind::Editor(key.to_owned()),
+        FileKind::Pdf => TabKind::Pdf(key.to_owned()),
+        FileKind::Office => TabKind::Office(key.to_owned()),
+        FileKind::Sound => TabKind::Sound(key.to_owned()),
         FileKind::Unknown => {
             return Command::toast(Toast::info(t!("project.file.no-app")).body(files::name(key).to_owned()));
         }
@@ -1429,7 +1556,11 @@ fn open_file(screen: &mut ProjectScreen, key: &str) -> Command<Msg> {
 fn open_tab(screen: &mut ProjectScreen, kind: TabKind) -> Command<Msg> {
     let key = TabKey(screen.next_key);
     let Some(project) = screen.projects.get_mut(screen.active) else { return Command::none() };
-    let focus = if matches!(kind, TabKind::Markdown(_)) { DOCUMENT_ID } else { TERMINAL_ID };
+    let focus = if matches!(kind, TabKind::Markdown(_) | TabKind::Pdf(_) | TabKind::Office(_)) {
+        DOCUMENT_ID
+    } else {
+        TERMINAL_ID
+    };
     if let Some(index) = project.tabs.iter().position(|tab| tab.kind() == &kind) {
         project.active_tab = index;
         return Command::focus(focus);
@@ -1552,7 +1683,7 @@ fn container_action(screen: &ProjectScreen, name: &str, again: bool) -> Command<
 /// The name the terminal in the middle is focused by.
 const TERMINAL_ID: &str = "project-terminal";
 
-/// The name the document of a Markdown tab is focused by.
+/// The name the document of a Markdown tab, or the text of a PDF, is focused by.
 const DOCUMENT_ID: &str = "project-document";
 
 /// The name the tab strip is focused by; with no tab its `+` is the whole strip, and the focus.
@@ -1678,6 +1809,16 @@ fn center(screen: &ProjectScreen, ui: &mut View<'_, Msg>) {
     }
     if let TabKind::Markdown(file) = tab.kind() {
         document(tab, file, ui);
+        return;
+    }
+    if viewer::shows(tab) {
+        viewer::view(tab, ui);
+        return;
+    }
+    if let TabKind::Sound(file) = tab.kind()
+        && sound::shows(tab)
+    {
+        sound::view(tab, file, ui);
         return;
     }
     let image = matches!(tab.kind(), TabKind::Image(_));
@@ -1876,6 +2017,16 @@ pub fn entry(screen: &ProjectScreen) -> &'static str {
     match screen.project().and_then(OpenProject::active_tab).map(Tab::kind) {
         Some(TabKind::New) => blank::CHOICES_ID,
         Some(TabKind::Markdown(_)) => DOCUMENT_ID,
+        Some(TabKind::Pdf(_) | TabKind::Office(_))
+            if !screen.project().and_then(OpenProject::active_tab).is_some_and(viewer::draws) =>
+        {
+            DOCUMENT_ID
+        }
+        Some(TabKind::Sound(_))
+            if screen.project().and_then(OpenProject::active_tab).is_some_and(|tab| tab.quiet().is_some()) =>
+        {
+            DOCUMENT_ID
+        }
         Some(_) => TERMINAL_ID,
         None => TABS_ID,
     }

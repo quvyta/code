@@ -38,13 +38,22 @@ RUN apt-get update \
 # terminal a tab draws in shows no kitty or sixel pictures, so an image is drawn in coloured
 # character cells, and chafa is what does that well. unzip, zip, xz-utils, bzip2 and 7zip,
 # because an archive in the project is opened and made from the shell tab, and a slim Debian
-# can do neither for the common formats.
+# can do neither for the common formats. poppler-utils, because a PDF is opened as its text
+# (pdftotext) and a page of it drawn as a picture (pdftoppm, then chafa). docx2txt and odt2txt,
+# because a Word or OpenDocument text is opened as its text; together they are under 1 MB,
+# where a converter that keeps the formatting (pandoc) would be 190 MB. sox, with its mp3, opus
+# and PulseAudio formats, because a sound is played by sox's `play` in a terminal (mp3, ogg,
+# opus, flac, wav) and described by `soxi`, about 21 MB; a player that also reads aac (mpv,
+# ffmpeg) would be close to 400 MB.
 #
-# Together they add about 120 MB to the image, most of it vim's runtime files (syntax, indent
-# and help for every language) and the image decoders chafa reads png, jpeg, webp, gif and avif
-# with. Recommended packages stay out, as above: nothing here needs them.
+# Together they add about 145 MB to the image, most of it vim's runtime files (syntax, indent
+# and help for every language), the image decoders chafa reads png, jpeg, webp, gif and avif
+# with, and poppler with its fonts, about 25 MB. Recommended packages stay out, as above:
+# nothing here needs them.
 RUN apt-get update \
  && apt-get install --yes --no-install-recommends nano vim chafa unzip zip xz-utils bzip2 7zip \
+    poppler-utils docx2txt odt2txt sox libsox-fmt-mp3 libsox-fmt-opus \
+    libsox-fmt-pulse \
  && rm -rf /var/lib/apt/lists/*
 
 # The user the image belongs to.

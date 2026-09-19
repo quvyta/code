@@ -23,7 +23,7 @@ use qframe::prelude::*;
 use qframe::widgets::{ScrollView, Segmented, Select, SettingRow, SettingsList, SettingsRows, Spinner, Switch, Toast};
 
 use crate::backup::BackupEvery;
-use crate::base::apps::Editor;
+use crate::base::apps::{Editor, Sound};
 use crate::engine::EngineKind;
 use crate::profile::SafeName;
 use crate::workspace::{Config, OnClose, Platform};
@@ -52,7 +52,7 @@ const ENGINES: [EngineKind; 2] = [EngineKind::Podman, EngineKind::Docker];
 
 /// What the settings screen asks the application to do, because it reaches past the screen.
 ///
-/// The first five and the editor are choices already applied to the running application and only waiting to be
+/// The first five, the editor and the sound choice are choices already applied to the running application and only waiting to be
 /// written down. The rest are work only the layers that own it can do: the setup wizard's steps
 /// and the engine's volumes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +69,8 @@ pub enum Request {
     Engine(EngineKind),
     /// Store the editor a file opens in, and open files in it from now on.
     Editor(Editor),
+    /// Store what opening a sound does, and do that from now on.
+    Sound(Sound),
     /// Run the setup wizard's engine step on its own. This is what the repair strip asks for.
     OpenEngineStep,
     /// Run the setup wizard's location step on its own, to move the workspace somewhere else.
@@ -135,6 +137,8 @@ pub enum Msg {
     Engine(EngineKind),
     /// An editor was chosen.
     Editor(Editor),
+    /// What opening a sound does was chosen.
+    Sound(Sound),
     /// A profile was chosen.
     Profile(usize),
     /// Refreshing the chosen profile's login was asked for; the question follows.
@@ -170,6 +174,7 @@ pub enum Msg {
 pub struct Settings {
     engine: EngineState,
     editor: Editor,
+    sound: Sound,
     workspace: Option<PathBuf>,
     repairs: Vec<Diagnostic>,
     repairs_read: bool,
@@ -190,6 +195,7 @@ impl Settings {
         Self {
             engine,
             editor: config.editor(),
+            sound: config.sound(),
             workspace: config.workspace_path(),
             repairs: config.diagnostics().to_vec(),
             repairs_read: false,
@@ -289,6 +295,10 @@ pub fn update(screen: &mut Settings, message: Msg) -> (Command<Msg>, Option<Requ
         Msg::Editor(editor) => {
             screen.editor = editor;
             (Command::none(), Some(Request::Editor(editor)))
+        }
+        Msg::Sound(sound) => {
+            screen.sound = sound;
+            (Command::none(), Some(Request::Sound(sound)))
         }
         Msg::Profile(index) => {
             if index < screen.profiles.as_ref().map_or(0, Vec::len) {
@@ -505,6 +515,14 @@ pub fn view(screen: &Settings, ui: &mut View<'_, Msg>) {
                                 .on_select(move |index| Msg::Editor(Editor::ALL[index])),
                         )
                         .id("editor");
+                    });
+                    let choices = Sound::ALL.map(|choice| t!(&format!("settings.sound-{}", choice.key())));
+                    let chosen = Sound::ALL.iter().position(|sound| *sound == screen.sound).unwrap_or(0);
+                    list.row(SettingRow::new(t!("settings.sound")).description(t!("settings.sound-text")), |ui| {
+                        ui.add(
+                            Segmented::new(choices).selected(chosen).on_select(|index| Msg::Sound(Sound::ALL[index])),
+                        )
+                        .id("sound");
                     });
 
                     list.heading(t!("settings.workspace"));
@@ -755,7 +773,7 @@ mod tests {
 
     use super::testing;
     use crate::backup::BackupEvery;
-    use crate::base::apps::Editor;
+    use crate::base::apps::{Editor, Sound};
     use crate::engine::EngineKind;
     use crate::ui::settings::Request;
     use crate::ui::settings::engine::{Health, Trouble};
@@ -952,12 +970,33 @@ mod tests {
     }
 
     #[test]
+    fn sounds_play_or_show_their_details_and_the_choice_sits_under_the_editor() {
+        let mut harness = testing::host(testing::screen(EngineKind::Podman, Health::Working), SIZE.0, 60);
+        let screen = harness.screen();
+        for label in ["Sounds", "Play", "Details only"] {
+            assert!(screen.contains(label), "`{label}` is missing:\n{screen}");
+        }
+        let editor = harness.find("Editor").expect("the editor row is on screen");
+        let sounds = harness.find("Sounds").expect("the sound row is on screen");
+        assert!(sounds.1 > editor.1, "the sound row comes after the editor's:\n{screen}");
+        harness.send(testing::wrap(super::Msg::Sound(Sound::Details))).render();
+        assert_eq!(harness.app().asked, [Request::Sound(Sound::Details)]);
+        assert_eq!(harness.app().screen.sound, Sound::Details);
+
+        // A settings file that chose the details opens the screen on them.
+        let screen = testing::from_config("[apps]\nsound = \"details\"\n", EngineKind::Podman, Health::Working);
+        assert_eq!(screen.sound, Sound::Details);
+    }
+
+    #[test]
     fn the_built_in_apps_are_named_in_turkish() {
         let mut harness = testing::host(testing::screen(EngineKind::Podman, Health::Working), SIZE.0, 40);
         harness.send(testing::wrap(super::Msg::Language("tr".to_owned()))).render();
         let screen = harness.screen();
         assert!(screen.contains("YERLEŞİK UYGULAMALAR"), "{screen}");
         assert!(screen.contains("Düzenleyici"), "{screen}");
+        assert!(screen.contains("Sesler"), "{screen}");
+        assert!(screen.contains("Yalnızca ayrıntılar"), "{screen}");
     }
 
     #[test]

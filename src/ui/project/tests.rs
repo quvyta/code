@@ -29,6 +29,8 @@ mod backups;
 mod files;
 mod history;
 mod registry;
+mod sound;
+mod viewers;
 mod watch;
 use super::{Choice, Msg, OpenProject, PanelWidget, ProjectScreen, Tab, TabKey, TabKind, TabState};
 

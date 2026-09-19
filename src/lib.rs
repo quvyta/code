@@ -582,6 +582,7 @@ impl QCode {
                     .backing_up(self.config.backup_every())
                     .watching(self.live_files);
                 screen.set_editor(self.config.editor());
+                screen.set_sound(self.config.sound());
                 let entered = ui::project::opened(&mut screen);
                 self.project = Some(screen);
                 entered
@@ -622,6 +623,7 @@ impl QCode {
             .backing_up(self.config.backup_every())
             .watching(self.live_files);
         screen.set_editor(self.config.editor());
+        screen.set_sound(self.config.sound());
         for (index, id) in ids.iter().enumerate() {
             if let Some(record) = session.projects.iter().find(|record| record.id == *id) {
                 screen.restore_tabs(index, record);
@@ -785,6 +787,13 @@ impl QCode {
                 self.config.set_editor(editor);
                 if let Some(screen) = self.project.as_mut() {
                     screen.set_editor(editor);
+                }
+                self.store()
+            }
+            Request::Sound(sound) => {
+                self.config.set_sound(sound);
+                if let Some(screen) = self.project.as_mut() {
+                    screen.set_sound(sound);
                 }
                 self.store()
             }
@@ -1848,6 +1857,26 @@ mod tests {
         harness.send(Msg::Settings(crate::ui::settings::Msg::BackupEvery(BackupEvery::Hour))).advance(MOMENT);
         assert_eq!(every(&harness), Some(BackupEvery::Hour));
         assert_eq!(harness.app().config.backup_every(), BackupEvery::Hour, "and it is stored");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_sound_choice_reaches_the_projects_opened_later_and_the_open_ones_at_once() {
+        use crate::base::apps::Sound;
+
+        let root = scratch("sound-choice");
+        workspace_of(&root, &["Alpha"]);
+        let mut harness = harness(app_with_absent_engine(config(&root, &[])), SIZE.0, SIZE.1);
+        let settings = |sound| Msg::Settings(crate::ui::settings::Msg::Sound(sound));
+        let sound =
+            |harness: &qframe::runtime::Harness<super::QCode>| harness.app().project.as_ref().map(ProjectScreen::sound);
+        harness.send(settings(Sound::Details)).advance(MOMENT);
+        assert!(harness.app().config.to_toml().contains("[apps]\nsound = \"details\""), "it is stored");
+        open_from_the_list(&mut harness, "Alpha");
+        assert_eq!(sound(&harness), Some(Sound::Details), "a screen made after the choice starts with it");
+        harness.send(settings(Sound::Play)).advance(MOMENT);
+        assert_eq!(sound(&harness), Some(Sound::Play), "and the open screen takes the next one at once");
+        assert!(!harness.app().config.to_toml().contains("[apps]"), "{}", harness.app().config.to_toml());
         let _ = std::fs::remove_dir_all(&root);
     }
 

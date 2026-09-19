@@ -34,7 +34,8 @@
 //! opened = 1758197400
 //! ```
 //!
-//! A tab that opens one of the project's files — `image`, `markdown` or `editor` — names the file
+//! A tab that opens one of the project's files — `image`, `markdown`, `editor`, `pdf`, `office` or
+//! `sound` — names the file
 //! by its path inside `Project/`, written with `/`.
 
 use std::fmt::Write as _;
@@ -70,6 +71,13 @@ pub enum SessionTabKind {
     Markdown(String),
     /// A file of the project, open in the chosen editor in the project's own container.
     Editor(String),
+    /// A PDF of the project, its text shown by QCode and its pages drawn in the project's own
+    /// container.
+    Pdf(String),
+    /// A word processor's document of the project, its text shown by QCode.
+    Office(String),
+    /// A sound of the project, played in a container of its own or described.
+    Sound(String),
 }
 
 /// One tab of a saved session.
@@ -189,6 +197,15 @@ impl Session {
                     SessionTabKind::Editor(file) => {
                         let _ = write!(out, "kind = \"editor\"\nfile = {}\n", quoted(file));
                     }
+                    SessionTabKind::Pdf(file) => {
+                        let _ = write!(out, "kind = \"pdf\"\nfile = {}\n", quoted(file));
+                    }
+                    SessionTabKind::Office(file) => {
+                        let _ = write!(out, "kind = \"office\"\nfile = {}\n", quoted(file));
+                    }
+                    SessionTabKind::Sound(file) => {
+                        let _ = write!(out, "kind = \"sound\"\nfile = {}\n", quoted(file));
+                    }
                 }
                 if let Some(conversation) = &tab.conversation {
                     let _ = writeln!(out, "conversation = {}", quoted(conversation));
@@ -215,7 +232,10 @@ impl Session {
 /// What a `session.toml` holds.
 fn shape() -> Shape {
     let tab = Shape::new()
-        .required("kind", ValueKind::choice(["shell", "profile", "new", "image", "markdown", "editor"]))
+        .required(
+            "kind",
+            ValueKind::choice(["shell", "profile", "new", "image", "markdown", "editor", "pdf", "office", "sound"]),
+        )
         .optional("profile", ValueKind::text())
         .optional("file", ValueKind::text())
         .optional("conversation", ValueKind::text())
@@ -260,7 +280,7 @@ fn session_tab(entry: &Table, diagnostics: &mut Vec<Diagnostic>) -> Option<Sessi
     let kind = match entry.text("kind")? {
         "shell" => SessionTabKind::Shell,
         "new" => SessionTabKind::New,
-        kind @ ("image" | "markdown" | "editor") => {
+        kind @ ("image" | "markdown" | "editor" | "pdf" | "office" | "sound") => {
             let Some(file) = entry.text("file") else {
                 let at = entry.value_location("kind").cloned();
                 diagnostics.push(Diagnostic::warning(at, format!("an {kind} tab names no `file`; it is skipped")));
@@ -270,6 +290,9 @@ fn session_tab(entry: &Table, diagnostics: &mut Vec<Diagnostic>) -> Option<Sessi
             match kind {
                 "image" => SessionTabKind::Image(file),
                 "markdown" => SessionTabKind::Markdown(file),
+                "pdf" => SessionTabKind::Pdf(file),
+                "office" => SessionTabKind::Office(file),
+                "sound" => SessionTabKind::Sound(file),
                 _ => SessionTabKind::Editor(file),
             }
         }
@@ -338,6 +361,21 @@ mod tests {
                             kind: SessionTabKind::Editor("src/main.rs".to_owned()),
                             conversation: None,
                             opened: 1_758_197_600,
+                        },
+                        SessionTab {
+                            kind: SessionTabKind::Pdf("papers/tide tables.pdf".to_owned()),
+                            conversation: None,
+                            opened: 1_758_197_700,
+                        },
+                        SessionTab {
+                            kind: SessionTabKind::Office("letters/to the harbour master.docx".to_owned()),
+                            conversation: None,
+                            opened: 1_758_197_800,
+                        },
+                        SessionTab {
+                            kind: SessionTabKind::Sound("sounds/foghorn.ogg".to_owned()),
+                            conversation: None,
+                            opened: 1_758_197_900,
                         },
                     ],
                 },

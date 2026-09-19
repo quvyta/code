@@ -224,8 +224,21 @@ tab named after the file; choosing it again goes back to that tab.
 | Text: `txt`, source code, configuration and data files, and files such as `README`, `LICENSE`, `Makefile` or `Dockerfile` | The editor chosen in **Settings**, **Built-in apps**: `nano` (the default) or `vim`. When the editor exits, the tab offers to open the file again |
 | Markdown: `md`, `markdown` | qcode itself, as a formatted page with no container at all. **Edit** above the page opens the same file in the editor |
 | Pictures: `png`, `jpg`, `jpeg`, `gif`, `webp` | `chafa`, which draws the picture in the tab with full colour. **Redraw** draws it again at the tab's new size |
+| PDF: `pdf` | Its text, taken out by `pdftotext` and shown by qcode like a document. **Page picture** draws a page with `chafa`, and **Previous** and **Next** walk through the pages; **Text** goes back. A PDF with no text, such as a scan, opens on its first page picture |
+| Word and OpenDocument text: `docx`, `odt` | Its text, taken out by `docx2txt` or `odt2txt` and shown by qcode like a document |
+| Sound: `mp3`, `ogg`, `oga`, `opus`, `flac`, `wav` | `sox`, which plays it in the tab and shows how far it has got; **Play again** plays it once more. `m4a` and `aac` are not supported |
 
-Other kinds of files (sound, PDF, office documents, archives) have no app yet; choosing one says
+A sound does not play in the base container. Each time it plays, qcode starts a container of its
+own for it, which sees the project read-only, has no network and reaches only this machine's
+sound server (PulseAudio, or PipeWire through its PulseAudio socket). On a machine with no such
+server, which includes macOS and Windows, the tab shows the sound's details (length, rate,
+channels) instead. If no container should ever reach the sound server, set **Sounds** to
+**Details only** in **Settings**, **Built-in apps**: every sound then shows its details and
+nothing plays. The default is **Play**.
+
+![The manual of a rain gauge read as text in a PDF tab, opened from the file tree](https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/pdf.png)
+
+Other kinds of files (spreadsheets, presentations, archives) have no app yet; choosing one says
 so. The base image also carries `unzip`, `zip`, `xz`, `bzip2` and `7z`, ready in the shell tab.
 Every program runs inside the container, on the file's path there, and is handed that path as one
 word, never through a shell. Open file tabs come back with **Continue** like any other tab; a file

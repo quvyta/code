@@ -639,7 +639,7 @@ fn with_files(name: &str) -> Scratch {
     fs::write(project.join("guide").join("harbour.md"), "# Harbour notes\n\nThe tide turns at *six*.\n")
         .expect("a document");
     fs::write(project.join("it's $HOME.txt"), "text\n").expect("a text file");
-    fs::write(project.join("song.mp3"), [0, 1, 2]).expect("a sound");
+    fs::write(project.join("voice.m4a"), [0, 1, 2]).expect("a sound nothing built in plays");
     scratch
 }
 
@@ -796,13 +796,13 @@ fn a_file_opened_twice_is_one_tab() {
 fn a_file_no_built_in_app_opens_is_said_in_a_toast_and_opens_nothing() {
     let scratch = with_files("unknown");
     let mut harness = harness(one_project(&scratch), SIZE.0, SIZE.1);
-    harness.send(Msg::OpenFile("song.mp3".to_owned())).advance(Duration::from_millis(400));
+    harness.send(Msg::OpenFile("voice.m4a".to_owned())).advance(Duration::from_millis(400));
     let text = harness.screen();
     assert!(text.contains("No built-in app opens this kind of file yet"), "{text}");
-    assert!(text.contains("song.mp3"), "{text}");
+    assert!(text.contains("voice.m4a"), "{text}");
     assert!(labels(&harness).is_empty(), "no tab is opened for it");
 
-    harness.set_locale("tr").send(Msg::OpenFile("song.mp3".to_owned())).advance(Duration::from_millis(400));
+    harness.set_locale("tr").send(Msg::OpenFile("voice.m4a".to_owned())).advance(Duration::from_millis(400));
     assert!(harness.screen().contains("Bu tür için henüz bir uygulama yok"), "{}", harness.screen());
 }
 

@@ -133,6 +133,45 @@ impl Engine {
         self.command(args)
     }
 
+    /// Runs a program in a container of its own, attached to a terminal and removed as soon as
+    /// the program ends.
+    ///
+    /// It is [`Engine::run_once`] for a program a person watches and stops: a tab spawns it in a
+    /// pseudo-terminal, the program draws there and reads its keys, and `ctrl+c` reaches it. The
+    /// container has a name so that closing the tab can take it away while the program still
+    /// runs: an engine client that is killed leaves its container behind, running.
+    #[must_use]
+    pub fn run_attached(&self, request: &RunAttached<'_>) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("run");
+        args.push("--rm");
+        args.push("--interactive");
+        args.push("--tty");
+        args.push("--name");
+        args.push(request.name);
+        for (key, value) in request.env {
+            args.push("--env");
+            args.push(format!("{key}={value}"));
+        }
+        for socket in request.sockets {
+            args.push("--volume");
+            args.push(socket.spelled());
+        }
+        let once = &request.once;
+        self.contained(
+            &mut args,
+            &Contained {
+                image: once.image,
+                mounts: once.mounts,
+                network: once.network,
+                user: once.user,
+                workdir: once.workdir,
+                command: once.command,
+            },
+        );
+        self.command(args)
+    }
+
     /// The part of `create` and `run` both engines take the same way: who the container runs
     /// as, what it reaches, what it sees, and the image with its command last.
     fn contained(&self, args: &mut Args, request: &Contained<'_>) {
@@ -363,6 +402,43 @@ pub struct RunOnce<'a> {
     pub command: &'a [&'a str],
 }
 
+/// Running a program in a container of its own, attached to a terminal, removed when it ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunAttached<'a> {
+    /// The container's name, by which it is removed when the program is not waited for.
+    pub name: &'a str,
+    /// The image, mounts, network, user, directory and command, as for a one-off container.
+    pub once: RunOnce<'a>,
+    /// Environment variables the program is given, as `(name, value)`.
+    pub env: &'a [(&'a str, &'a str)],
+    /// Sockets of this machine the program may talk to.
+    pub sockets: &'a [Socket<'a>],
+}
+
+/// A socket of this machine, made reachable inside a container at a path of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Socket<'a> {
+    /// Where the socket is on this machine.
+    pub host: &'a Path,
+    /// Where it appears inside the container.
+    pub target: &'a Path,
+}
+
+impl Socket<'_> {
+    /// The socket as both engines spell its mount: `host:target:rw`.
+    ///
+    /// Never relabelled, unlike a folder: relabelling changes the label of the file on this
+    /// machine, and a socket another program serves is that program's, not the container's to
+    /// relabel. Writable, because talking to a socket is writing to it.
+    fn spelled(&self) -> OsString {
+        let mut spelled = self.host.as_os_str().to_os_string();
+        spelled.push(":");
+        spelled.push(self.target);
+        spelled.push(":rw");
+        spelled
+    }
+}
+
 /// What a created container and a one-off one are both made of.
 struct Contained<'a> {
     image: &'a str,
@@ -512,7 +588,8 @@ impl HostUser {
 mod tests {
     use super::super::{Engine, EngineKind};
     use crate::engine::{
-        Access, ContainerCreate, CopyIn, CopyOut, Exec, HostUser, ImageBuild, Mount, MountSource, Network, RunOnce,
+        Access, ContainerCreate, CopyIn, CopyOut, Exec, HostUser, ImageBuild, Mount, MountSource, Network, RunAttached,
+        RunOnce, Socket,
     };
     use std::path::Path;
 
@@ -786,5 +863,71 @@ mod tests {
             HostUser::current().expect("the current user is readable"),
             HostUser::Ids { uid: reported("-u"), gid: reported("-g") }
         );
+    }
+
+    #[test]
+    fn a_program_run_attached_gets_a_terminal_a_name_its_variables_and_an_unlabelled_socket() {
+        let mounts = [Mount {
+            source: MountSource::Path(Path::new("/home/me/QCode/Projects/p/Project")),
+            target: Path::new("/work/Project"),
+            access: Access::ReadOnly,
+        }];
+        let sockets = [Socket { host: Path::new("/run/user/1000/pulse/native"), target: Path::new("/run/sound") }];
+        let request = RunAttached {
+            name: "qcode-p.play-3",
+            once: RunOnce {
+                image: "qcode/base",
+                mounts: &mounts,
+                network: Network::None,
+                user: HostUser::Ids { uid: 1000, gid: 100 },
+                workdir: Some(Path::new("/work/Project")),
+                command: &["play", "/work/Project/a song.mp3"],
+            },
+            env: &[("PULSE_SERVER", "unix:/run/sound")],
+            sockets: &sockets,
+        };
+        let head = [
+            "run",
+            "--rm",
+            "--interactive",
+            "--tty",
+            "--name",
+            "qcode-p.play-3",
+            "--env",
+            "PULSE_SERVER=unix:/run/sound",
+        ];
+        let tail = ["--workdir", "/work/Project", "qcode/base", "play", "/work/Project/a song.mp3"];
+        let podman = args(&podman().run_attached(&request));
+        assert_eq!(podman[..8], head);
+        assert_eq!(
+            podman[8..15],
+            [
+                "--volume",
+                "/run/user/1000/pulse/native:/run/sound:rw",
+                "--userns=keep-id",
+                "--network=none",
+                "--volume",
+                "/home/me/QCode/Projects/p/Project:/work/Project:ro,z",
+                "--workdir",
+            ],
+            "the folder is relabelled like every folder, the socket never"
+        );
+        assert_eq!(podman[14..], tail);
+        let docker = args(&docker().run_attached(&request));
+        assert_eq!(docker[..8], head);
+        assert_eq!(
+            docker[8..16],
+            [
+                "--volume",
+                "/run/user/1000/pulse/native:/run/sound:rw",
+                "--user",
+                "1000:100",
+                "--network=none",
+                "--volume",
+                "/home/me/QCode/Projects/p/Project:/work/Project:ro",
+                "--workdir",
+            ]
+        );
+        assert_eq!(docker[15..], tail);
     }
 }

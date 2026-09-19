@@ -5,6 +5,19 @@ Every release of quvyta-code, newest first. The format follows
 [Semantic Versioning](https://semver.org/); while the version starts with 0, a minor release may
 change files qcode writes, and the notes say so when it does.
 
+## 0.1.7 - 2026-09-19
+
+### Added
+
+- A PDF opened from the file tree shows its text in a tab (`pdftotext`). **Page picture** draws a page with `chafa`, **Previous** and **Next** walk through the pages, and a PDF with no text, such as a scan, opens on its first page picture.
+- A Word or OpenDocument text (`docx`, `odt`) opens in a tab as its text (`docx2txt`, `odt2txt`).
+- A sound (`mp3`, `ogg`, `oga`, `opus`, `flac`, `wav`) plays in a tab with `sox`, which shows how far it has got; **Play again** plays it once more. It plays in a short-lived container of its own that sees the project read-only, has no network and reaches only this machine's sound server (PulseAudio, or PipeWire through its PulseAudio socket). With no such server, as on macOS and Windows, the tab shows the sound's length, rate and channels instead.
+- **Sounds** in **Settings**, **Built-in apps**: **Play** (the default) or **Details only**, for when no container should ever reach the sound server.
+
+### Changed
+
+- The base image carries `poppler-utils`, `docx2txt`, `odt2txt` and `sox` with its mp3, opus and PulseAudio formats, about 47 MB more. It is built again once, by itself, the first time it is needed.
+
 ## 0.1.6 - 2026-09-19
 
 ### Added

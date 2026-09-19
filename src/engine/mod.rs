@@ -16,7 +16,7 @@ mod state;
 
 pub use command::{
     Access, ContainerCreate, CopyIn, CopyOut, EngineCommand, Exec, HostUser, ImageBuild, Mount, MountSource, Network,
-    RunOnce,
+    RunAttached, RunOnce, Socket,
 };
 pub use detect::{Unavailable, detect};
 pub use state::{Container, ContainerState};

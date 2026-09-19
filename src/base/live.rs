@@ -18,7 +18,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::apps::{PROGRAMS, picture};
+use super::apps::{PROGRAMS, office_text, pages, pdf_page, pdf_text, picture, sound_details};
 use super::paths::{ASSETS_DIR, HOME_DIR, KEEP_ALIVE, OPEN_HOME, PROJECT_DIR};
 use super::{Outcome, Presence, containerfile, ensure, presence};
 use crate::engine::names::HOSTNAME;
@@ -408,5 +408,151 @@ fn the_image_is_built_once_and_then_left_alone() {
         let second = ensure(&engine, &|| false, &mut |_| again += 1).expect("the image is already there");
         assert_eq!(second, Outcome::AlreadyThere, "{:?}: an image that is current is not built again", engine.kind());
         assert_eq!(again, 0, "{:?}: and nothing runs to find that out", engine.kind());
+    }
+}
+
+/// A two-page PDF with a line of text on each page, written by hand so the test needs no PDF
+/// library: the objects one after another, then the table of where each one starts.
+fn pdf() -> Vec<u8> {
+    let page = |text: &str, contents: usize| {
+        let stream = format!("BT /F1 24 Tf 72 700 Td ({text}) Tj ET");
+        [
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                 /Resources << /Font << /F1 7 0 R >> >> /Contents {contents} 0 R >>"
+            ),
+            format!("<< /Length {} >>\nstream\n{stream}\nendstream", stream.len()),
+        ]
+    };
+    let mut objects = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
+        "<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>".to_owned(),
+    ];
+    objects.extend(page("Harbour notes", 4));
+    objects.extend(page("Second page", 6));
+    objects.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_owned());
+    let mut out = String::from("%PDF-1.4\n");
+    let mut starts = Vec::new();
+    for (index, object) in objects.iter().enumerate() {
+        starts.push(out.len());
+        out.push_str(&format!("{} 0 obj\n{object}\nendobj\n", index + 1));
+    }
+    let table = out.len();
+    out.push_str(&format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1));
+    for start in starts {
+        out.push_str(&format!("{start:010} 00000 n \n"));
+    }
+    out.push_str(&format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{table}\n%%EOF\n", objects.len() + 1));
+    out.into_bytes()
+}
+
+/// Runs `command` in the test container without a terminal, the way a tab reads a file's text.
+fn read_with(engine: &Engine, command: &[String]) -> String {
+    let parts: Vec<&str> = command.iter().map(String::as_str).collect();
+    capture(&engine.exec_without_terminal(&Exec { container: CONTAINER, command: &parts }))
+        .unwrap_or_else(|error| panic!("{:?}: `{}` failed: {error:?}", engine.kind(), parts.join(" ")))
+}
+
+#[test]
+#[ignore = "needs a container engine; run with QCODE_CONTAINER_TESTS=1"]
+fn a_pdf_gives_its_text_and_draws_its_pages() {
+    // The words a PDF tab runs, run for real on a real PDF: its text comes out with a page
+    // break after each page, and a page is drawn in coloured cells.
+    for engine in engines() {
+        clear(&engine);
+        let scratch = Scratch::new("pdf");
+        build(&engine, TEST_BASE, &containerfile(), &scratch);
+        let project = scratch.dir("Project");
+        std::fs::write(project.join("tide tables.pdf"), pdf()).expect("the PDF is written");
+        start(&engine, TEST_BASE, &project, &scratch.dir("Assets"));
+        let path = format!("{PROJECT_DIR}/tide tables.pdf");
+
+        let text = read_with(&engine, &pdf_text(&path));
+        assert!(text.contains("Harbour notes") && text.contains("Second page"), "{:?}: {text:?}", engine.kind());
+        assert_eq!(pages(&text), 2, "{:?}: {text:?}", engine.kind());
+
+        let drawn = read_with(&engine, &pdf_page(&path, 2));
+        assert!(drawn.contains("\u{1b}["), "{:?}: the page is not drawn: {drawn:?}", engine.kind());
+        assert!(drawn.lines().count() > 1, "{:?}: {drawn:?}", engine.kind());
+
+        clear(&engine);
+    }
+}
+
+#[test]
+#[ignore = "needs a container engine; run with QCODE_CONTAINER_TESTS=1"]
+fn a_word_document_and_an_opendocument_text_give_their_text() {
+    // The smallest files each program reads, zipped in the container with the image's own zip,
+    // so the test carries no office file and needs no zip library.
+    let make = format!(
+        "set -e\n\
+         cd \"$(mktemp -d)\" && mkdir -p word && \
+         printf '%s' '<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"/>' \
+           > '[Content_Types].xml' && \
+         printf '%s' '<?xml version=\"1.0\"?><w:document \
+           xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body><w:p><w:r>\
+           <w:t>Dear harbour master, şimdi</w:t></w:r></w:p></w:body></w:document>' > word/document.xml && \
+         zip -q -r '{PROJECT_DIR}/to the harbour master.docx' .\n\
+         cd \"$(mktemp -d)\" && printf '%s' 'application/vnd.oasis.opendocument.text' > mimetype && \
+         printf '%s' '<?xml version=\"1.0\"?><office:document-content \
+           xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" \
+           xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\"><office:body><office:text>\
+           <text:p>The tide turns at six, ğ</text:p></office:text></office:body></office:document-content>' \
+           > content.xml && \
+         zip -q -X -0 '{PROJECT_DIR}/Tide.odt' mimetype && zip -q -X '{PROJECT_DIR}/Tide.odt' content.xml"
+    );
+    for engine in engines() {
+        clear(&engine);
+        let scratch = Scratch::new("office");
+        build(&engine, TEST_BASE, &containerfile(), &scratch);
+        start(&engine, TEST_BASE, &scratch.dir("Project"), &scratch.dir("Assets"));
+        run_in(&engine, &make);
+
+        let docx = office_text(&format!("{PROJECT_DIR}/to the harbour master.docx")).expect("a docx is read");
+        let text = read_with(&engine, &docx);
+        assert!(text.contains("Dear harbour master, şimdi"), "{:?}: {text:?}", engine.kind());
+        let odt = office_text(&format!("{PROJECT_DIR}/Tide.odt")).expect("an odt is read");
+        let text = read_with(&engine, &odt);
+        assert!(text.contains("The tide turns at six, ğ"), "{:?}: {text:?}", engine.kind());
+
+        clear(&engine);
+    }
+}
+
+#[test]
+#[ignore = "needs a container engine; run with QCODE_CONTAINER_TESTS=1"]
+fn a_sound_is_described_and_every_kind_a_tab_plays_is_one_sox_reads() {
+    // Nothing is played here: a sound is made in the container, then described with the very
+    // words a tab uses when it does not play. That sox can play each kind a tab offers, and send
+    // it to a sound server, is asked of sox's own list of what it reads and writes.
+    for engine in engines() {
+        clear(&engine);
+        let scratch = Scratch::new("sound");
+        build(&engine, TEST_BASE, &containerfile(), &scratch);
+        start(&engine, TEST_BASE, &scratch.dir("Project"), &scratch.dir("Assets"));
+        run_in(&engine, &format!("sox -n -r 8000 -c 1 '{PROJECT_DIR}/fog horn.wav' synth 1.5 sine 440"));
+        // Ogg audio often comes as .oga, a name sox has no handler for; it knows the file by
+        // what is in it instead.
+        run_in(&engine, &format!("cd {PROJECT_DIR} && sox 'fog horn.wav' tide.ogg && cp tide.ogg tide.oga"));
+
+        let details = read_with(&engine, &sound_details(&format!("{PROJECT_DIR}/fog horn.wav")));
+        assert!(details.contains("00:00:01.50"), "{:?}: {details:?}", engine.kind());
+        assert!(details.contains("Sample Rate    : 8000"), "{:?}: {details:?}", engine.kind());
+        let details = read_with(&engine, &sound_details(&format!("{PROJECT_DIR}/tide.oga")));
+        assert!(details.contains("Vorbis") && details.contains("00:00:01.50"), "{:?}: {details:?}", engine.kind());
+
+        let help = run_in(&engine, "sox -h");
+        let listed = |heading: &str| -> Vec<String> {
+            let after = help.split(heading).nth(1).unwrap_or_default();
+            after.lines().next().unwrap_or_default().split_whitespace().map(str::to_owned).collect()
+        };
+        let formats = listed("AUDIO FILE FORMATS:");
+        for kind in ["mp3", "ogg", "opus", "flac", "wav"] {
+            assert!(formats.iter().any(|known| known == kind), "{:?}: sox reads no {kind}: {formats:?}", engine.kind());
+        }
+        let devices = listed("AUDIO DEVICE DRIVERS:");
+        assert!(devices.iter().any(|known| known == "pulseaudio"), "{:?}: {devices:?}", engine.kind());
+
+        clear(&engine);
     }
 }

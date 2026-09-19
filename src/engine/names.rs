@@ -47,6 +47,15 @@ pub fn base_container(project: &str) -> String {
     format!("qcode-{project}-base")
 }
 
+/// The container a sound of a project is played in while the tab `tab` plays it.
+///
+/// The dot is what no project id and no profile name can hold, so this name can never be the
+/// container of a profile, whatever the profile is called.
+#[must_use]
+pub fn sound_container(project: &str, tab: u64) -> String {
+    format!("qcode-{project}.play-{tab}")
+}
+
 /// The volume holding a profile's login, shared by every project that uses the profile.
 #[must_use]
 pub fn credential_volume(profile: &str) -> String {
@@ -64,6 +73,7 @@ pub fn home_volume(project: &str, profile: &str) -> String {
 mod tests {
     use super::{
         BASE_IMAGE, HOSTNAME, base_container, credential_volume, home_volume, profile_container, profile_image,
+        sound_container,
     };
     use crate::profile::SafeName;
 
@@ -119,6 +129,9 @@ mod tests {
             assert!(is_object_name(&home_volume(name, name)), "{text:?}");
             assert!(is_object_name(&credential_volume(name)), "{text:?}");
             assert!(is_object_name(&base_container(name)), "{text:?}");
+            assert!(is_object_name(&sound_container(name, 7)), "{text:?}");
+            // No profile, whatever its name, has the container a sound plays in.
+            assert!(!profile_container(name, name).contains('.'), "{text:?}");
         }
     }
 
@@ -137,5 +150,6 @@ mod tests {
         assert_eq!(base_container("my-app"), "qcode-my-app-base");
         assert_eq!(credential_volume("claude-sub"), "qcode-cred-claude-sub");
         assert_eq!(home_volume("my-app", "claude-sub"), "qcode-home-my-app-claude-sub");
+        assert_eq!(sound_container("my-app", 3), "qcode-my-app.play-3");
     }
 }
