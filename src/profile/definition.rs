@@ -141,6 +141,16 @@ impl Profile {
             diagnostics.push(Diagnostic::error(root.value_location(ACCOUNT).cloned(), message));
             return Loaded { profile: None, diagnostics };
         }
+        if harness.withdrawn(account) {
+            let message = format!(
+                "`{ACCOUNT}` is `{}`: {} stopped this sign-in for personal accounts on 2026-06-18; \
+                 it still works for Gemini Code Assist Standard and Enterprise, and a new profile \
+                 with an API key works for everyone",
+                account.id(),
+                harness.record().display_name
+            );
+            diagnostics.push(Diagnostic::warning(root.value_location(ACCOUNT).cloned(), message));
+        }
 
         let profile = Profile {
             name,
@@ -315,6 +325,16 @@ mode = \"full\"
         let loaded = parse("name = \"x\"\nharness = \"codex\"\naccount = \"none\"\n");
         assert_eq!(loaded.profile, None);
         assert!(loaded.diagnostics.iter().any(|d| d.severity == Severity::Error), "{:?}", loaded.diagnostics);
+    }
+
+    #[test]
+    fn a_gemini_profile_signed_in_with_google_still_loads_and_says_the_sign_in_closed() {
+        let loaded = Profile::parse("g.toml", "name = \"g\"\nharness = \"gemini-cli\"\naccount = \"subscription\"\n");
+        let profile = loaded.profile.expect("a Code Assist Standard or Enterprise login still works");
+        assert_eq!(profile.account, AccountKind::Subscription);
+        assert_eq!(loaded.diagnostics.len(), 1, "{:?}", loaded.diagnostics);
+        assert_eq!(loaded.diagnostics[0].severity, Severity::Warning);
+        assert!(loaded.diagnostics[0].message.contains("2026-06-18"), "{:?}", loaded.diagnostics);
     }
 
     #[test]

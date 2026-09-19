@@ -1,6 +1,8 @@
 # qcode
 
-![A project open in qcode: a shell tab beside a Claude Code and an opencode tab, and the panel with the file tree, the project and its containers](https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/project.png)
+**Run Claude Code, opencode, Gemini CLI and Codex side by side in Podman or Docker containers, with tabs like a browser, from one terminal app.**
+
+![qcode in half a minute: Continue opens a project, a shell lists its files, the tab strip passes Claude Code and opencode tabs, a new tab lists each profile's recent conversations, the side panel shows the containers and a file made in the shell appearing in the tree, three files are selected with their menu open, and the README opens in a tab of its own](https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/qcode.gif)
 
 **quvyta-code** runs coding harnesses inside containers, from the terminal. You set up a
 profile once, sign it in, and from then on open that harness in any of your projects in a few
@@ -46,15 +48,75 @@ The harnesses qcode knows today:
 | Harness | Account types |
 |---|---|
 | Claude Code | subscription, API key |
-| opencode | subscription, API key |
-| Gemini CLI | subscription, API key |
+| opencode | free models, subscription, API key |
+| Gemini CLI | API key |
 | Codex CLI | subscription, API key |
+
+Google closed Gemini CLI's "Login with Google" to personal accounts (Code Assist for
+individuals, Google AI Pro and Ultra) on 18 June 2026, so a new Gemini CLI profile signs in with
+an API key. A profile made earlier with a Google sign-in still loads, with a note saying so: that
+sign-in keeps working for Gemini Code Assist Standard and Enterprise.
 
 Each harness is installed from its own published package when a profile's image is built; qcode
 does not ship or change any of them. The interface follows your system language (English and
 Turkish are included) and uses the family's themes, icons, keys and mouse behaviour.
 
+## Why qcode, and what else there is
+
+qcode is an everyday place to work with several harnesses, not a security product. What it adds
+is the whole working surface around the containers: profiles you sign in once, a login copy per
+project, tabs, going back to an earlier conversation, a file tree and the containers' state in
+one screen. Other good tools solve neighbouring problems:
+
+| Tool | What it does | How qcode differs |
+|---|---|---|
+| Docker Sandboxes (`docker sandbox`) | Runs harnesses in Docker's microVMs | Its isolation is stronger than a container's; it needs Docker Desktop and is a command-line tool, without tabs, a project screen or a list of earlier conversations |
+| Dagger container-use | Gives each task of a harness its own container and git branch, over MCP | A base for running tasks in parallel, with no interface of its own; needs Dagger and git |
+| Dev containers | The route the Claude Code documentation suggests | Tied to an editor such as VS Code and set up by hand for each project |
+| claude-squad and similar | Several harnesses side by side with tmux and git worktrees | No container: the harness still runs on your machine |
+| Single-image scripts (claudebox and others) | One harness in one Docker image | No interface, profiles, per-project logins or conversations to go back to |
+
+If what you need is the strongest possible wall between a harness and your machine, a microVM is
+the better tool. If you want to use several harnesses every day without handing them your
+machine, qcode is made for that.
+
+## What the container protects, and what it does not
+
+The harnesses run in an unattended mode, without asking before each command, because the
+container is what keeps them away from your machine. It helps to know exactly where that wall is.
+
+The container keeps the harness away from:
+
+- your home folder, your other projects and every file qcode did not mount: a container sees
+  only its project's `Project/` folder, its `Assets/` folder (read-only unless the profile allows
+  writing) and its own home;
+- other projects' logins and conversations: each project has its own copy of a profile's home;
+- the container engine itself: its socket is never mounted, containers are not privileged, and
+  processes inside run as your own user id, never as root on your machine.
+
+It does not protect:
+
+- **the project folder.** The harness can change or delete anything in `Project/`, and it is
+  mounted straight from your disk. Keep your work in git and push it somewhere.
+- **your data from leaving over the network.** A profile with network access (the default) can
+  send anything it can read, the project included, anywhere. A profile can be set to have no
+  network, but most harnesses need it to reach their model.
+- **the logins.** A profile's login lives in the engine's volumes. Anyone who can use your
+  container engine can read them.
+- **against the engine or the kernel.** A container shares your machine's kernel; a flaw there
+  or in the engine is a way out that a virtual machine would not have.
+
+## No telemetry
+
+qcode itself sends nothing anywhere: it has no network code and no network library, collects no
+statistics and checks for no updates. The only network traffic it causes goes through your
+container engine: building images (the base image and the harness packages), cloning a project
+from a git address, and whatever the harnesses do inside their containers. The harnesses keep
+their own behaviour, including any telemetry of their own; their documentation says what that is.
+
 ## Screens
+
+![A project open in qcode: a shell tab beside a Claude Code and an opencode tab, and the panel with the file tree, the project and its containers](https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/project.png)
 
 <p>
   <img src="https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/new-tab.png" width="49%" alt="A new tab offering a shell and each profile's earlier conversations">
@@ -260,6 +322,9 @@ Before your first commit, enable the checks (formatting, clippy, tests and docs)
 ```sh
 git config core.hooksPath .githooks
 ```
+
+[CONTRIBUTING.md](CONTRIBUTING.md) says more about tests and pull requests, and
+[CHANGELOG.md](CHANGELOG.md) lists what changed in each release.
 
 ## Licence
 

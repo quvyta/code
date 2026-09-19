@@ -1,0 +1,82 @@
+name: Bug report
+description: Something in qcode does not work the way it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Thank you for reporting. Please check that nothing private (logins, e-mail addresses, private project names) is visible in what you paste or attach.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to make it happen again
+      placeholder: |
+        1. Open a project with a Claude Code profile
+        2. Press ctrl+t
+        3. ...
+  - type: input
+    id: version
+    attributes:
+      label: qcode version
+      description: The output of `qcode --version`.
+    validations:
+      required: true
+  - type: dropdown
+    id: engine
+    attributes:
+      label: Container engine
+      options:
+        - Podman
+        - Docker
+    validations:
+      required: true
+  - type: input
+    id: engine-version
+    attributes:
+      label: Engine version
+      description: The output of `podman --version` or `docker --version`.
+    validations:
+      required: true
+  - type: dropdown
+    id: rootless
+    attributes:
+      label: Does the engine run rootless?
+      options:
+        - "Yes"
+        - "No"
+        - I do not know
+  - type: dropdown
+    id: harness
+    attributes:
+      label: Harness
+      description: The harness of the profile involved, if any.
+      multiple: true
+      options:
+        - None, it is not about a harness
+        - Claude Code
+        - opencode
+        - Gemini CLI
+        - Codex CLI
+  - type: input
+    id: system
+    attributes:
+      label: Operating system and distribution
+      placeholder: Arch Linux, Fedora 43, macOS 26, ...
+    validations:
+      required: true
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal
+      placeholder: kitty 0.44, GNOME Terminal, WezTerm, ...
+  - type: textarea
+    id: shots
+    attributes:
+      label: Screenshot or log
+      description: A screenshot, or the text qcode showed. Drag an image here to attach it.

@@ -70,6 +70,15 @@ impl ProjectPaths {
     pub fn harness_profile(&self, profile: &str) -> PathBuf {
         self.harness.join(profile)
     }
+
+    /// The folder the project's backups are kept in.
+    ///
+    /// Not made with the project: the first backup makes it, so a project that has never been
+    /// backed up has no folder claiming otherwise.
+    #[must_use]
+    pub fn backup(&self) -> PathBuf {
+        self.root.join("Backup")
+    }
 }
 
 /// One project folder as it was found on disk.
@@ -441,6 +450,7 @@ mod tests {
         assert_eq!(entries(&paths.root.join("Containers")), ["Harness"]);
         assert!(paths.harness.join("").is_dir());
         assert_eq!(entries(&paths.harness), [] as [String; 0]);
+        assert_eq!(paths.backup(), paths.root.join("Backup"), "named, but left for the first backup to make");
 
         let read = workspace.read_project(&file.id);
         assert!(read.is_clean(), "{:?}", read.diagnostics);

@@ -55,8 +55,12 @@ pub struct Harness {
     pub id: &'static str,
     /// The name the harness gives itself, shown as it writes it.
     pub display_name: &'static str,
-    /// The account types the harness can sign in with.
+    /// The account types a new profile of the harness can sign in with.
     pub accounts: &'static [AccountKind],
+    /// Account types the harness's makers closed to most people after profiles were made with
+    /// them. A profile that has one still loads, because the few for whom it still works would
+    /// otherwise lose it, but no new profile is offered it and loading it says why.
+    pub withdrawn: &'static [AccountKind],
     /// The shell commands that install the harness into the image.
     pub install: &'static [&'static str],
     /// The program that starts the harness in the container.
@@ -118,7 +122,13 @@ impl HarnessKind {
     /// Whether the harness can sign in with `account`.
     #[must_use]
     pub fn supports(self, account: AccountKind) -> bool {
-        self.record().accounts.contains(&account)
+        self.record().accounts.contains(&account) || self.withdrawn(account)
+    }
+
+    /// Whether `account` is one the harness no longer offers to new profiles.
+    #[must_use]
+    pub fn withdrawn(self, account: AccountKind) -> bool {
+        self.record().withdrawn.contains(&account)
     }
 
     /// The program and arguments a tab runs inside the profile's container: the harness in
@@ -200,6 +210,7 @@ static CLAUDE_CODE: Harness = Harness {
     id: "claude-code",
     display_name: "Claude Code",
     accounts: &[AccountKind::Subscription, AccountKind::ApiKey],
+    withdrawn: &[],
     install: &["npm install -g @anthropic-ai/claude-code"],
     command: "claude",
     auto_run: &["--dangerously-skip-permissions"],
@@ -238,6 +249,7 @@ static OPENCODE: Harness = Harness {
     id: "opencode",
     display_name: "opencode",
     accounts: &[AccountKind::Free, AccountKind::Subscription, AccountKind::ApiKey],
+    withdrawn: &[],
     install: &["npm install -g opencode-ai"],
     command: "opencode",
     auto_run: &["--auto"],
@@ -296,10 +308,17 @@ static OPENCODE: Harness = Harness {
 /// `gemini --approval-mode=yolo --resume <id> --prompt hi` with an id the project's
 /// conversations do not have answers `Error resuming session: Invalid session identifier`, and
 /// with the id [`history`](super::history) lists it goes on to ask for an auth method.
+///
+/// Google stopped serving Gemini CLI to personal Google accounts (Code Assist for individuals and
+/// the paid Pro and Ultra plans) and removed "Login with Google" for them on 2026-06-18
+/// (`developers.google.com/gemini-code-assist/docs/deprecations/code-assist-individuals`). Code
+/// Assist Standard and Enterprise still sign in that way, so a profile made with a sign-in keeps
+/// loading; a new one is offered an API key.
 static GEMINI_CLI: Harness = Harness {
     id: "gemini-cli",
     display_name: "Gemini CLI",
-    accounts: &[AccountKind::Subscription, AccountKind::ApiKey],
+    accounts: &[AccountKind::ApiKey],
+    withdrawn: &[AccountKind::Subscription],
     install: &["npm install -g @google/gemini-cli"],
     command: "gemini",
     auto_run: &["--approval-mode=yolo"],
@@ -346,6 +365,7 @@ static CODEX: Harness = Harness {
     id: "codex",
     display_name: "Codex",
     accounts: &[AccountKind::Subscription, AccountKind::ApiKey],
+    withdrawn: &[],
     install: &["npm install -g @openai/codex"],
     command: "codex",
     auto_run: &["--dangerously-bypass-approvals-and-sandbox"],
@@ -494,6 +514,17 @@ mod tests {
         assert_eq!(record.auto_run, ["--auto"]);
         assert_eq!(record.identity, [".local/share/opencode/auth.json"]);
         assert!(record.install.iter().any(|step| step.contains("opencode-ai")));
+    }
+
+    #[test]
+    fn gemini_cli_offers_only_an_api_key_to_new_profiles() {
+        // Google stopped personal "Login with Google" for Gemini CLI on 2026-06-18.
+        assert_eq!(HarnessKind::GeminiCli.record().accounts, [AccountKind::ApiKey]);
+        assert!(HarnessKind::GeminiCli.supports(AccountKind::Subscription), "existing profiles keep loading");
+        assert!(HarnessKind::GeminiCli.withdrawn(AccountKind::Subscription));
+        for harness in [HarnessKind::ClaudeCode, HarnessKind::OpenCode, HarnessKind::Codex] {
+            assert!(!harness.withdrawn(AccountKind::Subscription), "{harness:?}");
+        }
     }
 
     #[test]

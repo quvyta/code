@@ -86,7 +86,6 @@ impl Engine {
     /// Creates a container without starting it.
     #[must_use]
     pub fn create_container(&self, request: &ContainerCreate<'_>) -> EngineCommand {
-        let dialect = self.kind.dialect();
         let mut args = Args::new();
         args.push("create");
         args.push("--name");
@@ -94,6 +93,50 @@ impl Engine {
         // Spelled the same by both engines, like the network below.
         args.push("--hostname");
         args.push(request.hostname);
+        self.contained(
+            &mut args,
+            &Contained {
+                image: request.image,
+                mounts: request.mounts,
+                network: request.network,
+                user: request.user,
+                workdir: request.workdir,
+                command: request.command,
+            },
+        );
+        self.command(args)
+    }
+
+    /// Runs a container that exists only for as long as its command does, and lets
+    /// [`run::capture`](super::run::capture) read what the command printed.
+    ///
+    /// A lasting container takes its mounts when it is created, so a job that needs other
+    /// mounts than the project's containers have — a backup writing to `Backup/` — would mean
+    /// making those containers again. A container that removes itself when its command ends
+    /// needs nothing made again, and nothing is left behind to be cleared away.
+    #[must_use]
+    pub fn run_once(&self, request: &RunOnce<'_>) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("run");
+        args.push("--rm");
+        self.contained(
+            &mut args,
+            &Contained {
+                image: request.image,
+                mounts: request.mounts,
+                network: request.network,
+                user: request.user,
+                workdir: request.workdir,
+                command: request.command,
+            },
+        );
+        self.command(args)
+    }
+
+    /// The part of `create` and `run` both engines take the same way: who the container runs
+    /// as, what it reaches, what it sees, and the image with its command last.
+    fn contained(&self, args: &mut Args, request: &Contained<'_>) {
+        let dialect = self.kind.dialect();
         match (dialect.user_mapping, &request.user) {
             (UserMapping::KeepId, HostUser::Ids { .. }) => args.push("--userns=keep-id"),
             (UserMapping::Ids, HostUser::Ids { uid, gid }) => {
@@ -118,7 +161,6 @@ impl Engine {
         }
         args.push(request.image);
         args.extend(request.command);
-        self.command(args)
     }
 
     /// Starts an existing container.
@@ -304,6 +346,33 @@ pub struct ContainerCreate<'a> {
     pub command: &'a [&'a str],
 }
 
+/// Running a command in a container of its own that is removed as soon as the command ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunOnce<'a> {
+    /// The image it starts from.
+    pub image: &'a str,
+    /// What the container can see of the host and of its volumes.
+    pub mounts: &'a [Mount<'a>],
+    /// Whether the command reaches the network.
+    pub network: Network,
+    /// Who the container runs as.
+    pub user: HostUser,
+    /// Where the command starts.
+    pub workdir: Option<&'a Path>,
+    /// The command and its arguments.
+    pub command: &'a [&'a str],
+}
+
+/// What a created container and a one-off one are both made of.
+struct Contained<'a> {
+    image: &'a str,
+    mounts: &'a [Mount<'a>],
+    network: Network,
+    user: HostUser,
+    workdir: Option<&'a Path>,
+    command: &'a [&'a str],
+}
+
 /// Running a command in a container that is already up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Exec<'a> {
@@ -443,7 +512,7 @@ impl HostUser {
 mod tests {
     use super::super::{Engine, EngineKind};
     use crate::engine::{
-        Access, ContainerCreate, CopyIn, CopyOut, Exec, HostUser, ImageBuild, Mount, MountSource, Network,
+        Access, ContainerCreate, CopyIn, CopyOut, Exec, HostUser, ImageBuild, Mount, MountSource, Network, RunOnce,
     };
     use std::path::Path;
 
@@ -584,6 +653,69 @@ mod tests {
         let expected = ["create", "--name", "qcode-p-base", "--hostname", "box", "qcode/base"];
         assert_eq!(args(&podman().create_container(&request)), expected);
         assert_eq!(args(&docker().create_container(&request)), expected);
+    }
+
+    #[test]
+    fn a_one_off_container_removes_itself_and_maps_the_user_like_a_lasting_one() {
+        let mounts = [
+            Mount {
+                source: MountSource::Path(Path::new("/home/me/QCode/Projects/p/Project")),
+                target: Path::new("/work/Project"),
+                access: Access::ReadOnly,
+            },
+            Mount {
+                source: MountSource::Path(Path::new("/home/me/QCode/Projects/p/Backup")),
+                target: Path::new("/work/Backup"),
+                access: Access::ReadWrite,
+            },
+        ];
+        let request = RunOnce {
+            image: "qcode/base",
+            mounts: &mounts,
+            network: Network::None,
+            user: HostUser::Ids { uid: 1000, gid: 100 },
+            workdir: Some(Path::new("/work/Project")),
+            command: &["sh", "-c", "git status"],
+        };
+        assert_eq!(
+            args(&podman().run_once(&request)),
+            [
+                "run",
+                "--rm",
+                "--userns=keep-id",
+                "--network=none",
+                "--volume",
+                "/home/me/QCode/Projects/p/Project:/work/Project:ro,z",
+                "--volume",
+                "/home/me/QCode/Projects/p/Backup:/work/Backup:rw,z",
+                "--workdir",
+                "/work/Project",
+                "qcode/base",
+                "sh",
+                "-c",
+                "git status"
+            ]
+        );
+        assert_eq!(
+            args(&docker().run_once(&request)),
+            [
+                "run",
+                "--rm",
+                "--user",
+                "1000:100",
+                "--network=none",
+                "--volume",
+                "/home/me/QCode/Projects/p/Project:/work/Project:ro",
+                "--volume",
+                "/home/me/QCode/Projects/p/Backup:/work/Backup:rw",
+                "--workdir",
+                "/work/Project",
+                "qcode/base",
+                "sh",
+                "-c",
+                "git status"
+            ]
+        );
     }
 
     #[test]

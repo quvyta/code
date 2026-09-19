@@ -576,7 +576,7 @@ dependencies = [
 
 [[package]]
 name = "quvyta-code"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "quvyta-framework",
 ]

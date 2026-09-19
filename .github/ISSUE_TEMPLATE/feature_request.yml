@@ -1,0 +1,20 @@
+name: Feature request
+description: Something qcode could do, or do better.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What you are trying to do
+      description: The work you do with qcode that this would help, in your own words.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would help
+      description: How you imagine it. A rough idea is enough.
+  - type: textarea
+    id: now
+    attributes:
+      label: What you do today instead

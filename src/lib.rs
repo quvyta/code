@@ -9,6 +9,7 @@
 //! each of them is given, and what happens when one of them asks for something only the
 //! application can do.
 
+pub mod backup;
 pub mod base;
 pub mod engine;
 pub mod profile;
@@ -42,6 +43,12 @@ use workspace::{
     Config, HostDirs, Loaded, Platform, ProjectFile, ProjectId, ProjectPaths, Registry, Session, SetupStep, Workspace,
 };
 
+/// What `qcode --version` prints: the package's name and version, the way cargo writes them.
+#[must_use]
+pub fn version_line() -> String {
+    format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+}
+
 /// Starts the application: preferences come from the platform's config folder, the text is
 /// compiled in, and the runtime drives the screens until the person leaves.
 ///
@@ -53,6 +60,10 @@ use workspace::{
 ///
 /// Returns the terminal's error when the screen cannot be taken over or restored.
 pub fn run() -> io::Result<()> {
+    // Asked for in bug reports, so it answers before anything is read or held.
+    if std::env::args_os().nth(1).is_some_and(|arg| arg == "--version" || arg == "-V") {
+        return writeln!(io::stdout(), "{}", version_line());
+    }
     let Loaded { value: config, diagnostics: left_behind } = Config::load();
     let places = service::Places::detect();
     let text = || std::sync::Arc::new(service::translator(config.settings().language().as_deref()));
@@ -2066,5 +2077,13 @@ mod tests {
         let windows = app(config(&root, &[]), &settled(), None).with_service(None, Platform::Windows);
         assert_eq!(windows.settings.service(), Some(ServiceRow::Unsupported));
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod version {
+    #[test]
+    fn the_version_line_names_the_package_and_its_version() {
+        assert_eq!(super::version_line(), format!("quvyta-code {}", env!("CARGO_PKG_VERSION")));
     }
 }

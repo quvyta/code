@@ -28,6 +28,7 @@ use qframe::icons::IconMode;
 use qframe::storage::{Family, Schema, SettingKind, Settings, config_dir};
 
 use super::{Loaded, ProjectId};
+use crate::backup::BackupEvery;
 use crate::base::apps::Editor;
 
 /// QCode's id in the family: its settings file is `code.conf` and its other files are under
@@ -128,6 +129,8 @@ impl Config {
     const RECENT: &'static str = "projects.recent";
     /// The key of what happens to the containers once no QCode is open.
     const ON_CLOSE: &'static str = "containers.on-close";
+    /// The key of how often an open project is backed up.
+    const BACKUP_EVERY: &'static str = "backup.every";
     /// The key of the editor a text file opens in.
     const EDITOR: &'static str = "apps.editor";
 
@@ -189,6 +192,7 @@ impl Config {
             // Stopping is the default because a container left running holds memory the person
             // never sees again; keeping them running is the choice of someone who wants that.
             .choice(Self::ON_CLOSE, OnClose::ALL.map(OnClose::key), OnClose::Stop.key())
+            .choice(Self::BACKUP_EVERY, BackupEvery::ALL.map(BackupEvery::key), BackupEvery::default().key())
             .choice(Self::EDITOR, Editor::ALL.map(Editor::key), Editor::default().key())
     }
 
@@ -316,6 +320,25 @@ impl Config {
         match choice {
             OnClose::Stop => self.settings.remove(Self::ON_CLOSE),
             OnClose::Keep => self.settings.set(Self::ON_CLOSE, choice.key().to_owned()),
+        }
+    }
+
+    /// How often an open project is backed up, every fifteen minutes until the person says
+    /// otherwise.
+    #[must_use]
+    pub fn backup_every(&self) -> BackupEvery {
+        self.settings.get::<String>(Self::BACKUP_EVERY).and_then(|key| BackupEvery::from_key(&key)).unwrap_or_default()
+    }
+
+    /// Records how often an open project is backed up. Answers whether anything changed.
+    ///
+    /// Like [`set_on_close`](Self::set_on_close), choosing the default takes the key out of the
+    /// file.
+    pub fn set_backup_every(&mut self, choice: BackupEvery) -> bool {
+        if choice == BackupEvery::default() {
+            self.settings.remove(Self::BACKUP_EVERY)
+        } else {
+            self.settings.set(Self::BACKUP_EVERY, choice.key().to_owned())
         }
     }
 
@@ -698,6 +721,26 @@ mod tests {
         assert_eq!(stored.on_close(), OnClose::Keep);
         config.set_on_close(OnClose::Stop);
         assert_eq!(config.to_toml(), "", "going back to the default takes the key out again");
+    }
+
+    #[test]
+    fn a_project_is_backed_up_every_fifteen_minutes_until_the_person_says_otherwise() {
+        let mut config = Config::parse_str(FILE, "");
+        assert_eq!(config.backup_every(), BackupEvery::Fifteen);
+        config.set_backup_every(BackupEvery::Fifteen);
+        assert_eq!(config.to_toml(), "", "the default is not written down");
+        assert!(config.set_backup_every(BackupEvery::Five));
+        assert_eq!(config.to_toml(), "[backup]\nevery = \"5m\"\n");
+        let stored = Config::parse_str(FILE, &config.to_toml());
+        assert!(stored.is_clean(), "{:?}", stored.diagnostics());
+        assert_eq!(stored.backup_every(), BackupEvery::Five);
+        assert!(config.set_backup_every(BackupEvery::Off));
+        assert_eq!(Config::parse_str(FILE, &config.to_toml()).backup_every(), BackupEvery::Off);
+        config.set_backup_every(BackupEvery::Fifteen);
+        assert_eq!(config.to_toml(), "", "going back to the default takes the key out again");
+        let unknown = Config::parse_str(FILE, "[backup]\nevery = \"1m\"\n");
+        assert_eq!(unknown.backup_every(), BackupEvery::Fifteen);
+        assert_eq!(unknown.diagnostics().len(), 1);
     }
 
     #[test]

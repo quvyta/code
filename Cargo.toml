@@ -23,13 +23,13 @@ repository = "https://github.com/quvyta/code"
 readme = "README.md"
 keywords = ["tui", "terminal", "agent", "podman", "docker"]
 categories = ["command-line-utilities", "development-tools"]
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
 # Only what the program is built from goes into the package; the rest of the repository is for
 # working on it.
-include = ["src/**", "assets/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
+include = ["src/**", "assets/**", "Cargo.toml", "Cargo.lock", "README.md", "CHANGELOG.md", "LICENSE"]
 # Both commands are declared below; nothing is discovered by name.
 autobins = false
 

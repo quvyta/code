@@ -17,6 +17,11 @@ pub const PROJECT_DIR: &str = "/work/Project";
 /// profile says.
 pub const ASSETS_DIR: &str = "/work/Assets";
 
+/// Where a project's `Backup/` folder appears in the one-off container that takes or restores a
+/// backup. No lasting container mounts it: a harness that could write there could rewrite the
+/// history it would be restored from.
+pub const BACKUP_DIR: &str = "/work/Backup";
+
 /// The home directory of whoever the container runs as, and the one place a harness keeps its
 /// login, its settings, its history and its memory.
 ///
@@ -54,18 +59,20 @@ pub const OPEN_HOME: &str = "qcode-open-home";
 
 #[cfg(test)]
 mod tests {
-    use super::{ASSETS_DIR, HOME_DIR, KEEP_ALIVE, OPEN_HOME, PROJECT_DIR, USER, WORK_DIR};
+    use super::{ASSETS_DIR, BACKUP_DIR, HOME_DIR, KEEP_ALIVE, OPEN_HOME, PROJECT_DIR, USER, WORK_DIR};
     use crate::base::CONTAINERFILE;
 
     #[test]
     fn every_path_is_absolute_and_the_project_material_is_under_one_roof() {
-        for path in [WORK_DIR, PROJECT_DIR, ASSETS_DIR, HOME_DIR] {
+        for path in [WORK_DIR, PROJECT_DIR, ASSETS_DIR, BACKUP_DIR, HOME_DIR] {
             assert!(path.starts_with('/'), "{path}");
             assert!(!path.ends_with('/'), "{path}");
         }
         assert!(PROJECT_DIR.starts_with(&format!("{WORK_DIR}/")), "{PROJECT_DIR}");
         assert!(ASSETS_DIR.starts_with(&format!("{WORK_DIR}/")), "{ASSETS_DIR}");
+        assert!(BACKUP_DIR.starts_with(&format!("{WORK_DIR}/")), "{BACKUP_DIR}");
         assert_ne!(PROJECT_DIR, ASSETS_DIR);
+        assert_ne!(PROJECT_DIR, BACKUP_DIR);
         assert!(!HOME_DIR.starts_with(&format!("{WORK_DIR}/")), "a home inside the project would be mounted over");
     }
 
