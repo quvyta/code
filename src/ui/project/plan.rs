@@ -64,6 +64,10 @@ pub struct ContainerPlan {
     /// settings the bridge's server is registered in. The base container has none, because no
     /// harness runs in it.
     pub bridge: Option<Bridge>,
+    /// Where a window's container leaves the web addresses it wants opened: the project's
+    /// `Containers/Browser/` on the host, mounted writable at [`desktop::signin::OPEN_DIR`].
+    /// `None` for every container that opens no window.
+    pub browser: Option<PathBuf>,
 }
 
 /// The bridge a profile container carries.
@@ -90,6 +94,7 @@ impl ContainerPlan {
             network: Network::Full,
             window: None,
             bridge: None,
+            browser: None,
         }
     }
 
@@ -107,6 +112,7 @@ impl ContainerPlan {
             network: network(profile.network),
             window: None,
             bridge: Some(Bridge { folder: paths.mcp(), harness: profile.harness }),
+            browser: None,
         }
     }
 
@@ -126,6 +132,7 @@ impl ContainerPlan {
         Some(Self {
             name: names::desktop_container(project.as_str(), profile.name.as_str()),
             window: Some(desktop),
+            browser: Some(paths.browser()),
             // No bridge: what runs in this container is the application itself, not an agent of
             // QCode's, so there is nothing to answer the socket and no reason to let the
             // application see it.
@@ -152,6 +159,15 @@ impl ContainerPlan {
             mounts.push(Mount {
                 source: MountSource::Volume(home),
                 target: Path::new(HOME_DIR),
+                access: Access::ReadWrite,
+            });
+        }
+        if let Some(browser) = &self.browser {
+            // Writable, because the address the application wants opened is written here; it is
+            // the only thing of the machine this container may write to besides the project.
+            mounts.push(Mount {
+                source: MountSource::Path(browser),
+                target: Path::new(desktop::signin::OPEN_DIR),
                 access: Access::ReadWrite,
             });
         }
@@ -243,7 +259,10 @@ impl ContainerPlan {
         let sockets = [Socket { host: &display.socket, target: &target }];
         let tmpfs = [Tmpfs { target: Path::new(desktop::RUNTIME_DIR), mode: desktop::RUNTIME_MODE }];
         let devices: Vec<&Path> = display.device.iter().map(PathBuf::as_path).collect();
-        let environment = display.environment();
+        let mut environment = display.environment();
+        // What the application runs when it wants a web address opened. Without it the call goes
+        // to `xdg-open`, which inside a container finds no browser and quietly does nothing.
+        environment.push(("BROWSER".to_owned(), desktop::signin::OPEN_PROGRAM.to_owned()));
         let env: Vec<(&str, &str)> = environment.iter().map(|(key, value)| (key.as_str(), value.as_str())).collect();
         Some(engine.run_window(&RunWindow {
             name: &self.name,
@@ -457,6 +476,11 @@ pub fn open_window(
             run::capture(&engine.remove_container(&plan.name)).map_err(|error| LaunchFailure::from(&error))?;
         }
         None => {}
+    }
+    // The folder the window writes addresses into has to be there before the container starts:
+    // an engine refuses to mount a path that does not exist.
+    if let Some(browser) = &plan.browser {
+        std::fs::create_dir_all(browser).map_err(|error| LaunchFailure::from_host(&error))?;
     }
     let seccomp = if engine.needs_sandbox_profile() {
         Some(desktop::seccomp::file().map_err(|error| LaunchFailure::from_host(&error))?)

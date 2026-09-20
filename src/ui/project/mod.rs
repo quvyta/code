@@ -210,6 +210,10 @@ pub enum Msg {
     WindowOpened(TabKey, u64, Result<Opening, LaunchFailure>),
     /// The window of a tab closed, whoever closed it, with the exit code the engine reported.
     WindowEnded(TabKey, u64, Option<u32>),
+    /// The window of this tab, in this run, asked for these web addresses to be opened.
+    SignInWanted(TabKey, u64, Vec<String>),
+    /// The opening of that address on this machine answered: whether a browser was started here.
+    SignInOpened(TabKey, u64, String, bool),
     /// The open window of a tab was asked to show itself.
     RaiseWindow(TabKey),
     /// That asking finished; a refusal is worth saying, because nothing else would show it.
@@ -1244,6 +1248,8 @@ fn apply(screen: &mut ProjectScreen, message: Msg) -> Command<Msg> {
         Msg::Silenced => Command::none(),
         Msg::WindowOpened(key, run, answer) => desktop::opened(screen, key, run, answer),
         Msg::WindowEnded(key, run, code) => desktop::ended(screen, key, run, code),
+        Msg::SignInWanted(key, run, addresses) => desktop::sign_in_wanted(screen, key, run, &addresses),
+        Msg::SignInOpened(key, run, address, opened) => desktop::sign_in_opened(screen, key, run, &address, opened),
         Msg::RaiseWindow(key) => desktop::raise(screen, key),
         // Nothing is said when it worked: the window came forward, or the compositor marked it,
         // and either way the person is looking at their screen rather than at this tab.

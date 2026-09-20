@@ -493,6 +493,10 @@ fn naming(tree: &FileTree, ui: &mut View<'_, Msg>) {
 /// Width of the naming dialog, in cells: room for a long file name without covering the screen.
 const NAMING_WIDTH: u16 = 48;
 
+/// Cells of the panel a widget's own content never has: the dock's indent on the left, the
+/// panel's padding on the right. What is left is what a row of buttons has to fit in.
+const WIDGET_INSET: u16 = 7;
+
 /// The theme colour of the icon of an entry the backup leaves out.
 const LEFT_OUT_TONE: &str = "warning";
 
@@ -588,29 +592,40 @@ fn containers_widget(screen: &ProjectScreen, project: &OpenProject, ui: &mut Vie
     let name = selected.map(|container| container.name.clone());
     let running = selected.is_some_and(|container| container.state.is_running());
     let busy = project.busy;
-    ui.row(|ui| {
+    let labels = [t!("project.containers.stop"), t!("project.containers.restart"), t!("project.containers.refresh")];
+    let buttons = |ui: &mut View<'_, Msg>| {
         let stop = name.clone().map(Msg::StopContainer);
-        let mut button = Button::new(t!("project.containers.stop")).disabled(!running || busy);
+        let mut button = Button::new(labels[0].clone()).disabled(!running || busy);
         if let Some(message) = stop {
             button = button.on_press(message);
         }
         ui.add(button).id("project-container-stop");
 
-        let restart = name.map(Msg::RestartContainer);
-        let mut button = Button::new(t!("project.containers.restart")).disabled(selected.is_none() || busy);
+        let restart = name.clone().map(Msg::RestartContainer);
+        let mut button = Button::new(labels[1].clone()).disabled(selected.is_none() || busy);
         if let Some(message) = restart {
             button = button.on_press(message);
         }
         ui.add(button).id("project-container-restart");
 
         // The engine is the only one who knows; the list is what it said last, and this asks again.
-        ui.add(
-            Button::new(t!("project.containers.refresh")).loading(busy).disabled(busy).on_press(Msg::RefreshContainers),
-        )
-        .id("project-container-refresh");
-    })
-    .gap(1)
-    .fill_width();
+        ui.add(Button::new(labels[2].clone()).loading(busy).disabled(busy).on_press(Msg::RefreshContainers))
+            .id("project-container-refresh");
+    };
+    // Three words side by side fit an English panel and not a German or Russian one. Rather than
+    // cut a word, the row becomes a column as soon as the three no longer fit the panel's width.
+    if buttons_width(&labels) <= screen.panel().width().saturating_sub(WIDGET_INSET) {
+        ui.row(buttons).gap(1).fill_width();
+    } else {
+        ui.column(buttons).fill_width();
+    }
+}
+
+/// Cells a row of these buttons asks for: each label in its own button, which the theme pads by
+/// two cells on either side, and one cell between neighbours.
+fn buttons_width(labels: &[String]) -> u16 {
+    let gaps = u16::try_from(labels.len().saturating_sub(1)).unwrap_or(0);
+    labels.iter().fold(gaps, |total, label| total.saturating_add(qframe::text::width(label)).saturating_add(4))
 }
 
 /// The theme colour of a container's state. Colour never carries the meaning alone: the state is

@@ -32,8 +32,9 @@ use engine::{EngineState, Gate, Health};
 use identity::ProfileIdentity;
 
 /// Width of the drop-downs in the settings list. Wide enough for the longest theme and language
-/// name, narrow enough to leave the labels their column.
-const CONTROL_WIDTH: u16 = 20;
+/// name — `Português (Brasil)`, the longest of the nine — narrow enough to leave the labels their
+/// column. A drop-down keeps seven of these cells for its arrow and its padding.
+const CONTROL_WIDTH: u16 = 25;
 
 /// Rows between the blocks of the screen.
 const BLOCK_GAP: u16 = 1;
@@ -814,6 +815,29 @@ mod tests {
         assert!(harness.screen().contains("Language"), "{}", harness.screen());
         let (label, _) = harness.find("Language").expect("the language row is shown");
         assert!(label < 8, "a narrow terminal keeps the column at its edge:\n{}", harness.screen());
+    }
+
+    #[test]
+    fn every_language_fits_the_settings_rows_and_their_drop_downs() {
+        // The rows and the drop-downs are sized in cells, so a language whose words are longer
+        // than English's is where a label or a chosen value would lose its end.
+        for (code, name) in [
+            ("en", "English"),
+            ("tr", "Türkçe"),
+            ("de", "Deutsch"),
+            ("es", "Español"),
+            ("fr", "Français"),
+            ("pt-BR", "Português (Brasil)"),
+            ("ru", "Русский"),
+            ("zh-Hans", "简体中文"),
+            ("ja", "日本語"),
+        ] {
+            let mut harness = testing::host(testing::screen(EngineKind::Podman, Health::Working), SIZE.0, SIZE.1);
+            harness.set_locale(code).render();
+            let screen = harness.screen();
+            assert!(!screen.contains('…'), "{code} is cut somewhere:\n{screen}");
+            assert!(screen.contains(name), "{code} does not name itself in the drop-down:\n{screen}");
+        }
     }
 
     #[test]

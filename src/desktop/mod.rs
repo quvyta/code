@@ -14,6 +14,7 @@
 //! way back, and the tab says so.
 
 pub mod seccomp;
+pub mod signin;
 
 #[cfg(test)]
 mod live;

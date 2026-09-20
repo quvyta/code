@@ -71,6 +71,23 @@ impl Engine {
     }
 
     /// Asks after an image. It answers only when the image is there, which is how a profile
+    /// How many bytes an image takes, as the engine reports it. Both engines answer the same
+    /// field of the same command.
+    ///
+    /// It is what keeps the size QCode promises a person honest: a record that says how large a
+    /// desktop image is can go stale silently, and a stale number is a promise broken before the
+    /// download starts.
+    #[must_use]
+    pub fn image_size(&self, image: &str) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("image");
+        args.push("inspect");
+        args.push("--format");
+        args.push("{{.Size}}");
+        args.push(image);
+        self.command(args)
+    }
+
     /// knows whether it still has one to start containers from.
     #[must_use]
     pub fn image_exists(&self, image: &str) -> EngineCommand {
@@ -837,6 +854,13 @@ mod tests {
             args(&docker().image_exists("qcode/base")),
             ["image", "inspect", "--format", "{{.Id}}", "qcode/base"]
         );
+    }
+
+    #[test]
+    fn asks_how_large_an_image_is_the_same_way_on_both_engines() {
+        let spelled = ["image", "inspect", "--format", "{{.Size}}", "qcode/profile/anti"];
+        assert_eq!(args(&docker().image_size("qcode/profile/anti")), spelled);
+        assert_eq!(args(&podman().image_size("qcode/profile/anti")), spelled);
     }
 
     #[test]

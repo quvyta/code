@@ -100,9 +100,16 @@ pub struct Desktop {
     pub flags: &'static [&'static str],
     /// The Debian packages the application needs beside what the base image brings.
     pub packages: &'static [&'static str],
-    /// How much room the built image takes, in whole mebibytes, as it was measured. The person is
-    /// told before they ask for it: a desktop image is an order of magnitude larger than a
-    /// command-line harness's.
+    /// How much room the built image takes, in whole mebibytes, as it was measured **on top of
+    /// `qcode/base`**, which is what the recipe builds on. The person is told this before they
+    /// ask for the image: a desktop image is an order of magnitude larger than a command-line
+    /// harness's.
+    ///
+    /// Measure it the way the recipe builds it, not on a bare Debian: the first number here was
+    /// taken on `debian:trixie-slim` during the trial and understated the image by 900 MiB,
+    /// which is a promise broken before the download even starts. The live test
+    /// `the_image_builds_from_the_makers_archive_and_carries_the_application_and_its_settings`
+    /// prints the built size, so a re-measure is one run away.
     pub image_mib: u64,
 }
 
@@ -632,8 +639,13 @@ static ANTIGRAVITY: Desktop = Desktop {
         "libxtst6",
         "mesa-vulkan-drivers",
         "procps",
+        // Without it the application's own "open this in a browser" call returns success and does
+        // nothing at all, which is how signing in stayed silent; measured 2026-09-20.
+        "xdg-utils",
     ],
-    image_mib: 1_390,
+    // Measured 2026-09-20 on top of qcode/base: base 517 MB, the packages 351 MB, the
+    // application 769 MB, which is 2295 MiB in all.
+    image_mib: 2_295,
 };
 
 #[cfg(test)]

@@ -17,7 +17,11 @@
 
 use qframe::prelude::*;
 
-use crate::desktop::{self, Display, NoDisplay};
+use qframe::runtime::{DetachedHandoff, DetachedOutcome};
+use qframe::storage::FolderWatch;
+use qframe::widgets::EmptyState;
+
+use crate::desktop::{self, Display, NoDisplay, signin};
 use crate::engine::Network;
 
 use super::plan::{self, ContainerPlan, LaunchFailure};
@@ -101,6 +105,93 @@ pub(super) fn watch(screen: &ProjectScreen, key: TabKey, run: u64) -> Command<Ms
     Command::perform(move || Msg::WindowEnded(key, run, plan::await_window(&engine, &plan.name)))
 }
 
+/// Watches the folder the window writes web addresses into, on a background thread of its own,
+/// and answers with whatever was written there.
+///
+/// One address at a time is enough: the application asks for a browser when the person presses
+/// sign in, and what matters is that the newest address reaches them. The folder is read once
+/// before the wait as well, so an address written while QCode was busy is not missed.
+pub(super) fn watch_browser(screen: &ProjectScreen, key: TabKey, run: u64) -> Command<Msg> {
+    let Some((plan, _)) = plan_of(screen, key) else { return Command::none() };
+    let Some(folder) = plan.browser.clone() else { return Command::none() };
+    Command::perform(move || {
+        let waiting = signin::taken(&folder);
+        if !waiting.is_empty() {
+            return Msg::SignInWanted(key, run, waiting);
+        }
+        let Ok(mut watch) = FolderWatch::new() else {
+            // No watch to be had on this system: the tab keeps working, it simply cannot say
+            // when the window wants a browser. Nothing is retried in a loop.
+            return Msg::SignInWanted(key, run, Vec::new());
+        };
+        if watch.watch(&folder).is_err() {
+            return Msg::SignInWanted(key, run, Vec::new());
+        }
+        let changes = watch.changes();
+        loop {
+            if changes.next().is_empty() {
+                return Msg::SignInWanted(key, run, Vec::new());
+            }
+            let found = signin::taken(&folder);
+            if !found.is_empty() {
+                return Msg::SignInWanted(key, run, found);
+            }
+        }
+    })
+}
+
+/// Takes the addresses the window asked to have opened: the newest one is opened in the person's
+/// own browser, and the watch is set again for the next one.
+pub(super) fn sign_in_wanted(screen: &mut ProjectScreen, key: TabKey, run: u64, addresses: &[String]) -> Command<Msg> {
+    let Some((_, tab)) = screen.owner_mut(key).and_then(|project| project.find(key)) else {
+        return Command::none();
+    };
+    if tab.run() != run || tab.state() != &TabState::Running {
+        // The window is gone; nothing is watched for it any more.
+        return Command::none();
+    }
+    let Some(address) = addresses.last().cloned() else { return Command::none() };
+    // The address is put on the tab at once: whatever the browser does, the person can read it.
+    tab.asked_to_open(address.clone());
+    let Some(words) = signin::open_here(&address) else {
+        // Not an address QCode hands a browser. The tab says so rather than opening it quietly.
+        tab.opened_here(&address, false);
+        return watch_browser(screen, key, run);
+    };
+    // The one door to the desktop: a handoff, which a test run records instead of running.
+    let answer = address.clone();
+    let opening = Command::handoff_detached(
+        DetachedHandoff::new(signin::OPEN_HERE, move |outcome| {
+            let opened = match outcome {
+                DetachedOutcome::Detached { .. } => true,
+                // The shell ends at once either way; a code of its own, a signal or a shell
+                // that would not start all mean no browser came up here.
+                DetachedOutcome::Finished { code } => code == Some(0),
+                DetachedOutcome::Failed(_) => false,
+            };
+            Msg::SignInOpened(key, run, answer, opened)
+        })
+        .args(words),
+    );
+    Command::batch([opening, watch_browser(screen, key, run)])
+}
+
+/// Takes the answer of that opening: whether a browser came up here for the address.
+pub(super) fn sign_in_opened(
+    screen: &mut ProjectScreen,
+    key: TabKey,
+    run: u64,
+    address: &str,
+    opened: bool,
+) -> Command<Msg> {
+    if let Some((_, tab)) = screen.owner_mut(key).and_then(|project| project.find(key))
+        && tab.run() == run
+    {
+        tab.opened_here(address, opened);
+    }
+    Command::none()
+}
+
 /// Takes the answer that the window of the tab `key` is open, or why it is not.
 pub(super) fn opened(
     screen: &mut ProjectScreen,
@@ -122,7 +213,7 @@ pub(super) fn opened(
         }
         Ok(Opening::Up) => {
             tab.settled(TabState::Running);
-            watch(screen, key, run)
+            Command::batch([watch(screen, key, run), watch_browser(screen, key, run)])
         }
         Err(failure) => {
             tab.settled(TabState::Failed(failure));
@@ -201,6 +292,16 @@ pub(super) fn close_all(screen: &ProjectScreen, project: &OpenProject, tabs: &[&
 /// The shape is colour and space, never a box: a heading-sized line for where the window stands, a
 /// quieter line under it for what that means, and the actions below that.
 pub(super) fn view(screen: &ProjectScreen, tab: &Tab, profile: &str, ui: &mut View<'_, Msg>) {
+    // A tab brought back from the last session to a machine with no container engine is never
+    // started: nothing is going to open this window. Saying it is opening would promise work
+    // nobody is doing, and the tab would offer nothing to do about it, so it says where it
+    // stands the way every other kind of tab says it in the same place.
+    if tab.state() == &TabState::Waiting && screen.engine.is_none() {
+        ui.add(EmptyState::new(t!("project.waiting")).icon("inbox").message(t!("project.no-engine")))
+            .fill()
+            .id("project-waiting");
+        return;
+    }
     let key = tab.key();
     let offline = plan_of(screen, key).is_some_and(|(_, offline)| offline);
     let (colour, headline, detail) = words(tab, profile, offline);
@@ -209,6 +310,18 @@ pub(super) fn view(screen: &ProjectScreen, tab: &Tab, profile: &str, ui: &mut Vi
             ui.add(Text::new(headline).role("title").color(colour));
             if let Some(detail) = detail {
                 ui.add(Text::new(detail).role("secondary")).selectable(true).fill_width();
+            }
+            // What the window asked to have opened, if it asked: the person can see the address
+            // and copy it, whether or not a browser came up here.
+            if let Some((address, opened)) = tab.sign_in() {
+                // While the opening is still on its way there is nothing true to say about the
+                // browser, so only the address is shown; the sentence joins it a moment later.
+                if let Some(opened) = opened {
+                    let said =
+                        if opened { "project.window.signin-opened" } else { "project.window.signin-open-yourself" };
+                    ui.add(Text::new(t!(said)).role("secondary")).fill_width();
+                }
+                ui.add(Text::new(address.to_owned())).selectable(true).fill_width();
             }
             ui.row(|ui| match tab.state() {
                 TabState::Running => {

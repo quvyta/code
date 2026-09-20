@@ -136,6 +136,14 @@ impl Config {
     /// The key of what opening a sound does.
     const SOUND: &'static str = "apps.sound";
 
+    /// Every language QCode speaks, in the order the setup wizard offers them.
+    ///
+    /// The list lives with the settings file because this is where a chosen language stops
+    /// being a choice on a screen and becomes text a schema has to accept. A screen that offers
+    /// a language the file will not hold writes it once and loses it at the next start, so the
+    /// screens read their list from here rather than keeping one of their own.
+    pub const LANGUAGES: [&'static str; 9] = ["en", "tr", "de", "es", "fr", "pt-BR", "ru", "zh-Hans", "ja"];
+
     /// How many projects the recent list keeps. Beyond a screenful the list stops being a
     /// shortcut, and the full list of projects is one screen away.
     pub const RECENT_LIMIT: usize = 10;
@@ -183,7 +191,7 @@ impl Config {
             // written down — even the one that happens to match the default that used to be
             // here — and a word QCode does not speak is dropped rather than quietly turned
             // into English on a machine that reads Turkish.
-            .optional(Settings::LANGUAGE, SettingKind::choice(["en", "tr"]))
+            .optional(Settings::LANGUAGE, SettingKind::choice(Self::LANGUAGES))
             .flag(Self::COMPLETED, false)
             .choice(Self::STEP, SetupStep::ALL.map(SetupStep::key), SetupStep::Language.key())
             .choice(Self::ENGINE, ENGINE_KINDS, ENGINE_KINDS[0])
@@ -472,10 +480,24 @@ mod tests {
     }
 
     #[test]
+    fn every_language_qcode_speaks_survives_being_written_down() {
+        // The wizard and the settings screen offer every language QCode carries a file for. One
+        // the settings file will not hold is chosen, written, and gone the next time QCode
+        // opens: the person picks Japanese and comes back to a machine speaking English.
+        for code in Config::LANGUAGES {
+            let mut config = Config::parse_str(FILE, "");
+            assert!(config.set_language(code), "{code} is written down");
+            let stored = Config::parse_str(FILE, &config.to_toml());
+            assert!(stored.is_clean(), "{code}: {:?}", stored.diagnostics());
+            assert_eq!(stored.settings().language().as_deref(), Some(code));
+        }
+    }
+
+    #[test]
     fn a_language_qcode_does_not_speak_is_dropped_rather_than_swapped_for_another() {
-        // Turning `fr` into `en` would put an application the person never asked for in front
+        // Turning `it` into `en` would put an application the person never asked for in front
         // of them. Dropping it hands the question back to the machine's own locale.
-        let config = Config::parse_str(FILE, "language = \"fr\"\n");
+        let config = Config::parse_str(FILE, "language = \"it\"\n");
         assert_eq!(config.settings().language(), None);
         assert!(!config.is_clean(), "the repair is reported");
         assert!(!config.to_toml().contains("language"), "{}", config.to_toml());

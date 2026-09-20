@@ -83,6 +83,16 @@ impl ProjectPaths {
         self.root.join("Containers").join("MCP")
     }
 
+    /// The folder a window's container leaves web addresses in, for QCode to open in the
+    /// person's own browser.
+    ///
+    /// Not made with the project: opening a window makes it, so a project that has never opened
+    /// one has none.
+    #[must_use]
+    pub fn browser(&self) -> PathBuf {
+        self.root.join("Containers").join("Browser")
+    }
+
     /// The folder the project's backups are kept in.
     ///
     /// Not made with the project: the first backup makes it, so a project that has never been

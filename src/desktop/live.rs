@@ -180,6 +180,24 @@ fn the_image_builds_from_the_makers_archive_and_carries_the_application_and_its_
         // Nothing is asserted about how long it takes; it is printed so a change is visible.
         println!("{:?}: the desktop image built in {took:?}", engine.kind());
 
+        // The size the record promises is the size that was built. A record that drifts is a
+        // number shown to the person before they start a download of gigabytes, so it is checked
+        // here rather than trusted: one tenth of slack for what an engine counts differently.
+        let bytes: u64 = capture(&engine.image_size(IMAGE))
+            .expect("the engine says how large the image is")
+            .trim()
+            .parse()
+            .expect("a size in bytes");
+        let mib = bytes / (1024 * 1024);
+        println!("{:?}: the desktop image is {mib} MiB, the record says {}", engine.kind(), desktop.image_mib);
+        let slack = desktop.image_mib / 10;
+        assert!(
+            mib.abs_diff(desktop.image_mib) <= slack,
+            "{:?}: the record says {} MiB and the image is {mib} MiB; re-measure it",
+            engine.kind(),
+            desktop.image_mib
+        );
+
         // A one-off container is enough to read the image: no window, no display, no sandbox.
         let read = |script: &str| {
             let command = ["sh", "-c", script];

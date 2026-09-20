@@ -222,6 +222,58 @@ fn spelled(command: &EngineCommand) -> Vec<String> {
 }
 
 #[test]
+fn every_language_fits_the_project_screen_without_losing_a_label() {
+    // The rail, the panel and the tab strip are all counted in cells, so a language with longer
+    // words is where a heading or a hint would lose its end.
+    let scratch = Scratch::new("languages");
+    let mut catalog = qframe::i18n::I18n::builtin();
+    for (file, text) in crate::locales() {
+        catalog.add_source(&file, &text);
+    }
+    for code in ["en", "tr", "de", "es", "fr", "pt-BR", "ru", "zh-Hans", "ja"] {
+        let mut harness = harness(one_project(&scratch), SIZE.0, SIZE.1);
+        harness.set_locale(code).render();
+        catalog.set_active(code);
+        let screen = harness.screen();
+        for key in [
+            "project.widget.files",
+            "project.widget.info",
+            "project.widget.containers",
+            "project.new-tab",
+            "project.containers.stop",
+            "project.containers.restart",
+            "project.containers.refresh",
+        ] {
+            let label = catalog.translate(key, &[]);
+            assert!(screen.contains(&label), "{code} loses `{label}`:\n{screen}");
+        }
+        // The only ellipsis a resting screen may show is one a text of its own ends with.
+        let ours: Vec<String> = ["project.files.reading", "project.backup.size-reading", "project.starting"]
+            .iter()
+            .map(|key| catalog.translate(key, &[]))
+            .collect();
+        for line in screen.lines().filter(|line| line.contains('…')) {
+            assert!(ours.iter().any(|text| line.contains(text.as_str())), "{code} cuts a line:\n{screen}");
+        }
+
+        // Dragged wide, the panel has room for the three container buttons side by side, and
+        // they still stand there whole.
+        harness.send(Msg::ResizePanel(super::PANEL_MAX));
+        harness.render();
+        let wide = harness.screen();
+        let row: Vec<String> = ["project.containers.stop", "project.containers.restart", "project.containers.refresh"]
+            .iter()
+            .map(|key| catalog.translate(key, &[]))
+            .collect();
+        let line = wide
+            .lines()
+            .find(|line| row.iter().all(|label| line.contains(label.as_str())))
+            .unwrap_or_else(|| panic!("{code} does not put the three on one line:\n{wide}"));
+        assert!(!line.contains('…'), "{code} cuts the widened row:\n{wide}");
+    }
+}
+
+#[test]
 fn a_tab_opens_inside_a_container_and_never_on_this_machine() {
     let scratch = Scratch::new("inside");
     let mut screen = one_project(&scratch);

@@ -32,8 +32,9 @@ use crate::workspace::{Config, HostDirs, SetupStep};
 use gates::{EngineCheck, EngineProblem, Gates, LocationCheck, LocationProblem};
 use install::{InstallHost, Remedy};
 
-/// The languages QCode speaks, in the order they are offered.
-const LANGUAGES: [&str; 2] = ["en", "tr"];
+/// The languages QCode speaks, in the order they are offered. The list is the settings file's,
+/// so the wizard can offer nothing the file would refuse to keep.
+const LANGUAGES: [&str; 9] = Config::LANGUAGES;
 
 /// The engines, in the order they are offered. Podman is first because it is the recommended
 /// one, and first is also what a person who presses on through takes.
@@ -754,6 +755,28 @@ mod tests {
         assert_eq!(harness.app().setup.step(), SetupStep::Engine);
         let screen = harness.screen();
         assert!(screen.contains("Container engine"), "{screen}");
+    }
+
+    #[test]
+    fn every_language_qcode_speaks_is_offered_whole_on_the_first_step() {
+        // Nine names on one page: each has to stand there in full, in every language, or the
+        // first screen someone meets would ask them to choose between cut-off words.
+        let gates = Gates { language: false, engine: EngineCheck::Unknown, location: LocationCheck::Unknown };
+        let mut catalog = qframe::i18n::I18n::builtin();
+        for (file, text) in crate::locales() {
+            catalog.add_source(&file, &text);
+        }
+        for code in super::LANGUAGES {
+            let mut harness = wizard("", &gates, Some(temporary("home")));
+            harness.set_locale(code).render();
+            catalog.set_active(code);
+            let screen = harness.screen();
+            assert!(!screen.contains('…'), "{code} is cut somewhere:\n{screen}");
+            for offered in super::LANGUAGES {
+                let name = catalog.translate(&format!("setup.language-{offered}"), &[]);
+                assert!(screen.contains(&name), "{code} does not show {offered} as `{name}`:\n{screen}");
+            }
+        }
     }
 
     #[test]

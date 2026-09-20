@@ -5,6 +5,20 @@ Every release of quvyta-code, newest first. The format follows
 [Semantic Versioning](https://semver.org/); while the version starts with 0, a minor release may
 change files qcode writes, and the notes say so when it does.
 
+## 0.1.10 - 2026-09-20
+
+### Added
+
+- qcode speaks nine languages: English, Turkish, German, Spanish, French, Italian, Portuguese, Russian and Chinese. The language is asked for on the first screen and changed in **Settings**; the one you pick is the one qcode opens in next time. A gate keeps every language complete and keeps each one in its own words, so a file that quietly held English would not pass.
+- Signing in from a desktop window works. The window's application asks its desktop to open a page, as every Linux program does; qcode takes that address through a folder the container shares with it and opens it in your own browser, where your accounts already are. The address is always shown on the tab as well, so a machine with no browser to be had can still be signed in from somewhere else. Only `http` and `https` addresses are opened; anything else is refused and said aloud.
+- Closing qcode and opening it again finds everything where you left it: the projects that were open, their tabs in their order, and the tab you were on. A window tab comes back with the others and waits to be asked before it opens its window again, because opening qcode is not asking for that window.
+
+### Changed
+
+- The size promised for a desktop image is the size it really builds to. The figure was the download, not the image; it is now measured and shown as what the image costs on disk.
+- Longer words keep their ends: drop-downs are as wide as what they hold, and the buttons of a narrow panel stack instead of being cut.
+- The page a window asks to have opened is handed to your desktop through the framework's handoff, in a shell that starts the browser in the background and ends at once. qcode never spawns it itself any more, which is also why a test run of qcode cannot open anything on your screen.
+
 ## 0.1.9 - 2026-09-20
 
 ### Added

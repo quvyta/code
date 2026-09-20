@@ -239,7 +239,9 @@ fn shape() -> Shape {
     let tab = Shape::new()
         .required(
             "kind",
-            ValueKind::choice(["shell", "profile", "new", "image", "markdown", "editor", "pdf", "office", "sound"]),
+            ValueKind::choice([
+                "shell", "profile", "new", "image", "markdown", "editor", "pdf", "office", "sound", "desktop",
+            ]),
         )
         .optional("profile", ValueKind::text())
         .optional("file", ValueKind::text())
@@ -301,8 +303,9 @@ fn session_tab(entry: &Table, diagnostics: &mut Vec<Diagnostic>) -> Option<Sessi
                 _ => SessionTabKind::Editor(file),
             }
         }
-        // A window tab and a harness tab are both a profile's; an unknown kind that names a
-        // profile is read as a harness tab, as it was before windows existed.
+        // A window tab and a harness tab are both a profile's, and both are named the same way.
+        // Any other kind that names a profile is read as a harness tab, as it was read before
+        // windows existed.
         kind => match entry.text("profile") {
             Some(name) if kind == "desktop" => SessionTabKind::Desktop(name.to_owned()),
             Some(name) => SessionTabKind::Profile(name.to_owned()),
@@ -384,6 +387,11 @@ mod tests {
                             kind: SessionTabKind::Sound("sounds/foghorn.ogg".to_owned()),
                             conversation: None,
                             opened: 1_758_197_900,
+                        },
+                        SessionTab {
+                            kind: SessionTabKind::Desktop("antigravity".to_owned()),
+                            conversation: None,
+                            opened: 1_758_198_000,
                         },
                     ],
                 },
@@ -479,6 +487,20 @@ mod tests {
             let read = Session::parse(NAME, text);
             assert!(read.value.projects.iter().all(|project| project.active_tab <= project.tabs.len()));
         }
+    }
+
+    #[test]
+    fn a_window_of_a_profile_is_one_of_the_tabs_that_come_back() {
+        // A window tab is written like every other tab, so it has to read back like every other
+        // tab: a tab that is saved and then dropped on the way in loses the person's window
+        // without ever saying so.
+        let text = "[[project]]\nid = \"moth\"\n\n[[project.tab]]\nkind = \"desktop\"\n\
+                    profile = \"antigravity\"\nopened = 12\n";
+        let read = Session::parse(NAME, text);
+        assert!(read.is_clean(), "{:?}", read.diagnostics);
+        let tabs = &read.value.projects[0].tabs;
+        assert_eq!(tabs.len(), 1, "the window tab is kept");
+        assert_eq!(tabs[0].kind, SessionTabKind::Desktop("antigravity".to_owned()));
     }
 
     #[test]

@@ -19,6 +19,9 @@ pub mod service;
 pub mod ui;
 pub mod workspace;
 
+#[cfg(test)]
+mod reopen_tests;
+
 use std::io::{self, Write as _};
 use std::path::PathBuf;
 
@@ -126,10 +129,20 @@ pub fn run() -> io::Result<()> {
 /// it instead of looking for files beside the binary.
 #[must_use]
 pub fn locales() -> Vec<(String, String)> {
-    [("en.toml", include_str!("../assets/locales/en.toml")), ("tr.toml", include_str!("../assets/locales/tr.toml"))]
-        .into_iter()
-        .map(|(file, text)| (file.to_owned(), text.to_owned()))
-        .collect()
+    [
+        ("en.toml", include_str!("../assets/locales/en.toml")),
+        ("tr.toml", include_str!("../assets/locales/tr.toml")),
+        ("de.toml", include_str!("../assets/locales/de.toml")),
+        ("es.toml", include_str!("../assets/locales/es.toml")),
+        ("fr.toml", include_str!("../assets/locales/fr.toml")),
+        ("pt-BR.toml", include_str!("../assets/locales/pt-BR.toml")),
+        ("ru.toml", include_str!("../assets/locales/ru.toml")),
+        ("zh-Hans.toml", include_str!("../assets/locales/zh-Hans.toml")),
+        ("ja.toml", include_str!("../assets/locales/ja.toml")),
+    ]
+    .into_iter()
+    .map(|(file, text)| (file.to_owned(), text.to_owned()))
+    .collect()
 }
 
 /// The application's own key bindings, compiled in for the same reason the text is: an
@@ -271,12 +284,8 @@ pub struct QCode {
 }
 
 impl QCode {
-    /// The application as this machine leaves it: the gates of the design are asked, and the
-    /// first one that does not hold opens the wizard on its step.
-    ///
-    /// A setup that has been through is never asked again — that is the design's rule, and the
-    /// one thing that overrides it is a settings file that has been through the wizard and still
-    /// names no workspace, which leaves nothing to open.
+    /// The application as this machine leaves it: the gates of the design are asked, and
+    /// [`entry`](Self::entry) turns their answer into the step the wizard opens on, if any.
     #[must_use]
     pub fn start(config: Config, dirs: HostDirs, host: InstallHost) -> Self {
         let gates = Gates::probe(&config);
@@ -287,13 +296,24 @@ impl QCode {
             (Some(kind), true) => detect(kind).ok(),
             _ => None,
         };
-        let settled = config.setup_completed() && config.workspace_path().is_some();
-        let entry = if settled { None } else { gates.entry() };
+        let entry = Self::entry(&config, &gates);
         Self::new(config, dirs, host, &gates, found, entry)
             .with_session(Session::file())
             .with_registry(Registry::file())
             .with_service(ServiceHost::detect(), Platform::host())
             .following_files()
+    }
+
+    /// The wizard step a machine whose settings are `config` opens on, or `None` when there is
+    /// nothing left to ask.
+    ///
+    /// A setup that has been through is never asked again — that is the design's rule, and the
+    /// one thing that overrides it is a settings file that has been through the wizard and still
+    /// names no workspace, which leaves nothing to open.
+    #[must_use]
+    pub fn entry(config: &Config, gates: &Gates) -> Option<SetupStep> {
+        let settled = config.setup_completed() && config.workspace_path().is_some();
+        if settled { None } else { gates.entry() }
     }
 
     /// The application with every answer already in hand, which is how a test builds one.

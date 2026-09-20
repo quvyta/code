@@ -7,7 +7,11 @@
 
 use super::*;
 
-use crate::desktop::{Display, NoDisplay, RUNTIME_DIR};
+use std::ffi::OsString;
+
+use qframe::runtime::DetachedOutcome;
+
+use crate::desktop::{Display, NoDisplay, RUNTIME_DIR, signin};
 use crate::ui::project::{Opening, entry};
 
 /// The desktop profile of these tests.
@@ -111,6 +115,53 @@ fn the_window_sees_the_project_the_home_volume_and_one_socket_of_this_machine() 
     );
     // What the machine keeps to itself: the runtime folder, the engine's socket, the session bus.
     assert!(!words.iter().any(|word| word.ends_with("/run/user/1000") || word.contains("podman.sock")), "{words:?}");
+}
+
+#[test]
+fn the_window_is_told_where_to_leave_an_address_it_wants_opened() {
+    let session = Session::new("window-browser");
+    let words = opening_words(&session.screen());
+    // The folder the address is written into is the project's own and is writable, because
+    // writing the address is the whole point of it.
+    let folder = session.scratch.paths().browser();
+    assert!(words.contains(&format!("{}:{}:rw,z", folder.display(), crate::desktop::signin::OPEN_DIR)), "{words:?}");
+    // And the application is told to run QCode's little program rather than look for a browser
+    // it has not got.
+    assert!(words.contains(&format!("BROWSER={}", crate::desktop::signin::OPEN_PROGRAM)), "{words:?}");
+}
+
+#[test]
+fn an_address_the_window_leaves_is_shown_on_the_tab_with_a_way_to_open_it() {
+    let session = Session::new("window-signin");
+    let mut screen = session.screen();
+    open(&mut screen, window());
+    let key = key(&screen, 0);
+    apply(&mut screen, Msg::WindowOpened(key, 0, Ok(Opening::Up)));
+    assert_eq!(state(&screen, 0, 0), TabState::Running);
+    let mut harness = harness(screen, SIZE.0, SIZE.1);
+
+    // The address arrives the way the window's own program leaves it, and a browser comes up for
+    // it. Nothing is opened here: the opening is a handoff, which the harness records instead of
+    // running, so this test never reaches the desktop of whoever runs it.
+    let address = "https://accounts.google.com/o/oauth2/auth?client_id=x";
+    harness.set_detached_outcome(DetachedOutcome::Finished { code: Some(0) });
+    harness.send(Msg::SignInWanted(key, 0, vec![address.to_owned()]));
+    let asked = harness.detached_handoffs().last().expect("the address was handed over to be opened");
+    assert_eq!(asked.program, OsString::from(signin::OPEN_HERE));
+    assert!(asked.args.iter().any(|arg| arg == address), "the address is what is opened: {:?}", asked.args);
+    harness.render();
+    let text = harness.screen();
+    assert!(text.contains(address), "the address is on the tab:\n{text}");
+    assert!(text.contains("opened its page in your browser"), "{text}");
+
+    // A machine with no browser to be had says so, and the address is still there to be read.
+    let other = "https://accounts.google.com/o/oauth2/auth?client_id=y";
+    harness.set_detached_outcome(DetachedOutcome::Finished { code: Some(1) });
+    harness.send(Msg::SignInWanted(key, 0, vec![other.to_owned()]));
+    harness.render();
+    let text = harness.screen();
+    assert!(text.contains(other), "the address is on the tab:\n{text}");
+    assert!(text.contains("Open this page in your browser"), "{text}");
 }
 
 #[test]

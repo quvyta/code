@@ -171,6 +171,9 @@ pub struct Tab {
     /// Whether a sound tab waits to be asked before it plays: a tab brought back from the last
     /// session does, because opening QCode again is not asking to hear the sound again.
     held: bool,
+    /// The web address the window asked to have opened, and whether QCode managed to open it in
+    /// the person's browser — `None` while the opening is still on its way. A window tab only.
+    sign_in: Option<(String, Option<bool>)>,
     /// Counts the sessions this tab has started, so the watch of a session that was replaced by
     /// a restart is recognised and ignored.
     run: u64,
@@ -198,6 +201,7 @@ impl Tab {
             partial: false,
             pages: Pages::default(),
             quiet: None,
+            sign_in: None,
             socket: None,
             held: false,
             run: 0,
@@ -319,6 +323,28 @@ impl Tab {
     /// Makes a sound tab wait to be asked before it plays, or lets it play.
     pub fn hold(&mut self, held: bool) {
         self.held = held;
+    }
+
+    /// The web address the window asked to have opened, with whether it was opened here; that
+    /// is `None` until the opening answers.
+    #[must_use]
+    pub fn sign_in(&self) -> Option<(&str, Option<bool>)> {
+        self.sign_in.as_ref().map(|(address, opened)| (address.as_str(), *opened))
+    }
+
+    /// Records the address the window asked to have opened. The address is shown at once, before
+    /// anything is known about the browser, because reading it is what the person needs most.
+    pub fn asked_to_open(&mut self, address: String) {
+        self.sign_in = Some((address, None));
+    }
+
+    /// Records how the opening of that address went, if it is still the address being opened.
+    pub fn opened_here(&mut self, address: &str, opened: bool) {
+        if let Some((waiting, how)) = self.sign_in.as_mut()
+            && waiting == address
+        {
+            *how = Some(opened);
+        }
     }
 
     /// Which session of this tab is the current one.

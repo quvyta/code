@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 
 use crate::base::paths::{OPEN_HOME, USER};
+use crate::desktop::signin;
 use crate::engine::names::BASE_IMAGE;
 use crate::profile::{Desktop, Profile};
 
@@ -92,7 +93,19 @@ pub fn image(profile: &Profile) -> Recipe {
 fn desktop_steps(desktop: &Desktop) -> Vec<String> {
     let packages = desktop.packages.join(" ");
     let dir = desktop.install_dir;
+    // The program the application runs to open a web address, and the folder it writes into. The
+    // folder is made in the image so that a container given nothing there still has it.
+    //
+    // The script is written with `printf '%b'` from a single line: a `RUN` step is one line, so
+    // the script's own line breaks travel as `\n` and are turned back into breaks by printf.
+    let opener = format!(
+        "RUN printf '%b' '{script}' > '{program}' \\\n && chmod 0755 '{program}' \\\n && mkdir -p '{folder}'",
+        script = signin::script().replace('\\', "\\\\").replace('\'', "'\\''").replace('\n', "\\n"),
+        program = signin::OPEN_PROGRAM,
+        folder = signin::OPEN_DIR,
+    );
     vec![
+        opener,
         format!(
             "RUN apt-get update \\\n && apt-get install --yes --no-install-recommends {packages} \\\n \
              && rm -rf /var/lib/apt/lists/*"
@@ -302,5 +315,44 @@ mod tests {
                 assert!(script.contains(&format!("{CAPTURE_DIR}/{path}")), "{harness:?}: {path}");
             }
         }
+    }
+    #[test]
+    fn the_image_writes_the_opener_and_a_shell_turns_it_back_into_the_script() {
+        let recipe = image(&profile(HarnessKind::AntigravityIde, Template::Recommended));
+        let program = crate::desktop::signin::OPEN_PROGRAM;
+        let step = recipe
+            .containerfile
+            .split("\nRUN ")
+            .find(|step| step.contains(program))
+            .expect("the image installs the opener")
+            .to_owned();
+        assert!(recipe.containerfile.contains("xdg-utils"), "and the call that runs it is installed");
+        // A build step is one line; what looks like several is a line continuation.
+        assert!(step.lines().count() > 1, "the step is written over continuations");
+        assert!(step.lines().rev().skip(1).all(|line| line.trim_end().ends_with('\\')), "{step}");
+
+        // The proof that the escaping is right: a shell runs the step and the file it writes is
+        // the script, with only the paths changed to this test's own.
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let dir = std::env::temp_dir().join(format!("qcode-opener-{stamp}"));
+        let open_dir = dir.join("open");
+        std::fs::create_dir_all(&dir).expect("a folder of this test's own");
+        let here = dir.join("qcode-open");
+        let script = step
+            .replace(program, &here.display().to_string())
+            .replace(crate::desktop::signin::OPEN_DIR, &open_dir.display().to_string());
+        let ran = std::process::Command::new("sh").arg("-c").arg(&script).status().expect("a shell runs the step");
+        assert!(ran.success(), "{script}");
+        let written = std::fs::read_to_string(&here).expect("the opener is written");
+        let wanted =
+            crate::desktop::signin::script().replace(crate::desktop::signin::OPEN_DIR, &open_dir.display().to_string());
+        assert_eq!(written, wanted);
+
+        // And the script it wrote really hands an address over.
+        let address = "https://accounts.google.com/o/oauth2/auth?client_id=x&redirect_uri=http%3A%2F%2Flocalhost%3A1";
+        let ran = std::process::Command::new("sh").arg(&here).arg(address).status().expect("the opener runs");
+        assert!(ran.success());
+        assert_eq!(crate::desktop::signin::taken(&open_dir), [address]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

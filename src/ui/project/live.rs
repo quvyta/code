@@ -58,6 +58,7 @@ impl Scratch {
             name: name.to_owned(),
             image: ALPINE.to_owned(),
             home: None,
+            browser: None,
             project: self.0.join("Project"),
             assets: self.0.join("Assets"),
             assets_access: Access::ReadWrite,
