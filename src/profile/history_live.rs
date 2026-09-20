@@ -64,6 +64,7 @@ impl Lab {
         capture(&engine.create_container(&ContainerCreate {
             name: &container,
             hostname: HOSTNAME,
+            labels: &[],
             image: BASE_IMAGE,
             mounts: &[],
             network,

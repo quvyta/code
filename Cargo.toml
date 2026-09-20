@@ -23,13 +23,13 @@ repository = "https://github.com/quvyta/code"
 readme = "README.md"
 keywords = ["tui", "terminal", "agent", "podman", "docker"]
 categories = ["command-line-utilities", "development-tools"]
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
 # Only what the program is built from goes into the package; the rest of the repository is for
 # working on it.
-include = ["src/**", "assets/**", "Cargo.toml", "Cargo.lock", "README.md", "CHANGELOG.md", "LICENSE"]
+include = ["/src/**", "/assets/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/CHANGELOG.md", "/LICENSE"]
 # Both commands are declared below; nothing is discovered by name.
 autobins = false
 
@@ -53,5 +53,12 @@ path = "src/bin/quvyta-code.rs"
 
 [dependencies]
 # The terminal tabs and the sign-in flow run a harness in a pseudo-terminal.
-quvyta-framework = { version = "0.1.8", features = ["pty"] }
+quvyta-framework = { version = "0.1.10", features = ["pty"] }
+# The bridge between tabs reads JSON from containers, which is untrusted input, and merges the
+# harnesses' JSON settings, which the person also edits; `preserve_order` keeps their keys where
+# they wrote them.
+serde_json = { version = "1.0.150", features = ["preserve_order"] }
+# Codex keeps its settings in TOML. The framework already builds this crate; reading is all the
+# bridge needs of it, so nothing but the parser is turned on.
+toml = { version = "1.1.6", default-features = false, features = ["std", "parse", "preserve_order"] }
 

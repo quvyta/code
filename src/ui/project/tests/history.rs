@@ -9,14 +9,22 @@ use super::*;
 use crate::profile::history::Conversation;
 use crate::ui::project::HistoryKey;
 
-/// Now, in milliseconds since the Unix epoch, so "today" on the page is today.
-fn now_ms() -> i64 {
-    let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-    i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
-}
-
 const HOUR_MS: i64 = 3_600_000;
 const DAY_MS: i64 = 24 * HOUR_MS;
+
+/// Noon of today where this machine stands, in milliseconds since the Unix epoch.
+///
+/// The page writes "today" for a conversation used today, and reads the real clock to know what
+/// today is. A test that counted back from the very moment it runs wrote "an hour ago", which is
+/// yesterday when the test runs between midnight and one; the page then said "yesterday" and the
+/// test failed. Counting back from noon keeps a day's worth of hours on either side inside today.
+fn now_ms() -> i64 {
+    let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let real = i64::try_from(since.as_millis()).unwrap_or(i64::MAX);
+    let offset = i64::from(qframe::date::local_offset_minutes()) * 60_000;
+    let noon_here = (real + offset).div_euclid(DAY_MS) * DAY_MS + 12 * HOUR_MS;
+    noon_here - offset
+}
 
 fn conversation(id: &str, title: Option<&str>, used_ms: i64) -> Conversation {
     Conversation { id: id.to_owned(), title: title.map(str::to_owned), used_ms }
@@ -224,7 +232,7 @@ fn the_keyboard_stays_on_its_row_when_a_section_above_fills_in() {
 fn words(screen: &ProjectScreen, key: TabKey) -> Vec<String> {
     let command = screen.launch_command(key).expect("a chosen tab has a command");
     assert_eq!(command.program, Path::new(NO_ENGINE), "only the engine binary is ever started");
-    command.args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect()
+    spelled(&command)
 }
 
 #[test]

@@ -19,14 +19,17 @@ use crate::engine::{
     run::{self, EngineError},
 };
 use crate::profile::identity::{self, Home};
-use crate::profile::{MountAccess, NetworkMode, Profile};
+use crate::profile::{HarnessKind, MountAccess, NetworkMode, Profile};
 use crate::workspace::{ProjectId, ProjectPaths};
 
 /// The places every container agrees on, taken from the one contract the base image is built to.
 ///
 /// They are re-exported here because the plan is what callers and tests reach for when they ask
 /// where a mount lands; the definition stays with the image so the two can never disagree.
-pub use crate::base::paths::{ASSETS_DIR, HOME_DIR, KEEP_ALIVE, PROJECT_DIR};
+pub use crate::base::paths::{ASSETS_DIR, HOME_DIR, KEEP_ALIVE, MCP_DIR, PROJECT_DIR};
+
+/// The label a container carries the digest of the plan it was made from in.
+pub const PLAN_LABEL: &str = "qcode.plan";
 
 /// What an empty terminal tab runs: a login shell in the project's base container.
 pub const SHELL: &[&str] = &["sh", "-l"];
@@ -52,6 +55,20 @@ pub struct ContainerPlan {
     pub assets_access: Access,
     /// Whether the container reaches the network.
     pub network: Network,
+    /// The bridge between the project's tabs, for a profile container: the project's
+    /// `Containers/MCP/` on the host, mounted read-only at [`MCP_DIR`], and the harness whose
+    /// settings the bridge's server is registered in. The base container has none, because no
+    /// harness runs in it.
+    pub bridge: Option<Bridge>,
+}
+
+/// The bridge a profile container carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bridge {
+    /// The project's `Containers/MCP/` on the host.
+    pub folder: PathBuf,
+    /// The harness of the profile.
+    pub harness: HarnessKind,
 }
 
 impl ContainerPlan {
@@ -67,6 +84,7 @@ impl ContainerPlan {
             assets: paths.assets.clone(),
             assets_access: Access::ReadWrite,
             network: Network::Full,
+            bridge: None,
         }
     }
 
@@ -82,6 +100,7 @@ impl ContainerPlan {
             assets: paths.assets.clone(),
             assets_access: access(profile.assets),
             network: network(profile.network),
+            bridge: Some(Bridge { folder: paths.mcp(), harness: profile.harness }),
         }
     }
 
@@ -106,17 +125,46 @@ impl ContainerPlan {
                 access: Access::ReadWrite,
             });
         }
+        if let Some(bridge) = &self.bridge {
+            mounts.push(Mount {
+                source: MountSource::Path(&bridge.folder),
+                target: Path::new(MCP_DIR),
+                access: Access::ReadOnly,
+            });
+        }
         mounts
     }
 
-    /// The command that creates the container, without starting it.
+    /// The command that creates the container, without starting it. The container carries the
+    /// [`digest`](Self::digest) of this plan in [`PLAN_LABEL`].
     #[must_use]
     pub fn create(&self, engine: &Engine, user: HostUser) -> EngineCommand {
+        let digest = self.digest(engine, user);
+        self.create_labelled(engine, user, &[(PLAN_LABEL, &digest)])
+    }
+
+    /// What tells this plan from any other: a digest of the command that creates its container,
+    /// label aside. A container made from another plan (other mounts, another network, a bridge
+    /// it did not have yet) carries another digest, which is how `ensure_running` knows to make
+    /// it again.
+    #[must_use]
+    pub fn digest(&self, engine: &Engine, user: HostUser) -> String {
+        let command = self.create_labelled(engine, user, &[]);
+        let mut spelled = command.program.as_os_str().to_string_lossy().into_owned();
+        for arg in &command.args {
+            spelled.push('\0');
+            spelled.push_str(&arg.to_string_lossy());
+        }
+        format!("{:016x}", base::digest(&spelled))
+    }
+
+    fn create_labelled(&self, engine: &Engine, user: HostUser, labels: &[(&str, &str)]) -> EngineCommand {
         let home = self.home.as_ref().map(Home::volume);
         let mounts = self.mounts(home.as_deref());
         engine.create_container(&ContainerCreate {
             name: &self.name,
             hostname: names::HOSTNAME,
+            labels,
             image: &self.image,
             mounts: &mounts,
             network: self.network,
@@ -132,7 +180,13 @@ impl ContainerPlan {
     /// container: the program is an argument of the engine, never something started here.
     #[must_use]
     pub fn enter(&self, engine: &Engine, command: &[&str]) -> EngineCommand {
-        engine.exec(&Exec { container: &self.name, command })
+        self.enter_with(engine, command, &[])
+    }
+
+    /// [`ContainerPlan::enter`] with environment variables for the program, as `(name, value)`.
+    #[must_use]
+    pub fn enter_with(&self, engine: &Engine, command: &[&str], env: &[(&str, &str)]) -> EngineCommand {
+        engine.exec_with_env(&Exec { container: &self.name, command }, env)
     }
 }
 
@@ -206,35 +260,60 @@ fn written(command: &EngineCommand) -> String {
 /// container is left as it is: it is the project's own copy, and only the person may have it
 /// rewritten.
 ///
+/// A container takes its mounts and its network when it is made, so a stopped container made
+/// from another plan than this one (its [`PLAN_LABEL`] says so) is made again: removed and
+/// created anew, which keeps every named volume and so the home with the harness's login,
+/// history and settings in it. What was only in the container itself, outside the home and the
+/// project's folders, goes with it, as it does when the container is removed by hand. A running
+/// container is never made again, because tabs are working in it; it keeps its old plan until
+/// it is next stopped, which happens by the latest when no QCode is open.
+///
 /// This runs engine commands and waits for them, so it belongs on a background thread: give it
 /// to `Command::perform`, never to `update` or `view`.
 ///
 /// # Errors
 ///
 /// The engine's own words when it cannot be started, or refuses to build the base image, to
-/// create or start the container, or to copy the login in.
+/// create or start the container, or to copy the login in; the machine's when the bridge's
+/// folder cannot be made.
 pub fn ensure_running(engine: &Engine, plan: &ContainerPlan, user: HostUser) -> Result<(), LaunchFailure> {
     // A container QCode cannot ask after is one that is not there: both engines answer an
     // unknown name with an error rather than with a state.
     let state = run::capture(&engine.container_state(&plan.name)).map(|word| ContainerState::parse(&word)).ok();
-    match state {
+    let exists = match state {
         Some(ContainerState::Running) => return Ok(()),
-        Some(_) => {}
-        None => {
-            if plan.image == names::BASE_IMAGE {
-                base::ensure(engine, &|| false, &mut |_| {}).map_err(|failure| LaunchFailure::base(&failure))?;
+        Some(_) => {
+            let made_from = run::capture(&engine.container_label(&plan.name, PLAN_LABEL)).unwrap_or_default();
+            let current = made_from.trim() == plan.digest(engine, user);
+            if !current {
+                run::capture(&engine.remove_container(&plan.name)).map_err(|error| LaunchFailure::from(&error))?;
             }
-            // Asked before the creation, because the creation is what makes the volume.
-            let mut new_home = None;
-            if let Some(home) = &plan.home
-                && !identity::home_exists(engine, home).map_err(|error| LaunchFailure::from(&error))?
-            {
-                new_home = Some(home);
-            }
-            run::capture(&plan.create(engine, user)).map_err(|error| LaunchFailure::from(&error))?;
-            if let Some(home) = new_home {
-                identity::first_fill(engine, home, user).map_err(|error| LaunchFailure::from(&error))?;
-            }
+            current
+        }
+        None => false,
+    };
+    if !exists {
+        if plan.image == names::BASE_IMAGE {
+            base::ensure(engine, &|| false, &mut |_| {}).map_err(|failure| LaunchFailure::base(&failure))?;
+        }
+        // An engine mounting a folder that is not there fails, or makes it as its own user; the
+        // folder is made here, as the person.
+        if let Some(bridge) = &plan.bridge {
+            std::fs::create_dir_all(&bridge.folder).map_err(|error| LaunchFailure {
+                command: String::new(),
+                output: format!("{}: {error}", bridge.folder.display()),
+            })?;
+        }
+        // Asked before the creation, because the creation is what makes the volume.
+        let mut new_home = None;
+        if let Some(home) = &plan.home
+            && !identity::home_exists(engine, home).map_err(|error| LaunchFailure::from(&error))?
+        {
+            new_home = Some(home);
+        }
+        run::capture(&plan.create(engine, user)).map_err(|error| LaunchFailure::from(&error))?;
+        if let Some(home) = new_home {
+            identity::first_fill(engine, home, user).map_err(|error| LaunchFailure::from(&error))?;
         }
     }
     run::capture(&engine.start_container(&plan.name)).map_err(|error| LaunchFailure::from(&error))?;

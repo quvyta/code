@@ -69,6 +69,49 @@ pub fn capture(command: &EngineCommand) -> Result<String, EngineError> {
     }))
 }
 
+/// Runs `command`, writes `input` to its standard input and closes it, and returns what it
+/// printed to standard output, the way [`capture`] does.
+///
+/// The input is written on a thread of its own while the output is read here, so a command that
+/// prints before it has read everything cannot leave both sides waiting on a full pipe.
+///
+/// # Errors
+///
+/// When the engine cannot be started, or runs and fails.
+pub fn feed(command: &EngineCommand, input: &[u8]) -> Result<String, EngineError> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let not_runnable = |error| EngineError::NotRunnable { command: command.clone(), error };
+    let mut child = Command::new(&command.program)
+        .args(&command.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(not_runnable)?;
+    let writer = child.stdin.take().map(|mut stdin| {
+        let input = input.to_vec();
+        std::thread::spawn(move || {
+            // A command that stops reading early says why in its output, which is what the
+            // person is shown; the broken pipe itself adds nothing.
+            let _ = stdin.write_all(&input);
+        })
+    });
+    let output = child.wait_with_output().map_err(not_runnable)?;
+    if let Some(writer) = writer {
+        let _ = writer.join();
+    }
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+    }
+    Err(EngineError::Failed(Failure {
+        command: command.clone(),
+        code: output.status.code(),
+        output: both(&String::from_utf8_lossy(&output.stdout), &String::from_utf8_lossy(&output.stderr)),
+    }))
+}
+
 /// Joins what a command printed to its two streams into the one text the person is shown.
 fn both(out: &str, err: &str) -> String {
     match (out.trim_end(), err.trim_end()) {
@@ -141,7 +184,7 @@ pub fn build_image(
 
 #[cfg(test)]
 mod tests {
-    use super::{EngineError, capture, stream};
+    use super::{EngineError, capture, feed, stream};
     use crate::engine::EngineCommand;
     use std::cell::Cell;
     use std::ffi::OsString;
@@ -167,6 +210,17 @@ mod tests {
         let EngineError::Failed(failure) = error else { panic!("the command ran and refused") };
         assert_eq!(failure.code, Some(3));
         assert_eq!(failure.output, "out\nerr");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn what_is_fed_reaches_the_command_whole_even_past_the_pipe_size() {
+        // Larger than any pipe buffer, so a writer that waited for the reader would hang here.
+        let input = "x".repeat(300_000);
+        assert_eq!(feed(&shell("wc -c"), input.as_bytes()).expect("the shell runs").trim(), "300000");
+        let error = feed(&shell("cat > /dev/null; exit 4"), b"text").expect_err("the script fails");
+        let EngineError::Failed(failure) = error else { panic!("the command ran and refused") };
+        assert_eq!(failure.code, Some(4));
     }
 
     #[test]

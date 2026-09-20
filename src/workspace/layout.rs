@@ -72,6 +72,17 @@ impl ProjectPaths {
         self.harness.join(profile)
     }
 
+    /// The folder the bridge between the project's tabs lives in: the socket QCode answers on
+    /// while the project is open, and the server the harnesses start. Every profile container
+    /// of the project sees it read-only.
+    ///
+    /// Not made with the project: opening it makes the folder, so a project never opened since
+    /// the bridge came has none.
+    #[must_use]
+    pub fn mcp(&self) -> PathBuf {
+        self.root.join("Containers").join("MCP")
+    }
+
     /// The folder the project's backups are kept in.
     ///
     /// Not made with the project: the first backup makes it, so a project that has never been

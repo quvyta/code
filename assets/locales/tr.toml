@@ -411,6 +411,41 @@ backup.restore-assets-title = "Varlıklar {time} haline dönsün mü?"
 backup.restore-assets-text = "Varlıklar klasöründeki bütün dosyalar o anki hallerine döner. Hiçbir şey silinmez: sonradan eklenen dosyalar yerinde kalır. Önce şimdiki hal yedeklenir, bu yüzden bu da geri alınabilir."
 backup.restored-assets = "Varlıklar eski haline döndü"
 
+# Sekmeler arası köprü: kişiye sorulan ve gösterilenler, bir sekmenin ajanı öbür sekmeleri
+# listelediğinde ya da birine mesaj gönderdiğinde okuduğu cevaplar.
+[bridge]
+closed = "{project} projesinin sekmeleri birbirine mesaj gönderemiyor"
+asking = "Cevap bekleniyor"
+waiting = { one = "{from} sekmesinden bir mesaj burada bekliyor", other = "Burada {n} mesaj bekliyor, sonuncusu {from} sekmesinden" }
+letter.from = "Gönderen: {from}"
+letters.show = "Oku"
+letters.hide = "Gizle"
+letters.discard = "At"
+ask.title = "{from}, {to} sekmesine mesaj gönderebilsin mi?"
+ask.message = "İlk mesajı:\n\n{text}\n\nÖbür sekmedeki ajan okuduğunu, o sekmenin yapabildiği her şeyle uygular. Cevabın bu iki sekme için QCode kapanana kadar geçerli."
+ask.allow = "İzin ver"
+ask.deny = "Reddet"
+unregistered.title = "Bu projedeki {harness} öbür sekmelere ulaşamıyor"
+unregistered.taken = "Ayar dosyası {file} içinde qcode adlı, başka bir şey başlatan bir sunucu zaten var; dosyaya dokunulmadı."
+unregistered.unreadable = "Ayar dosyası {file}, {place} konumunda okunamadı; dosyaya dokunulmadı."
+answer.malformed = "QCode soruyu okuyamadı. Hiçbir şey gönderilmedi."
+answer.stranger = "QCode bunun hangi sekme olduğunu bilmiyor: QCode başlatmamış ya da sekme kapanmış. Hiçbir şey gönderilmedi."
+answer.alone = "Bu projede ajan çalıştıran başka sekme yok."
+answer.listed = { one = "Ajan çalıştıran bir sekme daha var:", other = "Ajan çalıştıran {n} sekme daha var:" }
+answer.tab = "sekme {tab}: {title}, {harness}, {network}"
+answer.online = "ağa açık"
+answer.offline = "ağa kapalı"
+answer.no-tab = "Bu projede {tab} diye başka bir ajan sekmesi yok. Olanları list_tabs sayar. Hiçbir şey gönderilmedi."
+answer.empty = "Mesaj boş. Hiçbir şey gönderilmedi."
+answer.long = "Mesaj {most} karakterden uzun. Uzun içeriği projede bir dosyaya koyup yolunu gönder. Hiçbir şey gönderilmedi."
+answer.network = "Bu sekmenin ağı yok, {tab} sekmesinin var; QCode buradan oraya gönderime izin vermez, çünkü öbür sekme kendisine verileni dışarı taşıyabilir. Hiçbir şey gönderilmedi."
+answer.chain = "Bu, sekmeler arasındaki tek bir yazışmanın {next}. mesajı olurdu; QCode iki ajan birbirine sonsuza kadar cevap vermesin diye bir yazışmayı {most} mesajda bitirir. Hiçbir şey gönderilmedi. Bu sekmeye on dakika hiçbir şey gönderilmezse yeni bir yazışma başlar."
+answer.pace = "Bu sekme son {seconds} saniyede {most} mesaj gönderdi; QCode bir sekmeye bundan fazlasını göndertmez. Hiçbir şey gönderilmedi; bir dakika sonra yeniden dene."
+answer.denied = "Kişi bu sekmenin {tab} sekmesine mesaj göndermesine izin vermedi. Hiçbir şey gönderilmedi. Yeniden deneme; bunun yerine bu sekmedeki kişiye sor."
+answer.gone = "Sekme, kişi cevap vermeden kapandı. Hiçbir şey gönderilmedi."
+answer.asking = "Kişi bu sekmenin o sekmeye gönderip gönderemeyeceğini henüz cevaplamadı. Mesaj cevabı bekliyor: izin verirse o zaman iletilir, vermezse atılır."
+answer.queued = "Alındı. Mesaj {tab} sekmesinde bekliyor; kişi orada kimin gönderdiğini görüyor ve okuyor. QCode onu henüz o ajanın istemine yazamıyor, bu yüzden ajan kendiliğinden işe koyulmaz."
+
 [settings]
 title = "Ayarlar"
 

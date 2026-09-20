@@ -5,6 +5,16 @@ Every release of quvyta-code, newest first. The format follows
 [Semantic Versioning](https://semver.org/); while the version starts with 0, a minor release may
 change files qcode writes, and the notes say so when it does.
 
+## 0.1.8 - 2026-09-20
+
+### Added
+
+- Tabs can talk to each other. The agent in one harness tab lists the project's other agent tabs and sends them a message, through a small server qcode registers in each harness's own settings, beside anything you put there. It runs inside the container and reaches qcode through a socket in the project's `Containers/MCP/` folder, so a profile without the network can use it too. You approve the first message between any two tabs; a tab without the network never sends to one with it; and an exchange stops after 6 messages, with each tab sending at most 5 a minute. A message that is taken waits in the tab it was sent to, with **Read** and **Discard**; qcode does not type it into the receiving harness's prompt yet.
+
+### Changed
+
+- The picture that opens the README now shows an opencode tab answering a question about the project, with a Claude Code tab beside it, and is recorded with the framework's own recorder: 411 KB instead of 3.8 MB.
+
 ## 0.1.7 - 2026-09-19
 
 ### Added

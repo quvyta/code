@@ -62,6 +62,7 @@ impl Scratch {
             assets: self.0.join("Assets"),
             assets_access: Access::ReadWrite,
             network: Network::Full,
+            bridge: None,
         }
     }
 }
@@ -121,6 +122,71 @@ fn every_container_of_the_plan_answers_to_the_same_machine_name() {
         // Not the engine's random name, and not this machine's either: the one QCode fixed, so a
         // login keyed to the machine name decrypts in whichever container it is copied into.
         assert_eq!(answered, [HOSTNAME, HOSTNAME], "{:?}", engine.kind());
+    }
+}
+
+/// The container and home of the check that a container made from an older plan is made again.
+const REMADE: &str = "qcode-uiprojectlive-remade";
+
+#[test]
+#[ignore = "needs a container engine; run with QCODE_CONTAINER_TESTS=1"]
+fn a_stopped_container_of_an_older_plan_is_made_again_with_the_bridge_and_keeps_its_home() {
+    use crate::base::paths::{HOME_DIR, MCP_DIR};
+    use crate::engine::names::BASE_IMAGE;
+    use crate::profile::identity::Home;
+    use crate::profile::{HarnessKind, SafeName};
+    use crate::workspace::ProjectId;
+
+    use super::plan::{Bridge, PLAN_LABEL, ensure_running};
+
+    for engine in engines() {
+        crate::base::ensure(&engine, &|| false, &mut |_| {}).expect("the base image is there");
+        let scratch = Scratch::new();
+        let user = HostUser::current().expect("the current user");
+        let home = Home::new(
+            SafeName::parse("remade").expect("a safe name"),
+            ProjectId::parse("uiprojectlive").expect("a project id"),
+        );
+        let _ = capture(&engine.remove_container(REMADE));
+        let _ = capture(&engine.remove_volume(&home.volume()));
+        let run = |script: &str| {
+            capture(&engine.exec_without_terminal(&Exec { container: REMADE, command: &["sh", "-c", script] }))
+        };
+
+        // A container as QCode made it before the bridge: no mount of Containers/MCP.
+        let older = ContainerPlan { image: BASE_IMAGE.to_owned(), home: Some(home.clone()), ..scratch.plan(REMADE) };
+        ensure_running(&engine, &older, user).expect("the older container comes up");
+        run(&format!("echo kept > {HOME_DIR}/marker")).expect("the home is written");
+        capture(&engine.stop_container(REMADE)).expect("the container stops");
+
+        let folder = scratch.0.join("Containers").join("MCP");
+        let newer = ContainerPlan {
+            bridge: Some(Bridge { folder: folder.clone(), harness: HarnessKind::ClaudeCode }),
+            ..older.clone()
+        };
+        assert_ne!(older.digest(&engine, user), newer.digest(&engine, user), "the bridge changes the plan");
+        ensure_running(&engine, &newer, user).expect("the newer container comes up");
+        let label = capture(&engine.container_label(REMADE, PLAN_LABEL)).expect("the label is read");
+        assert_eq!(label.trim(), newer.digest(&engine, user), "{:?}: the container was made again", engine.kind());
+        assert_eq!(run(&format!("cat {HOME_DIR}/marker")).expect("the home is read").trim(), "kept");
+        std::fs::write(folder.join("probe"), "from the host").expect("the folder was made as the person");
+        assert_eq!(run(&format!("cat {MCP_DIR}/probe")).expect("the bridge is mounted").trim(), "from the host");
+        assert!(run(&format!("touch {MCP_DIR}/written")).is_err(), "{:?}: the bridge is read-only", engine.kind());
+
+        // Running, a container is never made again: tabs work in it.
+        ensure_running(&engine, &older, user).expect("the running container is left as it is");
+        let label = capture(&engine.container_label(REMADE, PLAN_LABEL)).expect("the label is read");
+        assert_eq!(label.trim(), newer.digest(&engine, user));
+
+        // Stopped and asked for with the same plan, it is only started: what was written into the
+        // container itself is still there.
+        run("echo same > /tmp/layer").expect("the container's own files are written");
+        capture(&engine.stop_container(REMADE)).expect("the container stops");
+        ensure_running(&engine, &newer, user).expect("the container starts again");
+        assert_eq!(run("cat /tmp/layer").expect("the same container").trim(), "same");
+
+        capture(&engine.remove_container(REMADE)).expect("the container is removed");
+        capture(&engine.remove_volume(&home.volume())).expect("the home is removed");
     }
 }
 

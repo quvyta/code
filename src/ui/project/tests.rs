@@ -17,7 +17,7 @@ use qframe::prelude::*;
 use qframe::runtime::Harness;
 use qframe::widgets::{TerminalEvent, TerminalSession};
 
-use crate::engine::{Container, ContainerState, Engine, EngineKind, HostUser};
+use crate::engine::{Container, ContainerState, Engine, EngineCommand, EngineKind, HostUser};
 use crate::profile::{AccountKind, HarnessKind, MountAccess, NetworkMode, Profile, SafeName, Template};
 use crate::workspace::{
     ProjectFile, ProjectId, ProjectPaths, ProjectProfile, Session, SessionProject, SessionTab, SessionTabKind,
@@ -26,6 +26,7 @@ use crate::workspace::{
 use super::plan::{PROJECT_DIR, SHELL};
 
 mod backups;
+mod bridge;
 mod files;
 mod history;
 mod registry;
@@ -204,6 +205,21 @@ fn key(screen: &ProjectScreen, index: usize) -> TabKey {
     screen.project().expect("a project is open").tabs()[index].key()
 }
 
+/// The words of `command` without the bridge's token: it is random, so a test that spells out
+/// a command leaves it out, and `tests/bridge.rs` checks it is there.
+fn spelled(command: &EngineCommand) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut args = command.args.iter().map(|arg| arg.to_string_lossy().into_owned()).peekable();
+    while let Some(word) = args.next() {
+        if word == "--env" && args.peek().is_some_and(|next| next.starts_with("QCODE_BRIDGE=")) {
+            args.next();
+            continue;
+        }
+        words.push(word);
+    }
+    words
+}
+
 #[test]
 fn a_tab_opens_inside_a_container_and_never_on_this_machine() {
     let scratch = Scratch::new("inside");
@@ -217,7 +233,7 @@ fn a_tab_opens_inside_a_container_and_never_on_this_machine() {
     assert_eq!(words, ["exec", "--interactive", "--tty", "qcode-firefly-base", SHELL[0], SHELL[1]]);
 
     let harness = screen.launch_command(key(&screen, 1)).expect("the profile tab has a command");
-    let words: Vec<String> = harness.args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
+    let words = spelled(&harness);
     assert_eq!(harness.program, Path::new(NO_ENGINE));
     assert_eq!(
         words,
@@ -248,6 +264,35 @@ fn the_container_a_tab_enters_carries_the_project_and_the_profiles_permissions()
     assert!(words.contains(&"--userns=keep-id".to_owned()), "podman maps the user its own way: {words:?}");
     assert!(words.iter().any(|word| word.contains("/Assets:/work/Assets:ro")), "read-only assets: {words:?}");
     assert!(words.iter().any(|word| word.starts_with("qcode-home-firefly-claude-sub:")), "{words:?}");
+    let bridge = format!("{}:/run/qcode-mcp:ro,z", scratch.0.join("Containers").join("MCP").display());
+    assert!(words.contains(&bridge), "the profile container sees the bridge, read-only: {words:?}");
+    let label = format!("qcode.plan={}", profile.digest(engine, user));
+    assert!(words.contains(&label), "the container carries the plan it was made from: {words:?}");
+
+    let base_words: Vec<String> =
+        base.create(engine, user).args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
+    assert!(!base_words.iter().any(|word| word.contains("qcode-mcp")), "no harness, no bridge: {base_words:?}");
+}
+
+#[test]
+fn a_plan_that_mounts_or_reaches_anything_else_is_another_plan() {
+    let scratch = Scratch::new("digest");
+    let screen = one_project(&scratch);
+    let open = screen.project().expect("a project is open");
+    let engine = screen.engine().expect("an engine");
+    let user = HostUser::Ids { uid: 1000, gid: 1000 };
+    let plan = open.plan(&TabKind::Profile("claude-sub".to_owned())).expect("the profile container is planned");
+    assert_eq!(plan.digest(engine, user), plan.digest(engine, user), "the same plan, the same digest");
+    let without_bridge = super::ContainerPlan { bridge: None, ..plan.clone() };
+    let without_network = super::ContainerPlan { network: crate::engine::Network::None, ..plan.clone() };
+    for other in [without_bridge.digest(engine, user), without_network.digest(engine, user)] {
+        assert_ne!(other, plan.digest(engine, user));
+    }
+    // Docker names the user in the command; podman maps whoever runs it, so there it is not
+    // part of the plan.
+    let docker = Engine::new(EngineKind::Docker, NO_ENGINE);
+    let someone_else = HostUser::Ids { uid: 1001, gid: 1001 };
+    assert_ne!(plan.digest(&docker, user), plan.digest(&docker, someone_else));
 }
 
 #[test]
@@ -428,7 +473,7 @@ fn choosing_turns_the_same_tab_into_a_shell_or_a_chat_inside_a_container() {
     let words = |key: TabKey| -> Vec<String> {
         let command = screen.launch_command(key).expect("a chosen tab has a command");
         assert_eq!(command.program, Path::new(NO_ENGINE), "only the engine binary is ever started");
-        command.args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect()
+        spelled(&command)
     };
     assert_eq!(words(first)[..4], ["exec", "--interactive", "--tty", "qcode-firefly-claude-sub"]);
     assert_eq!(words(second)[..4], ["exec", "--interactive", "--tty", "qcode-firefly-base"]);

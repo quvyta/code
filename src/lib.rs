@@ -11,6 +11,7 @@
 
 pub mod backup;
 pub mod base;
+pub mod bridge;
 pub mod engine;
 pub mod profile;
 pub mod service;
@@ -365,8 +366,9 @@ impl QCode {
         self.refreshed_home()
     }
 
-    /// The same application with the project screen's file tree following the disk. A test's
-    /// application leaves it off, because its harness would wait for the disk forever.
+    /// The same application with the project screen's file tree following the disk and its
+    /// projects listening for their tabs' agents. A test's application leaves both off, because
+    /// its harness would wait for the disk and the socket forever.
     fn following_files(mut self) -> Self {
         self.live_files = true;
         self
@@ -580,7 +582,8 @@ impl QCode {
                 let mut screen = ProjectScreen::new(self.found.clone(), self.user, vec![project])
                     .with_registry(self.registry.clone())
                     .backing_up(self.config.backup_every())
-                    .watching(self.live_files);
+                    .watching(self.live_files)
+                    .bridging(self.live_files);
                 screen.set_editor(self.config.editor());
                 screen.set_sound(self.config.sound());
                 let entered = ui::project::opened(&mut screen);
@@ -621,7 +624,8 @@ impl QCode {
         let mut screen = ProjectScreen::new(self.found.clone(), self.user, projects)
             .with_registry(self.registry.clone())
             .backing_up(self.config.backup_every())
-            .watching(self.live_files);
+            .watching(self.live_files)
+            .bridging(self.live_files);
         screen.set_editor(self.config.editor());
         screen.set_sound(self.config.sound());
         for (index, id) in ids.iter().enumerate() {

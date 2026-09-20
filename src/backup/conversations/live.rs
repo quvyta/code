@@ -155,6 +155,7 @@ fn conversations_are_backed_up_without_the_login_and_brought_back_without_losing
         capture(&engine.create_container(&ContainerCreate {
             name: &container,
             hostname: HOSTNAME,
+            labels: &[],
             image: BASE_IMAGE,
             mounts: &mounts,
             network: Network::None,

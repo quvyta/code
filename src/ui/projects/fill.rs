@@ -128,6 +128,7 @@ impl ClonePlan {
         let create = engine.create_container(&ContainerCreate {
             name: &container,
             hostname: names::HOSTNAME,
+            labels: &[],
             image: names::BASE_IMAGE,
             mounts: &mounts,
             // A clone reaches the network by definition; a profile's own setting is another matter.

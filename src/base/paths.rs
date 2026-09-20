@@ -29,6 +29,15 @@ pub const BACKUP_DIR: &str = "/work/Backup";
 /// another project.
 pub const HOME_DIR: &str = "/home/qcode";
 
+/// Where a profile container sees the project's `Containers/MCP/` folder: the socket QCode
+/// answers the bridge between tabs on, and the server a harness starts to reach it.
+///
+/// Outside the home directory, so no home volume is mounted over it, and outside [`WORK_DIR`],
+/// which is the project's material. It is mounted read-only: the container talks to the socket,
+/// which a read-only mount allows, and may not replace the server every harness of the project
+/// starts. The image does not make it; the engine makes the place a mount lands on.
+pub const MCP_DIR: &str = "/run/qcode-mcp";
+
 /// The user the image belongs to.
 ///
 /// Not who the container runs as on Linux — that is the person's own user — but who owns what
@@ -59,12 +68,12 @@ pub const OPEN_HOME: &str = "qcode-open-home";
 
 #[cfg(test)]
 mod tests {
-    use super::{ASSETS_DIR, BACKUP_DIR, HOME_DIR, KEEP_ALIVE, OPEN_HOME, PROJECT_DIR, USER, WORK_DIR};
+    use super::{ASSETS_DIR, BACKUP_DIR, HOME_DIR, KEEP_ALIVE, MCP_DIR, OPEN_HOME, PROJECT_DIR, USER, WORK_DIR};
     use crate::base::CONTAINERFILE;
 
     #[test]
     fn every_path_is_absolute_and_the_project_material_is_under_one_roof() {
-        for path in [WORK_DIR, PROJECT_DIR, ASSETS_DIR, BACKUP_DIR, HOME_DIR] {
+        for path in [WORK_DIR, PROJECT_DIR, ASSETS_DIR, BACKUP_DIR, HOME_DIR, MCP_DIR] {
             assert!(path.starts_with('/'), "{path}");
             assert!(!path.ends_with('/'), "{path}");
         }
@@ -74,6 +83,7 @@ mod tests {
         assert_ne!(PROJECT_DIR, ASSETS_DIR);
         assert_ne!(PROJECT_DIR, BACKUP_DIR);
         assert!(!HOME_DIR.starts_with(&format!("{WORK_DIR}/")), "a home inside the project would be mounted over");
+        assert!(!MCP_DIR.starts_with(&format!("{WORK_DIR}/")) && !MCP_DIR.starts_with(&format!("{HOME_DIR}/")));
     }
 
     #[test]

@@ -109,11 +109,33 @@ impl Lab {
 /// person, without a network: the install already happened, and nothing checked afterwards
 /// should need the outside.
 fn open(engine: Engine, profile: &Profile) -> Lab {
-    let record = profile.harness.record();
-    let container = format!("qcode-harnesstest-{}", record.id);
-    clear(&engine, profile, &container);
+    let container = format!("qcode-harnesstest-{}", profile.harness.record().id);
+    let _ = capture(&engine.remove_container(&container));
+    build(&engine, profile);
+    capture(&engine.create_container(&ContainerCreate {
+        name: &container,
+        hostname: HOSTNAME,
+        labels: &[],
+        image: &profile.image(),
+        mounts: &[],
+        network: Network::None,
+        user: HostUser::current().expect("the current user"),
+        workdir: Some(Path::new(PROJECT_DIR)),
+        command: KEEP_ALIVE,
+    }))
+    .expect("the container is made");
+    capture(&engine.start_container(&container)).expect("the container starts");
+    Lab { engine, container }
+}
 
-    crate::base::ensure(&engine, &|| false, &mut |_| {})
+/// Builds the image of `profile` from its recipe, on a copy of the base image named
+/// [`TEST_BASE`] so the machine's own `qcode/base` is never replaced. [`clear`] takes both away.
+pub(crate) fn build(engine: &Engine, profile: &Profile) {
+    let record = profile.harness.record();
+    let _ = capture(&engine.remove_image(&profile.image()));
+    let _ = capture(&engine.remove_image(TEST_BASE));
+
+    crate::base::ensure(engine, &|| false, &mut |_| {})
         .unwrap_or_else(|error| panic!("the base image does not build on {:?}: {error:?}", engine.kind()));
 
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
@@ -123,7 +145,7 @@ fn open(engine: Engine, profile: &Profile) -> Lab {
     let copy = folder.join("base.Containerfile");
     std::fs::write(&copy, format!("FROM {BASE_IMAGE}\n")).expect("a Containerfile");
     build_image(
-        &engine,
+        engine,
         &ImageBuild { image: TEST_BASE, containerfile: &copy, context: &folder },
         &|| false,
         &mut |_| {},
@@ -142,7 +164,7 @@ fn open(engine: Engine, profile: &Profile) -> Lab {
     }
     let mut said = String::new();
     let built = build_image(
-        &engine,
+        engine,
         &ImageBuild { image: &profile.image(), containerfile: &folder.join("Containerfile"), context: &folder },
         &|| false,
         &mut |line| {
@@ -152,24 +174,10 @@ fn open(engine: Engine, profile: &Profile) -> Lab {
     );
     let _ = std::fs::remove_dir_all(&folder);
     assert!(built.is_ok(), "{} on {:?} did not build:\n{said}", record.id, engine.kind());
-
-    capture(&engine.create_container(&ContainerCreate {
-        name: &container,
-        hostname: HOSTNAME,
-        image: &profile.image(),
-        mounts: &[],
-        network: Network::None,
-        user: HostUser::current().expect("the current user"),
-        workdir: Some(Path::new(PROJECT_DIR)),
-        command: KEEP_ALIVE,
-    }))
-    .expect("the container is made");
-    capture(&engine.start_container(&container)).expect("the container starts");
-    Lab { engine, container }
 }
 
 /// Takes away everything a run makes, except the machine's own base image.
-fn clear(engine: &Engine, profile: &Profile, container: &str) {
+pub(crate) fn clear(engine: &Engine, profile: &Profile, container: &str) {
     let _ = capture(&engine.remove_container(container));
     let _ = capture(&engine.remove_image(&profile.image()));
     let _ = capture(&engine.remove_image(TEST_BASE));

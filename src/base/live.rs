@@ -138,6 +138,7 @@ fn start(engine: &Engine, image: &str, project: &Path, assets: &Path) {
     capture(&engine.create_container(&ContainerCreate {
         name: CONTAINER,
         hostname: HOSTNAME,
+        labels: &[],
         image,
         mounts: &mounts,
         network: Network::Full,

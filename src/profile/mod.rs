@@ -12,7 +12,7 @@ pub mod identity;
 mod definition;
 mod harness;
 #[cfg(test)]
-mod harness_live;
+pub(crate) mod harness_live;
 #[cfg(test)]
 mod history_live;
 #[cfg(test)]
@@ -21,6 +21,6 @@ mod name;
 mod template;
 
 pub use definition::{Loaded, MountAccess, NetworkMode, Profile};
-pub use harness::{AccountKind, ConfigFile, Harness, HarnessKind, Resume};
+pub use harness::{AccountKind, ConfigFile, Harness, HarnessKind, McpSettings, McpShape, Resume};
 pub use name::SafeName;
 pub use template::Template;

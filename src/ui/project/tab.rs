@@ -6,7 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use qframe::widgets::TerminalSession;
 
 use crate::base::apps::Quiet;
+use crate::bridge;
 
+use super::bridge::Letter;
 use super::plan::LaunchFailure;
 
 /// A tab's identity, which stays the same while tabs are closed and dragged around it.
@@ -151,6 +153,12 @@ pub struct Tab {
     /// Counts the sessions this tab has started, so the watch of a session that was replaced by
     /// a restart is recognised and ignored.
     run: u64,
+    /// What a harness tab's agent hands QCode's bridge to say which tab it is in.
+    token: String,
+    /// Messages other tabs' agents sent this tab that wait in it, oldest first.
+    letters: Vec<Letter>,
+    /// Whether the waiting letters are shown.
+    letters_shown: bool,
 }
 
 impl Tab {
@@ -172,6 +180,9 @@ impl Tab {
             socket: None,
             held: false,
             run: 0,
+            token: bridge::token(),
+            letters: Vec::new(),
+            letters_shown: false,
         }
     }
 
@@ -293,6 +304,40 @@ impl Tab {
     #[must_use]
     pub fn run(&self) -> u64 {
         self.run
+    }
+
+    /// The token a harness tab is started with, by which the bridge knows it.
+    #[must_use]
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// The messages that wait in this tab, oldest first.
+    #[must_use]
+    pub fn letters(&self) -> &[Letter] {
+        &self.letters
+    }
+
+    /// Whether the waiting messages are shown.
+    #[must_use]
+    pub fn letters_shown(&self) -> bool {
+        self.letters_shown
+    }
+
+    /// Leaves `letter` waiting in the tab.
+    pub fn receive(&mut self, letter: Letter) {
+        self.letters.push(letter);
+    }
+
+    /// Shows the waiting messages, or hides them.
+    pub fn show_letters(&mut self, shown: bool) {
+        self.letters_shown = shown;
+    }
+
+    /// Throws the waiting messages away.
+    pub fn discard_letters(&mut self) {
+        self.letters.clear();
+        self.letters_shown = false;
     }
 
     /// Turns a blank tab into a tab of `kind` showing `conversation`, opened now and waiting for

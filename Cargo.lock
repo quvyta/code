@@ -576,16 +576,18 @@ dependencies = [
 
 [[package]]
 name = "quvyta-code"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "quvyta-framework",
+ "serde_json",
+ "toml",
 ]
 
 [[package]]
 name = "quvyta-framework"
-version = "0.1.8"
+version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58bdf2b720c210b0b485c7ec8e9d81c4a5b11bf4605e69d8ed73029eccd490f2"
+checksum = "f90c5c6763803c0cb40de17a1fe1c849b46a90b23b620f691a2ead199cfb681d"
 dependencies = [
  "crossterm",
  "dirs",
@@ -729,6 +731,20 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.6",
+]
+
+[[package]]
+name = "serde_json"
+version = "1.0.151"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "memchr",
+ "serde",
+ "serde_core",
+ "zmij",
 ]
 
 [[package]]
@@ -1060,3 +1076,9 @@ checksum = "80d0f4e272c85def139476380b12f9ac60926689dd2e01d4923222f40580869d"
 dependencies = [
  "winapi",
 ]
+
+[[package]]
+name = "zmij"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"

@@ -156,6 +156,7 @@ pub fn open_login(engine: &Engine, profile: &Profile) -> Result<LoginContainer, 
     let request = ContainerCreate {
         name: &name,
         hostname: names::HOSTNAME,
+        labels: &[],
         image: &profile.image(),
         mounts: &mounts,
         network: Network::Full,
@@ -224,6 +225,7 @@ pub fn store_login(engine: &Engine, profile: &Profile, container: &LoginContaine
     let request = ContainerCreate {
         name: &holder,
         hostname: names::HOSTNAME,
+        labels: &[],
         image: &profile.image(),
         mounts: &mounts,
         network: Network::None,

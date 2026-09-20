@@ -65,8 +65,10 @@ pub fn revision() -> String {
     format!("{:016x}", digest(CONTAINERFILE))
 }
 
-/// FNV-1a over the bytes of `text`.
-fn digest(text: &str) -> u64 {
+/// FNV-1a over the bytes of `text`: a short digest that tells two descriptions apart, where
+/// nothing depends on it being hard to forge.
+#[must_use]
+pub fn digest(text: &str) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
     text.bytes().fold(OFFSET, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(PRIME))

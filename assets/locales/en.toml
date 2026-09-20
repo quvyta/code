@@ -410,6 +410,41 @@ backup.restore-assets-title = "Bring back Assets of {time}?"
 backup.restore-assets-text = "Every file in Assets comes back as it was then. Nothing is deleted: files added since stay where they are. How things are now is backed up first, so this can be undone too."
 backup.restored-assets = "Assets are back as they were"
 
+# The bridge between tabs: what the person is asked and shown, and the answers the agent of a
+# tab reads when it lists the other tabs or sends one of them a message.
+[bridge]
+closed = "The tabs of {project} cannot send each other messages"
+asking = "Waiting for an answer"
+waiting = { one = "A message from {from} waits here", other = "{n} messages wait here, the last from {from}" }
+letter.from = "From {from}"
+letters.show = "Read"
+letters.hide = "Hide"
+letters.discard = "Discard"
+ask.title = "Let {from} send messages to {to}?"
+ask.message = "Its first message:\n\n{text}\n\nThe agent in the other tab acts on what it reads, with everything that tab may do. Your answer holds for these two tabs until QCode closes."
+ask.allow = "Allow"
+ask.deny = "Deny"
+unregistered.title = "{harness} in this project cannot reach the other tabs"
+unregistered.taken = "Its settings file {file} already has a server named qcode that starts something else, so it was left as it is."
+unregistered.unreadable = "Its settings file {file} could not be read at {place}, so it was left as it is."
+answer.malformed = "QCode could not read the question. Nothing was sent."
+answer.stranger = "QCode does not know which tab this is: it was not started by QCode, or the tab was closed. Nothing was sent."
+answer.alone = "No other tab of this project runs an agent."
+answer.listed = { one = "One other tab runs an agent:", other = "{n} other tabs run an agent:" }
+answer.tab = "tab {tab}: {title}, {harness}, {network}"
+answer.online = "with the network"
+answer.offline = "without the network"
+answer.no-tab = "There is no other agent tab {tab} in this project. list_tabs names the ones there are. Nothing was sent."
+answer.empty = "The message is empty. Nothing was sent."
+answer.long = "The message is longer than {most} characters. Put long content in a file of the project and send its path. Nothing was sent."
+answer.network = "This tab has no network and {tab} has it, so QCode does not let it send there: the other tab could carry what it is given out. Nothing was sent."
+answer.chain = "This would be message {next} of one exchange between tabs, and QCode ends an exchange after {most} so that two agents cannot answer each other forever. Nothing was sent. A new exchange starts once this tab has not been sent anything for ten minutes."
+answer.pace = "This tab has sent {most} messages in the last {seconds} seconds, the most QCode lets a tab send. Nothing was sent; try again in a minute."
+answer.denied = "The person did not allow this tab to send messages to {tab}. Nothing was sent. Do not try again; ask the person in this tab instead."
+answer.gone = "The tab was closed before the person answered. Nothing was sent."
+answer.asking = "The person has not answered yet whether this tab may send to that one. The message waits for the answer: if they allow it, it is handed over then; if not, it is dropped."
+answer.queued = "Taken. The message waits in {tab}, where the person sees who sent it and reads it; QCode cannot type it into that agent's prompt yet, so it does not start work on its own."
+
 [settings]
 title = "Settings"
 

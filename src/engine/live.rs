@@ -130,6 +130,7 @@ fn builds_an_image_then_lives_a_container_through_its_whole_life() {
         capture(&engine.create_container(&ContainerCreate {
             name: &container,
             hostname: HOSTNAME,
+            labels: &[],
             image: &image,
             mounts: &mounts,
             network: Network::Full,
@@ -183,6 +184,7 @@ fn carries_a_credential_into_a_volume_and_back_out() {
         capture(&engine.create_container(&ContainerCreate {
             name: &container,
             hostname: HOSTNAME,
+            labels: &[],
             image: ALPINE,
             mounts: &mounts,
             network: Network::None,

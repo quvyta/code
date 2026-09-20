@@ -122,6 +122,7 @@ pub fn rewrite(engine: &Engine, home: &Home, user: HostUser) -> Rewrite {
     let create = engine.create_container(&ContainerCreate {
         name: &courier,
         hostname: names::HOSTNAME,
+        labels: &[],
         image: &names::profile_image(home.profile.as_str()),
         mounts: &mounts,
         network: Network::None,

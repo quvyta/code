@@ -47,6 +47,31 @@ pub struct ConfigFile {
     pub contents: &'static str,
 }
 
+/// Where a harness reads the MCP servers it starts in every project, and in which shape.
+///
+/// These are the user-level settings, the ones a harness reads without asking for trust or
+/// approval, because QCode registers its bridge between tabs there (see [`crate::bridge`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct McpSettings {
+    /// Where the file is, relative to the harness's home directory in the container.
+    pub path: &'static str,
+    /// How a server is written into it.
+    pub shape: McpShape,
+}
+
+/// How a harness writes the servers of its settings file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpShape {
+    /// JSON, servers under `mcpServers` with `type`, `command` and `args`.
+    Claude,
+    /// JSON, servers under `mcp` with `type` and one `command` list.
+    OpenCode,
+    /// JSON, servers under `mcpServers` with `command`, `args` and `trust`.
+    Gemini,
+    /// TOML, one `[mcp_servers.<name>]` table per server with `command` and `args`.
+    Codex,
+}
+
 /// Everything QCode needs to know about one harness to build its image, start it and carry its
 /// login from one volume to another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +102,8 @@ pub struct Harness {
     pub settings: Option<ConfigFile>,
     /// How the harness is told to open a conversation it had before, by that conversation's id.
     pub resume: Resume,
+    /// Where the harness reads the MCP servers it starts.
+    pub mcp: McpSettings,
 }
 
 /// How a harness opens an earlier conversation from its command line.
@@ -206,6 +233,11 @@ impl AccountKind {
 /// and checked against 2.1.276: `claude --dangerously-skip-permissions --resume <id> --print hi`
 /// with an id no transcript has answers `No conversation found with session ID: <id>`, and with
 /// the id [`history`](super::history) lists for a transcript it goes on to `Not logged in`.
+///
+/// MCP servers, from `code.claude.com/docs/en/mcp` (user scope lives in `~/.claude.json`, under
+/// `mcpServers`) and checked against 2.1.278: with the entry [`crate::bridge::config`] writes,
+/// `claude mcp list` checks the server's health and prints `qcode: node … - ✔ Connected`, and
+/// the harness keeps the entry when it rewrites the file at its next start.
 static CLAUDE_CODE: Harness = Harness {
     id: "claude-code",
     display_name: "Claude Code",
@@ -221,6 +253,7 @@ static CLAUDE_CODE: Harness = Harness {
         contents: "{\n  \"permissions\": {\n    \"defaultMode\": \"bypassPermissions\"\n  }\n}\n",
     }),
     resume: Resume::Option("--resume"),
+    mcp: McpSettings { path: ".claude.json", shape: McpShape::Claude },
 };
 
 /// opencode. Install and start command from the opencode documentation (`opencode.ai/docs`), the
@@ -245,6 +278,10 @@ static CLAUDE_CODE: Harness = Harness {
 /// checked against 1.18.31: `opencode --auto --session <id>` with an id no session has answers
 /// `Error: Session not found: <id>`, and with the id [`history`](super::history) lists for a
 /// session made by `opencode run` it opens the interface.
+///
+/// MCP servers, from `opencode.ai/docs/mcp-servers` (`mcp` in the configuration, a `local`
+/// server by one `command` list) and checked against 1.18.31: with the entry written into the
+/// file the template writes, `opencode mcp list` starts it and prints `✓ qcode connected`.
 static OPENCODE: Harness = Harness {
     id: "opencode",
     display_name: "opencode",
@@ -260,6 +297,7 @@ static OPENCODE: Harness = Harness {
         contents: "{\n  \"$schema\": \"https://opencode.ai/config.json\",\n  \"permission\": {\n    \"*\": \"allow\"\n  }\n}\n",
     }),
     resume: Resume::Option("--session"),
+    mcp: McpSettings { path: ".config/opencode/opencode.json", shape: McpShape::OpenCode },
 };
 
 /// Gemini CLI. Install and start command from the project's readme, the argument from
@@ -314,6 +352,13 @@ static OPENCODE: Harness = Harness {
 /// (`developers.google.com/gemini-code-assist/docs/deprecations/code-assist-individuals`). Code
 /// Assist Standard and Enterprise still sign in that way, so a profile made with a sign-in keeps
 /// loading; a new one is offered an API key.
+///
+/// MCP servers, from `geminicli.com/docs/tools/mcp-server` (`mcpServers` in `settings.json`,
+/// `trust` skips the confirmation of each call) and checked against 0.60.0: `gemini mcp list`
+/// starts the server and prints `✓ qcode: node … (stdio) - Connected`. It prints `Disabled`
+/// instead in a folder nobody trusted, because the harness then suppresses user-level servers
+/// too; the `recommended` template's settings turn folder trust off, and under `base` the
+/// person's own answer in the harness's trust dialog decides.
 static GEMINI_CLI: Harness = Harness {
     id: "gemini-cli",
     display_name: "Gemini CLI",
@@ -329,6 +374,7 @@ static GEMINI_CLI: Harness = Harness {
         contents: "{\n  \"security\": {\n    \"folderTrust\": {\n      \"enabled\": false\n    }\n  }\n}\n",
     }),
     resume: Resume::Option("--resume"),
+    mcp: McpSettings { path: ".gemini/settings.json", shape: McpShape::Gemini },
 };
 
 /// Codex CLI. Install and start command from the project's readme, the argument from the source
@@ -361,6 +407,12 @@ static GEMINI_CLI: Harness = Harness {
 /// one: `codex exec resume <id> hi` answers `no rollout found for thread id <id>` for an unknown
 /// id, and for the id [`history`](super::history) lists it prints `session id: <id>` and goes
 /// on to the model.
+///
+/// MCP servers, from `developers.openai.com/codex/mcp` (`[mcp_servers.<name>]` in
+/// `config.toml`) and checked against 0.155.1: `codex mcp get qcode` reads the table back as
+/// `enabled: true, transport: stdio`, and `codex exec` starts the server even before it finds
+/// there is no login. Codex hands a server only a short list of variables, so the server finds
+/// its tab's token in the harness's own process instead (see the server's `token`).
 static CODEX: Harness = Harness {
     id: "codex",
     display_name: "Codex",
@@ -376,6 +428,7 @@ static CODEX: Harness = Harness {
         contents: "approval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\n",
     }),
     resume: Resume::Subcommand("resume"),
+    mcp: McpSettings { path: ".codex/config.toml", shape: McpShape::Codex },
 };
 
 #[cfg(test)]
@@ -412,6 +465,28 @@ mod tests {
                 assert!(!file.path.starts_with('/') && !file.path.starts_with('~'), "{harness:?}");
                 assert!(!file.contents.is_empty(), "{harness:?}");
             }
+        }
+    }
+
+    #[test]
+    fn every_harness_reads_its_servers_from_its_home_and_never_from_its_login() {
+        for harness in HarnessKind::ALL {
+            let record = harness.record();
+            let path = record.mcp.path;
+            assert!(!path.starts_with('/') && !path.starts_with('~'), "{harness:?}: {path}");
+            assert!(!record.identity.contains(&path), "{harness:?}: registering a server would touch the login");
+        }
+        assert_eq!(HarnessKind::ClaudeCode.record().mcp.path, ".claude.json");
+        assert_eq!(HarnessKind::Codex.record().mcp.shape, McpShape::Codex);
+    }
+
+    #[test]
+    fn where_a_template_writes_settings_the_servers_go_into_the_same_file() {
+        // Otherwise the harness would read two files, and the one the template wrote could hide
+        // the servers.
+        for harness in [HarnessKind::OpenCode, HarnessKind::GeminiCli, HarnessKind::Codex] {
+            let record = harness.record();
+            assert_eq!(record.settings.map(|file| file.path), Some(record.mcp.path), "{harness:?}");
         }
     }
 

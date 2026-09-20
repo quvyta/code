@@ -109,6 +109,7 @@ fn with_volume(
     let request = ContainerCreate {
         name: container,
         hostname: names::HOSTNAME,
+        labels: &[],
         image: &names::profile_image(PROFILE),
         mounts: &mounts,
         network: Network::None,
@@ -204,6 +205,7 @@ fn a_project_whose_harness_is_running_is_left_alone_and_named() {
         let request = ContainerCreate {
             name: &busy.container(),
             hostname: names::HOSTNAME,
+            labels: &[],
             image: &names::profile_image(PROFILE),
             mounts: &mounts,
             network: Network::None,

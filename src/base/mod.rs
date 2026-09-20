@@ -18,4 +18,6 @@ mod image;
 mod live;
 pub mod paths;
 
-pub use image::{CONTAINERFILE, Failure, Outcome, Presence, REVISION_LABEL, containerfile, ensure, presence, revision};
+pub use image::{
+    CONTAINERFILE, Failure, Outcome, Presence, REVISION_LABEL, containerfile, digest, ensure, presence, revision,
+};

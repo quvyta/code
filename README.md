@@ -2,7 +2,7 @@
 
 **Run Claude Code, opencode, Gemini CLI and Codex side by side in Podman or Docker containers, with tabs like a browser, from one terminal app.**
 
-![qcode in half a minute: Continue opens a project, a shell lists its files, the tab strip passes Claude Code and opencode tabs, a new tab lists each profile's recent conversations, the side panel shows the containers and a file made in the shell appearing in the tree, three files are selected with their menu open, and the README opens in a tab of its own](https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/qcode.gif)
+![qcode in forty seconds: Continue opens a project, a shell lists its files, an opencode tab answers a question about the project's own code while a Claude Code tab waits beside it on the strip, a new tab lists each profile's recent conversations, the side panel shows the containers and a file made in the shell appearing in the tree, three files are selected with their menu open, and the README opens in a tab of its own](https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/qcode.gif)
 
 **quvyta-code** runs coding harnesses inside containers, from the terminal. You set up a
 profile once, sign it in, and from then on open that harness in any of your projects in a few
@@ -319,6 +319,32 @@ The **Project** part of the side panel also shows when the last backup was made 
 
 ![The list of a project's backups, the newest taken just before a restore, with the choice of the project's files, its assets or a profile's conversations above it](https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/backups.png)
 
+## Tabs talking to each other
+
+The agents in a project's harness tabs can hand each other work: the one in a Claude Code tab can
+ask the one in a Codex tab to write a test, and hear back. qcode gives every harness two tools for
+this, `list_tabs` and `send_message`, through a small MCP server it registers in each harness's
+own settings, next to anything you added there. The server runs inside the container and talks
+to qcode through a socket in the project's `Containers/MCP/` folder, so it works in a profile
+without the network too.
+
+Three rules hold for every message:
+
+- **You approve the first one.** The first message from one tab to another asks you, with the
+  message shown. Your answer holds for those two tabs, in that direction, until qcode closes, and
+  is never written to disk. Esc denies.
+- **A tab without the network never sends to a tab with it.** The second tab could carry out what
+  it is given, which is what taking the network away was meant to prevent. The other way round is
+  allowed.
+- **Loops stop.** An exchange between tabs ends after 6 messages, and one tab sends at most 5
+  messages a minute. The sending agent is told why its message was refused.
+
+A message that is taken waits in the tab it was sent to, on a line that says who sent it; **Read**
+shows it and **Discard** throws it away. qcode does not type it into the receiving harness's
+prompt yet: that needs the terminal to paste the way the harness expects, which comes with the
+next release of the framework qcode is built on. Until then the receiving agent starts on it
+only when you pass it on.
+
 ## When QCode closes
 
 **Settings**, **When QCode closes** decides what the containers QCode started do once no QCode is
@@ -350,6 +376,7 @@ so the containers keep running; Settings says so.
 | Workspace | `Quvyta/Code` in your Documents folder by default (`~/Documents/Quvyta/Code`, or `~/Belgeler/Quvyta/Code` where the desktop names it so), or the folder you chose; a folder chosen before stays where it is |
 | Profiles | `Profiles/<profile>.toml` in the workspace |
 | Projects | `Projects/<project>/` in the workspace: `project.qcode`, the code in `Project/`, your material in `Assets/` |
+| Tabs talking to each other | `Projects/<project>/Containers/MCP/` in the workspace: the server the harnesses start and, while the project is open, the socket qcode listens on; each harness's own settings in `qcode-home-<project>-<profile>` hold the entry `qcode` |
 | Backups | `Projects/<project>/Backup/` in the workspace: `Project.git`, the backups of `Project/`; `Assets.git`, those of `Assets/` when it is backed up; `Conversations/<profile>.git`, each profile's conversations; and the lock files that keep two QCodes from backing up the same thing at once |
 | Images | `qcode/base` and `qcode/profile/<profile>`, in the engine |
 | Logins | engine volumes: `qcode-cred-<profile>` for the profile, `qcode-home-<project>-<profile>` for each project's copy |

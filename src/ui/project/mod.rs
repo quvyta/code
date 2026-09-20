@@ -16,6 +16,7 @@
 
 mod backups;
 mod blank;
+mod bridge;
 mod file_ops;
 mod files;
 mod history;
@@ -33,11 +34,15 @@ mod tests;
 
 pub use backups::{BackupOf, BackupTrouble, Farewell, Leaving, Part, leaving};
 pub use blank::Choice;
+pub use bridge::{Letter, Letters};
 pub use file_ops::{Change, FileError, NameProblem};
 pub use files::{DocumentTrouble, FileEntry, FileMsg, FileTree, NameFor, Naming};
 pub use history::HistoryKey;
 pub use panel::{Panel, PanelWidget};
-pub use plan::{ASSETS_DIR, ContainerPlan, HOME_DIR, KEEP_ALIVE, LaunchFailure, PROJECT_DIR, SHELL};
+pub use plan::{
+    ASSETS_DIR, Bridge, ContainerPlan, HOME_DIR, KEEP_ALIVE, LaunchFailure, MCP_DIR, PLAN_LABEL, PROJECT_DIR, SHELL,
+    ensure_running,
+};
 pub use tab::{Pages, Tab, TabKey, TabKind, TabState};
 pub use viewer::{MOST_TEXT, Taken};
 
@@ -60,9 +65,12 @@ use std::path::{Path, PathBuf};
 use crate::backup::conversations::Brought;
 use crate::backup::{BackupEvery, Entry, Snapshot, SnapshotId};
 use crate::base::apps::{self, Editor, FileKind, Quiet, Sound};
+use crate::bridge::config::{self as bridge_config, Unregistered};
+use crate::bridge::rules::Rules;
+use crate::bridge::socket::Call;
 use crate::engine::{Container, Engine, EngineCommand, EngineKind, Exec, HostUser};
-use crate::profile::Profile;
 use crate::profile::history::Conversation;
+use crate::profile::{HarnessKind, Profile};
 use crate::workspace::{
     ProjectFile, ProjectId, ProjectPaths, Registry, Session, SessionProject, SessionTab, SessionTabKind, add_profile,
 };
@@ -266,6 +274,31 @@ pub enum Msg {
     KeepBackup,
     /// The list of backups was closed.
     CloseBackups,
+    /// A call came to the bridge of the project of this id, on the listener of this number, or
+    /// the listener was closed.
+    Bridge(String, u64, Option<Call>),
+    /// The person answered whether the agent of one tab may send messages to another's.
+    Allow {
+        /// The sending tab.
+        from: TabKey,
+        /// The receiving tab.
+        to: TabKey,
+        /// Whether it may.
+        allow: bool,
+    },
+    /// The question about one tab sending to another has waited long enough that the senders
+    /// are told their messages wait.
+    StillAsking {
+        /// The sending tab.
+        from: TabKey,
+        /// The receiving tab.
+        to: TabKey,
+    },
+    /// Something was done with the messages waiting in a tab.
+    Letters(TabKey, Letters),
+    /// The bridge could not be registered in the settings of a harness whose container came up;
+    /// the message that came with the start follows.
+    Unbridged(HarnessKind, Unregistered, Box<Msg>),
     /// Bringing a backup back finished.
     Restored {
         /// The project's id.
@@ -319,6 +352,8 @@ pub struct OpenProject {
     skip: Vec<String>,
     /// Whether its backup takes `Assets/` too, as its file says.
     assets: bool,
+    /// Whether the project listens for its tabs' agents.
+    link: bridge::Link,
 }
 
 impl OpenProject {
@@ -351,6 +386,7 @@ impl OpenProject {
             backup: backups::State::default(),
             skip: file.backup_skip.clone(),
             assets: file.backup_assets,
+            link: bridge::Link::default(),
         };
         project.set_profiles(profiles);
         project
@@ -493,6 +529,12 @@ impl OpenProject {
         }
     }
 
+    /// Whether the project listens for its tabs' agents.
+    #[must_use]
+    pub fn is_bridged(&self) -> bool {
+        matches!(self.link, bridge::Link::On { .. })
+    }
+
     /// The tab of `key` and where it sits.
     fn find(&mut self, key: TabKey) -> Option<(usize, &mut Tab)> {
         self.tabs.iter_mut().enumerate().find(|(_, tab)| tab.key() == key)
@@ -547,6 +589,14 @@ pub struct ProjectScreen {
     listing: Option<backups::Listing>,
     /// The number the last reading of a list of backups was given.
     last_listing: u64,
+    /// Whether each open project listens for its tabs' agents.
+    bridging: bool,
+    /// The number the last listener of a project was given.
+    last_link: u64,
+    /// What the bridge remembers to apply its rules.
+    rules: Rules,
+    /// The questions to the person about one tab sending to another that are not answered yet.
+    asking: Vec<bridge::Asking>,
 }
 
 impl ProjectScreen {
@@ -579,6 +629,10 @@ impl ProjectScreen {
             last_timer: 0,
             listing: None,
             last_listing: 0,
+            bridging: false,
+            last_link: 0,
+            rules: Rules::default(),
+            asking: Vec::new(),
         }
     }
 
@@ -591,6 +645,18 @@ impl ProjectScreen {
     #[must_use]
     pub fn watching(mut self, live: bool) -> Self {
         self.live = live;
+        self
+    }
+
+    /// The same screen, listening for the agents of each open project's tabs when `bridging` is
+    /// true, so they can send each other messages.
+    ///
+    /// It is off unless asked for for the same reason as [`ProjectScreen::watching`]: a listener
+    /// waits on a background thread, which a test harness would run in line. Tests hand the
+    /// screen its calls by hand instead.
+    #[must_use]
+    pub fn bridging(mut self, bridging: bool) -> Self {
+        self.bridging = bridging;
         self
     }
 
@@ -776,7 +842,14 @@ impl ProjectScreen {
         let plan = project.plan(tab.kind())?;
         let program = project.program(tab, self.editor)?;
         let parts: Vec<&str> = program.iter().map(String::as_str).collect();
-        Some(plan.enter(engine, &parts))
+        // A harness tab carries the token its agent's bridge server hands back, which is how
+        // QCode knows which tab a message comes from.
+        match tab.kind() {
+            TabKind::Profile(_) => {
+                Some(plan.enter_with(engine, &parts, &[(crate::bridge::TOKEN_VARIABLE, tab.token())]))
+            }
+            _ => Some(plan.enter(engine, &parts)),
+        }
     }
 
     /// The command that takes the text out of the file the tab `key` shows, which is always the
@@ -801,6 +874,11 @@ impl ProjectScreen {
     /// What a blank tab's page knows of the conversations of `key`, when its project is open.
     fn shelf(&mut self, key: &HistoryKey) -> Option<&mut history::Shelf> {
         Some(self.project_mut(&key.project)?.history.entry(key.profile.clone()).or_default())
+    }
+
+    /// The project holding the tab `key`, when one does.
+    fn owner(&self, key: TabKey) -> Option<&OpenProject> {
+        self.projects.iter().find(|project| project.tabs.iter().any(|tab| tab.key() == key))
     }
 
     /// The project holding the tab `key`, when one does.
@@ -845,7 +923,7 @@ impl ProjectScreen {
 /// is one.
 pub fn opened(screen: &mut ProjectScreen) -> Command<Msg> {
     let command = Command::batch([load_root(screen), list_containers(screen), wake(screen), show_page(screen, true)]);
-    Command::batch([command, follow_disk(screen), backups::keep(screen)])
+    Command::batch([command, follow_disk(screen), backups::keep(screen), bridge::follow(screen)])
 }
 
 /// Adds `project` to the rail and opens it, or only opens it when the rail has it already; the
@@ -870,7 +948,7 @@ pub fn update(screen: &mut ProjectScreen, message: Msg) -> Command<Msg> {
     // Profiles read again may be new ones, whose conversations the page shown has not read.
     let profiles = matches!(message, Msg::Profiles(_));
     let command = apply(screen, message);
-    let kept = Command::batch([reread(screen), follow_disk(screen), backups::keep(screen)]);
+    let kept = Command::batch([reread(screen), follow_disk(screen), backups::keep(screen), bridge::follow(screen)]);
     Command::batch([command, wake(screen), show_page(screen, profiles), kept])
 }
 
@@ -906,6 +984,8 @@ fn apply(screen: &mut ProjectScreen, message: Msg) -> Command<Msg> {
             for tab in &mut project.tabs {
                 tab.close_session();
             }
+            let keys: Vec<TabKey> = project.tabs.iter().map(Tab::key).collect();
+            bridge::closed(screen, &keys);
             TabEdit::Close(index).apply(&mut screen.projects, &mut screen.active);
             Command::batch([backed, silenced, load_root(screen), list_containers(screen)])
         }
@@ -928,10 +1008,13 @@ fn apply(screen: &mut ProjectScreen, message: Msg) -> Command<Msg> {
                 None => Command::none(),
             };
             let Some(project) = screen.projects.get_mut(screen.active) else { return Command::none() };
+            let mut gone = Vec::new();
             if let Some(tab) = project.tabs.get_mut(index) {
                 tab.close_session();
+                gone.push(tab.key());
             }
             TabEdit::Close(index).apply(&mut project.tabs, &mut project.active_tab);
+            bridge::closed(screen, &gone);
             silenced
         }
         Msg::MoveTab { from, to } => {
@@ -1184,6 +1267,22 @@ fn apply(screen: &mut ProjectScreen, message: Msg) -> Command<Msg> {
         Msg::BackupEvery(every) => {
             backups::set_every(screen, every);
             Command::none()
+        }
+        Msg::Bridge(id, run, call) => bridge::called(screen, &id, run, call),
+        Msg::Allow { from, to, allow } => {
+            bridge::allowed(screen, from, to, allow);
+            Command::none()
+        }
+        Msg::StillAsking { from, to } => {
+            bridge::still_asking(screen, from, to);
+            Command::none()
+        }
+        Msg::Letters(key, action) => {
+            bridge::letters(screen, key, action);
+            Command::none()
+        }
+        Msg::Unbridged(harness, trouble, message) => {
+            Command::batch([bridge::unregistered(harness, &trouble), update(screen, *message)])
         }
         Msg::ContainerActed(result) => {
             let refresh = list_containers(screen);
@@ -1466,7 +1565,17 @@ fn start(
 ) -> Msg {
     let result = plan::ensure_running(engine, plan, user);
     let up = result.is_ok();
-    let message = answer(result);
+    // Registered before the harness starts, so it finds the bridge's server at its first start.
+    let unregistered = match &plan.bridge {
+        Some(bridge) if up => {
+            bridge_config::register(engine, &plan.name, bridge.harness).err().map(|trouble| (bridge.harness, trouble))
+        }
+        _ => None,
+    };
+    let mut message = answer(result);
+    if let Some((harness, trouble)) = unregistered {
+        message = Msg::Unbridged(harness, trouble, Box::new(message));
+    }
     if up { noted(registry, engine.kind(), &plan.name, message) } else { message }
 }
 
@@ -1782,8 +1891,24 @@ fn header(screen: &ProjectScreen, ui: &mut View<'_, Msg>) {
     .id(TABS_ID);
 }
 
-/// What the middle shows: the open tab, or why there is nothing to show.
+/// What the middle shows: the open tab, or why there is nothing to show, and under a tab the
+/// messages other tabs' agents left waiting in it.
 fn center(screen: &ProjectScreen, ui: &mut View<'_, Msg>) {
+    let waiting = screen.project().and_then(OpenProject::active_tab).filter(|tab| !tab.letters().is_empty());
+    match waiting {
+        Some(tab) => {
+            ui.column(|ui| {
+                ui.column(|ui| tab_body(screen, ui)).fill();
+                bridge::view(tab, ui);
+            })
+            .fill();
+        }
+        None => tab_body(screen, ui),
+    }
+}
+
+/// The open tab, or why there is nothing to show.
+fn tab_body(screen: &ProjectScreen, ui: &mut View<'_, Msg>) {
     let Some(project) = screen.project() else {
         let open = Button::new(t!("project.none.open")).icon("project").variant("primary").on_press(Msg::AddProject);
         ui.add(

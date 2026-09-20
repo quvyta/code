@@ -93,6 +93,10 @@ impl Engine {
         // Spelled the same by both engines, like the network below.
         args.push("--hostname");
         args.push(request.hostname);
+        for (key, value) in request.labels {
+            args.push("--label");
+            args.push(format!("{key}={value}"));
+        }
         self.contained(
             &mut args,
             &Contained {
@@ -236,10 +240,38 @@ impl Engine {
     /// session: the harness inside draws and reads keys itself.
     #[must_use]
     pub fn exec(&self, request: &Exec<'_>) -> EngineCommand {
+        self.exec_with_env(request, &[])
+    }
+
+    /// [`Engine::exec`] with environment variables for the program, as `(name, value)`.
+    ///
+    /// A harness tab is started this way: the variable that says which tab it is reaches the
+    /// harness and, through it, whatever the harness starts.
+    #[must_use]
+    pub fn exec_with_env(&self, request: &Exec<'_>, env: &[(&str, &str)]) -> EngineCommand {
         let mut args = Args::new();
         args.push("exec");
         args.push("--interactive");
         args.push("--tty");
+        for (key, value) in env {
+            args.push("--env");
+            args.push(format!("{key}={value}"));
+        }
+        args.push(request.container);
+        args.extend(request.command);
+        self.command(args)
+    }
+
+    /// Runs a command inside a running container without a terminal but with its standard input
+    /// open, for [`run::feed`](super::run::feed) to write into.
+    ///
+    /// A file is written into a home volume this way: the text goes through the pipe, where an
+    /// argument would be cut off at the system's limit on one argument's length.
+    #[must_use]
+    pub fn exec_reading(&self, request: &Exec<'_>) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("exec");
+        args.push("--interactive");
         args.push(request.container);
         args.extend(request.command);
         self.command(args)
@@ -272,6 +304,19 @@ impl Engine {
         args.push("inspect");
         args.push("--format");
         args.push("{{.State.Status}}");
+        args.push(name);
+        self.command(args)
+    }
+
+    /// Asks for the value of one label of a container. A label the container does not carry
+    /// comes back empty or as `<no value>`, depending on the engine.
+    #[must_use]
+    pub fn container_label(&self, name: &str, label: &str) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("container");
+        args.push("inspect");
+        args.push("--format");
+        args.push(format!("{{{{index .Config.Labels \"{label}\"}}}}"));
         args.push(name);
         self.command(args)
     }
@@ -370,6 +415,9 @@ pub struct ContainerCreate<'a> {
     /// [`names::HOSTNAME`](super::names::HOSTNAME), so that a login keyed to the machine name
     /// survives the move from the sign-in container to a project's.
     pub hostname: &'a str,
+    /// Labels the container carries, as `(name, value)`; a project's container carries the
+    /// digest of the request it was made from, which is how a changed request is noticed.
+    pub labels: &'a [(&'a str, &'a str)],
     /// The image it starts from.
     pub image: &'a str,
     /// What the container can see of the host and of its volumes.
@@ -651,6 +699,7 @@ mod tests {
         let request = ContainerCreate {
             name: "qcode-p-claude",
             hostname: "qcode",
+            labels: &[],
             image: "qcode/profile/claude",
             mounts: &mounts,
             network: Network::Full,
@@ -690,6 +739,7 @@ mod tests {
         let request = ContainerCreate {
             name: "qcode-p-claude",
             hostname: "qcode",
+            labels: &[],
             image: "qcode/profile/claude",
             mounts: &mounts,
             network: Network::None,
@@ -720,6 +770,7 @@ mod tests {
         let request = ContainerCreate {
             name: "qcode-p-base",
             hostname: "box",
+            labels: &[],
             image: "qcode/base",
             mounts: &[],
             network: Network::Full,
@@ -809,6 +860,47 @@ mod tests {
         assert_eq!(
             args(&docker().exec(&request)),
             ["exec", "--interactive", "--tty", "qcode-p-claude", "claude", "--dangerously-skip-permissions"]
+        );
+    }
+
+    #[test]
+    fn a_tab_is_told_which_tab_it_is_through_its_environment() {
+        let request = Exec { container: "qcode-p-claude", command: &["claude"] };
+        assert_eq!(
+            args(&podman().exec_with_env(&request, &[("QCODE_BRIDGE", "abc")])),
+            ["exec", "--interactive", "--tty", "--env", "QCODE_BRIDGE=abc", "qcode-p-claude", "claude"]
+        );
+    }
+
+    #[test]
+    fn a_command_that_reads_its_input_keeps_it_open_without_a_terminal() {
+        let request = Exec { container: "qcode-p-claude", command: &["sh", "-c", "cat > f"] };
+        assert_eq!(
+            args(&docker().exec_reading(&request)),
+            ["exec", "--interactive", "qcode-p-claude", "sh", "-c", "cat > f"]
+        );
+    }
+
+    #[test]
+    fn a_container_is_made_with_its_labels_and_asked_for_one() {
+        let request = ContainerCreate {
+            name: "qcode-p-base",
+            hostname: "box",
+            labels: &[("qcode.plan", "0123")],
+            image: "qcode/base",
+            mounts: &[],
+            network: Network::Full,
+            user: HostUser::ImageDefault,
+            workdir: None,
+            command: &[],
+        };
+        assert_eq!(
+            args(&podman().create_container(&request)),
+            ["create", "--name", "qcode-p-base", "--hostname", "box", "--label", "qcode.plan=0123", "qcode/base"]
+        );
+        assert_eq!(
+            args(&docker().container_label("qcode-p-base", "qcode.plan")),
+            ["container", "inspect", "--format", "{{index .Config.Labels \"qcode.plan\"}}", "qcode-p-base"]
         );
     }
 
