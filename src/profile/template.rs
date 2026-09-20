@@ -72,7 +72,7 @@ mod tests {
     fn unattended_mode_does_not_depend_on_the_template() {
         // The container is the isolation. A template only writes settings; what makes the
         // harness stop asking are the arguments it is started with, under both templates.
-        for harness in HarnessKind::ALL {
+        for harness in HarnessKind::TERMINAL {
             assert!(!harness.record().auto_run.is_empty(), "{harness:?}");
         }
     }

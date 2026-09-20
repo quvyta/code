@@ -17,6 +17,7 @@
 mod backups;
 mod blank;
 mod bridge;
+mod desktop;
 mod file_ops;
 mod files;
 mod history;
@@ -35,6 +36,7 @@ mod tests;
 pub use backups::{BackupOf, BackupTrouble, Farewell, Leaving, Part, leaving};
 pub use blank::Choice;
 pub use bridge::{Letter, Letters};
+pub use desktop::Opening;
 pub use file_ops::{Change, FileError, NameProblem};
 pub use files::{DocumentTrouble, FileEntry, FileMsg, FileTree, NameFor, Naming};
 pub use history::HistoryKey;
@@ -204,6 +206,19 @@ pub enum Msg {
     Described(TabKey, u64, Quiet, Result<Taken, LaunchFailure>),
     /// The containers of sound tabs that were closed while playing were taken away.
     Silenced,
+    /// The window of a tab is open, or it waits to be asked, or the engine refused.
+    WindowOpened(TabKey, u64, Result<Opening, LaunchFailure>),
+    /// The window of a tab closed, whoever closed it, with the exit code the engine reported.
+    WindowEnded(TabKey, u64, Option<u32>),
+    /// The open window of a tab was asked to show itself.
+    RaiseWindow(TabKey),
+    /// That asking finished; a refusal is worth saying, because nothing else would show it.
+    WindowRaised(Result<(), LaunchFailure>),
+    /// The window of a tab was asked to close.
+    CloseWindow(TabKey),
+    /// The containers of windows that were closed have been taken away, or one of them would not
+    /// go and this is the engine's word on it.
+    WindowsClosed(Option<LaunchFailure>),
     /// A row of the container widget was selected.
     SelectContainer(usize),
     /// The container widget was asked for the engine's current answer.
@@ -484,6 +499,13 @@ impl OpenProject {
                 .iter()
                 .find(|profile| profile.name.as_str() == name)
                 .map(|profile| ContainerPlan::profile(&self.id, &self.paths, profile)),
+            // A window has a container of its own, beside the one the same profile's harness tabs
+            // enter, so that the container's end and the window's are one thing.
+            TabKind::Desktop(name) => self
+                .profiles
+                .iter()
+                .find(|profile| profile.name.as_str() == name)
+                .and_then(|profile| ContainerPlan::window(&self.id, &self.paths, profile)),
             TabKind::New => None,
         }
     }
@@ -503,7 +525,14 @@ impl OpenProject {
             TabKind::Image(file) => Some(apps::picture(&inside_container(file))),
             TabKind::Editor(file) => Some(editor.command(&inside_container(file))),
             TabKind::Pdf(file) if tab.pages().drawn => Some(apps::pdf_page(&inside_container(file), tab.pages().page)),
-            TabKind::New | TabKind::Markdown(_) | TabKind::Pdf(_) | TabKind::Office(_) | TabKind::Sound(_) => None,
+            // A window is not run in a terminal, so it has no program a tab spawns: it is started
+            // by its own container, which `desktop` does.
+            TabKind::New
+            | TabKind::Markdown(_)
+            | TabKind::Pdf(_)
+            | TabKind::Office(_)
+            | TabKind::Sound(_)
+            | TabKind::Desktop(_) => None,
         }
     }
 
@@ -513,6 +542,9 @@ impl OpenProject {
         let Some(tab) = self.tabs.get(index) else { return String::new() };
         match tab.kind() {
             TabKind::Profile(name) => name.clone(),
+            // The window's tab is labelled by its profile like a harness tab, with the mark that
+            // says it is a window rather than a terminal.
+            TabKind::Desktop(name) => t!("project.tab.window", profile = name.clone()),
             TabKind::New => t!("project.new-tab"),
             TabKind::Image(file)
             | TabKind::Markdown(file)
@@ -571,6 +603,9 @@ pub struct ProjectScreen {
     sound: Sound,
     /// This machine's runtime folder, where the sound server's socket is looked for.
     runtime: Option<PathBuf>,
+    /// What this machine offers a window, or why it offers none. Read once when the screen is
+    /// made: a session does not change its compositor underneath QCode.
+    display: Result<crate::desktop::Display, crate::desktop::NoDisplay>,
     next_key: u64,
     /// Whether the open project's folders are watched, so the tree follows the disk.
     live: bool,
@@ -620,6 +655,7 @@ impl ProjectScreen {
             editor: Editor::default(),
             sound: Sound::default(),
             runtime: std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
+            display: desktop::display(),
             next_key: 0,
             live: false,
             last_watch: 0,
@@ -725,6 +761,18 @@ impl ProjectScreen {
         self
     }
 
+    /// The same screen, opening windows on `display` rather than on the session this process was
+    /// started in.
+    ///
+    /// The application never calls this: the screen reads the session itself. It exists so that
+    /// what a window's tab does can be checked on a machine with no compositor, and what it says
+    /// when there is none on a machine that has one.
+    #[must_use]
+    pub fn showing_on(mut self, display: Result<crate::desktop::Display, crate::desktop::NoDisplay>) -> Self {
+        self.display = display;
+        self
+    }
+
     /// Opens the project at `index` of the rail, when there is one there.
     pub fn set_active(&mut self, index: usize) {
         if index < self.projects.len() {
@@ -754,6 +802,7 @@ impl ProjectScreen {
                 SessionTabKind::Pdf(file) => TabKind::Pdf(file.clone()),
                 SessionTabKind::Office(file) => TabKind::Office(file.clone()),
                 SessionTabKind::Sound(file) => TabKind::Sound(file.clone()),
+                SessionTabKind::Desktop(name) => TabKind::Desktop(name.clone()),
             };
             let usable = match &kind {
                 TabKind::New => true,
@@ -763,7 +812,7 @@ impl ProjectScreen {
                 | TabKind::Pdf(file)
                 | TabKind::Office(file)
                 | TabKind::Sound(file) => files::is_inside(file),
-                TabKind::Shell | TabKind::Profile(_) => project.plan(&kind).is_some(),
+                TabKind::Shell | TabKind::Profile(_) | TabKind::Desktop(_) => project.plan(&kind).is_some(),
             };
             if !usable {
                 continue;
@@ -774,8 +823,9 @@ impl ProjectScreen {
             let key = TabKey(self.next_key);
             self.next_key += 1;
             let mut tab = Tab::restored(key, kind, saved.opened, saved.conversation.clone());
-            // Opening QCode again is not asking to hear a sound again.
-            tab.hold(matches!(tab.kind(), TabKind::Sound(_)));
+            // Opening QCode again is not asking to hear a sound again, and no more is it asking for
+            // a window on the screen: both come back saying so, with the way to ask for them.
+            tab.hold(matches!(tab.kind(), TabKind::Sound(_) | TabKind::Desktop(_)));
             project.tabs.push(tab);
         }
         project.active_tab = active;
@@ -805,6 +855,7 @@ impl ProjectScreen {
                             TabKind::Pdf(file) => SessionTabKind::Pdf(file.clone()),
                             TabKind::Office(file) => SessionTabKind::Office(file.clone()),
                             TabKind::Sound(file) => SessionTabKind::Sound(file.clone()),
+                            TabKind::Desktop(name) => SessionTabKind::Desktop(name.clone()),
                         },
                         conversation: tab.conversation().map(str::to_owned),
                         opened: tab.opened(),
@@ -976,10 +1027,14 @@ fn apply(screen: &mut ProjectScreen, message: Msg) -> Command<Msg> {
         }
         Msg::CloseProject(index) => {
             let backed = backups::closing(screen, index);
-            let silenced = match screen.projects.get(index) {
-                Some(project) => sound::silence(screen, project, &project.tabs.iter().collect::<Vec<_>>()),
-                None => Command::none(),
+            let (silenced, shut) = match screen.projects.get(index) {
+                Some(project) => {
+                    let tabs: Vec<&Tab> = project.tabs.iter().collect();
+                    (sound::silence(screen, project, &tabs), desktop::close_all(screen, project, &tabs))
+                }
+                None => (Command::none(), Command::none()),
             };
+            let silenced = Command::batch([silenced, shut]);
             let Some(project) = screen.projects.get_mut(index) else { return Command::none() };
             for tab in &mut project.tabs {
                 tab.close_session();
@@ -1003,7 +1058,8 @@ fn apply(screen: &mut ProjectScreen, message: Msg) -> Command<Msg> {
         Msg::CloseTab(index) => {
             let silenced = match screen.project() {
                 Some(project) => {
-                    sound::silence(screen, project, &project.tabs.get(index).into_iter().collect::<Vec<_>>())
+                    let tabs: Vec<&Tab> = project.tabs.get(index).into_iter().collect();
+                    Command::batch([sound::silence(screen, project, &tabs), desktop::close_all(screen, project, &tabs)])
                 }
                 None => Command::none(),
             };
@@ -1186,6 +1242,20 @@ fn apply(screen: &mut ProjectScreen, message: Msg) -> Command<Msg> {
         Msg::Playable(key, run, answer) => sound::playable(screen, key, run, answer),
         Msg::Described(key, run, why, answer) => sound::described(screen, key, run, why, answer),
         Msg::Silenced => Command::none(),
+        Msg::WindowOpened(key, run, answer) => desktop::opened(screen, key, run, answer),
+        Msg::WindowEnded(key, run, code) => desktop::ended(screen, key, run, code),
+        Msg::RaiseWindow(key) => desktop::raise(screen, key),
+        // Nothing is said when it worked: the window came forward, or the compositor marked it,
+        // and either way the person is looking at their screen rather than at this tab.
+        Msg::WindowRaised(result) => match result {
+            Ok(()) => Command::none(),
+            Err(failure) => Command::toast(Toast::warning(t!("project.window.raise-failed")).body(failure.output)),
+        },
+        Msg::CloseWindow(key) => desktop::close(screen, key),
+        Msg::WindowsClosed(failure) => match failure {
+            None => Command::none(),
+            Some(failure) => Command::toast(Toast::danger(t!("project.window.close-failed")).body(failure.output)),
+        },
         Msg::SelectContainer(index) => {
             if let Some(project) = screen.projects.get_mut(screen.active) {
                 project.container_row = index;
@@ -1321,19 +1391,26 @@ fn choose(screen: &mut ProjectScreen, key: TabKey, choice: Choice) -> Command<Ms
         Choice::Shell => (TabKind::Shell, None),
         Choice::NewChat(name) => (TabKind::Profile(name), None),
         Choice::Resume(name, id) => (TabKind::Profile(name), Some(id)),
+        Choice::Window(name) => (TabKind::Desktop(name), None),
     };
     let Some(plan) = project.plan(&kind) else { return Command::none() };
     // A tab that was chosen already is not chosen again: two quick presses open one container.
     if project.find(key).is_none_or(|(_, tab)| tab.kind() != &TabKind::New) {
         return Command::none();
     }
-    let record = match &kind {
-        TabKind::Profile(name) if !project.carries(name) => record_profile(project, name),
+    let record = match kind.profile() {
+        Some(name) if !project.carries(name) => record_profile(project, name),
         _ => Command::none(),
     };
+    let window = plan.window.is_some();
     let Some((_, tab)) = project.find(key) else { return Command::none() };
     tab.choose(kind, conversation);
     let run = tab.run();
+    // A window is not entered with a terminal, so it takes the window's own path and the keyboard
+    // goes to the tab's one action rather than to a terminal that is not there.
+    if window {
+        return Command::batch([desktop::open(screen, key, run), Command::focus(desktop::WINDOW_ID), record]);
+    }
     Command::batch([
         Command::perform(move || {
             start(registry.as_deref(), &engine, &plan, user, |result| Msg::Ready(key, run, result))
@@ -1388,6 +1465,13 @@ fn wake(screen: &mut ProjectScreen) -> Command<Msg> {
         tab.wake();
         let (key, run) = (tab.key(), tab.run());
         return sound::hear(screen, key, run);
+    }
+    // A window is opened by a container of its own rather than entered, so it never goes through
+    // the terminal path below.
+    if let TabKind::Desktop(_) = tab.kind() {
+        tab.wake();
+        let (key, run) = (tab.key(), tab.run());
+        return desktop::open(screen, key, run);
     }
     // A PDF shows its text first, which is read rather than run in a terminal.
     if viewer::text_command(tab.kind()).is_some() && !viewer::draws(tab) {
@@ -1514,6 +1598,13 @@ fn restart_tab(screen: &mut ProjectScreen, key: TabKey) -> Command<Msg> {
         tab.hold(false);
         let run = tab.run();
         return sound::hear(screen, key, run);
+    }
+    // Asking for the window is what lifts the hold a tab brought back from the last session has.
+    if let TabKind::Desktop(_) = &kind {
+        tab.restarting();
+        tab.hold(false);
+        let run = tab.run();
+        return desktop::open(screen, key, run);
     }
     // A PDF whose text could not be read reads it again; one showing a page draws it again.
     let reads = viewer::text_command(&kind).is_some() && !viewer::draws(tab);
@@ -1946,6 +2037,12 @@ fn tab_body(screen: &ProjectScreen, ui: &mut View<'_, Msg>) {
         sound::view(tab, file, ui);
         return;
     }
+    // A window's tab draws its own status in every state it can be in, failure included: there is
+    // no terminal on it and no last screen to keep, so the general shape below does not fit.
+    if let TabKind::Desktop(profile) = tab.kind() {
+        desktop::view(screen, tab, profile, ui);
+        return;
+    }
     let image = matches!(tab.kind(), TabKind::Image(_));
     let restart = t!("project.restart");
     match tab.state() {
@@ -2152,6 +2249,7 @@ pub fn entry(screen: &ProjectScreen) -> &'static str {
         {
             DOCUMENT_ID
         }
+        Some(TabKind::Desktop(_)) => desktop::WINDOW_ID,
         Some(_) => TERMINAL_ID,
         None => TABS_ID,
     }

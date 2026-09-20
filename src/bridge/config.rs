@@ -56,7 +56,9 @@ const ABSENT: i32 = 3;
 /// [`Unregistered`] when the file holds a server of the same name, cannot be read as its format,
 /// or the engine refuses.
 pub fn register(engine: &Engine, container: &str, harness: HarnessKind) -> Result<(), Unregistered> {
-    let settings = harness.record().mcp;
+    // A harness that opens a window has no settings of this kind and no agent to reach the
+    // bridge, so there is nothing to register and nothing to complain about.
+    let Some(settings) = harness.record().mcp else { return Ok(()) };
     let read = ["sh", "-c", "[ -e \"$HOME/$1\" ] || exit 3; cat -- \"$HOME/$1\"", "sh", settings.path];
     let existing = match capture(&engine.exec_without_terminal(&Exec { container, command: &read })) {
         Ok(text) => Some(text),

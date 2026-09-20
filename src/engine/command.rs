@@ -6,7 +6,7 @@
 //! terminal layer's.
 
 use super::Engine;
-use super::dialect::{Relabel, UserMapping};
+use super::dialect::{Relabel, Sandboxing, TmpfsOwner, UserMapping};
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -173,6 +173,106 @@ impl Engine {
                 command: once.command,
             },
         );
+        self.command(args)
+    }
+
+    /// Runs a program in a container of its own that draws a window on the person's desktop, in
+    /// the background, and answers with the container's id.
+    ///
+    /// It is neither [`Engine::run_once`] nor [`Engine::run_attached`]: nothing reads what it
+    /// prints and nothing types at it, because the person works in the window. The container is
+    /// not removed when the program ends either — the tab wants to see that the window closed, and
+    /// the exit code with it, before the container goes away.
+    ///
+    /// What each option is for is in [`RunWindow`]'s fields. The container's first process is the
+    /// engine's own init rather than the program, so that the program's children are reaped and
+    /// the stop signal reaches it.
+    #[must_use]
+    pub fn run_window(&self, request: &RunWindow<'_>) -> EngineCommand {
+        let dialect = self.kind.dialect();
+        let mut args = Args::new();
+        args.push("run");
+        args.push("--detach");
+        args.push("--init");
+        args.push(format!("--shm-size={}", request.shm));
+        args.push("--name");
+        args.push(request.name);
+        if dialect.sandboxing == Sandboxing::NeedsProfile
+            && let Some(profile) = request.seccomp
+        {
+            let mut option = OsString::from("seccomp=");
+            option.push(profile);
+            args.push("--security-opt");
+            args.push(option);
+        }
+        for tmpfs in request.tmpfs {
+            args.push("--tmpfs");
+            args.push(tmpfs.spelled(dialect.tmpfs_owner, request.once.user));
+        }
+        for device in request.devices {
+            args.push("--device");
+            args.push(device);
+        }
+        for (key, value) in request.env {
+            args.push("--env");
+            args.push(format!("{key}={value}"));
+        }
+        for socket in request.sockets {
+            args.push("--volume");
+            args.push(socket.spelled());
+        }
+        let once = &request.once;
+        self.contained(
+            &mut args,
+            &Contained {
+                image: once.image,
+                mounts: once.mounts,
+                network: once.network,
+                user: once.user,
+                workdir: once.workdir,
+                command: once.command,
+            },
+        );
+        self.command(args)
+    }
+
+    /// What a container printed, which is the only account of why a window never came up: the
+    /// application writes its complaints to its output, and once the container is gone so are
+    /// they. Both engines spell it the same way.
+    #[must_use]
+    pub fn container_logs(&self, name: &str) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("logs");
+        args.push(name);
+        self.command(args)
+    }
+
+    /// Waits for a container to end and answers its exit code.
+    ///
+    /// This is how QCode learns that a window was closed by the person: the container's only
+    /// program is the application, so the container ends exactly when the window does, and no
+    /// compositor has to be asked anything. Both engines spell it the same way.
+    #[must_use]
+    pub fn wait_container(&self, name: &str) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("wait");
+        args.push(name);
+        self.command(args)
+    }
+
+    /// Stops a running container, giving its program `seconds` to close by itself before it is
+    /// killed.
+    ///
+    /// [`Engine::stop_container`] leaves the engine's own default in place, which is fine for a
+    /// container running nothing but a keep-alive loop. A window has state to write out, so it is
+    /// given a stated amount of time rather than whatever the engine on the machine defaults to.
+    #[must_use]
+    pub fn stop_container_within(&self, name: &str, seconds: u32) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("stop");
+        args.push("--time");
+        args.push(seconds.to_string());
+        args.push(name);
         self.command(args)
     }
 
@@ -463,6 +563,63 @@ pub struct RunAttached<'a> {
     pub sockets: &'a [Socket<'a>],
 }
 
+/// Running a program in a container of its own that draws a window on the person's desktop.
+///
+/// Every field beyond [`RunOnce`] is there because a window needs it, and each one is as narrow as
+/// it can be: the container is given one socket, not the folder it sits in, and one device, not the
+/// machine's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunWindow<'a> {
+    /// The container's name, by which the window is raised, stopped and waited for.
+    pub name: &'a str,
+    /// The image, mounts, network, user, directory and command, as for a one-off container.
+    pub once: RunOnce<'a>,
+    /// Environment variables the program is given, as `(name, value)`.
+    pub env: &'a [(&'a str, &'a str)],
+    /// Sockets of this machine the program may talk to: for a window, the compositor's, and
+    /// nothing else that lives beside it.
+    pub sockets: &'a [Socket<'a>],
+    /// Private, writable filesystems the container gets of its own, which is where the sockets
+    /// above are mounted into: a folder of this machine's own would bring everything else in it.
+    pub tmpfs: &'a [Tmpfs<'a>],
+    /// Devices of this machine the program may use, by their path, such as a graphics card.
+    pub devices: &'a [&'a Path],
+    /// How large the container's shared memory is, spelled as the engines take it (`1g`).
+    ///
+    /// Both engines give 64 MB, which a browser engine fills in seconds: the trial watched the
+    /// window stop answering, the update check fail for want of resources and the program ignore
+    /// the stop signal, all from that one number.
+    pub shm: &'a str,
+    /// The seccomp profile to run under. The engine that needs none ignores it.
+    pub seccomp: Option<&'a Path>,
+}
+
+/// A private, writable filesystem a container gets of its own at a path inside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tmpfs<'a> {
+    /// Where it appears inside the container.
+    pub target: &'a Path,
+    /// Its permissions, spelled as `mount` takes them (`0700`).
+    pub mode: &'a str,
+}
+
+impl Tmpfs<'_> {
+    /// The filesystem as an engine spells its option: `target:options`.
+    ///
+    /// It has to belong to whoever runs inside — an application refuses a runtime directory that
+    /// is not its own — and the two engines are told that differently.
+    fn spelled(&self, owner: TmpfsOwner, user: HostUser) -> OsString {
+        let mut spelled = self.target.as_os_str().to_os_string();
+        spelled.push(format!(":rw,mode={}", self.mode));
+        match (owner, user) {
+            (TmpfsOwner::Mapped, HostUser::Ids { .. }) => spelled.push(",U"),
+            (TmpfsOwner::Ids, HostUser::Ids { uid, gid }) => spelled.push(format!(",uid={uid},gid={gid}")),
+            (_, HostUser::ImageDefault) => {}
+        }
+        spelled
+    }
+}
+
 /// A socket of this machine, made reachable inside a container at a path of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Socket<'a> {
@@ -637,7 +794,7 @@ mod tests {
     use super::super::{Engine, EngineKind};
     use crate::engine::{
         Access, ContainerCreate, CopyIn, CopyOut, Exec, HostUser, ImageBuild, Mount, MountSource, Network, RunAttached,
-        RunOnce, Socket,
+        RunOnce, RunWindow, Socket, Tmpfs,
     };
     use std::path::Path;
 
@@ -844,6 +1001,121 @@ mod tests {
                 "git status"
             ]
         );
+    }
+
+    #[test]
+    fn podman_opens_a_window_with_the_options_the_trial_measured() {
+        let command = window(&podman());
+        assert_eq!(
+            command[..6],
+            ["run", "--detach", "--init", "--shm-size=1g", "--name", "qcode-p-anti.desk"],
+            "detached because nobody watches it, and init so the stop signal reaches the program"
+        );
+        // Podman needs no profile of ours: its default already lets the application build its own
+        // sandbox, so it is never handed one even when one is offered.
+        assert!(!command.contains(&"--security-opt".to_owned()), "{command:?}");
+        // The runtime folder is the container's own and belongs to whoever runs inside.
+        assert!(window_at(&command, "--tmpfs") == Some("/run/qcode-display:rw,mode=0700,U".to_owned()), "{command:?}");
+        assert_eq!(window_at(&command, "--device").as_deref(), Some("/dev/dri"));
+        assert_eq!(window_at(&command, "--env").as_deref(), Some("XDG_RUNTIME_DIR=/run/qcode-display"));
+        // One socket file of the machine's runtime folder, never the folder: the engine's own
+        // socket lives beside it, and a container that had it could start anything on the machine.
+        assert!(
+            command.contains(&"/run/user/1000/wayland-1:/run/qcode-display/wayland-1:rw".to_owned()),
+            "{command:?}"
+        );
+        assert!(!command.iter().any(|arg| arg == "/run/user/1000:/run/qcode-display:rw"), "{command:?}");
+        assert_eq!(&command[command.len() - 3..], ["/opt/app/app", "--ozone-platform=wayland", "/work/Project"]);
+        // Never the flag that would give up the application's own sandbox.
+        assert!(!command.contains(&"--no-sandbox".to_owned()), "{command:?}");
+    }
+
+    #[test]
+    fn docker_opens_a_window_with_the_ids_named_and_the_profile_its_default_lacks() {
+        let command = window(&docker());
+        assert_eq!(command[..6], ["run", "--detach", "--init", "--shm-size=1g", "--name", "qcode-p-anti.desk"]);
+        assert_eq!(command[6..8], ["--security-opt", "seccomp=/tmp/qcode-seccomp.json"]);
+        assert_eq!(
+            window_at(&command, "--tmpfs").as_deref(),
+            Some("/run/qcode-display:rw,mode=0700,uid=1000,gid=1000"),
+            "docker takes no `U`, so the ids are named as they are everywhere else on it"
+        );
+        assert!(command.contains(&"--user".to_owned()) && command.contains(&"1000:1000".to_owned()), "{command:?}");
+    }
+
+    #[test]
+    fn a_window_on_a_machine_without_a_graphics_card_or_a_profile_asks_for_neither() {
+        let mounts = [];
+        let request = RunWindow {
+            name: "qcode-p-anti.desk",
+            once: RunOnce {
+                image: "qcode/profile/anti",
+                mounts: &mounts,
+                network: Network::Full,
+                user: HostUser::Ids { uid: 1000, gid: 1000 },
+                workdir: None,
+                command: &["/opt/app/app"],
+            },
+            env: &[],
+            sockets: &[],
+            tmpfs: &[],
+            devices: &[],
+            shm: "1g",
+            seccomp: None,
+        };
+        for engine in [podman(), docker()] {
+            let command = args(&engine.run_window(&request));
+            assert!(!command.contains(&"--device".to_owned()), "{command:?}");
+            assert!(!command.contains(&"--security-opt".to_owned()), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn a_window_is_waited_for_and_given_time_to_close_before_it_is_killed() {
+        for engine in [podman(), docker()] {
+            assert_eq!(args(&engine.wait_container("qcode-p-anti.desk")), ["wait", "qcode-p-anti.desk"]);
+            assert_eq!(
+                args(&engine.stop_container_within("qcode-p-anti.desk", 10)),
+                ["stop", "--time", "10", "qcode-p-anti.desk"]
+            );
+        }
+    }
+
+    /// The words of the command that opens a window through `engine`, with everything a window can
+    /// be given: the machine's compositor socket, its graphics device and a seccomp profile.
+    fn window(engine: &Engine) -> Vec<String> {
+        let mounts = [Mount {
+            source: MountSource::Path(Path::new("/home/me/QCode/Projects/p/Project")),
+            target: Path::new("/work/Project"),
+            access: Access::ReadWrite,
+        }];
+        let sockets =
+            [Socket { host: Path::new("/run/user/1000/wayland-1"), target: Path::new("/run/qcode-display/wayland-1") }];
+        let tmpfs = [Tmpfs { target: Path::new("/run/qcode-display"), mode: "0700" }];
+        let devices = [Path::new("/dev/dri")];
+        args(&engine.run_window(&RunWindow {
+            name: "qcode-p-anti.desk",
+            once: RunOnce {
+                image: "qcode/profile/anti",
+                mounts: &mounts,
+                network: Network::Full,
+                user: HostUser::Ids { uid: 1000, gid: 1000 },
+                workdir: Some(Path::new("/work/Project")),
+                command: &["/opt/app/app", "--ozone-platform=wayland", "/work/Project"],
+            },
+            env: &[("XDG_RUNTIME_DIR", "/run/qcode-display"), ("WAYLAND_DISPLAY", "wayland-1")],
+            sockets: &sockets,
+            tmpfs: &tmpfs,
+            devices: &devices,
+            shm: "1g",
+            seccomp: Some(Path::new("/tmp/qcode-seccomp.json")),
+        }))
+    }
+
+    /// The word after the first `flag` of `command`.
+    fn window_at(command: &[String], flag: &str) -> Option<String> {
+        let at = command.iter().position(|arg| arg == flag)?;
+        command.get(at + 1).cloned()
     }
 
     #[test]

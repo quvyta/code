@@ -21,6 +21,6 @@ mod name;
 mod template;
 
 pub use definition::{Loaded, MountAccess, NetworkMode, Profile};
-pub use harness::{AccountKind, ConfigFile, Harness, HarnessKind, McpSettings, McpShape, Resume};
+pub use harness::{AccountKind, ConfigFile, Desktop, Harness, HarnessKind, McpSettings, McpShape, Resume, Surface};
 pub use name::SafeName;
 pub use template::Template;

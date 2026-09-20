@@ -8,10 +8,16 @@
 //! only limits the list.
 //!
 //! On the installs: npm 11 warns about a package's install scripts and runs them anyway. All
-//! four installed clean with the plain command, and the two that need a script (Claude Code and
-//! opencode copy a native binary over a stub in `postinstall`) answered afterwards, so no
-//! `--allow-scripts` is written here; the live test is what would notice if npm stopped running
-//! them.
+//! four command-line harnesses installed clean with the plain command, and the two that need a
+//! script (Claude Code and opencode copy a native binary over a stub in `postinstall`) answered
+//! afterwards, so no `--allow-scripts` is written here; the live test is what would notice if npm
+//! stopped running them.
+//!
+//! One harness here opens a window instead of drawing in a terminal. Its record carries a
+//! [`Desktop`] beside the fields every harness has, and the fields that only mean something in a
+//! terminal — the registry install, the unattended argument, the login file QCode carries, the
+//! resume argument — are empty for it. [`HarnessKind::TERMINAL`] is the list to walk when a rule
+//! is about those.
 
 /// A harness QCode can build a profile image for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +30,8 @@ pub enum HarnessKind {
     GeminiCli,
     /// Codex CLI.
     Codex,
+    /// Antigravity IDE, which opens a window instead of drawing in a terminal.
+    AntigravityIde,
 }
 
 /// What a profile signs in with.
@@ -36,6 +44,10 @@ pub enum AccountKind {
     Subscription,
     /// A key the user pastes in.
     ApiKey,
+    /// A login the person makes inside the harness's own window, with nothing for QCode to
+    /// make, store or carry: the harness writes it into the project's home volume itself and
+    /// finds it there again. QCode's sign-in container and credential volume have no part in it.
+    InApp,
 }
 
 /// A configuration file a template writes into the image, by its path under the home directory.
@@ -45,6 +57,71 @@ pub struct ConfigFile {
     pub path: &'static str,
     /// What the file holds, written as the harness expects to read it.
     pub contents: &'static str,
+}
+
+/// Where a harness draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surface {
+    /// In the tab's own terminal, which is where every command-line harness draws.
+    Terminal,
+    /// In a window of its own on the person's desktop, opened by a container. The tab has no
+    /// terminal then; it says where the window stands and offers the two things that can be done
+    /// to it.
+    Desktop(&'static Desktop),
+}
+
+/// A harness that opens a window: where its application comes from, what the image needs beside
+/// the base image to run it, and how the window is started.
+///
+/// The application is never carried inside a QCode image. Its terms permit running it, not
+/// redistributing it, so the image is built on the person's own machine and fetches the archive
+/// from the maker's address at install time, exactly as a command-line harness is installed from
+/// its own registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Desktop {
+    /// The version this record was read from and checked against.
+    pub version: &'static str,
+    /// Where the archive is downloaded from while the image is built.
+    pub archive: &'static str,
+    /// How many bytes that archive is, as the server reports its length.
+    pub bytes: u64,
+    /// The SHA-256 of the archive, so an image is never built from something else that answered
+    /// at the same address.
+    pub sha256: &'static str,
+    /// Where the archive unpacks to in the image, the one directory inside it stripped away.
+    pub install_dir: &'static str,
+    /// The program that opens the window, by its name under [`Desktop::install_dir`].
+    ///
+    /// The archive's own launcher script is not used: it runs the real program through `sh`, and
+    /// a container whose first process is that shell never passes the stop signal on, so every
+    /// stop costs the engine's ten-second timeout and a kill.
+    pub program: &'static str,
+    /// The arguments the window is always opened with.
+    pub flags: &'static [&'static str],
+    /// The Debian packages the application needs beside what the base image brings.
+    pub packages: &'static [&'static str],
+    /// How much room the built image takes, in whole mebibytes, as it was measured. The person is
+    /// told before they ask for it: a desktop image is an order of magnitude larger than a
+    /// command-line harness's.
+    pub image_mib: u64,
+}
+
+impl Desktop {
+    /// The program that opens the window, as an absolute path in the image.
+    #[must_use]
+    pub fn command(&self) -> String {
+        format!("{}/{}", self.install_dir, self.program)
+    }
+
+    /// The whole line that opens the window on the project at `project`: the program, the
+    /// arguments it always takes, and the folder to open.
+    #[must_use]
+    pub fn command_line(&self, project: &str) -> Vec<String> {
+        let mut line = vec![self.command()];
+        line.extend(self.flags.iter().map(|flag| (*flag).to_owned()));
+        line.push(project.to_owned());
+        line
+    }
 }
 
 /// Where a harness reads the MCP servers it starts in every project, and in which shape.
@@ -86,24 +163,34 @@ pub struct Harness {
     /// them. A profile that has one still loads, because the few for whom it still works would
     /// otherwise lose it, but no new profile is offered it and loading it says why.
     pub withdrawn: &'static [AccountKind],
-    /// The shell commands that install the harness into the image.
+    /// The shell commands that install the harness into the image. A harness that opens a window
+    /// has none: what its image is made of is in [`Desktop`], which the recipe reads instead.
     pub install: &'static [&'static str],
     /// The program that starts the harness in the container.
     pub command: &'static str,
     /// The arguments that let the harness work without asking for permission. The container is
-    /// the isolation, so they are always passed.
+    /// the isolation, so they are always passed. A harness that opens a window has none: it asks
+    /// the person, in its own window, and the arguments its window needs are in [`Desktop`].
     pub auto_run: &'static [&'static str],
     /// Environment variables the container must set for the harness to behave as described here.
     pub environment: &'static [(&'static str, &'static str)],
     /// The files the login lives in, relative to the home directory. Each one is a file, not a
     /// directory, so a copy never drags settings along with the login.
+    ///
+    /// Empty for a harness whose login QCode does not carry: one signed in to inside its own
+    /// window ([`AccountKind::InApp`]) writes its login into the project's home volume itself,
+    /// and there is no sign-in container it could be taken out of.
     pub identity: &'static [&'static str],
     /// The configuration the `recommended` template writes, when the harness reads one.
     pub settings: Option<ConfigFile>,
-    /// How the harness is told to open a conversation it had before, by that conversation's id.
-    pub resume: Resume,
-    /// Where the harness reads the MCP servers it starts.
-    pub mcp: McpSettings,
+    /// How the harness is told to open a conversation it had before, by that conversation's id;
+    /// `None` for one that keeps no conversations QCode can list.
+    pub resume: Option<Resume>,
+    /// Where the harness draws.
+    pub surface: Surface,
+    /// Where the harness reads the MCP servers it starts; `None` for one that opens a window,
+    /// which has no agent of QCode's bridge in it.
+    pub mcp: Option<McpSettings>,
 }
 
 /// How a harness opens an earlier conversation from its command line.
@@ -126,8 +213,15 @@ pub enum Resume {
 }
 
 impl HarnessKind {
-    /// Every harness, in the order the profile wizard offers them.
-    pub const ALL: [Self; 4] = [Self::ClaudeCode, Self::OpenCode, Self::GeminiCli, Self::Codex];
+    /// Every harness, in the order the profile wizard offers them. The ones that draw in a
+    /// terminal come first, because that is what nearly every profile is.
+    pub const ALL: [Self; 5] = [Self::ClaudeCode, Self::OpenCode, Self::GeminiCli, Self::Codex, Self::AntigravityIde];
+
+    /// The harnesses that draw in the tab's own terminal, in the same order.
+    ///
+    /// Most of what QCode knows about a harness — the install from a registry, the unattended
+    /// arguments, the conversation script, the login file it carries — is only true of these.
+    pub const TERMINAL: [Self; 4] = [Self::ClaudeCode, Self::OpenCode, Self::GeminiCli, Self::Codex];
 
     /// What QCode knows about this harness.
     #[must_use]
@@ -137,6 +231,16 @@ impl HarnessKind {
             Self::OpenCode => &OPENCODE,
             Self::GeminiCli => &GEMINI_CLI,
             Self::Codex => &CODEX,
+            Self::AntigravityIde => &ANTIGRAVITY_IDE,
+        }
+    }
+
+    /// The window this harness opens, when it opens one rather than drawing in a terminal.
+    #[must_use]
+    pub fn desktop(self) -> Option<&'static Desktop> {
+        match self.record().surface {
+            Surface::Terminal => None,
+            Surface::Desktop(desktop) => Some(desktop),
         }
     }
 
@@ -163,25 +267,24 @@ impl HarnessKind {
     ///
     /// An id that [`history::is_safe_id`](super::history::is_safe_id) would not have let through
     /// is not passed on: a word starting with `-` would be read as an option, so the harness is
-    /// started as if none had been asked for rather than with an argument nobody chose.
+    /// started as if none had been asked for rather than with an argument nobody chose. Nor is one
+    /// given to a harness that has no way of being told to open a conversation again.
     #[must_use]
     pub fn command_line(self, conversation: Option<&str>) -> Vec<String> {
         let record = self.record();
         let auto_run = record.auto_run.iter().map(|arg| (*arg).to_owned());
         let mut line = vec![record.command.to_owned()];
-        match conversation.filter(|id| super::history::is_safe_id(id)) {
+        match conversation.filter(|id| super::history::is_safe_id(id)).zip(record.resume) {
             None => line.extend(auto_run),
-            Some(id) => match record.resume {
-                Resume::Option(option) => {
-                    line.extend(auto_run);
-                    line.extend([option.to_owned(), id.to_owned()]);
-                }
-                Resume::Subcommand(command) => {
-                    line.push(command.to_owned());
-                    line.extend(auto_run);
-                    line.push(id.to_owned());
-                }
-            },
+            Some((id, Resume::Option(option))) => {
+                line.extend(auto_run);
+                line.extend([option.to_owned(), id.to_owned()]);
+            }
+            Some((id, Resume::Subcommand(command))) => {
+                line.push(command.to_owned());
+                line.extend(auto_run);
+                line.push(id.to_owned());
+            }
         }
         line
     }
@@ -189,7 +292,7 @@ impl HarnessKind {
 
 impl AccountKind {
     /// Every account type. The wizard offers each harness's own list, in that harness's order.
-    pub const ALL: [Self; 3] = [Self::Free, Self::Subscription, Self::ApiKey];
+    pub const ALL: [Self; 4] = [Self::Free, Self::Subscription, Self::ApiKey, Self::InApp];
 
     /// How the account type is written in definition files.
     #[must_use]
@@ -198,6 +301,7 @@ impl AccountKind {
             Self::Free => "free",
             Self::Subscription => "subscription",
             Self::ApiKey => "api-key",
+            Self::InApp => "in-app",
         }
     }
 
@@ -207,11 +311,16 @@ impl AccountKind {
         Self::ALL.into_iter().find(|account| account.id() == id)
     }
 
-    /// Whether a profile with this account has a login at all. One that has none is ready as
-    /// soon as its image is, and nothing about it waits for a credentials volume.
+    /// Whether QCode has a login to make for a profile with this account. One that has none is
+    /// ready as soon as its image is, and nothing about it waits for a credentials volume.
+    ///
+    /// An in-app login is none of QCode's: the person makes it inside the harness's own window,
+    /// where it lands in the project's home volume. There is nothing for the sign-in container to
+    /// capture and nothing to carry from project to project, so the profile is ready the moment
+    /// its image is, exactly like one that signs in to nothing.
     #[must_use]
     pub fn needs_login(self) -> bool {
-        self != Self::Free
+        matches!(self, Self::Subscription | Self::ApiKey)
     }
 }
 
@@ -252,8 +361,9 @@ static CLAUDE_CODE: Harness = Harness {
         path: ".claude/settings.json",
         contents: "{\n  \"permissions\": {\n    \"defaultMode\": \"bypassPermissions\"\n  }\n}\n",
     }),
-    resume: Resume::Option("--resume"),
-    mcp: McpSettings { path: ".claude.json", shape: McpShape::Claude },
+    resume: Some(Resume::Option("--resume")),
+    surface: Surface::Terminal,
+    mcp: Some(McpSettings { path: ".claude.json", shape: McpShape::Claude }),
 };
 
 /// opencode. Install and start command from the opencode documentation (`opencode.ai/docs`), the
@@ -296,8 +406,9 @@ static OPENCODE: Harness = Harness {
         path: ".config/opencode/opencode.json",
         contents: "{\n  \"$schema\": \"https://opencode.ai/config.json\",\n  \"permission\": {\n    \"*\": \"allow\"\n  }\n}\n",
     }),
-    resume: Resume::Option("--session"),
-    mcp: McpSettings { path: ".config/opencode/opencode.json", shape: McpShape::OpenCode },
+    resume: Some(Resume::Option("--session")),
+    surface: Surface::Terminal,
+    mcp: Some(McpSettings { path: ".config/opencode/opencode.json", shape: McpShape::OpenCode }),
 };
 
 /// Gemini CLI. Install and start command from the project's readme, the argument from
@@ -373,8 +484,9 @@ static GEMINI_CLI: Harness = Harness {
         path: ".gemini/settings.json",
         contents: "{\n  \"security\": {\n    \"folderTrust\": {\n      \"enabled\": false\n    }\n  }\n}\n",
     }),
-    resume: Resume::Option("--resume"),
-    mcp: McpSettings { path: ".gemini/settings.json", shape: McpShape::Gemini },
+    resume: Some(Resume::Option("--resume")),
+    surface: Surface::Terminal,
+    mcp: Some(McpSettings { path: ".gemini/settings.json", shape: McpShape::Gemini }),
 };
 
 /// Codex CLI. Install and start command from the project's readme, the argument from the source
@@ -427,8 +539,101 @@ static CODEX: Harness = Harness {
         path: ".codex/config.toml",
         contents: "approval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\n",
     }),
-    resume: Resume::Subcommand("resume"),
-    mcp: McpSettings { path: ".codex/config.toml", shape: McpShape::Codex },
+    resume: Some(Resume::Subcommand("resume")),
+    surface: Surface::Terminal,
+    mcp: Some(McpSettings { path: ".codex/config.toml", shape: McpShape::Codex }),
+};
+
+/// Antigravity IDE, the one harness here that opens a window instead of drawing in a terminal.
+///
+/// Everything below was measured in a throwaway container on a Wayland desktop, and the paragraphs
+/// that follow say what each field was read from and what was seen.
+///
+/// The archive: the address, the version and the length are from the maker's own download page
+/// (`antigravity.google/download`), whose Linux x64 link for the IDE is the one below; the server
+/// answers it with `content-length: 240837095` and `last-modified` of 2026-09-13. The digest was
+/// taken of that download. The address carries the version, so a new version is a new record and
+/// a new image, the way a command-line harness is updated by installing it again.
+///
+/// The program: the archive holds one directory, `Antigravity IDE/`, and `antigravity-ide` inside
+/// it is the real program. Its `bin/antigravity-ide` launcher is a shell script, and a container
+/// whose first process is that shell swallowed the stop signal: `stop` waited its ten seconds
+/// and killed. Started directly, with `--init` above it, the window closed on the signal in
+/// under two and a half seconds with an exit code of 0.
+///
+/// The one flag: `--ozone-platform=wayland` was enough for a native Wayland window (the
+/// compositor listed the client with `xwayland: false`). `--enable-features=UseOzonePlatform` was
+/// not needed, the application draws its own title bar, and `--ignore-gpu-blocklist` must never
+/// be added: with it the window came up empty and the graphics process restarted four times.
+/// `--no-sandbox` is not here either, and is not to be added: the application's own sandbox comes
+/// up inside the container on both engines (see `crate::desktop` for what docker needs for that).
+///
+/// The packages: the application is Electron 39 with Chromium 142 inside, so it wants GTK 3, NSS,
+/// ALSA, GBM, libsecret, the X and Wayland client libraries and a font; Mesa, so that the
+/// graphics process can fall back to drawing in software, which is what it did on the virtual
+/// card it was measured on; `dbus` and `procps`, which it looks for on startup; and `curl`, which
+/// the base image does not carry and the install step downloads with. Recommended packages stay
+/// out, as everywhere in these images.
+///
+/// The login: the application offers nothing but "Continue with Google" on its first screen, and
+/// that sign-in is not built yet — it opens a browser inside the container, which has none, and
+/// waits on a port of the container's own network. So the account type says the login is the
+/// person's to make inside the window, and the tab says plainly that the window is waiting for
+/// one. Closing that gap means carrying the browser call out to this machine and the port it
+/// answers on back in, and that is a slice of its own.
+///
+/// The settings: the `recommended` template turns the maker's telemetry and the application's own
+/// updater off, and nothing else. It is written into the image's home directory like every
+/// template's file, which means the project's home volume gets it when the volume is first filled
+/// and never again, so an edit the person makes afterwards stays. The workspace trust question is
+/// deliberately left alone: refusing it on someone's behalf is not QCode's to do.
+static ANTIGRAVITY_IDE: Harness = Harness {
+    id: "antigravity-ide",
+    display_name: "Antigravity IDE",
+    accounts: &[AccountKind::InApp],
+    withdrawn: &[],
+    install: &[],
+    command: "/opt/antigravity-ide/antigravity-ide",
+    auto_run: &[],
+    environment: &[],
+    identity: &[],
+    settings: Some(ConfigFile {
+        path: ".config/Antigravity IDE/User/settings.json",
+        contents: "{\n  \"telemetry.telemetryLevel\": \"off\",\n  \"update.mode\": \"none\"\n}\n",
+    }),
+    resume: None,
+    surface: Surface::Desktop(&ANTIGRAVITY),
+    mcp: None,
+};
+
+/// The window Antigravity IDE opens, as the trial measured it.
+static ANTIGRAVITY: Desktop = Desktop {
+    version: "2.5.5",
+    archive: "https://edgedl.me.gvt1.com/edgedl/release2/j0qc3/antigravity/stable/\
+              2.5.5-4923483625488384/linux-x64/Antigravity%20IDE.tar.gz",
+    bytes: 240_837_095,
+    sha256: "0c5233b297d2b3aebb61af49f8944012c2953d361a5ebb16978490636917f831",
+    install_dir: "/opt/antigravity-ide",
+    program: "antigravity-ide",
+    flags: &["--ozone-platform=wayland"],
+    packages: &[
+        "curl",
+        "dbus",
+        "fonts-dejavu-core",
+        "libasound2t64",
+        "libegl1",
+        "libgbm1",
+        "libgl1-mesa-dri",
+        "libgtk-3-0t64",
+        "libnss3",
+        "libsecret-1-0",
+        "libxkbfile1",
+        "libxss1",
+        "libxtst6",
+        "mesa-vulkan-drivers",
+        "procps",
+    ],
+    image_mib: 1_390,
 };
 
 #[cfg(test)]
@@ -441,16 +646,30 @@ mod tests {
             let record = harness.record();
             assert!(!record.id.is_empty() && !record.display_name.is_empty(), "{harness:?}");
             assert!(!record.accounts.is_empty(), "{harness:?} must support an account type");
-            assert!(!record.install.is_empty(), "{harness:?} must say how it is installed");
             assert!(!record.command.is_empty(), "{harness:?} must say how it is started");
-            assert!(!record.auto_run.is_empty(), "{harness:?} must say how unattended mode is turned on");
-            assert!(!record.identity.is_empty(), "{harness:?} must say where its identity lives");
         }
     }
 
     #[test]
+    fn every_command_line_harness_says_how_it_is_installed_run_and_resumed() {
+        // The four fields below are what a terminal tab needs and a window has no use for: a
+        // window is installed from an archive named in its own record, asks the person in its own
+        // interface instead of taking an unattended flag, keeps a login QCode never carries, and
+        // has no conversation id to be handed back.
+        for harness in HarnessKind::TERMINAL {
+            let record = harness.record();
+            assert!(!record.install.is_empty(), "{harness:?} must say how it is installed");
+            assert!(!record.auto_run.is_empty(), "{harness:?} must say how unattended mode is turned on");
+            assert!(!record.identity.is_empty(), "{harness:?} must say where its identity lives");
+            assert!(record.resume.is_some(), "{harness:?} must say how a conversation is opened again");
+            assert_eq!(harness.desktop(), None, "{harness:?} draws in the terminal");
+        }
+        assert_eq!(HarnessKind::TERMINAL.len() + 1, HarnessKind::ALL.len(), "every harness is one or the other");
+    }
+
+    #[test]
     fn identity_paths_stay_inside_the_home_directory() {
-        for harness in HarnessKind::ALL {
+        for harness in HarnessKind::TERMINAL {
             for path in harness.record().identity {
                 assert!(!path.starts_with('/') && !path.starts_with('~'), "{harness:?}: {path}");
                 assert!(!path.split('/').any(|part| part == ".." || part.is_empty()), "{harness:?}: {path}");
@@ -472,12 +691,17 @@ mod tests {
     fn every_harness_reads_its_servers_from_its_home_and_never_from_its_login() {
         for harness in HarnessKind::ALL {
             let record = harness.record();
-            let path = record.mcp.path;
+            // A harness that opens a window has no such file: nothing of QCode's runs inside it.
+            let Some(mcp) = record.mcp else {
+                assert!(matches!(record.surface, Surface::Desktop(_)), "{harness:?} reads servers from nowhere");
+                continue;
+            };
+            let path = mcp.path;
             assert!(!path.starts_with('/') && !path.starts_with('~'), "{harness:?}: {path}");
             assert!(!record.identity.contains(&path), "{harness:?}: registering a server would touch the login");
         }
-        assert_eq!(HarnessKind::ClaudeCode.record().mcp.path, ".claude.json");
-        assert_eq!(HarnessKind::Codex.record().mcp.shape, McpShape::Codex);
+        assert_eq!(HarnessKind::ClaudeCode.record().mcp.expect("it has one").path, ".claude.json");
+        assert_eq!(HarnessKind::Codex.record().mcp.expect("it has one").shape, McpShape::Codex);
     }
 
     #[test]
@@ -486,7 +710,7 @@ mod tests {
         // the servers.
         for harness in [HarnessKind::OpenCode, HarnessKind::GeminiCli, HarnessKind::Codex] {
             let record = harness.record();
-            assert_eq!(record.settings.map(|file| file.path), Some(record.mcp.path), "{harness:?}");
+            assert_eq!(record.settings.map(|file| file.path), record.mcp.map(|mcp| mcp.path), "{harness:?}");
         }
     }
 
@@ -511,9 +735,10 @@ mod tests {
             seen.push(id);
             assert_eq!(HarnessKind::parse(id), Some(harness));
         }
-        assert_eq!(seen, ["claude-code", "opencode", "gemini-cli", "codex"]);
+        assert_eq!(seen, ["claude-code", "opencode", "gemini-cli", "codex", "antigravity-ide"]);
         assert_eq!(HarnessKind::parse("Claude-Code"), None, "identifiers are written one way only");
         assert_eq!(HarnessKind::parse("cursor"), None);
+        assert_eq!(HarnessKind::parse("antigravity-ide"), Some(HarnessKind::AntigravityIde));
     }
 
     #[test]
@@ -535,6 +760,12 @@ mod tests {
         }
         assert!(!AccountKind::Free.needs_login());
         assert!(AccountKind::Subscription.needs_login() && AccountKind::ApiKey.needs_login());
+        // QCode has no login of its own to make for a window the person signs in to themselves.
+        assert!(!AccountKind::InApp.needs_login());
+        assert_eq!(HarnessKind::AntigravityIde.record().accounts, [AccountKind::InApp]);
+        for harness in HarnessKind::TERMINAL {
+            assert!(!harness.supports(AccountKind::InApp), "{harness:?}");
+        }
     }
 
     #[test]
@@ -617,6 +848,62 @@ mod tests {
         assert_eq!(settings.path, ".gemini/settings.json");
         assert!(settings.contents.contains("\"folderTrust\""), "{}", settings.contents);
         assert!(settings.contents.contains("\"enabled\": false"), "{}", settings.contents);
+    }
+
+    #[test]
+    fn verified_antigravity_ide_facts() {
+        let record = HarnessKind::AntigravityIde.record();
+        let desktop = HarnessKind::AntigravityIde.desktop().expect("it opens a window");
+        assert_eq!(record.command, desktop.command());
+        assert_eq!(desktop.command(), "/opt/antigravity-ide/antigravity-ide");
+        // The address is the maker's own, carries the version this record describes, and is the
+        // Linux x64 archive of the IDE rather than of the other product on the same page.
+        assert!(desktop.archive.starts_with("https://"), "{}", desktop.archive);
+        assert!(desktop.archive.contains(desktop.version), "{}", desktop.archive);
+        assert!(desktop.archive.contains("/linux-x64/"), "{}", desktop.archive);
+        assert!(!desktop.archive.contains(' ') && !desktop.archive.contains('\n'), "{}", desktop.archive);
+        assert_eq!(desktop.bytes, 240_837_095);
+        assert_eq!(desktop.sha256.len(), 64);
+        assert!(desktop.sha256.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        // The one flag the window needs, and the two that must never be added: one blanked the
+        // window, the other would give up the application's own sandbox.
+        assert_eq!(desktop.flags, ["--ozone-platform=wayland"]);
+        assert!(!desktop.flags.contains(&"--no-sandbox"), "the sandbox comes up on both engines");
+        assert!(!desktop.flags.contains(&"--ignore-gpu-blocklist"), "it left the window empty");
+        // Nothing is installed from a registry, and nothing of the archive is carried here.
+        assert!(record.install.is_empty() && record.auto_run.is_empty() && record.resume.is_none());
+        assert!(record.identity.is_empty(), "the login lives in the project's home volume");
+        let settings = record.settings.expect("the template turns telemetry and the updater off");
+        assert!(settings.contents.contains("\"telemetry.telemetryLevel\": \"off\""), "{}", settings.contents);
+        assert!(settings.contents.contains("\"update.mode\": \"none\""), "{}", settings.contents);
+        // Refusing the workspace trust question on someone's behalf is not QCode's to do.
+        assert!(!settings.contents.contains("workspace.trust"), "{}", settings.contents);
+        assert!(desktop.image_mib > 1_000, "the person is told how large it is: {}", desktop.image_mib);
+    }
+
+    #[test]
+    fn a_window_is_opened_on_the_project_with_the_flags_it_always_takes() {
+        let desktop = HarnessKind::AntigravityIde.desktop().expect("it opens a window");
+        assert_eq!(
+            desktop.command_line("/work/Project"),
+            ["/opt/antigravity-ide/antigravity-ide", "--ozone-platform=wayland", "/work/Project"]
+        );
+    }
+
+    #[test]
+    fn the_packages_a_window_needs_are_named_once_and_installable() {
+        let desktop = HarnessKind::AntigravityIde.desktop().expect("it opens a window");
+        let mut sorted = desktop.packages.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted, desktop.packages, "the list is sorted and says each package once");
+        for package in desktop.packages {
+            // A word apt takes as a package name, never an option and never a shell word.
+            assert!(package.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit()), "{package}");
+            assert!(package.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "+-.".contains(c)));
+        }
+        // The archive is downloaded by the install step, and the base image carries no client.
+        assert!(desktop.packages.contains(&"curl"), "nothing would fetch the archive");
     }
 
     #[test]

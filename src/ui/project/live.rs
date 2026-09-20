@@ -62,6 +62,7 @@ impl Scratch {
             assets: self.0.join("Assets"),
             assets_access: Access::ReadWrite,
             network: Network::Full,
+            window: None,
             bridge: None,
         }
     }

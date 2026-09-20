@@ -78,6 +78,8 @@ pub enum SessionTabKind {
     Office(String),
     /// A sound of the project, played in a container of its own or described.
     Sound(String),
+    /// The window of the desktop harness of the profile of this name.
+    Desktop(String),
 }
 
 /// One tab of a saved session.
@@ -206,6 +208,9 @@ impl Session {
                     SessionTabKind::Sound(file) => {
                         let _ = write!(out, "kind = \"sound\"\nfile = {}\n", quoted(file));
                     }
+                    SessionTabKind::Desktop(name) => {
+                        let _ = write!(out, "kind = \"desktop\"\nprofile = {}\n", quoted(name));
+                    }
                 }
                 if let Some(conversation) = &tab.conversation {
                     let _ = writeln!(out, "conversation = {}", quoted(conversation));
@@ -296,7 +301,10 @@ fn session_tab(entry: &Table, diagnostics: &mut Vec<Diagnostic>) -> Option<Sessi
                 _ => SessionTabKind::Editor(file),
             }
         }
-        _ => match entry.text("profile") {
+        // A window tab and a harness tab are both a profile's; an unknown kind that names a
+        // profile is read as a harness tab, as it was before windows existed.
+        kind => match entry.text("profile") {
+            Some(name) if kind == "desktop" => SessionTabKind::Desktop(name.to_owned()),
             Some(name) => SessionTabKind::Profile(name.to_owned()),
             None => {
                 let at = entry.value_location("kind").cloned();

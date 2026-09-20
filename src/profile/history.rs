@@ -329,13 +329,18 @@ const CODEX: &str = concat!(
 impl HarnessKind {
     /// The Node script that prints this harness's conversations in the project whose folder is
     /// its first argument, in the shape [`parse`] reads.
+    ///
+    /// `None` for a harness whose conversations QCode cannot list: the window harness keeps its
+    /// own, under [`HarnessKind::conversation_paths`], in a shape that was never read, and a list
+    /// guessed at would offer conversations that do not open.
     #[must_use]
-    pub fn history_script(self) -> &'static str {
+    pub fn history_script(self) -> Option<&'static str> {
         match self {
-            Self::ClaudeCode => CLAUDE_CODE,
-            Self::OpenCode => OPENCODE,
-            Self::GeminiCli => GEMINI_CLI,
-            Self::Codex => CODEX,
+            Self::ClaudeCode => Some(CLAUDE_CODE),
+            Self::OpenCode => Some(OPENCODE),
+            Self::GeminiCli => Some(GEMINI_CLI),
+            Self::Codex => Some(CODEX),
+            Self::AntigravityIde => None,
         }
     }
 
@@ -358,6 +363,11 @@ impl HarnessKind {
             ],
             Self::GeminiCli => &[".gemini/tmp", ".gemini/projects.json"],
             Self::Codex => &[".codex/sessions", ".codex/session_index.jsonl"],
+            // The agent inside the window keeps its work here: the trial found `conversations/`,
+            // `brain/`, `knowledge/` and `html_artifacts/` under it after one session. QCode does
+            // not read the shape of any of it; it only knows the folder, which is what a backup
+            // needs. The editor's own state lives elsewhere and stays out.
+            Self::AntigravityIde => &[".gemini/antigravity-ide"],
         }
     }
 
@@ -371,7 +381,7 @@ impl HarnessKind {
     pub fn conversation_database(self) -> Option<&'static str> {
         match self {
             Self::OpenCode => Some(".local/share/opencode/opencode.db"),
-            Self::ClaudeCode | Self::GeminiCli | Self::Codex => None,
+            Self::ClaudeCode | Self::GeminiCli | Self::Codex | Self::AntigravityIde => None,
         }
     }
 }
@@ -388,15 +398,16 @@ pub struct Reading {
     pub list: EngineCommand,
 }
 
-/// Spells out the commands that read `harness`'s conversations from `container`.
+/// Spells out the commands that read `harness`'s conversations from `container`, or `None` for a
+/// harness whose conversations QCode cannot list.
 #[must_use]
-pub fn reading(engine: &Engine, container: &str, harness: HarnessKind) -> Reading {
-    let command = ["node", "-e", harness.history_script(), PROJECT_DIR];
-    Reading {
+pub fn reading(engine: &Engine, container: &str, harness: HarnessKind) -> Option<Reading> {
+    let command = ["node", "-e", harness.history_script()?, PROJECT_DIR];
+    Some(Reading {
         state: engine.container_state(container),
         start: engine.start_container(container),
         list: engine.exec_without_terminal(&Exec { container, command: &command }),
-    }
+    })
 }
 
 /// What reading takes, given what the engine said about the container.
@@ -447,7 +458,9 @@ pub fn read_starting(
     harness: HarnessKind,
     started: &mut dyn FnMut(),
 ) -> Result<Vec<Conversation>, EngineError> {
-    let reading = reading(engine, container, harness);
+    // A harness whose conversations QCode cannot list has none to show, and nothing is run to
+    // find that out: no container is started and no engine is asked.
+    let Some(reading) = reading(engine, container, harness) else { return Ok(Vec::new()) };
     // Both engines answer a name they do not know with an error rather than with a state.
     let state = capture(&reading.state).ok().map(|word| ContainerState::parse(&word));
     match steps(state.as_ref()) {
@@ -472,6 +485,10 @@ mod tests {
 
     fn ids(found: &[Conversation]) -> Vec<&str> {
         found.iter().map(|conversation| conversation.id.as_str()).collect()
+    }
+
+    fn script(harness: HarnessKind) -> &'static str {
+        harness.history_script().expect("a command-line harness has a script")
     }
 
     #[test]
@@ -578,8 +595,8 @@ mod tests {
 
     #[test]
     fn every_harness_has_a_script_that_reads_the_project_it_is_given() {
-        for harness in HarnessKind::ALL {
-            let script = harness.history_script();
+        for harness in HarnessKind::TERMINAL {
+            let script = harness.history_script().expect("a command-line harness has a script");
             assert!(script.starts_with(prelude!()), "{harness:?}");
             assert!(script.len() > prelude!().len(), "{harness:?} has only the prelude");
             assert!(script.contains("process.argv[1]"), "{harness:?}");
@@ -590,17 +607,27 @@ mod tests {
 
     #[test]
     fn each_script_looks_where_its_harness_writes() {
-        assert!(HarnessKind::ClaudeCode.history_script().contains("'.claude', 'projects'"));
-        assert!(HarnessKind::OpenCode.history_script().contains("'session', 'list', '--format', 'json'"));
-        assert!(HarnessKind::GeminiCli.history_script().contains("'projects.json'"));
-        assert!(HarnessKind::Codex.history_script().contains("'session_index.jsonl'"));
+        assert!(script(HarnessKind::ClaudeCode).contains("'.claude', 'projects'"));
+        assert!(script(HarnessKind::OpenCode).contains("'session', 'list', '--format', 'json'"));
+        assert!(script(HarnessKind::GeminiCli).contains("'projects.json'"));
+        assert!(script(HarnessKind::Codex).contains("'session_index.jsonl'"));
+    }
+
+    #[test]
+    fn a_window_harness_has_no_list_and_nothing_is_run_to_find_that_out() {
+        // The shape of what the agent in the window writes was never read, so QCode offers
+        // nothing rather than a list of conversations that might not open. Asking costs no
+        // engine command at all: a stopped container is not started for the question.
+        assert_eq!(HarnessKind::AntigravityIde.history_script(), None);
+        let engine = Engine::new(EngineKind::Podman, "/usr/bin/podman");
+        assert_eq!(reading(&engine, "qcode-p-anti", HarnessKind::AntigravityIde), None);
     }
 
     #[test]
     fn a_conversation_backup_takes_where_the_scripts_read_and_never_a_login() {
-        assert!(HarnessKind::ClaudeCode.history_script().contains("'.claude', 'projects'"));
-        assert!(HarnessKind::GeminiCli.history_script().contains("'.gemini'") && GEMINI_CLI.contains("'tmp'"));
-        assert!(HarnessKind::Codex.history_script().contains("'.codex'") && CODEX.contains("'sessions'"));
+        assert!(script(HarnessKind::ClaudeCode).contains("'.claude', 'projects'"));
+        assert!(script(HarnessKind::GeminiCli).contains("'.gemini'") && GEMINI_CLI.contains("'tmp'"));
+        assert!(script(HarnessKind::Codex).contains("'.codex'") && CODEX.contains("'sessions'"));
         for harness in HarnessKind::ALL {
             let paths = harness.conversation_paths();
             assert!(!paths.is_empty(), "{harness:?}");
@@ -624,7 +651,7 @@ mod tests {
     #[test]
     fn the_script_runs_without_a_terminal_in_the_project_folder() {
         let engine = Engine::new(EngineKind::Podman, "/usr/bin/podman");
-        let reading = reading(&engine, "qcode-my-app-claude-sub", HarnessKind::ClaudeCode);
+        let reading = reading(&engine, "qcode-my-app-claude-sub", HarnessKind::ClaudeCode).expect("a script");
         assert_eq!(
             args(&reading.state),
             ["container", "inspect", "--format", "{{.State.Status}}", "qcode-my-app-claude-sub"]
@@ -632,7 +659,7 @@ mod tests {
         assert_eq!(args(&reading.start), ["start", "qcode-my-app-claude-sub"]);
         let list = args(&reading.list);
         assert_eq!(list[..4], ["exec", "qcode-my-app-claude-sub", "node", "-e"]);
-        assert_eq!(list[4], HarnessKind::ClaudeCode.history_script());
+        assert_eq!(list[4], script(HarnessKind::ClaudeCode));
         assert_eq!(list[5], PROJECT_DIR);
         assert_eq!(list.len(), 6);
         assert!(!list.iter().any(|arg| arg == "--tty" || arg == "--interactive" || arg == "--user"), "{list:?}");
@@ -641,7 +668,7 @@ mod tests {
     #[test]
     fn docker_reads_the_same_way() {
         let engine = Engine::new(EngineKind::Docker, "/usr/bin/docker");
-        let reading = reading(&engine, "qcode-p-codex", HarnessKind::Codex);
+        let reading = reading(&engine, "qcode-p-codex", HarnessKind::Codex).expect("a script");
         assert_eq!(reading.list.program, std::path::Path::new("/usr/bin/docker"));
         assert_eq!(args(&reading.list)[..2], ["exec", "qcode-p-codex"]);
     }

@@ -16,7 +16,7 @@ mod state;
 
 pub use command::{
     Access, ContainerCreate, CopyIn, CopyOut, EngineCommand, Exec, HostUser, ImageBuild, Mount, MountSource, Network,
-    RunAttached, RunOnce, Socket,
+    RunAttached, RunOnce, RunWindow, Socket, Tmpfs,
 };
 pub use detect::{Unavailable, detect};
 pub use state::{Container, ContainerState};
@@ -77,5 +77,16 @@ impl Engine {
     #[must_use]
     pub fn bin(&self) -> &Path {
         &self.bin
+    }
+
+    /// Whether a container whose program builds sandboxes of its own has to be handed a seccomp
+    /// profile, or whether the engine's own default already allows it.
+    ///
+    /// Asked before a window is opened, so that the engine which needs no profile is not given one
+    /// and no file is written for it. Why the other one needs it is in
+    /// [`crate::desktop::seccomp`].
+    #[must_use]
+    pub fn needs_sandbox_profile(&self) -> bool {
+        self.kind.dialect().sandboxing == dialect::Sandboxing::NeedsProfile
     }
 }

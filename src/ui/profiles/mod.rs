@@ -751,7 +751,18 @@ fn account_word(account: AccountKind) -> String {
         AccountKind::Free => "profiles.account-free",
         AccountKind::Subscription => "profiles.account-subscription",
         AccountKind::ApiKey => "profiles.account-api-key",
+        AccountKind::InApp => "profiles.account-in-app",
     })
+}
+
+/// Why a profile has no sign-in step, for the two accounts that have none: the harness needs no
+/// account at all, or the person signs in inside its own window and QCode never sees it.
+fn no_login_detail(account: AccountKind, harness: &str) -> Option<String> {
+    match account {
+        AccountKind::Free => Some(t!("profiles.wizard.account-free-detail", harness = harness)),
+        AccountKind::InApp => Some(t!("profiles.wizard.account-in-app-detail", harness = harness)),
+        AccountKind::Subscription | AccountKind::ApiKey => None,
+    }
 }
 
 /// The word for a mount access.
@@ -905,9 +916,8 @@ fn draw_account(draft: &Draft, ui: &mut View<'_, Msg>) {
             .on_select(Msg::PickAccount),
     )
     .id("profile-account");
-    if !draft.account.needs_login() {
-        let harness = draft.harness.record().display_name;
-        ui.add(Text::new(t!("profiles.wizard.account-free-detail", harness = harness)).role("secondary")).fill_width();
+    if let Some(detail) = no_login_detail(draft.account, draft.harness.record().display_name) {
+        ui.add(Text::new(detail).role("secondary")).fill_width();
     }
 }
 
@@ -949,7 +959,24 @@ fn draw_image(state: &Profiles, draft: &Draft, ui: &mut View<'_, Msg>) {
         .fill_width();
     if draft.build == Build::Done && !draft.account.needs_login() {
         let harness = draft.harness.record().display_name;
-        ui.add(Text::new(t!("profiles.wizard.free-ready", harness = harness)).color("success")).fill_width();
+        let ready = match draft.account {
+            AccountKind::InApp => t!("profiles.wizard.in-app-ready", harness = harness),
+            _ => t!("profiles.wizard.free-ready", harness = harness),
+        };
+        ui.add(Text::new(ready).color("success")).fill_width();
+    }
+    // A window's image carries a whole desktop application, which is an order of magnitude more
+    // than a command-line harness; the person is told before the build rather than after.
+    if let Some(desktop) = draft.harness.desktop()
+        && matches!(draft.build, Build::Waiting | Build::Running(_))
+    {
+        let size = t!(
+            "profiles.wizard.desktop-size",
+            harness = draft.harness.record().display_name,
+            version = desktop.version,
+            mib = desktop.image_mib.to_string()
+        );
+        ui.add(Text::new(size).role("secondary")).fill_width();
     }
     if engineless {
         ui.add(Text::new(t!("profiles.no-engine-detail")).color("warning")).fill_width();

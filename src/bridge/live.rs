@@ -100,6 +100,9 @@ fn harness_says(harness: HarnessKind) -> (&'static str, &'static [&'static str])
         HarnessKind::OpenCode => ("opencode mcp list", &["qcode", "connected"]),
         HarnessKind::GeminiCli => ("gemini mcp list", &["qcode", "Connected"]),
         HarnessKind::Codex => ("codex mcp get qcode", &["enabled: true", "command: node", "qcode-bridge.mjs"]),
+        // A harness that opens a window runs no agent of QCode's, so it is never registered and
+        // never asked. `verify` is called for the four that are.
+        HarnessKind::AntigravityIde => unreachable!("a window harness is not registered"),
     }
 }
 
@@ -212,14 +215,15 @@ fn verify(harness: HarnessKind) {
         ensure_running(&engine, &plan, user).unwrap_or_else(|failure| panic!("{kind:?}: {failure:?}"));
 
         // The harness's settings, as the template left them, get the server and keep the rest.
-        let settings = harness.record().mcp.path;
+        let mcp = harness.record().mcp.expect("a harness with an agent reads servers from a file");
+        let settings = mcp.path;
         let before = run(&engine, &plan.name, &format!("cat \"$HOME/{settings}\" 2>/dev/null || true")).expect("read");
         config::register(&engine, &plan.name, harness).unwrap_or_else(|trouble| panic!("{kind:?}: {trouble:?}"));
         let after = run(&engine, &plan.name, &format!("cat \"$HOME/{settings}\"")).expect("the settings are there");
         assert!(after.contains("qcode-bridge.mjs"), "{kind:?} {harness:?}: {after}");
         if let Some(template) = harness.record().settings.filter(|template| template.path == settings) {
             assert_eq!(before, template.contents, "{kind:?} {harness:?}: the template's file was there first");
-            match harness.record().mcp.shape {
+            match mcp.shape {
                 crate::profile::McpShape::Codex => assert!(after.starts_with(&before), "{after}"),
                 _ => {
                     let was: Value = serde_json::from_str(&before).expect("the template is JSON");

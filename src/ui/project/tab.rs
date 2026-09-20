@@ -45,6 +45,10 @@ pub enum TabKind {
     /// A sound of the project: played in a container of its own made for it, or, when it
     /// cannot or should not play, described.
     Sound(String),
+    /// A window of the desktop harness of the profile of this name, open on the person's own
+    /// screen from a container of its own. The tab has no terminal: it says where the window
+    /// stands and offers the two things that can be done to it.
+    Desktop(String),
 }
 
 impl TabKind {
@@ -58,7 +62,24 @@ impl TabKind {
             | Self::Pdf(file)
             | Self::Office(file)
             | Self::Sound(file) => Some(file),
-            Self::Shell | Self::Profile(_) | Self::New => None,
+            Self::Shell | Self::Profile(_) | Self::New | Self::Desktop(_) => None,
+        }
+    }
+
+    /// The profile the tab belongs to, when it belongs to one: a harness in a terminal or a
+    /// window on the screen.
+    #[must_use]
+    pub fn profile(&self) -> Option<&str> {
+        match self {
+            Self::Profile(name) | Self::Desktop(name) => Some(name),
+            Self::Shell
+            | Self::New
+            | Self::Image(_)
+            | Self::Markdown(_)
+            | Self::Editor(_)
+            | Self::Pdf(_)
+            | Self::Office(_)
+            | Self::Sound(_) => None,
         }
     }
 }

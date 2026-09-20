@@ -8,9 +8,9 @@
 
 use std::path::PathBuf;
 
-use crate::base::paths::OPEN_HOME;
+use crate::base::paths::{OPEN_HOME, USER};
 use crate::engine::names::BASE_IMAGE;
-use crate::profile::Profile;
+use crate::profile::{Desktop, Profile};
 
 /// Where the build context puts the files a template writes, so the `COPY` never has to know
 /// the home directory of the image.
@@ -37,10 +37,21 @@ pub struct Recipe {
 /// recipe never has to name that directory. The last step opens everything the build wrote into
 /// the home directory: the build runs as the image's user and the container as the person's,
 /// and where those differ a login could otherwise not be stored beside the settings.
+///
+/// A harness that opens a window is installed by [`desktop_steps`] instead of from a registry: it
+/// needs system packages and an archive unpacked into `/opt`, neither of which the base image's
+/// own user may do, so those steps run as root and the image ends as its user again.
 #[must_use]
 pub fn image(profile: &Profile) -> Recipe {
     let harness = profile.harness.record();
     let mut lines = vec![format!("FROM {BASE_IMAGE}")];
+    let desktop = profile.harness.desktop();
+    if let Some(desktop) = desktop {
+        // Root, because system packages and /opt are not the image user's to write. The image
+        // goes back to its own user at the end, below.
+        lines.push("USER root".to_owned());
+        lines.extend(desktop_steps(desktop));
+    }
     for step in harness.install {
         lines.push(format!("RUN {step}"));
     }
@@ -59,8 +70,45 @@ pub fn image(profile: &Profile) -> Recipe {
     lines.push(format!("RUN {OPEN_HOME}"));
     // The name is on the image so that a stray image can be traced back to its profile.
     lines.push(format!("LABEL qcode.profile=\"{}\"", profile.name));
+    if desktop.is_some() {
+        lines.push(format!("USER {USER}"));
+    }
     lines.push(String::new());
     Recipe { containerfile: lines.join("\n"), files }
+}
+
+/// The steps that put a desktop application into the image: the packages it needs, then the
+/// archive from its maker's address.
+///
+/// The download and the check are one step, so a build never keeps an archive that is not the one
+/// this version of QCode was written against: the digest is verified before anything is unpacked,
+/// and the archive is removed in the same step so it does not become a layer of its own. The
+/// archive holds a single directory, which is stripped, so the program lands directly under the
+/// install directory whatever the maker renames that directory to.
+///
+/// The unpacking is done as root on purpose: the archive carries a set-user-id helper the
+/// application's own sandbox uses when it cannot open an unprivileged user namespace, and only
+/// root can restore that bit. Nothing else in the image needs root.
+fn desktop_steps(desktop: &Desktop) -> Vec<String> {
+    let packages = desktop.packages.join(" ");
+    let dir = desktop.install_dir;
+    vec![
+        format!(
+            "RUN apt-get update \\\n && apt-get install --yes --no-install-recommends {packages} \\\n \
+             && rm -rf /var/lib/apt/lists/*"
+        ),
+        format!(
+            "RUN curl --fail --silent --show-error --location --output /tmp/desktop.tar.gz '{archive}' \\\n \
+             && echo '{sha}  /tmp/desktop.tar.gz' | sha256sum --check --strict - \\\n \
+             && mkdir -p '{dir}' \\\n \
+             && tar --extract --gzip --file /tmp/desktop.tar.gz --directory '{dir}' --strip-components=1 \\\n \
+             && rm /tmp/desktop.tar.gz \\\n \
+             && test -x '{program}'",
+            archive = desktop.archive,
+            sha = desktop.sha256,
+            program = desktop.command(),
+        ),
+    ]
 }
 
 /// The shell that takes a fresh login out of the container it was made in.
@@ -161,6 +209,73 @@ mod tests {
                 assert!(opened < label, "{harness:?} {template:?}: the label may only follow the last step");
             }
         }
+    }
+
+    #[test]
+    fn a_window_is_installed_from_its_maker_and_never_carried_inside_qcode() {
+        let recipe = image(&profile(HarnessKind::AntigravityIde, Template::Recommended));
+        let desktop = HarnessKind::AntigravityIde.desktop().expect("it opens a window");
+        assert!(recipe.containerfile.contains("RUN curl "), "{recipe:?}");
+        assert!(recipe.containerfile.contains(desktop.archive), "the archive comes from its maker");
+        assert!(recipe.containerfile.contains(desktop.sha256), "nothing is unpacked unchecked");
+        assert!(recipe.containerfile.contains("sha256sum --check --strict"), "{recipe:?}");
+        // The digest is checked before the archive is opened, and the archive does not stay.
+        let unpack = recipe.containerfile.find("tar --extract").expect("the archive is unpacked");
+        assert!(recipe.containerfile.find("sha256sum").expect("checked") < unpack, "{recipe:?}");
+        assert!(recipe.containerfile.contains("rm /tmp/desktop.tar.gz"), "{recipe:?}");
+        // The one directory inside the archive is stripped, so the program is where the record says.
+        assert!(recipe.containerfile.contains("--strip-components=1"), "{recipe:?}");
+        assert!(recipe.containerfile.contains(&format!("test -x '{}'", desktop.command())), "{recipe:?}");
+        // Nothing of the application is in QCode's own files: only its address.
+        assert!(recipe.files.iter().all(|(path, _)| path.starts_with("template")), "{recipe:?}");
+    }
+
+    #[test]
+    fn a_window_installs_its_packages_as_root_and_the_image_ends_as_its_own_user() {
+        let recipe = image(&profile(HarnessKind::AntigravityIde, Template::Recommended));
+        let file = &recipe.containerfile;
+        // Root only for the two steps that need it: system packages and /opt.
+        let root = file.find("USER root").expect("the packages need root");
+        let apt = file.find("apt-get install").expect("the packages are installed");
+        let back = file.rfind(&format!("USER {USER}")).expect("the image ends as its own user");
+        assert!(root < apt && apt < back, "{file}");
+        assert!(file.trim_end().ends_with(&format!("USER {USER}")), "a container must not default to root: {file}");
+        for package in HarnessKind::AntigravityIde.desktop().expect("a window").packages {
+            assert!(file.contains(package), "{package} is not installed");
+        }
+        assert!(file.contains("rm -rf /var/lib/apt/lists/*"), "the package lists stay in the image: {file}");
+    }
+
+    #[test]
+    fn a_command_line_harness_never_becomes_root_in_its_image() {
+        for harness in HarnessKind::TERMINAL {
+            for template in Template::ALL {
+                let file = image(&profile(harness, template)).containerfile;
+                assert!(!file.contains("USER root"), "{harness:?} {template:?}: {file}");
+                assert!(!file.contains("apt-get"), "{harness:?} {template:?}: {file}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_window_gets_its_settings_into_the_home_the_same_way_every_harness_does() {
+        // The file lands in the image's home directory, which is copied into the project's home
+        // volume the first time a container of the profile starts and never again, so what the
+        // person changes afterwards stays theirs.
+        let recipe = image(&profile(HarnessKind::AntigravityIde, Template::Recommended));
+        let (path, contents) = recipe.files.first().expect("the template writes a file");
+        assert_eq!(path, &PathBuf::from("template/.config/Antigravity IDE/User/settings.json"));
+        assert!(contents.contains("\"telemetry.telemetryLevel\": \"off\""), "{contents}");
+        assert!(recipe.containerfile.contains("\"$HOME/.config/Antigravity IDE/User/settings.json\""), "{recipe:?}");
+        assert!(image(&profile(HarnessKind::AntigravityIde, Template::Base)).files.is_empty(), "base writes nothing");
+    }
+
+    #[test]
+    fn a_window_has_no_login_for_the_sign_in_container_to_take() {
+        // The person signs in inside the window, where the application stores it in the project's
+        // home volume; there is no file to copy out and the script would have nothing to do.
+        let script = capture_script(&profile(HarnessKind::AntigravityIde, Template::Base));
+        assert_eq!(script, "set -e");
     }
 
     #[test]

@@ -13,13 +13,14 @@
 use std::path::{Path, PathBuf};
 
 use crate::base;
+use crate::desktop::{self, Display};
 use crate::engine::{
     Access, Container, ContainerCreate, ContainerState, Engine, EngineCommand, Exec, HostUser, Mount, MountSource,
-    Network, names,
+    Network, RunOnce, RunWindow, Socket, Tmpfs, names,
     run::{self, EngineError},
 };
 use crate::profile::identity::{self, Home};
-use crate::profile::{HarnessKind, MountAccess, NetworkMode, Profile};
+use crate::profile::{Desktop, HarnessKind, MountAccess, NetworkMode, Profile};
 use crate::workspace::{ProjectId, ProjectPaths};
 
 /// The places every container agrees on, taken from the one contract the base image is built to.
@@ -55,6 +56,9 @@ pub struct ContainerPlan {
     pub assets_access: Access,
     /// Whether the container reaches the network.
     pub network: Network,
+    /// The window this container opens, for the container of a desktop profile; `None` for every
+    /// container a tab enters with a terminal.
+    pub window: Option<&'static Desktop>,
     /// The bridge between the project's tabs, for a profile container: the project's
     /// `Containers/MCP/` on the host, mounted read-only at [`MCP_DIR`], and the harness whose
     /// settings the bridge's server is registered in. The base container has none, because no
@@ -84,6 +88,7 @@ impl ContainerPlan {
             assets: paths.assets.clone(),
             assets_access: Access::ReadWrite,
             network: Network::Full,
+            window: None,
             bridge: None,
         }
     }
@@ -100,8 +105,33 @@ impl ContainerPlan {
             assets: paths.assets.clone(),
             assets_access: access(profile.assets),
             network: network(profile.network),
+            window: None,
             bridge: Some(Bridge { folder: paths.mcp(), harness: profile.harness }),
         }
+    }
+
+    /// The container the window of a desktop profile is open in: the same image, permissions and
+    /// home volume as that profile's command-line container would have, under a name of its own.
+    ///
+    /// A window gets a container to itself rather than being started inside the long-lived one.
+    /// Then the container's only program is the application: "the window closed" and "the
+    /// container ended" become one fact, which the engine will tell QCode by itself, and nothing
+    /// has to ask a compositor what is on screen. The two can stand side by side on the same home
+    /// volume, so a profile's window and its command-line tabs share their settings and history.
+    ///
+    /// `None` for a profile whose harness draws in a terminal.
+    #[must_use]
+    pub fn window(project: &ProjectId, paths: &ProjectPaths, profile: &Profile) -> Option<Self> {
+        let desktop = profile.harness.desktop()?;
+        Some(Self {
+            name: names::desktop_container(project.as_str(), profile.name.as_str()),
+            window: Some(desktop),
+            // No bridge: what runs in this container is the application itself, not an agent of
+            // QCode's, so there is nothing to answer the socket and no reason to let the
+            // application see it.
+            bridge: None,
+            ..Self::profile(project, paths, profile)
+        })
     }
 
     /// What the container can see, in the order the command lists it.
@@ -188,6 +218,70 @@ impl ContainerPlan {
     pub fn enter_with(&self, engine: &Engine, command: &[&str], env: &[(&str, &str)]) -> EngineCommand {
         engine.exec_with_env(&Exec { container: &self.name, command }, env)
     }
+
+    /// The command that opens the window, given what this machine offers it and, for the engine
+    /// that needs one, the seccomp profile at `seccomp`.
+    ///
+    /// `None` for a plan that opens no window. Every option and why it is there is in
+    /// [`RunWindow`] and in [`crate::desktop`]; the shape of the call is the trial's, measured.
+    #[must_use]
+    pub fn open_window(
+        &self,
+        engine: &Engine,
+        user: HostUser,
+        display: &Display,
+        seccomp: Option<&Path>,
+    ) -> Option<EngineCommand> {
+        let desktop = self.window?;
+        let home = self.home.as_ref().map(Home::volume);
+        let mounts = self.mounts(home.as_deref());
+        let program = desktop.command_line(PROJECT_DIR);
+        let command: Vec<&str> = program.iter().map(String::as_str).collect();
+        // The one file of the machine's runtime folder the window needs, inside a folder of the
+        // container's own, so that nothing else living beside it comes along.
+        let target = display.target();
+        let sockets = [Socket { host: &display.socket, target: &target }];
+        let tmpfs = [Tmpfs { target: Path::new(desktop::RUNTIME_DIR), mode: desktop::RUNTIME_MODE }];
+        let devices: Vec<&Path> = display.device.iter().map(PathBuf::as_path).collect();
+        let environment = display.environment();
+        let env: Vec<(&str, &str)> = environment.iter().map(|(key, value)| (key.as_str(), value.as_str())).collect();
+        Some(engine.run_window(&RunWindow {
+            name: &self.name,
+            once: RunOnce {
+                image: &self.image,
+                mounts: &mounts,
+                network: self.network,
+                user,
+                workdir: Some(Path::new(PROJECT_DIR)),
+                command: &command,
+            },
+            env: &env,
+            sockets: &sockets,
+            tmpfs: &tmpfs,
+            devices: &devices,
+            shm: desktop::SHM_SIZE,
+            seccomp,
+        }))
+    }
+
+    /// The command that asks the open window to show itself: the application started a second time
+    /// inside the container it already runs in.
+    ///
+    /// A Wayland application cannot raise its own window without an activation token from the
+    /// compositor, and QCode, being a terminal application, has none to hand it. What this does is
+    /// what a second start of an editor of this family does: it finds the instance already running
+    /// on the same data folder, tells it, and exits. Whether the window then comes forward or is
+    /// only marked as asking for attention is the compositor's to decide, and it differs between
+    /// them; either way the person is pointed at the window they asked for.
+    ///
+    /// `None` for a plan that opens no window.
+    #[must_use]
+    pub fn raise_window(&self, engine: &Engine) -> Option<EngineCommand> {
+        let desktop = self.window?;
+        let program = desktop.command_line(PROJECT_DIR);
+        let command: Vec<&str> = program.iter().map(String::as_str).collect();
+        Some(engine.exec_without_terminal(&Exec { container: &self.name, command: &command }))
+    }
 }
 
 /// An engine command that did not do what was asked, kept as text so a tab can show the engine's
@@ -220,6 +314,12 @@ impl LaunchFailure {
             base::Failure::Host(error) => Self { command: String::new(), output: error.to_string() },
             base::Failure::Engine(error) => Self::from(error),
         }
+    }
+
+    /// The failure of this machine itself rather than of the engine, which has no command to show
+    /// above its words.
+    pub(super) fn from_host(error: &std::io::Error) -> Self {
+        Self { command: String::new(), output: error.to_string() }
     }
 
     /// The failure of an engine command, in the words the person is shown.
@@ -318,6 +418,103 @@ pub fn ensure_running(engine: &Engine, plan: &ContainerPlan, user: HostUser) -> 
     }
     run::capture(&engine.start_container(&plan.name)).map_err(|error| LaunchFailure::from(&error))?;
     Ok(())
+}
+
+/// What opening a window came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Window {
+    /// A container was started and the window is on its way up.
+    Opened,
+    /// A container of that name was already running, so the tab took that window rather than
+    /// opening a second one. This is what a QCode that crashed with a window open leaves behind,
+    /// and what a second tab of the same profile would otherwise duplicate.
+    Adopted,
+}
+
+/// Opens the window of `plan` and says whether it was started or found already up.
+///
+/// A container of the same name that is not running is in nobody's way and is removed: it is the
+/// remains of a window that closed while no QCode was watching, or of one a closing QCode stopped,
+/// and the window is opened fresh. Nothing of the person's is in it — the settings, the history and
+/// the login are all in the home volume, which the new container mounts.
+///
+/// Runs engine commands and waits for them, so it belongs on a background thread.
+///
+/// # Errors
+///
+/// The engine's own words when it cannot be started, or refuses to remove the old container or to
+/// run the new one; and the machine's when the seccomp profile cannot be written.
+pub fn open_window(
+    engine: &Engine,
+    plan: &ContainerPlan,
+    user: HostUser,
+    display: &Display,
+) -> Result<Window, LaunchFailure> {
+    let state = run::capture(&engine.container_state(&plan.name)).map(|word| ContainerState::parse(&word)).ok();
+    match state {
+        Some(ContainerState::Running) => return Ok(Window::Adopted),
+        Some(_) => {
+            run::capture(&engine.remove_container(&plan.name)).map_err(|error| LaunchFailure::from(&error))?;
+        }
+        None => {}
+    }
+    let seccomp = if engine.needs_sandbox_profile() {
+        Some(desktop::seccomp::file().map_err(|error| LaunchFailure::from_host(&error))?)
+    } else {
+        None
+    };
+    let Some(command) = plan.open_window(engine, user, display, seccomp.as_deref()) else {
+        return Ok(Window::Opened);
+    };
+    run::capture(&command).map_err(|error| LaunchFailure::from(&error))?;
+    Ok(Window::Opened)
+}
+
+/// Waits for the window's container to end and answers its exit code, or `None` when the engine
+/// said nothing a code could be read from.
+///
+/// This is how the person closing the window reaches QCode: the container's only program is the
+/// application, so the container ends when the window does. It blocks for as long as the window is
+/// open, so it belongs on a background thread of its own and on no other.
+#[must_use]
+pub fn await_window(engine: &Engine, name: &str) -> Option<u32> {
+    run::capture(&engine.wait_container(name)).ok()?.trim().lines().last()?.trim().parse().ok()
+}
+
+/// Closes the window of `name` and takes its container away.
+///
+/// The stop is what closes the window: the application answers the signal and writes its state
+/// out, which is why it is given [`desktop::WINDOW_GRACE`]. A container that had already ended is not
+/// there
+/// to stop, and saying so is not a failure; the removal is what must succeed.
+///
+/// Runs engine commands and waits for them, so it belongs on a background thread.
+///
+/// # Errors
+///
+/// The engine's own words when it will not remove the container.
+pub fn close_window(engine: &Engine, name: &str) -> Result<(), LaunchFailure> {
+    // Closing happens twice over: the person presses Close, and the tab's own wait on the
+    // container answers the moment it is gone and clears up after it. Whichever arrives second
+    // finds nothing, and must not report the first one's work as a failure — docker refuses to
+    // remove a container it does not know, where podman shrugs.
+    if run::capture(&engine.container_state(name)).is_err() {
+        return Ok(());
+    }
+    let _ = run::capture(&engine.stop_container_within(name, desktop::WINDOW_GRACE));
+    run::capture(&engine.remove_container(name)).map(|_| ()).map_err(|error| LaunchFailure::from(&error))
+}
+
+/// Asks the open window of `plan` to show itself.
+///
+/// Runs an engine command and waits for it, so it belongs on a background thread.
+///
+/// # Errors
+///
+/// The engine's own words when the container is not there any more or refuses.
+pub fn raise_window(engine: &Engine, plan: &ContainerPlan) -> Result<(), LaunchFailure> {
+    let Some(command) = plan.raise_window(engine) else { return Ok(()) };
+    run::capture(&command).map(|_| ()).map_err(|error| LaunchFailure::from(&error))
 }
 
 /// Whether the container of `plan` is running right now.

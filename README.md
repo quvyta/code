@@ -244,6 +244,56 @@ Every program runs inside the container, on the file's path there, and is handed
 word, never through a shell. Open file tabs come back with **Continue** like any other tab; a file
 that has gone since is reported in its tab.
 
+## Desktop harnesses
+
+Most harnesses draw in the tab's terminal. One does not: **Antigravity IDE** is a desktop
+application, and qcode runs it the same way it runs the others — in a container, on your project
+and nothing else — except that its window opens on your own screen instead of in a tab.
+
+A profile for it is made like any other, in **Profiles**. The image is built on qcode's base image
+and downloads the application from Google's own address while it builds; nothing of the
+application is carried inside qcode. That download is about 230 MiB and the finished image about
+1.4 GiB, so it is much larger than a command-line harness's, and the application uses well over a
+gigabyte of memory while its window is open. The version is fixed in qcode, so updating the
+application means building the image again.
+
+The tab is one line of status with two things you can do to the window:
+
+| The tab says | What it means |
+|---|---|
+| **Opening the window…** | The container is starting. The first time takes a few seconds longer |
+| **Window open** | The window is on your screen. **Bring to front** asks it to show itself, **Close the window** closes it |
+| **Window closed** | It is not open. **Open the window** opens it again. Nothing was lost: the settings, the history and the sign-in are in the project's home volume |
+| **The window did not open** | Why, in the engine's own words |
+
+The window is a container's, which is what makes it worth having and also where its limits come
+from:
+
+- **It needs Wayland.** The container is given the one socket file of your compositor and nothing
+  else that lives beside it — not the engine's own socket, not the session bus, not the keyring.
+  Because it is that one file, a compositor that restarts cuts an open window off; opening the tab
+  again is the way back. X11 is not offered: there every program on the screen could read this
+  one's windows and keypresses.
+- **Graphics.** If your machine has `/dev/dri`, the container is given it and the application may
+  use the card; without it, and on cards the application does not trust, it draws in software,
+  which works and is not noticeably slower in the editor. NVIDIA's closed driver is not supported
+  yet.
+- **The application's own sandbox stays on.** qcode never passes `--no-sandbox`. Podman needs
+  nothing extra for that. Docker's default seccomp profile refuses the calls the sandbox is built
+  from, so qcode hands docker a profile of its own: docker's default plus `clone`, `setns` and
+  `unshare`. It is in `assets/seccomp/desktop.json` with a comment saying what it costs.
+- **No sign-in yet.** The application cannot be used without a Google account, and signing in
+  means a browser and a port that qcode does not yet carry between your machine and the container.
+  The window will ask you to sign in and there is currently no way to complete it. Everything
+  else — that the window opens, keeps its settings, and closes cleanly — works.
+- **A profile with the network off makes no sense here.** The application does all its work on its
+  maker's servers; the tab says so if you try.
+
+Closing the tab closes the window and removes its container; closing the window ends the
+container, which the tab notices and offers to open again. qcode quitting stops any open window,
+like every other container it started. A container left over from a crash is found by name the
+next time and either taken over, if its window is still up, or cleared away.
+
 ## File manager
 
 The file tree of the side panel is also a file manager. It works on the project's own folder

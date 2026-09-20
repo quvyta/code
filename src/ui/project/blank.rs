@@ -32,6 +32,8 @@ pub enum Choice {
     NewChat(String),
     /// A conversation the harness of the profile of this name had before, by the harness's id.
     Resume(String, String),
+    /// The window of the desktop harness of the profile of this name, on the person's own screen.
+    Window(String),
 }
 
 /// One row of the page.
@@ -45,6 +47,8 @@ enum Row {
     Profile(usize),
     /// Starts a new conversation with the profile of this name.
     NewChat(String),
+    /// Opens the window of the desktop profile of this name.
+    Window(String),
     /// Opens again a conversation the profile of this name had.
     Chat(String, Conversation),
     /// Shows every conversation of a profile in place, when this many more are hidden.
@@ -71,6 +75,7 @@ impl Row {
         match self {
             Self::Shell => Some(Msg::Choose(tab, Choice::Shell)),
             Self::NewChat(name) => Some(Msg::Choose(tab, Choice::NewChat(name.clone()))),
+            Self::Window(name) => Some(Msg::Choose(tab, Choice::Window(name.clone()))),
             Self::Chat(name, conversation) => {
                 Some(Msg::Choose(tab, Choice::Resume(name.clone(), conversation.id.clone())))
             }
@@ -104,6 +109,12 @@ fn rows(screen: &ProjectScreen, project: &OpenProject) -> Vec<Row> {
     }
     for (index, profile) in project.profiles().iter().enumerate() {
         let name = profile.name.as_str();
+        // A desktop profile's section is one row: its window. It has no conversations QCode can
+        // list — the shape of what the agent inside writes was never read — so none are offered.
+        if profile.harness.desktop().is_some() {
+            rows.extend([Row::Gap, Row::Profile(index), Row::Window(name.to_owned())]);
+            continue;
+        }
         rows.extend([Row::Gap, Row::Profile(index), Row::NewChat(name.to_owned())]);
         if screen.engine().is_none() {
             continue;
@@ -182,6 +193,10 @@ fn item(project: &OpenProject, row: &Row, look: &Look, ready: bool) -> ListItem 
             })
         }
         Row::NewChat(_) => ListItem::new(t!("project.choose.new-chat")).icon("add", None).faint(!ready),
+        Row::Window(_) => ListItem::new(t!("project.choose.window"))
+            .icon("window-maximize", None)
+            .detail(t!("project.choose.window-detail"))
+            .faint(!ready),
         Row::Chat(_, conversation) => {
             let title = conversation.title.clone().unwrap_or_else(|| t!("project.history.untitled"));
             ListItem::new(format!("{}{title}", look.indent))

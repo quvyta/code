@@ -12,6 +12,7 @@
 pub mod backup;
 pub mod base;
 pub mod bridge;
+pub mod desktop;
 pub mod engine;
 pub mod profile;
 pub mod service;

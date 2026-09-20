@@ -56,6 +56,17 @@ pub fn sound_container(project: &str, tab: u64) -> String {
     format!("qcode-{project}.play-{tab}")
 }
 
+/// The container the window of a project's desktop profile is open in.
+///
+/// One per project and profile, not one per tab: the application is single-instance for a home
+/// directory, so a second container on the same home volume would only tell the first to show
+/// itself. The dot is what no project id and no profile name can hold, so this can never be the
+/// container the same profile's command-line work would live in.
+#[must_use]
+pub fn desktop_container(project: &str, profile: &str) -> String {
+    format!("qcode-{project}-{profile}.desk")
+}
+
 /// The volume holding a profile's login, shared by every project that uses the profile.
 #[must_use]
 pub fn credential_volume(profile: &str) -> String {
@@ -72,8 +83,8 @@ pub fn home_volume(project: &str, profile: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BASE_IMAGE, HOSTNAME, base_container, credential_volume, home_volume, profile_container, profile_image,
-        sound_container,
+        BASE_IMAGE, HOSTNAME, base_container, credential_volume, desktop_container, home_volume, profile_container,
+        profile_image, sound_container,
     };
     use crate::profile::SafeName;
 
@@ -130,8 +141,11 @@ mod tests {
             assert!(is_object_name(&credential_volume(name)), "{text:?}");
             assert!(is_object_name(&base_container(name)), "{text:?}");
             assert!(is_object_name(&sound_container(name, 7)), "{text:?}");
-            // No profile, whatever its name, has the container a sound plays in.
+            assert!(is_object_name(&desktop_container(name, name)), "{text:?}");
+            // No profile, whatever its name, has the container a sound plays in or a window opens
+            // in: both are told apart by a dot, which a safe name never holds.
             assert!(!profile_container(name, name).contains('.'), "{text:?}");
+            assert_ne!(desktop_container(name, name), profile_container(name, name), "{text:?}");
         }
     }
 
@@ -151,5 +165,6 @@ mod tests {
         assert_eq!(credential_volume("claude-sub"), "qcode-cred-claude-sub");
         assert_eq!(home_volume("my-app", "claude-sub"), "qcode-home-my-app-claude-sub");
         assert_eq!(sound_container("my-app", 3), "qcode-my-app.play-3");
+        assert_eq!(desktop_container("my-app", "antigravity"), "qcode-my-app-antigravity.desk");
     }
 }

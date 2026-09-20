@@ -27,6 +27,7 @@ use super::plan::{PROJECT_DIR, SHELL};
 
 mod backups;
 mod bridge;
+mod desktop;
 mod files;
 mod history;
 mod registry;

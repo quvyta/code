@@ -5,6 +5,21 @@ Every release of quvyta-code, newest first. The format follows
 [Semantic Versioning](https://semver.org/); while the version starts with 0, a minor release may
 change files qcode writes, and the notes say so when it does.
 
+## 0.1.9 - 2026-09-20
+
+### Added
+
+- Desktop harnesses, starting with Antigravity IDE. A profile of one opens its window from a container of its own: the window appears on your desktop, the project is at `/work/Project` inside it, and the profile's home volume keeps its settings and sign-in between starts. The tab has no terminal; it says where the window stands and offers the two things that can be done to it.
+- Closing the tab closes the window and takes the container away, and closing the window ends the container, which the tab notices and offers to open it again. Quitting qcode closes any window it opened.
+- The image is built on your own machine and fetches the application from its maker at install time, checked against the length and the SHA-256 the record names. It is about 1.4 GB, an order of magnitude larger than a command-line harness, and you are told so before you ask for it.
+- The window is given one file of your machine: the compositor's socket, inside a runtime folder of the container's own. It gets the graphics device when there is one, and draws in software when there is not. The application's own sandbox runs inside the container on both engines; on Docker qcode passes a seccomp profile that allows just what the sandbox needs, and never `--no-sandbox`.
+
+### Known gaps
+
+- Bringing a window to the front reaches the running application but cannot actually raise it: on Wayland that needs an activation token from the compositor, and a terminal application has no way to obtain one.
+- Signing in is not wired up yet. The application needs a browser, and a container has none; the note in the repository describes the remaining work.
+- A desktop harness cannot be used with a profile that has no network, and it has no agent of qcode's in it, so it takes no part in tabs talking to each other.
+
 ## 0.1.8 - 2026-09-20
 
 ### Added
