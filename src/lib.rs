@@ -2376,6 +2376,26 @@ mod tests {
         assert!(screen.contains("live in one folder"), "the location step is the one that opened:\n{screen}");
     }
 
+    #[test]
+    fn the_release_of_the_click_that_opened_the_location_step_does_not_finish_it() {
+        use qframe::event::{MouseButton, MouseKind};
+
+        // "Change" acts when the button goes down, and the page it opens puts Finish on the
+        // screen while the button is still held. Wherever that release lands, it began on the
+        // settings row and not on Finish, so the step must stay open for the person to answer.
+        let mut harness = harness(app(config(&scratch("release"), &[]), &settled(), None), SIZE.0, SIZE.1);
+        harness.click_text("Settings").advance(MOMENT);
+        let (x, y) = harness.find("Change").expect("the settings screen offers to move the store");
+        harness.mouse(MouseKind::Down(MouseButton::Left), x, y).advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Setup, "{}", harness.screen());
+        let (x, y) = harness.find("Finish").expect("the location step can be finished");
+        harness.mouse(MouseKind::Up(MouseButton::Left), x, y).advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Setup, "the step is still open:\n{}", harness.screen());
+        // The same button, pressed and released on itself, does finish: it was reachable all along.
+        harness.click_text("Finish").advance(MOMENT);
+        assert_ne!(harness.app().page(), Page::Setup, "{}", harness.screen());
+    }
+
     /// A store at `root` holding the workspaces `names`, made afresh.
     fn store_of(root: &std::path::Path, names: &[&str]) -> crate::store::Store {
         let _ = std::fs::remove_dir_all(root);

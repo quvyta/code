@@ -687,6 +687,7 @@ reached-version = "{tag} answered; it is running version {version}."
 reached-key = "The key was accepted."
 unreachable = "{url} could not be reached: {reason}"
 refused = "{url} refused with {status}: {said}"
+rate-limited = "{url} says there are too many requests right now (429). Free models are shared and limited per minute and per day, so this is the service asking you to wait, not a key or an address that is wrong. Wait a minute and press again, or choose another model. It said: {said}"
 unreadable = "{url} answered something this provider does not promise: {wanted}"
 save-failed = "The providers file could not be written: {reason}"
 

@@ -688,6 +688,7 @@ reached-version = "{tag} 应答了，它运行的是 {version} 版。"
 reached-key = "密钥被接受了。"
 unreachable = "无法连到 {url}：{reason}"
 refused = "{url} 以 {status} 拒绝了：{said}"
+rate-limited = "{url} 表示目前请求过多（429）。免费模型是共享的，每分钟和每天都有限额；这不是密钥或地址出了错，而是服务请你稍等。等一分钟再按一次，或者换一个模型。它的原话：{said}"
 unreadable = "{url} 返回了这个服务方并未承诺的内容：{wanted}"
 save-failed = "服务方文件写不进去：{reason}"
 

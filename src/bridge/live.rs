@@ -519,7 +519,7 @@ fn a_message_delivered_into_claude_code_reaches_its_own_prompt() {
         let parts = relay::wrapping(&line);
         let words: Vec<&str> = parts.iter().map(String::as_str).collect();
         let mut carried = vec![(super::TOKEN_VARIABLE.to_owned(), token.clone())];
-        carried.extend(choice.environment(&token, None));
+        carried.extend(choice.environment(harness, &token, None));
         let envs: Vec<(&str, &str)> = carried.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
         let command = plan.enter_with(&engine, &words, &envs);
         let session = TerminalSession::spawn(command.program.as_os_str(), &command.args, &scratch.0)
@@ -593,7 +593,7 @@ fn claude_code_opens_on_its_prompt(template: Template) {
         let parts = relay::wrapping(&line);
         let words: Vec<&str> = parts.iter().map(String::as_str).collect();
         let mut carried = vec![(super::TOKEN_VARIABLE.to_owned(), token.clone())];
-        carried.extend(choice.environment(&token, None));
+        carried.extend(choice.environment(harness, &token, None));
         let envs: Vec<(&str, &str)> = carried.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
         let command = plan.enter_with(&engine, &words, &envs);
         let session = TerminalSession::spawn(command.program.as_os_str(), &command.args, &scratch.0)

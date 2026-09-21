@@ -688,6 +688,7 @@ reached-version = "{tag} respondió; está ejecutando la versión {version}."
 reached-key = "La clave fue aceptada."
 unreachable = "No se pudo alcanzar {url}: {reason}"
 refused = "{url} rechazó con {status}: {said}"
+rate-limited = "{url} indica que hay demasiadas solicitudes ahora mismo (429). Los modelos gratuitos se comparten y tienen un límite por minuto y por día; no es que la clave o la dirección estén mal, el servicio te pide que esperes. Espera un minuto y vuelve a pulsar, o elige otro modelo. Su respuesta: {said}"
 unreadable = "{url} respondió algo que este proveedor no promete: {wanted}"
 save-failed = "No se pudo escribir el archivo de proveedores: {reason}"
 

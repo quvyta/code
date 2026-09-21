@@ -413,11 +413,10 @@ impl AccountKind {
 static CLAUDE_CODE: Harness = Harness {
     id: "claude-code",
     display_name: "Claude Code",
-    // A provider is offered here and nowhere else: `ANTHROPIC_BASE_URL` with
-    // `ANTHROPIC_AUTH_TOKEN`, read once at start, is the one redirection this record can verify
-    // works. opencode and Codex have their own provider configuration files rather than an
-    // environment variable, and Gemini CLI's was never tried; offering it to them would be a
-    // claim nobody checked.
+    // A provider is offered by `ANTHROPIC_BASE_URL` with `ANTHROPIC_AUTH_TOKEN`, read once at
+    // start (see `ProviderChoice::environment`), and was proven in a container with no network
+    // on an ollama server and on OpenRouter. Codex and Gemini CLI are not offered one: neither
+    // was ever run through the relay, and offering it to them would be a claim nobody checked.
     accounts: &[AccountKind::Subscription, AccountKind::ApiKey, AccountKind::Provider],
     withdrawn: &[],
     install: &["npm install -g @anthropic-ai/claude-code"],
@@ -469,7 +468,10 @@ const CLAUDE_FIRST_START: &str = "{\n  \"hasCompletedOnboarding\": true,\n  \"pr
 static OPENCODE: Harness = Harness {
     id: "opencode",
     display_name: "opencode",
-    accounts: &[AccountKind::Free, AccountKind::Subscription, AccountKind::ApiKey],
+    // A provider is offered by an OpenAI-compatible provider handed over in
+    // `OPENCODE_CONFIG_CONTENT` (see `ProviderChoice::environment`), proven in a container with
+    // no network on an ollama server.
+    accounts: &[AccountKind::Free, AccountKind::Subscription, AccountKind::ApiKey, AccountKind::Provider],
     withdrawn: &[],
     install: &["npm install -g opencode-ai"],
     command: "opencode",
@@ -842,9 +844,10 @@ mod tests {
     }
 
     #[test]
-    fn only_claude_code_is_offered_a_provider_of_ones_own() {
+    fn claude_code_and_opencode_are_offered_a_provider_of_ones_own_and_nothing_else_is() {
         assert!(HarnessKind::ClaudeCode.supports(AccountKind::Provider));
-        for harness in [HarnessKind::OpenCode, HarnessKind::GeminiCli, HarnessKind::Codex] {
+        assert!(HarnessKind::OpenCode.supports(AccountKind::Provider));
+        for harness in [HarnessKind::GeminiCli, HarnessKind::Codex, HarnessKind::AntigravityIde] {
             assert!(!harness.supports(AccountKind::Provider), "{harness:?}");
         }
         assert!(!AccountKind::Provider.needs_login(), "the key already lives in providers.toml");

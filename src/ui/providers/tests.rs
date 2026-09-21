@@ -285,6 +285,56 @@ fn asking_a_provider_what_it_offers_puts_both_windows_on_the_row() {
 }
 
 #[test]
+fn measuring_an_openrouter_model_asks_its_api_and_not_its_website() {
+    let path = file("openrouter-api");
+    let (web, seen) = canned(vec![
+        ("/api/v1/models", r#"{"data":[{"id":"nex-agi/nex-n2.5-mini:free","context_length":262144}]}"#),
+        ("/v1/messages", r#"{"usage":{"input_tokens":3010}}"#),
+    ]);
+    let mut harness = opened(&path, web);
+    add(&mut harness, "OpenRouter", "yol", "https://openrouter.ai", Some(MADE_UP));
+    harness.render();
+    harness.click_text("Ask what it offers").render();
+    harness.click_text("Measure the real window").render();
+    assert!(harness.screen().contains("3010"), "the measurement came back:\n{}", harness.screen());
+    let asked: Vec<String> = seen.lock().expect("the list").iter().map(Ask::line).collect();
+    // The same path without `/api` is OpenRouter's website, which answers a message with a page
+    // of HTML and a 200.
+    assert!(asked.iter().any(|line| line == "POST https://openrouter.ai/api/v1/messages"), "{asked:?}");
+    assert!(!asked.iter().any(|line| line.contains("openrouter.ai/v1/")), "nothing went to the website: {asked:?}");
+    let _ = std::fs::remove_dir_all(path.parent().expect("its folder"));
+}
+
+/// What OpenRouter really answered for a rate-limited free model on 2026-09-21, with its request
+/// id shortened.
+const RATE_LIMITED: &str = r#"{"type":"error","error":{"type":"rate_limit_error","message":"Provider returned error","error_type":"rate_limit_exceeded"},"request_id":"gen-1","metadata":{"raw":"google/gemma-4-26b-a4b-it:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations","provider_name":"Google AI Studio","is_byok":false,"provider_error_code":"429","limit_source":"upstream_provider_shared_pool"}}"#;
+
+#[test]
+fn a_free_model_that_is_rate_limited_is_said_to_be_asking_for_a_wait_not_to_have_refused() {
+    let path = file("rate-limited");
+    let web = Web::new(|ask: &Ask| {
+        if ask.url.ends_with("/api/v1/models") {
+            let body = r#"{"data":[{"id":"google/gemma-4-26b-a4b-it:free","context_length":262144}]}"#;
+            return Ok(Answer { status: 200, body: body.to_owned() });
+        }
+        Ok(Answer { status: 429, body: RATE_LIMITED.to_owned() })
+    });
+    let mut harness = opened(&path, web);
+    add(&mut harness, "OpenRouter", "yol", "https://openrouter.ai", Some(MADE_UP));
+    harness.render();
+    harness.click_text("Ask what it offers").render();
+    harness.click_text("Measure the real window").render();
+    let screen = harness.screen().split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(screen.contains("too many requests right now"), "the person is told what 429 means:\n{screen}");
+    assert!(screen.contains("Wait a minute"), "and what to do meanwhile:\n{screen}");
+    assert!(!screen.contains("refused with"), "a service asking for a wait did not refuse anything:\n{screen}");
+    // The provider's own sentence, not the "Provider returned error" in front of it.
+    assert!(screen.contains("temporarily rate-limited upstream"), "{screen}");
+    assert!(!screen.contains("Provider returned error"), "{screen}");
+    let _ = std::fs::remove_dir_all(path.parent().expect("its folder"));
+}
+
+#[test]
 fn a_window_whose_edge_was_never_found_is_not_called_cramped_and_offers_no_remedy() {
     let path = file("roomy");
     // Every probe is read whole, so growth never stops.

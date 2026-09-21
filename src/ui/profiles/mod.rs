@@ -1648,12 +1648,38 @@ mod tests {
     }
 
     #[test]
-    fn only_claude_code_offers_a_provider_of_ones_own() {
+    fn opencode_offers_a_provider_of_ones_own_from_the_rows_a_person_presses() {
         let mut harness = loaded(Vec::new());
-        harness.send(Msg::New).send(Msg::PickHarness(1)).render();
+        harness.send(Msg::ProvidersLoaded(vec![provider_entry("ev1", &["qwen3.8", "qwen3-coder:30b"])])).render();
+        harness.click_text("New profile").render();
+        harness.click_text("opencode").render();
         assert_eq!(harness.app().state.draft().expect("open").harness, HarnessKind::OpenCode);
-        harness.send(Msg::Next).send(Msg::Next).render();
-        assert!(!harness.screen().contains("a provider of your own"), "{}", harness.screen());
+        next(&mut harness);
+        next(&mut harness);
+        assert!(harness.screen().contains("What this profile signs in with"), "{}", harness.screen());
+        harness.click_text("a provider of your own").render();
+        harness.click_text("ev1").render();
+        harness.click_text("qwen3-coder:30b").render();
+        // What Claude Code would assume is Claude Code's alone and is not said of opencode.
+        assert!(!harness.screen().contains("will assume"), "{}", harness.screen());
+        let profile = harness.app().state.draft().expect("open").profile().expect("a provider and a model");
+        assert_eq!(profile.harness, HarnessKind::OpenCode);
+        assert_eq!(profile.account, AccountKind::Provider);
+        let provider = profile.provider.expect("a provider profile carries one");
+        assert_eq!((provider.tag.as_str(), provider.model.as_str()), ("ev1", "qwen3-coder:30b"));
+    }
+
+    #[test]
+    fn codex_and_gemini_cli_offer_no_provider_of_ones_own() {
+        for name in ["Codex", "Gemini CLI"] {
+            let mut harness = loaded(Vec::new());
+            harness.click_text("New profile").render();
+            harness.click_text(name).render();
+            next(&mut harness);
+            next(&mut harness);
+            assert!(harness.screen().contains("What this profile signs in with"), "{name}: {}", harness.screen());
+            assert!(!harness.screen().contains("a provider of your own"), "{name}: {}", harness.screen());
+        }
     }
 
     #[test]

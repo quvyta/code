@@ -447,6 +447,40 @@ fn a_tab_is_told_the_window_this_server_was_measured_to_give_rather_than_leaving
 }
 
 #[test]
+fn an_opencode_tab_on_a_provider_is_told_of_the_relay_in_its_own_configuration_with_the_measured_window() {
+    let scratch = Scratch::new("provider-opencode");
+    let path = measured_providers_file("opencode", "ev1", "qwen3-coder:30b", 31_512);
+    let profiles =
+        vec![Profile { harness: HarnessKind::OpenCode, ..provider_profile("oc-tab", "ev1", "qwen3-coder:30b") }];
+    let mut screen = WorkspaceScreen::new(
+        Some(engine()),
+        HostUser::Ids { uid: 1000, gid: 1000 },
+        vec![workspace("firefly", "Firefly", scratch.paths(), profiles)],
+    )
+    .with_providers_path(Some(path.clone()));
+    apply(&mut screen, Msg::OpenWorkspace(0));
+    open(&mut screen, Choice::NewChat("oc-tab".to_owned()));
+
+    let editor = screen.editor();
+    let workspace = screen.workspace().expect("a workspace");
+    let program = workspace.program(&workspace.tabs()[0], editor).expect("a harness tab runs something");
+    assert!(program[1].ends_with("qcode-relay.mjs"), "the relay starts opencode too: {program:?}");
+    assert_eq!(&program[2..], ["opencode", "--auto"], "{program:?}");
+
+    let env = envs(&screen.launch_command(key(&screen, 0)).expect("a chosen tab has a command"));
+    assert!(!env.contains_key("ANTHROPIC_BASE_URL"), "opencode is not Claude Code: {env:?}");
+    let config: serde_json::Value =
+        serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").expect("opencode is told of the provider"))
+            .expect("JSON");
+    let provider = &config["provider"]["ev1"];
+    assert_eq!(provider["options"]["baseURL"], "http://127.0.0.1:41417/v1");
+    assert_eq!(config["model"], "ev1/qwen3-coder:30b");
+    // A value only the measurement on the Providers page could have put there.
+    assert_eq!(provider["models"]["qwen3-coder:30b"]["limit"]["context"], 31_512);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn a_profile_whose_provider_tag_was_deleted_says_so_instead_of_starting() {
     let scratch = Scratch::new("provider-missing");
     let path = providers_file("missing", "ev1", false);

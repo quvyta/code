@@ -715,6 +715,12 @@ fn notice_line(notice: &Notice, entry: &ProviderEntry) -> (String, &'static str)
         Notice::Trouble(AskError::Unreachable { url, reason }) => {
             (t!("provider.unreachable", url = url.as_str(), reason = reason.as_str()), "danger")
         }
+        // Too many requests is not a refusal of the key or the address, and saying "refused"
+        // sends a person to check both. Free models hit it within a minute of use; the person is
+        // told it is the service asking them to wait, and what to do meanwhile.
+        Notice::Trouble(AskError::Refused { url, status: 429, said }) => {
+            (t!("provider.rate-limited", url = url.as_str(), said = said.as_str()), "warning")
+        }
         Notice::Trouble(AskError::Refused { url, status, said }) => {
             (t!("provider.refused", url = url.as_str(), status = i64::from(*status), said = said.as_str()), "danger")
         }

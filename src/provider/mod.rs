@@ -2,8 +2,9 @@
 //!
 //! A provider is the person's own tag, a kind, an address, the shape it speaks, the models it
 //! was last seen to offer and the key it is reached with. Both kinds QCode knows speak the
-//! Anthropic message shape directly, so a harness is pointed at the address and nothing
-//! translates in between.
+//! Anthropic message shape and the OpenAI one directly, so a harness is pointed at the address in
+//! the shape it speaks itself — Claude Code the one, opencode the other — and nothing translates
+//! in between.
 //!
 //! Three rules run through everything here.
 //!

@@ -688,6 +688,7 @@ reached-version = "{tag} が応答しました。バージョン {version} が�
 reached-key = "キーは受け入れられました。"
 unreachable = "{url} に届きませんでした: {reason}"
 refused = "{url} は {status} で断りました: {said}"
+rate-limited = "{url} は、いまリクエストが多すぎると応答しました（429）。無料モデルは共有されていて、1 分ごと・1 日ごとの上限があります。キーやアドレスが間違っているのではなく、サービスが待つよう求めています。1 分待ってからもう一度押すか、別のモデルを選んでください。返ってきた内容: {said}"
 unreadable = "{url} はこのプロバイダーが約束していないものを返しました: {wanted}"
 save-failed = "プロバイダーのファイルを書けませんでした: {reason}"
 

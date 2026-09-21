@@ -688,6 +688,7 @@ reached-version = "{tag} cevap verdi; {version} sürümünü çalıştırıyor."
 reached-key = "Anahtar kabul edildi."
 unreachable = "{url} adresine ulaşılamadı: {reason}"
 refused = "{url} {status} ile geri çevirdi: {said}"
+rate-limited = "{url} şu an çok fazla istek geldiğini söylüyor (429). Bedava modeller paylaşılıyor ve dakikalık ve günlük bir sınırları var; yani anahtar ya da adres yanlış değil, servis beklemeni istiyor. Bir dakika bekleyip yeniden bas ya da başka bir model seç. Söylediği: {said}"
 unreadable = "{url} bu sağlayıcının söz vermediği bir şey döndürdü: {wanted}"
 save-failed = "Sağlayıcılar dosyası yazılamadı: {reason}"
 

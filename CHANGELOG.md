@@ -5,6 +5,22 @@ Every release of quvyta-code, newest first. The format follows
 [Semantic Versioning](https://semver.org/); while the version starts with 0, a minor release may
 change files qcode writes, and the notes say so when it does.
 
+## 0.1.13 - 2026-09-21
+
+### Fixed
+
+- **The README said something that was not true, and it is corrected.** Its "No telemetry" section promised that qcode had no network code and no network library. That stopped being true in 0.1.12, which added providers, but the sentence stayed in 0.1.12's README on crates.io and GitHub: for one release, qcode described itself wrongly on a point of privacy. The section now says exactly what happens: qcode collects no statistics, checks for no updates and sends nothing of its own accord; it connects to the network only after you add a provider, only to that provider, and only when you press a button on the Providers page or while a tab of a profile that runs on that provider is open. Measuring a window sends up to four prompts, which a paid provider charges for, and the README now says that too.
+- **OpenRouter really works.** A tab running on OpenRouter, and the "Measure the real window" button, were sending their requests to OpenRouter's website instead of its API, which answered with a web page. They now go to the API, whichever of OpenRouter's two addresses you wrote. Listing the models and trying the connection were already right, which is why the page looked fine. A Claude Code tab on one of OpenRouter's free models was then watched answering and using its tools in a container with no network, on Podman and on Docker, with the key never inside the container.
+- When a free OpenRouter model is busy, the Providers page says the service is asking you to wait, in the provider's own words, instead of reporting a refusal.
+- **Typing fast no longer loses letters.** When several keys arrived at once — a quick typist, a terminal multiplexer, a slow connection — only the last reached the field: a workspace named "demo" was made as "o". Every key now arrives.
+- **Choose folder takes the folder you opened.** In "From a folder", opening a folder and pressing **Choose folder** took the first folder inside it. It now takes the one you opened, unless you moved to one inside it yourself.
+- A click is only a click where it began. Releasing the mouse over a button that appeared under it while the button was held, such as **Finish** on the step that "Change" in the settings opens, no longer presses that button.
+
+### Added
+
+- **opencode can run on a provider of your own.** Like Claude Code, an opencode profile can use your ollama server or OpenRouter through the relay, in a container with no network and without the key, and it is told the window that was measured. It was watched answering and using its tools on an ollama server and on an OpenRouter free model. Gemini CLI and Codex do not offer it yet.
+- The README describes the Providers page, which profiles can use a provider, where the key file lives, and how the relay keeps the key out of the container. The parts about tabs talking to each other and about signing in to a desktop window were out of date and now say what qcode does today.
+
 ## 0.1.12 - 2026-09-21
 
 ### Added

@@ -688,6 +688,7 @@ reached-version = "{tag} hat geantwortet; dort läuft Version {version}."
 reached-key = "Der Schlüssel wurde angenommen."
 unreachable = "{url} war nicht erreichbar: {reason}"
 refused = "{url} hat mit {status} abgelehnt: {said}"
+rate-limited = "{url} meldet gerade zu viele Anfragen (429). Kostenlose Modelle werden geteilt und sind pro Minute und pro Tag begrenzt; Schlüssel und Adresse sind also nicht falsch, der Dienst bittet nur ums Warten. Warte eine Minute und drücke erneut, oder wähle ein anderes Modell. Die Antwort war: {said}"
 unreadable = "{url} hat etwas geantwortet, was dieser Anbieter nicht zusagt: {wanted}"
 save-failed = "Die Anbieterdatei konnte nicht geschrieben werden: {reason}"
 

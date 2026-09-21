@@ -56,10 +56,17 @@ pub const MAX_CONTEXT_TOKENS: &str = "CLAUDE_CODE_MAX_CONTEXT_TOKENS";
 /// measured yet, because it is the figure Claude Code will then work to.
 pub const ASSUMED_CONTEXT_TOKENS: u64 = 200_000;
 
+/// The environment variable opencode reads a whole configuration from, merged over the file in
+/// its home, checked against 1.18.31: the program's text holds
+/// `process.env.OPENCODE_CONFIG_CONTENT` and logs `loaded custom config from
+/// OPENCODE_CONFIG_CONTENT` when it is set.
+pub const OPENCODE_CONFIG_CONTENT: &str = "OPENCODE_CONFIG_CONTENT";
+
 impl ProviderChoice {
-    /// The environment a tab of this profile is started with, so its harness speaks to the
-    /// workspace's relay at `http://127.0.0.1:<`[`crate::provider::relay::PORT`]`>` instead of
-    /// the provider's own address, asking for [`ProviderChoice::model`].
+    /// The environment a tab of `harness` on this provider is started with, so the harness
+    /// speaks to the workspace's relay at `http://127.0.0.1:<`[`crate::provider::relay::PORT`]`>`
+    /// instead of the provider's own address, asking for [`ProviderChoice::model`]. Empty for a
+    /// harness that is not offered a provider of one's own.
     ///
     /// `window` is what QCode measured this server really gives for that model, when it has been
     /// measured: the harness is told that rather than left to assume its own models' room.
@@ -70,9 +77,19 @@ impl ProviderChoice {
     /// value here to send a request at all, never the provider's real key — that never leaves
     /// this machine's own process.
     #[must_use]
-    pub fn environment(&self, token: &str, window: Option<u64>) -> Vec<(String, String)> {
+    pub fn environment(&self, harness: HarnessKind, token: &str, window: Option<u64>) -> Vec<(String, String)> {
+        match harness {
+            HarnessKind::ClaudeCode => self.claude_code(token, window),
+            HarnessKind::OpenCode => vec![(OPENCODE_CONFIG_CONTENT.to_owned(), self.opencode(token, window))],
+            HarnessKind::GeminiCli | HarnessKind::Codex | HarnessKind::AntigravityIde => Vec::new(),
+        }
+    }
+
+    /// Claude Code speaks the Anthropic message shape and is pointed at another endpoint by
+    /// three variables it reads once, as it starts.
+    fn claude_code(&self, token: &str, window: Option<u64>) -> Vec<(String, String)> {
         let mut environment = vec![
-            (ANTHROPIC_BASE_URL.to_owned(), format!("http://127.0.0.1:{}", crate::provider::relay::PORT)),
+            (ANTHROPIC_BASE_URL.to_owned(), relay_address()),
             (ANTHROPIC_AUTH_TOKEN.to_owned(), token.to_owned()),
             (ANTHROPIC_MODEL.to_owned(), self.model.clone()),
         ];
@@ -86,6 +103,49 @@ impl ProviderChoice {
         }
         environment
     }
+
+    /// opencode speaks the OpenAI completion shape to a provider it is told of in its own
+    /// configuration: an OpenAI-compatible one named after the person's tag, at the relay's
+    /// `/v1`, with the tab's token as its key and the chosen model as the one it uses — for the
+    /// conversation and for the short titles it writes beside it, which would otherwise go to a
+    /// provider of opencode's own choosing that a container with no network cannot reach.
+    ///
+    /// Handed over in [`OPENCODE_CONFIG_CONTENT`] rather than written into the image, so that
+    /// the token, which is the tab's own and new for every tab, never lands in a file; opencode
+    /// merges it over the settings the image and the bridge wrote, which keep their permission
+    /// and their MCP server.
+    fn opencode(&self, token: &str, window: Option<u64>) -> String {
+        let mut model = serde_json::json!({ "name": self.model });
+        // opencode compacts a conversation before it outgrows the window it was told of; told of
+        // none, it never does, and a server that cuts the front of a long prompt cuts it in
+        // silence. Only a measured window is handed over. Its configuration will not take a
+        // window without the room for an answer beside it (1.18.31: `Missing key
+        // ...limit.output`), and 0 there is opencode's own ceiling rather than a number QCode
+        // would have to invent: it reads the room as `Math.min(limit.output, max) || max`.
+        if let Some(window) = window {
+            model["limit"] = serde_json::json!({ "context": window, "output": 0 });
+        }
+        let chosen = format!("{}/{}", self.tag, self.model);
+        serde_json::json!({
+            "provider": {
+                self.tag.as_str(): {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "name": self.tag,
+                    "options": { "baseURL": format!("{}/v1", relay_address()), "apiKey": token },
+                    "models": { self.model.as_str(): model },
+                },
+            },
+            "model": chosen,
+            "small_model": chosen,
+        })
+        .to_string()
+    }
+}
+
+/// Where a harness inside a profile container reaches the relay: its loopback interface, on the
+/// relay's own port.
+fn relay_address() -> String {
+    format!("http://127.0.0.1:{}", crate::provider::relay::PORT)
 }
 
 /// A profile as its definition file describes it.
@@ -637,7 +697,7 @@ mode = \"full\"
     #[test]
     fn a_providers_environment_carries_the_relay_and_the_model_and_never_a_key() {
         let provider = ProviderChoice { tag: "ev1".to_owned(), model: "qwen3.8".to_owned() };
-        let env = provider.environment("tab-token-abc", None);
+        let env = provider.environment(HarnessKind::ClaudeCode, "tab-token-abc", None);
         let get = |env: &Vec<(String, String)>, name: &str| {
             env.iter().find(|(key, _)| key == name).map(|(_, value)| value.to_owned())
         };
@@ -649,8 +709,40 @@ mode = \"full\"
 
         // A window that was measured is handed over, because a harness that has never heard of
         // this model assumes its own models' room and loses the front of every larger prompt.
-        let measured = provider.environment("tab-token-abc", Some(31_512));
+        let measured = provider.environment(HarnessKind::ClaudeCode, "tab-token-abc", Some(31_512));
         assert_eq!(get(&measured, MAX_CONTEXT_TOKENS).as_deref(), Some("31512"));
+    }
+
+    #[test]
+    fn opencode_is_told_of_the_relay_as_an_openai_provider_named_after_the_tag() {
+        let provider = ProviderChoice { tag: "ev1".to_owned(), model: "qwen3-coder:30b".to_owned() };
+        let env = provider.environment(HarnessKind::OpenCode, "tab-token-abc", None);
+        assert_eq!(env.len(), 1, "one variable, the whole of it: {env:?}");
+        assert_eq!(env[0].0, OPENCODE_CONFIG_CONTENT);
+        let config: serde_json::Value = serde_json::from_str(&env[0].1).expect("the configuration is JSON");
+        let entry = &config["provider"]["ev1"];
+        assert_eq!(entry["npm"], "@ai-sdk/openai-compatible", "opencode carries this one in its own program");
+        assert_eq!(entry["options"]["baseURL"], "http://127.0.0.1:41417/v1");
+        assert_eq!(entry["options"]["apiKey"], "tab-token-abc", "the tab's token, never a provider's key");
+        assert!(entry["models"]["qwen3-coder:30b"].is_object());
+        assert!(entry["models"]["qwen3-coder:30b"].get("limit").is_none(), "no window is invented");
+        assert_eq!(config["model"], "ev1/qwen3-coder:30b");
+        assert_eq!(config["small_model"], "ev1/qwen3-coder:30b", "titles go to the same model, not elsewhere");
+
+        let measured = provider.environment(HarnessKind::OpenCode, "tab-token-abc", Some(31_512));
+        let config: serde_json::Value = serde_json::from_str(&measured[0].1).expect("JSON");
+        let limit = &config["provider"]["ev1"]["models"]["qwen3-coder:30b"]["limit"];
+        assert_eq!(limit["context"], 31_512);
+        assert_eq!(limit["output"], 0, "opencode's own ceiling for the answer; its configuration needs the key");
+    }
+
+    #[test]
+    fn a_harness_offered_no_provider_is_given_no_environment_for_one() {
+        let provider = ProviderChoice { tag: "ev1".to_owned(), model: "m".to_owned() };
+        for harness in [HarnessKind::GeminiCli, HarnessKind::Codex, HarnessKind::AntigravityIde] {
+            assert!(!harness.supports(AccountKind::Provider), "{harness:?}");
+            assert!(provider.environment(harness, "t", None).is_empty(), "{harness:?}");
+        }
     }
 
     #[test]

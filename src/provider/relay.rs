@@ -34,10 +34,16 @@
 //!
 //! # What is allowed
 //!
-//! A connection may ask for the provider's own message endpoint (`POST`, the path
-//! [`crate::provider::Wire::messages_path`] names) or list its models (`GET /v1/models`, which
-//! both wire shapes serve at the same path). Nothing else is carried: the relay forwards one
-//! conversation, not whatever address a container asks for.
+//! A connection may send a message (`POST`, at the path [`crate::provider::Wire::messages_path`]
+//! names for either shape) or list the provider's models (`GET /v1/models`, which both shapes
+//! serve at the same path). Nothing else is carried: the relay forwards one conversation, not
+//! whatever address a container asks for.
+//!
+//! Which of the two message paths a request takes is the harness's to say, not the provider
+//! entry's. Nothing translates between the shapes, so the only shape that can work is the one
+//! the harness speaks — Claude Code the Anthropic one, opencode the OpenAI one — and both kinds
+//! of provider QCode knows serve both. Holding a tab to its provider's recorded shape would only
+//! refuse the one request its harness can make.
 
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -147,10 +153,10 @@ fn path_only(path: &str) -> &str {
 
 /// Whether `entry` may be asked for `method` `path` through the relay. See the module's doc
 /// comment for why these two and nothing else.
-fn allowed(entry: &ProviderEntry, method: &str, path: &str) -> bool {
+fn allowed(method: &str, path: &str) -> bool {
     let path = path_only(path);
     match method {
-        "POST" => path == entry.wire.messages_path(),
+        "POST" => super::Wire::ALL.iter().any(|wire| path == wire.messages_path()),
         "GET" => path == "/v1/models",
         _ => false,
     }
@@ -495,7 +501,7 @@ mod unix {
             refuse(&mut writing, 405, "method not served here");
             return;
         };
-        if !allowed(&entry, &incoming.method, &incoming.path) {
+        if !allowed(&incoming.method, &incoming.path) {
             report(Event::NotAllowed { method: incoming.method.clone(), path: incoming.path.clone() });
             refuse(&mut writing, 404, "not served here");
             return;
@@ -508,7 +514,11 @@ mod unix {
             prefix: "Bearer ".to_owned(),
             key,
         });
-        let ask = UpstreamAsk { method, url: entry.address(&incoming.path), headers, secret, body: Box::new(reading) };
+        // Under the provider's API rather than its bare address: a harness asks for
+        // `/v1/messages` the way it would ask Anthropic, and OpenRouter answers that path only
+        // under `/api`.
+        let url = entry.api_address(&incoming.path);
+        let ask = UpstreamAsk { method, url, headers, secret, body: Box::new(reading) };
 
         match upstream.call(ask) {
             Ok(answer) => {
@@ -715,6 +725,21 @@ mod tests {
     }
 
     #[test]
+    fn a_harness_asking_openrouter_the_way_it_asks_anthropic_reaches_its_api() {
+        let scratch = Scratch::new("openrouter");
+        let mut entry = ProviderEntry::new(tag("yol"), ProviderKind::OpenRouter, "https://openrouter.ai");
+        entry.key = Some(Key::new(MADE_UP_KEY).expect("a key"));
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let listener = Listener::open(&scratch.0, resolve_one("tok", entry), canned(200, "{}", seen_tx), |_| {})
+            .expect("the socket opens");
+        // What Claude Code really sends: its own path, with the query string it adds.
+        let (head, _) = ask(listener.socket(), "tok", "POST", "/v1/messages?beta=true", b"{}");
+        assert_eq!(head["status"], 200);
+        let seen = seen_rx.recv().expect("the request reached the stand-in");
+        assert_eq!(seen.url, "https://openrouter.ai/api/v1/messages?beta=true", "the API, not the website");
+    }
+
+    #[test]
     fn no_token_or_a_wrong_one_is_refused_and_nothing_is_forwarded() {
         let scratch = Scratch::new("badtoken");
         let entry = ollama_entry(None);
@@ -864,13 +889,31 @@ mod tests {
 
     #[test]
     fn every_path_the_script_or_the_host_disagrees_on_is_refused_the_same_way() {
-        let entry = ollama_entry(None);
-        assert!(allowed(&entry, "POST", "/v1/messages"));
-        assert!(allowed(&entry, "GET", "/v1/models"));
-        assert!(allowed(&entry, "GET", "/v1/models?x=1"), "a query string does not change what path was asked for");
-        assert!(!allowed(&entry, "POST", "/v1/models"));
-        assert!(!allowed(&entry, "GET", "/v1/messages"));
-        assert!(!allowed(&entry, "DELETE", "/v1/messages"));
-        assert!(!allowed(&entry, "GET", "/anything/else"));
+        assert!(allowed("POST", "/v1/messages"), "what Claude Code sends");
+        assert!(allowed("POST", "/v1/chat/completions"), "what opencode sends");
+        assert!(allowed("GET", "/v1/models"));
+        assert!(allowed("GET", "/v1/models?x=1"), "a query string does not change what path was asked for");
+        assert!(!allowed("POST", "/v1/models"));
+        assert!(!allowed("GET", "/v1/messages"));
+        assert!(!allowed("GET", "/v1/chat/completions"));
+        assert!(!allowed("DELETE", "/v1/messages"));
+        assert!(!allowed("GET", "/anything/else"));
+        assert!(!allowed("POST", "/v1/completions"), "only a conversation, in either shape");
+    }
+
+    #[test]
+    fn an_openai_shaped_harness_is_carried_to_openrouter_whatever_shape_the_entry_was_measured_in() {
+        let scratch = Scratch::new("openai-shape");
+        let mut entry = ProviderEntry::new(tag("yol"), ProviderKind::OpenRouter, "https://openrouter.ai");
+        entry.key = Some(Key::new(MADE_UP_KEY).expect("a key"));
+        assert_eq!(entry.wire, super::super::Wire::Anthropic, "the entry was written down in the other shape");
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let listener = Listener::open(&scratch.0, resolve_one("tok", entry), canned(200, "{}", seen_tx), |_| {})
+            .expect("the socket opens");
+        let (head, _) = ask(listener.socket(), "tok", "POST", "/v1/chat/completions", b"{}");
+        assert_eq!(head["status"], 200);
+        let seen = seen_rx.recv().expect("the request reached the stand-in");
+        assert_eq!(seen.url, "https://openrouter.ai/api/v1/chat/completions");
+        assert_eq!(seen.secret.expect("the key is added").key.expose(), MADE_UP_KEY);
     }
 }

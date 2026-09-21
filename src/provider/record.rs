@@ -5,8 +5,9 @@ use super::{Key, Tag};
 
 /// A kind of provider QCode knows how to ask.
 ///
-/// Both of them speak the Anthropic message shape at `/v1/messages`, which is why a harness can
-/// be pointed straight at them and no translating endpoint is built.
+/// Both of them speak the Anthropic message shape at `/v1/messages` and the OpenAI one at
+/// `/v1/chat/completions`, under [`ProviderKind::api_root`], which is why a harness can be
+/// pointed straight at them in its own shape and no translating endpoint is built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
     /// An ollama server, the person's own or one on their network.
@@ -67,6 +68,22 @@ impl ProviderKind {
     #[must_use]
     pub fn wire(self) -> Wire {
         Wire::Anthropic
+    }
+
+    /// Where this kind's API sits under the address a person knows it by, which is not always
+    /// the address itself.
+    ///
+    /// OpenRouter is known as `https://openrouter.ai`, and that is the address its page names,
+    /// but its API answers under `/api`: `https://openrouter.ai/api/v1/messages`. The same path
+    /// without it is the website, which answers a message with `200` and a page of HTML — a
+    /// harness reading that as a model's answer is told nothing true about what went wrong. An
+    /// ollama server answers at its own root.
+    #[must_use]
+    pub fn api_root(self) -> &'static str {
+        match self {
+            Self::Ollama => "",
+            Self::OpenRouter => "/api",
+        }
     }
 }
 
@@ -218,11 +235,21 @@ impl ProviderEntry {
         format!("{}{path}", self.base)
     }
 
+    /// The address `path` of this provider's API sits at: under [`ProviderKind::api_root`],
+    /// unless the base a person wrote already ends there. OpenRouter's own instructions for
+    /// Claude Code name `https://openrouter.ai/api` as the base, so a person who copied that must
+    /// not be sent to `/api/api`.
+    #[must_use]
+    pub fn api_address(&self, path: &str) -> String {
+        let root = self.kind.api_root();
+        if self.base.ends_with(root) { self.address(path) } else { format!("{}{root}{path}", self.base) }
+    }
+
     /// Where a message to `model` would go. The page prints this before the person presses
     /// anything, so that nothing leaves the machine towards an address they have not read.
     #[must_use]
     pub fn messages_address(&self) -> String {
-        self.address(self.wire.messages_path())
+        self.api_address(self.wire.messages_path())
     }
 
     /// The model named `id`, when this provider was last seen to have one.
@@ -261,6 +288,27 @@ mod tests {
         assert_eq!(entry.messages_address(), "http://h:1/v1/messages", "both kinds speak Anthropic by default");
         entry.wire = Wire::OpenAi;
         assert_eq!(entry.messages_address(), "http://h:1/v1/chat/completions");
+    }
+
+    #[test]
+    fn openrouter_is_asked_under_its_api_whichever_of_its_two_addresses_was_written() {
+        // Measured against the real service: `https://openrouter.ai/v1/messages` is the website
+        // and answers `200` with HTML; only the path under `/api` is the API.
+        for base in [
+            "https://openrouter.ai",
+            "https://openrouter.ai/",
+            "https://openrouter.ai/api",
+            "https://openrouter.ai/api/",
+        ] {
+            let entry = ProviderEntry::new(tag("yol"), ProviderKind::OpenRouter, base);
+            assert_eq!(entry.messages_address(), "https://openrouter.ai/api/v1/messages", "{base}");
+            assert_eq!(entry.api_address("/v1/models"), "https://openrouter.ai/api/v1/models", "{base}");
+        }
+        let mut entry = ProviderEntry::new(tag("yol"), ProviderKind::OpenRouter, "https://openrouter.ai");
+        entry.wire = Wire::OpenAi;
+        assert_eq!(entry.messages_address(), "https://openrouter.ai/api/v1/chat/completions");
+        let ollama = ProviderEntry::new(tag("ev"), ProviderKind::Ollama, "http://h:1");
+        assert_eq!(ollama.api_address("/v1/models"), "http://h:1/v1/models", "an ollama server answers at its root");
     }
 
     #[test]

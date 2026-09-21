@@ -689,6 +689,7 @@ reached-version = "{tag} a répondu ; il fait tourner la version {version}."
 reached-key = "La clé a été acceptée."
 unreachable = "{url} n'a pas pu être joint : {reason}"
 refused = "{url} a refusé avec {status} : {said}"
+rate-limited = "{url} signale trop de requêtes pour le moment (429). Les modèles gratuits sont partagés et limités par minute et par jour : ce n'est ni la clé ni l'adresse qui sont fausses, le service vous demande d'attendre. Attendez une minute puis appuyez de nouveau, ou choisissez un autre modèle. Sa réponse : {said}"
 unreadable = "{url} a répondu quelque chose que ce fournisseur ne promet pas : {wanted}"
 save-failed = "Le fichier des fournisseurs n'a pas pu être écrit : {reason}"
 

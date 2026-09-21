@@ -232,11 +232,35 @@ impl Web {
     pub fn json(&self, ask: &Ask) -> Result<serde_json::Value, AskError> {
         let answer = (self.0)(ask)?;
         if !(200..300).contains(&answer.status) {
-            return Err(AskError::Refused { url: ask.url.clone(), status: answer.status, said: shorten(&answer.body) });
+            let said = shorten(&complaint(&answer.body));
+            return Err(AskError::Refused { url: ask.url.clone(), status: answer.status, said });
         }
         serde_json::from_str(&answer.body)
             .map_err(|error| AskError::Unreadable { url: ask.url.clone(), wanted: error.to_string() })
     }
+}
+
+/// The words of a refusal a person can act on, out of a body that may wrap them in JSON.
+///
+/// OpenRouter answers a rate-limited free model with `"message":"Provider returned error"` and
+/// keeps the sentence that says what happened — "temporarily rate-limited upstream. Please retry
+/// shortly" — under `metadata.raw` beside the error, two hundred characters in. Quoted from the front, the
+/// part a page has room for is the unhelpful half. So the most specific message is taken when the
+/// body is one of the shapes providers use, and the body itself otherwise.
+fn complaint(body: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else { return body.to_owned() };
+    let error = value.get("error");
+    [
+        value.get("metadata").and_then(|metadata| metadata.get("raw")),
+        error.and_then(|error| error.get("metadata")).and_then(|metadata| metadata.get("raw")),
+        error.and_then(|error| error.get("message")),
+        error.filter(|error| error.is_string()),
+        value.get("message"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|said| said.as_str().filter(|said| !said.trim().is_empty()))
+    .map_or_else(|| body.to_owned(), str::to_owned)
 }
 
 /// The beginning of `said`, so that a page is never filled with someone's error page.
@@ -253,7 +277,7 @@ fn shorten(said: &str) -> String {
 pub fn listing(entry: &ProviderEntry) -> Ask {
     match entry.kind {
         ProviderKind::Ollama => plain(Method::Get, entry.address("/api/tags")),
-        ProviderKind::OpenRouter => plain(Method::Get, entry.address("/api/v1/models")),
+        ProviderKind::OpenRouter => plain(Method::Get, entry.api_address("/v1/models")),
     }
 }
 
@@ -274,7 +298,7 @@ pub fn trial(entry: &ProviderEntry) -> Ask {
         // The key's own endpoint, so that the trial really tries the key rather than an address
         // that answers whether or not the key is any good — and so that trying a connection
         // never spends anything.
-        ProviderKind::OpenRouter => with_key(Method::Get, entry.address("/api/v1/key"), entry),
+        ProviderKind::OpenRouter => with_key(Method::Get, entry.api_address("/v1/key"), entry),
     }
 }
 

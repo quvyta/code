@@ -940,8 +940,14 @@ impl WorkspaceScreen {
         match tab.kind() {
             TabKind::Profile(_) => {
                 let mut env = vec![(crate::bridge::TOKEN_VARIABLE.to_owned(), tab.token().to_owned())];
-                if let Some(provider) = provider_choice(workspace, tab.kind()) {
-                    env.extend(provider.environment(tab.token(), self.measured_window(&provider)));
+                let name = tab.kind().profile();
+                let profile = workspace.profiles.iter().find(|profile| Some(profile.name.as_str()) == name);
+                if let Some(profile) = profile
+                    && let Some(provider) = &profile.provider
+                {
+                    // Each harness is pointed at the relay its own way, so the environment
+                    // follows the profile's harness as well as its provider.
+                    env.extend(provider.environment(profile.harness, tab.token(), self.measured_window(provider)));
                 }
                 let env: Vec<(&str, &str)> = env.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
                 Some(plan.enter_with(engine, &parts, &env))

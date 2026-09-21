@@ -21,21 +21,26 @@ source under the MIT licence.
   made for it. The container sees the workspace folder and, if you allow it, the workspace's assets
   folder and the network. Because the container is what keeps the work apart from your machine,
   the harness is set up to work without stopping to ask for permission.
-- **Profiles.** A profile is one harness with its settings: which harness, how much of qcode's
-  recommended configuration goes into the image, what it signs in with and what its containers
+- **Profiles.** A profile is one harness with its settings: which harness, which template (the
+  bare harness, **QCode basic** or **QCode high**), what it signs in with and what its containers
   may reach. Building a profile builds its image; the build can be stopped at any time and a
   half-made image is removed.
 - **Signing in once.** A profile signs in through the harness's own sign-in flow, run in a
   terminal inside a container. qcode then checks that the login file is really there before it
   keeps it. Each workspace that uses the profile gets its own copy of the login, so chat history,
   memory and settings never leak from one workspace into another. A copy can be refreshed from the
-  profile later, and the profile can be signed out.
+  profile later, and the profile can be signed out. A profile that runs on one of your own
+  providers has nothing to sign in to.
+- **Providers of your own.** An ollama server on your network or an OpenRouter account can stand
+  in for a harness's own account, for Claude Code and opencode. The provider's key stays on your
+  machine and never enters a container. See [Providers of your own](#providers-of-your-own).
 - **Workspaces.** A workspace starts empty, from a copy of a folder, or from a git address (the clone
   runs inside a container, so git does not have to be installed on your machine). The workspace
   screen has tabs for shells, harnesses and files, and a side panel with the workspace's files, its
   details and its containers, which can be stopped and restarted from there.
 - **Built-in apps.** A file opened from the file tree opens in a tab of its own, in the workspace's
-  base container, so nothing is installed on your machine for it. See [Built-in apps](#built-in-apps).
+  base container, so the programs that open it live in that container and none of them has to be
+  installed on your machine. See [Built-in apps](#built-in-apps).
 - **Containers stop when you are done.** When the last QCode closes, the containers it started
   are stopped, and an optional background service does the same after a crash. See
   [When QCode closes](#when-qcode-closes).
@@ -48,8 +53,8 @@ The harnesses qcode knows today:
 
 | Harness | Account types |
 |---|---|
-| Claude Code | subscription, API key |
-| opencode | free models, subscription, API key |
+| Claude Code | subscription, API key, a provider of your own |
+| opencode | free models, subscription, API key, a provider of your own |
 | Gemini CLI | API key |
 | Codex CLI | subscription, API key |
 
@@ -101,19 +106,43 @@ It does not protect:
   mounted straight from your disk. Keep your work in git and push it somewhere.
 - **your data from leaving over the network.** A profile with network access (the default) can
   send anything it can read, the workspace included, anywhere. A profile can be set to have no
-  network, but most harnesses need it to reach their model.
+  network, but most harnesses need it to reach their model. A profile that runs on one of your
+  providers can work with no network at all, and even then what the harness puts in its requests,
+  which can be anything in the workspace, goes to that provider: qcode carries those requests
+  there, and to nowhere else.
 - **the logins.** A profile's login lives in the engine's volumes. Anyone who can use your
   container engine can read them.
 - **against the engine or the kernel.** A container shares your machine's kernel; a flaw there
   or in the engine is a way out that a virtual machine would not have.
 
-## No telemetry
+## No telemetry, and what goes over the network
 
-qcode itself sends nothing anywhere: it has no network code and no network library, collects no
-statistics and checks for no updates. The only network traffic it causes goes through your
-container engine: building images (the base image and the harness packages), cloning a workspace
-from a git address, and whatever the harnesses do inside their containers. The harnesses keep
-their own behaviour, including any telemetry of their own; their documentation says what that is.
+qcode collects no statistics, checks for no updates and sends nothing anywhere of its own accord.
+
+It connects to the network itself only after you have added a provider on the **Providers** page,
+and then only to that provider's address:
+
+- **When you ask on the Providers page.** **Try the connection**, **Ask what it offers** and
+  **Measure the real window** each send their requests at the moment you press them, never
+  because the page was opened or qcode started. Measuring sends up to four prompts, of 400 to
+  48 000 words, and reads back how many tokens the provider counted; a provider that charges by
+  the token charges for them like for any other prompt.
+- **While a tab of a profile that runs on that provider is open.** The harness's requests for an
+  answer and for the list of models are carried from its container to the provider by qcode,
+  which adds the key on the way out. Nothing else the container asks for is carried, and the key
+  never enters the container.
+
+A version of qcode before 0.1.13 said here that it had no network code at all. That stopped being
+true in 0.1.12, which added providers, and the sentence was not changed with it.
+
+All other traffic comes from programs you can see qcode start: your container engine, when it
+builds an image (the base image, the harness packages and, for QCode high, what that template
+adds) or clones a workspace from a git address; the command that installs a container engine,
+when you let qcode run it in the setup; and your own browser, when a sign-in page is handed to
+it. Inside the containers, the harnesses keep their own behaviour, including any telemetry of
+their own; their documentation says what that is. Two are switched off by qcode's templates:
+QCode basic turns off Antigravity's telemetry, and QCode high turns off that of oh-my-openagent,
+which it adds.
 
 ## Screens
 
@@ -137,7 +166,8 @@ their own behaviour, including any telemetry of their own; their documentation s
 - **A container engine:** [Podman](https://podman.io/docs/installation) (recommended: rootless,
   with no background service) or [Docker](https://docs.docker.com/engine/install/) with its daemon
   running.
-- **An account** with the harness you want to use: a subscription or an API key from its provider.
+- **An account** with the harness you want to use: a subscription or an API key from its provider,
+  or, for Claude Code and opencode, a model service of your own (an ollama server or OpenRouter).
 - **Disk space and a network connection** for the first images. The base image is Debian with
   Node.js; each profile adds its harness on top of it.
 - Rust 1.95 or later to install from source.
@@ -283,10 +313,11 @@ from:
   nothing extra for that. Docker's default seccomp profile refuses the calls the sandbox is built
   from, so qcode hands docker a profile of its own: docker's default plus `clone`, `setns` and
   `unshare`. It is in `assets/seccomp/desktop.json` with a comment saying what it costs.
-- **No sign-in yet.** The application cannot be used without a Google account, and signing in
-  means a browser and a port that qcode does not yet carry between your machine and the container.
-  The window will ask you to sign in and there is currently no way to complete it. Everything
-  else — that the window opens, keeps its settings, and closes cleanly — works.
+- **Signing in does not finish yet.** The application cannot be used without a Google account.
+  The sign-in page it asks for opens in your own browser and its address is shown on the tab, but
+  Google then answers on a port inside the container that qcode does not yet carry back from your
+  machine, so the sign-in never completes. Everything else — that the window opens, keeps its
+  settings, and closes cleanly — works.
 - **A profile with the network off makes no sense here.** The application does all its work on its
   maker's servers; the tab says so if you try.
 
@@ -390,11 +421,34 @@ Three rules hold for every message:
 - **Loops stop.** An exchange between tabs ends after 6 messages, and one tab sends at most 5
   messages a minute. The sending agent is told why its message was refused.
 
-A message that is taken waits in the tab it was sent to, on a line that says who sent it; **Read**
-shows it and **Discard** throws it away. qcode does not type it into the receiving harness's
-prompt yet: that needs the terminal to paste the way the harness expects, which comes with the
-next release of the framework qcode is built on. Until then the receiving agent starts on it
-only when you pass it on.
+A message that is taken is typed into the receiving harness's own prompt, on a line that says
+which tab sent it, as soon as that tab is quiet: you are not typing in it and its program has
+stopped writing. Until then, or while the harness is not running, it waits in the tab, where
+**Read** shows it and **Discard** throws it away. The sending agent is told whether its message
+went in or still waits. A desktop window (Antigravity) can send messages but never receives any,
+because it has no prompt to type into.
+
+## Providers of your own
+
+**Providers**, beside **Profiles**, lists the model services you already have: an ollama server
+on your own network, or OpenRouter. Each gets a tag of your choosing, and a key where the service
+needs one, pasted into the dialog. The page shows, in a line of its own, which file the keys are
+kept in and that a backup of your home folder carries them in plain text.
+
+For each provider the page can try the connection, ask which models it offers and what window
+each one claims, and measure the window the server really gives: a model may say 262 144 tokens
+while the server quietly keeps three thousand and drops the front of everything larger. The page
+shows both numbers. Each of these goes out only when you press its button; see
+[what goes over the network](#no-telemetry-and-what-goes-over-the-network).
+
+A Claude Code or opencode profile can then sign in with **a provider of your own** and one of its
+models. Its tab talks to a small relay that runs inside the container, on the container's own
+loopback address; the relay hands each request to qcode through a socket in the workspace's
+`Containers/MCP/` folder, and qcode sends it on to the provider with the key added. So the
+container never holds the key and needs no network of its own, and the harness is told the window
+that was measured, so it does not assume room the server does not give. Only two kinds of request
+are carried: a message and the list of models. Gemini CLI and Codex do not offer a provider yet,
+because pointing them at another address has not been checked.
 
 ## When QCode closes
 
@@ -428,6 +482,8 @@ so the containers keep running; Settings says so.
 | Profiles | `Profiles/<profile>.toml` in the QCode folder |
 | Workspaces | `Workspaces/<workspace>/` in the QCode folder: `workspace.qcode`, the code in `Work/`, your material in `Assets/` |
 | Tabs talking to each other | `Workspaces/<workspace>/Containers/MCP/` in the QCode folder: the server the harnesses start and, while the workspace is open, the socket qcode listens on; each harness's own settings in `qcode-home-<workspace>-<profile>` hold the entry `qcode` |
+| Providers | `providers.toml` in the data folder, `~/.local/share/quvyta/code` on Linux, readable only by you in a folder only you can open. It holds the keys in plain text; they are never written to the settings file, the QCode folder or a container |
+| The relay to a provider | `relay.sock` and `qcode-relay.mjs` in `Workspaces/<workspace>/Containers/MCP/`, beside the bridge's socket and server |
 | Backups | `Workspaces/<workspace>/Backup/` in the QCode folder: `Code.git`, the backups of `Work/`; `Assets.git`, those of `Assets/` when it is backed up; `Conversations/<profile>.git`, each profile's conversations; and the lock files that keep two QCodes from backing up the same thing at once |
 | Images | `qcode/base` and `qcode/profile/<profile>`, in the engine |
 | Logins | engine volumes: `qcode-cred-<profile>` for the profile, `qcode-home-<workspace>-<profile>` for each workspace's copy |

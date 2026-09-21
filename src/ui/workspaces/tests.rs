@@ -170,6 +170,22 @@ fn a_name_shows_the_folder_name_it_would_get() {
 }
 
 #[test]
+fn a_name_typed_faster_than_a_frame_arrives_whole() {
+    // A terminal hands over every key waiting since the last frame in one read: a quick typist,
+    // a multiplexer or a slow connection does it. Each key must meet what the one before it did,
+    // or "demo" becomes "o" and the workspace is made under a name nobody typed.
+    let scratch = Scratch::new("burst");
+    let mut harness = screen(scratch.path(), None);
+    harness.send(Msg::Start).render();
+    let keys: Vec<Event> = "demo".chars().map(|c| Event::Key(KeyEvent::press(&c.to_string()))).collect();
+    harness.events(&keys);
+    let text = harness.screen();
+    assert!(text.contains("On disk: demo"), "{text}");
+    harness.events(&[Event::Key(KeyEvent::press("enter"))]).render();
+    assert!(Store::new(scratch.path()).workspaces_dir().join("demo").is_dir(), "{}", harness.screen());
+}
+
+#[test]
 fn a_name_that_is_taken_is_said_out_loud_and_never_numbered() {
     let scratch = Scratch::new("taken");
     let store = Store::new(scratch.path());
@@ -223,6 +239,30 @@ fn a_folder_is_copied_and_the_persons_own_copy_stays_where_it_is() {
     let copied = store.join("Workspaces").join("firefly").join("Work").join("src").join("main.rs");
     assert!(copied.is_file(), "the copy landed in the workspace");
     assert!(source.join("src").join("main.rs").is_file(), "their own folder is untouched");
+}
+
+#[test]
+fn choose_folder_takes_the_folder_that_is_open_and_not_the_first_one_inside_it() {
+    // The browser rests its cursor on the first entry of a folder it opens. That resting place is
+    // not a choice: Choose folder takes the folder on screen, and the copy holds all of it.
+    let scratch = Scratch::new("pick");
+    let source = scratch.path().join("source");
+    fs::create_dir_all(source.join("src")).expect("a source tree");
+    fs::write(source.join("src").join("main.rs"), "fn main() {}").expect("a file");
+    let store = scratch.path().join("store");
+
+    let mut harness = screen(&store, None);
+    harness.send(Msg::Start).render();
+    typed(&mut harness, "Firefly");
+    harness
+        .send(Msg::Source(super::Source::Folder.index()))
+        .send(Msg::Picker(qframe::widgets::FilePickerMsg::Open(source.clone())))
+        .advance(Duration::from_millis(50));
+    harness.click_text("Choose folder");
+    harness.send(Msg::Submit).advance(Duration::from_millis(50)).render();
+
+    let work = store.join("Workspaces").join("firefly").join("Work");
+    assert!(work.join("src").join("main.rs").is_file(), "the open folder was copied whole:\n{}", harness.screen());
 }
 
 #[test]
