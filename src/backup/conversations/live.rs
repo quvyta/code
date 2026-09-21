@@ -24,7 +24,7 @@ use crate::engine::{
 };
 use crate::profile::identity::Home;
 use crate::profile::{HarnessKind, SafeName};
-use crate::workspace::{ProjectId, ProjectPaths};
+use crate::store::{WorkspaceId, WorkspacePaths};
 
 /// The engines installed on this machine, or nothing at all when the tests are switched off.
 fn engines() -> Vec<Engine> {
@@ -37,7 +37,7 @@ fn engines() -> Vec<Engine> {
     found
 }
 
-/// A project folder and a home volume of this test's own, both removed by `Drop`, with the
+/// A workspace folder and a home volume of this test's own, both removed by `Drop`, with the
 /// profile's container too when the test made one.
 struct Scratch {
     engine: Engine,
@@ -48,18 +48,18 @@ struct Scratch {
 impl Scratch {
     fn new(engine: &Engine) -> Self {
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
-        let project = ProjectId::parse(&format!("chatlive{}", stamp % 1_000_000_000)).expect("a project id");
+        let workspace = WorkspaceId::parse(&format!("chatlive{}", stamp % 1_000_000_000)).expect("a workspace id");
         let root = std::env::temp_dir().join(format!("qcode-live-conversations-{}-{stamp}", engine.kind().name()));
-        fs::create_dir_all(&root).expect("a project folder");
-        let home = Home::new(SafeName::parse("claude-live").expect("a name"), project);
+        fs::create_dir_all(&root).expect("a workspace folder");
+        let home = Home::new(SafeName::parse("claude-live").expect("a name"), workspace);
         capture(&engine.create_volume(&home.volume())).expect("a home volume");
         Self { engine: engine.clone(), root, home }
     }
 
-    fn paths(&self) -> ProjectPaths {
-        ProjectPaths {
-            file: self.root.join("project.qcode"),
-            project: self.root.join("Project"),
+    fn paths(&self) -> WorkspacePaths {
+        WorkspacePaths {
+            file: self.root.join("workspace.qcode"),
+            code: self.root.join("Work"),
             assets: self.root.join("Assets"),
             harness: self.root.join("Containers").join("Harness"),
             root: self.root.clone(),

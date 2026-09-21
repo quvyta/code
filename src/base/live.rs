@@ -19,7 +19,7 @@
 use std::path::{Path, PathBuf};
 
 use super::apps::{PROGRAMS, office_text, pages, pdf_page, pdf_text, picture, sound_details};
-use super::paths::{ASSETS_DIR, HOME_DIR, KEEP_ALIVE, OPEN_HOME, PROJECT_DIR};
+use super::paths::{ASSETS_DIR, CODE_DIR, HOME_DIR, KEEP_ALIVE, OPEN_HOME};
 use super::{Outcome, Presence, containerfile, ensure, presence};
 use crate::engine::names::HOSTNAME;
 use crate::engine::run::{build_image, capture};
@@ -39,7 +39,7 @@ const TEST_PROFILE: &str = "qcode/basetest-profile";
 /// The container these tests live in.
 const CONTAINER: &str = "qcode-basetest-container";
 
-/// The volume standing in for a project's home.
+/// The volume standing in for a workspace's home.
 const HOME_VOLUME: &str = "qcode-basetest-home";
 
 /// The engines installed on this machine, or nothing at all when the tests are switched off.
@@ -129,9 +129,9 @@ fn run_in(engine: &Engine, script: &str) -> String {
 }
 
 /// Creates and starts the test container from `image`, with the mounts of the path contract.
-fn start(engine: &Engine, image: &str, project: &Path, assets: &Path) {
+fn start(engine: &Engine, image: &str, workspace: &Path, assets: &Path) {
     let mounts = [
-        Mount { source: MountSource::Path(project), target: Path::new(PROJECT_DIR), access: Access::ReadWrite },
+        Mount { source: MountSource::Path(workspace), target: Path::new(CODE_DIR), access: Access::ReadWrite },
         Mount { source: MountSource::Path(assets), target: Path::new(ASSETS_DIR), access: Access::ReadOnly },
         Mount { source: MountSource::Volume(HOME_VOLUME), target: Path::new(HOME_DIR), access: Access::ReadWrite },
     ];
@@ -145,7 +145,7 @@ fn start(engine: &Engine, image: &str, project: &Path, assets: &Path) {
         // The whole point: the container runs as the person, and the image was built by someone
         // else entirely.
         user: HostUser::current().expect("the current user"),
-        workdir: Some(Path::new(PROJECT_DIR)),
+        workdir: Some(Path::new(CODE_DIR)),
         command: KEEP_ALIVE,
     }))
     .expect("the container is made");
@@ -160,9 +160,9 @@ fn the_image_builds_and_keeps_a_container_that_writes_where_the_contract_says() 
         let scratch = Scratch::new("contract");
         build(&engine, TEST_BASE, &containerfile(), &scratch);
 
-        let project = scratch.dir("Project");
+        let workspace = scratch.dir("Work");
         let assets = scratch.dir("Assets");
-        start(&engine, TEST_BASE, &project, &assets);
+        start(&engine, TEST_BASE, &workspace, &assets);
         assert_eq!(
             ContainerState::parse(&capture(&engine.container_state(CONTAINER)).expect("a state")),
             ContainerState::Running,
@@ -170,9 +170,9 @@ fn the_image_builds_and_keeps_a_container_that_writes_where_the_contract_says() 
             engine.kind()
         );
 
-        // The project reaches the host, and what it leaves there belongs to the person.
-        run_in(&engine, &format!("echo from-the-container > {PROJECT_DIR}/marker"));
-        let marker = project.join("marker");
+        // The workspace reaches the host, and what it leaves there belongs to the person.
+        run_in(&engine, &format!("echo from-the-container > {CODE_DIR}/marker"));
+        let marker = workspace.join("marker");
         assert_eq!(
             std::fs::read_to_string(&marker).expect("the host sees the file").trim(),
             "from-the-container",
@@ -228,14 +228,14 @@ fn the_image_builds_and_keeps_a_container_that_writes_where_the_contract_says() 
 #[test]
 #[ignore = "needs a container engine; run with QCODE_CONTAINER_TESTS=1"]
 fn a_repository_is_cloned_inside_the_container() {
-    // A project can be made from a git address without the person having git, which only holds
+    // A workspace can be made from a git address without the person having git, which only holds
     // if the image has it. The repository is made inside the container too, so the test needs
     // neither the network nor git on this machine.
     for engine in engines() {
         clear(&engine);
         let scratch = Scratch::new("clone");
         build(&engine, TEST_BASE, &containerfile(), &scratch);
-        start(&engine, TEST_BASE, &scratch.dir("Project"), &scratch.dir("Assets"));
+        start(&engine, TEST_BASE, &scratch.dir("Work"), &scratch.dir("Assets"));
 
         run_in(
             &engine,
@@ -246,11 +246,11 @@ fn a_repository_is_cloned_inside_the_container() {
                  echo merhaba > hello.txt\n\
                  git add hello.txt\n\
                  git -c user.email=qcode@example.invalid -c user.name=qcode commit --quiet -m seed\n\
-                 cd {PROJECT_DIR}\n\
+                 cd {CODE_DIR}\n\
                  git clone --progress -- $HOME/seed cloned"
             ),
         );
-        assert_eq!(run_in(&engine, &format!("cat {PROJECT_DIR}/cloned/hello.txt")).trim(), "merhaba");
+        assert_eq!(run_in(&engine, &format!("cat {CODE_DIR}/cloned/hello.txt")).trim(), "merhaba");
 
         clear(&engine);
     }
@@ -313,23 +313,23 @@ fn png() -> Vec<u8> {
 #[test]
 #[ignore = "needs a container engine; run with QCODE_CONTAINER_TESTS=1"]
 fn the_built_in_apps_answer_and_a_picture_is_drawn() {
-    // A file opened from the file tree runs one of these in the project's container. A program
+    // A file opened from the file tree runs one of these in the workspace's container. A program
     // the image does not really carry would fail only when the person opens a file, so every one
     // is asked here, and a picture is drawn with the very words a tab uses.
     for engine in engines() {
         clear(&engine);
         let scratch = Scratch::new("apps");
         build(&engine, TEST_BASE, &containerfile(), &scratch);
-        let project = scratch.dir("Project");
-        std::fs::write(project.join("band of colour.png"), png()).expect("the picture is written");
-        start(&engine, TEST_BASE, &project, &scratch.dir("Assets"));
+        let workspace = scratch.dir("Work");
+        std::fs::write(workspace.join("band of colour.png"), png()).expect("the picture is written");
+        start(&engine, TEST_BASE, &workspace, &scratch.dir("Assets"));
 
         for program in PROGRAMS {
             let answer = capture(&engine.exec_without_terminal(&Exec { container: CONTAINER, command: program }));
             assert!(answer.is_ok(), "{:?}: `{}` does not answer: {answer:?}", engine.kind(), program.join(" "));
         }
 
-        let command = picture(&format!("{PROJECT_DIR}/band of colour.png"));
+        let command = picture(&format!("{CODE_DIR}/band of colour.png"));
         let parts: Vec<&str> = command.iter().map(String::as_str).collect();
         let drawn = capture(&engine.exec_without_terminal(&Exec { container: CONTAINER, command: &parts }))
             .unwrap_or_else(|error| panic!("{:?}: the picture is not drawn: {error:?}", engine.kind()));
@@ -373,7 +373,7 @@ fn a_harness_installs_on_top_of_the_image_and_answers() {
         lines.push(String::new());
         build(&engine, TEST_PROFILE, &lines.join("\n"), &scratch);
 
-        start(&engine, TEST_PROFILE, &scratch.dir("Project"), &scratch.dir("Assets"));
+        start(&engine, TEST_PROFILE, &scratch.dir("Work"), &scratch.dir("Assets"));
         let version = capture(
             &engine.exec_without_terminal(&Exec { container: CONTAINER, command: &[record.command, "--version"] }),
         )
@@ -463,10 +463,10 @@ fn a_pdf_gives_its_text_and_draws_its_pages() {
         clear(&engine);
         let scratch = Scratch::new("pdf");
         build(&engine, TEST_BASE, &containerfile(), &scratch);
-        let project = scratch.dir("Project");
-        std::fs::write(project.join("tide tables.pdf"), pdf()).expect("the PDF is written");
-        start(&engine, TEST_BASE, &project, &scratch.dir("Assets"));
-        let path = format!("{PROJECT_DIR}/tide tables.pdf");
+        let workspace = scratch.dir("Work");
+        std::fs::write(workspace.join("tide tables.pdf"), pdf()).expect("the PDF is written");
+        start(&engine, TEST_BASE, &workspace, &scratch.dir("Assets"));
+        let path = format!("{CODE_DIR}/tide tables.pdf");
 
         let text = read_with(&engine, &pdf_text(&path));
         assert!(text.contains("Harbour notes") && text.contains("Second page"), "{:?}: {text:?}", engine.kind());
@@ -493,26 +493,26 @@ fn a_word_document_and_an_opendocument_text_give_their_text() {
          printf '%s' '<?xml version=\"1.0\"?><w:document \
            xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body><w:p><w:r>\
            <w:t>Dear harbour master, şimdi</w:t></w:r></w:p></w:body></w:document>' > word/document.xml && \
-         zip -q -r '{PROJECT_DIR}/to the harbour master.docx' .\n\
+         zip -q -r '{CODE_DIR}/to the harbour master.docx' .\n\
          cd \"$(mktemp -d)\" && printf '%s' 'application/vnd.oasis.opendocument.text' > mimetype && \
          printf '%s' '<?xml version=\"1.0\"?><office:document-content \
            xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" \
            xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\"><office:body><office:text>\
            <text:p>The tide turns at six, ğ</text:p></office:text></office:body></office:document-content>' \
            > content.xml && \
-         zip -q -X -0 '{PROJECT_DIR}/Tide.odt' mimetype && zip -q -X '{PROJECT_DIR}/Tide.odt' content.xml"
+         zip -q -X -0 '{CODE_DIR}/Tide.odt' mimetype && zip -q -X '{CODE_DIR}/Tide.odt' content.xml"
     );
     for engine in engines() {
         clear(&engine);
         let scratch = Scratch::new("office");
         build(&engine, TEST_BASE, &containerfile(), &scratch);
-        start(&engine, TEST_BASE, &scratch.dir("Project"), &scratch.dir("Assets"));
+        start(&engine, TEST_BASE, &scratch.dir("Work"), &scratch.dir("Assets"));
         run_in(&engine, &make);
 
-        let docx = office_text(&format!("{PROJECT_DIR}/to the harbour master.docx")).expect("a docx is read");
+        let docx = office_text(&format!("{CODE_DIR}/to the harbour master.docx")).expect("a docx is read");
         let text = read_with(&engine, &docx);
         assert!(text.contains("Dear harbour master, şimdi"), "{:?}: {text:?}", engine.kind());
-        let odt = office_text(&format!("{PROJECT_DIR}/Tide.odt")).expect("an odt is read");
+        let odt = office_text(&format!("{CODE_DIR}/Tide.odt")).expect("an odt is read");
         let text = read_with(&engine, &odt);
         assert!(text.contains("The tide turns at six, ğ"), "{:?}: {text:?}", engine.kind());
 
@@ -530,16 +530,16 @@ fn a_sound_is_described_and_every_kind_a_tab_plays_is_one_sox_reads() {
         clear(&engine);
         let scratch = Scratch::new("sound");
         build(&engine, TEST_BASE, &containerfile(), &scratch);
-        start(&engine, TEST_BASE, &scratch.dir("Project"), &scratch.dir("Assets"));
-        run_in(&engine, &format!("sox -n -r 8000 -c 1 '{PROJECT_DIR}/fog horn.wav' synth 1.5 sine 440"));
+        start(&engine, TEST_BASE, &scratch.dir("Work"), &scratch.dir("Assets"));
+        run_in(&engine, &format!("sox -n -r 8000 -c 1 '{CODE_DIR}/fog horn.wav' synth 1.5 sine 440"));
         // Ogg audio often comes as .oga, a name sox has no handler for; it knows the file by
         // what is in it instead.
-        run_in(&engine, &format!("cd {PROJECT_DIR} && sox 'fog horn.wav' tide.ogg && cp tide.ogg tide.oga"));
+        run_in(&engine, &format!("cd {CODE_DIR} && sox 'fog horn.wav' tide.ogg && cp tide.ogg tide.oga"));
 
-        let details = read_with(&engine, &sound_details(&format!("{PROJECT_DIR}/fog horn.wav")));
+        let details = read_with(&engine, &sound_details(&format!("{CODE_DIR}/fog horn.wav")));
         assert!(details.contains("00:00:01.50"), "{:?}: {details:?}", engine.kind());
         assert!(details.contains("Sample Rate    : 8000"), "{:?}: {details:?}", engine.kind());
-        let details = read_with(&engine, &sound_details(&format!("{PROJECT_DIR}/tide.oga")));
+        let details = read_with(&engine, &sound_details(&format!("{CODE_DIR}/tide.oga")));
         assert!(details.contains("Vorbis") && details.contains("00:00:01.50"), "{:?}: {details:?}", engine.kind());
 
         let help = run_in(&engine, "sox -h");

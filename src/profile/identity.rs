@@ -1,9 +1,9 @@
-//! A profile's stored login, and the copy that carries it into a project.
+//! A profile's stored login, and the copy that carries it into a workspace.
 //!
-//! A login is made once, in the profile's own credentials volume. Every project that uses the
+//! A login is made once, in the profile's own credentials volume. Every workspace that uses the
 //! profile is given a copy in its own home volume, and from then on the copy lives its own life:
-//! a harness that rewrites its login in one project touches no other. The copy is made when a
-//! project's container for the profile is first made, and again whenever the person asks to
+//! a harness that rewrites its login in one workspace touches no other. The copy is made when a
+//! workspace's container for the profile is first made, and again whenever the person asks to
 //! refresh the identity from the profile.
 //!
 //! The copying is the engine's work. A volume has no door of its own, so a container that mounts
@@ -17,14 +17,14 @@ use crate::engine::{
     Access, ContainerCreate, ContainerState, Engine, EngineCommand, Exec, HostUser, Mount, MountSource, Network,
 };
 use crate::profile::SafeName;
-use crate::workspace::ProjectId;
+use crate::store::WorkspaceId;
 
 /// Where a profile's credentials volume is mounted in every container that reads or writes it:
 /// the one a login is put into, and the one a copy is taken from.
 pub const STORE_DIR: &str = "/qcode-credentials";
 
-/// The volume to remove when the person signs a profile out. Projects keep the copies they were
-/// given; signing out takes away what new projects would have been given.
+/// The volume to remove when the person signs a profile out. Workspaces keep the copies they were
+/// given; signing out takes away what new workspaces would have been given.
 #[must_use]
 pub fn sign_out(profile: &SafeName) -> String {
     names::credential_volume(profile.as_str())
@@ -44,19 +44,19 @@ fn listed(listing: &str, volume: &str) -> bool {
     listing.lines().any(|line| line.trim() == volume)
 }
 
-/// One project's copy of one profile's home: the volume the profile's login is written into,
+/// One workspace's copy of one profile's home: the volume the profile's login is written into,
 /// and the container that lives on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Home {
     profile: SafeName,
-    project: ProjectId,
+    workspace: WorkspaceId,
 }
 
 impl Home {
-    /// The home `project` keeps for `profile`.
+    /// The home `workspace` keeps for `profile`.
     #[must_use]
-    pub fn new(profile: SafeName, project: ProjectId) -> Self {
-        Self { profile, project }
+    pub fn new(profile: SafeName, workspace: WorkspaceId) -> Self {
+        Self { profile, workspace }
     }
 
     /// The profile whose login the home holds a copy of.
@@ -65,32 +65,32 @@ impl Home {
         &self.profile
     }
 
-    /// The project the home belongs to.
+    /// The workspace the home belongs to.
     #[must_use]
-    pub fn project(&self) -> &ProjectId {
-        &self.project
+    pub fn workspace(&self) -> &WorkspaceId {
+        &self.workspace
     }
 
-    /// The volume itself, mounted at [`HOME_DIR`] in the project's container for the profile.
+    /// The volume itself, mounted at [`HOME_DIR`] in the workspace's container for the profile.
     #[must_use]
     pub fn volume(&self) -> String {
-        names::home_volume(self.project.as_str(), self.profile.as_str())
+        names::home_volume(self.workspace.as_str(), self.profile.as_str())
     }
 
     /// The container the harness runs in, which is the one that must not be running while its
     /// login is rewritten under it.
     #[must_use]
     pub fn container(&self) -> String {
-        names::profile_container(self.project.as_str(), self.profile.as_str())
+        names::profile_container(self.workspace.as_str(), self.profile.as_str())
     }
 
     /// The short-lived container that carries the login from one volume to the other.
     fn courier(&self) -> String {
-        format!("qcode-refresh-{}-{}", self.project, self.profile)
+        format!("qcode-refresh-{}-{}", self.workspace, self.profile)
     }
 }
 
-/// The commands that write a profile's stored login into one project's home volume, in the
+/// The commands that write a profile's stored login into one workspace's home volume, in the
 /// order they run.
 ///
 /// The courier container mounts the credentials volume read-only and the home volume writable,
@@ -174,13 +174,13 @@ pub fn first_fill(engine: &Engine, home: &Home, user: HostUser) -> Result<(), En
     run(&rewrite(engine, home, user))
 }
 
-/// What refreshing a profile's login across its projects came to.
+/// What refreshing a profile's login across its workspaces came to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refreshed {
-    /// The projects whose copy was rewritten.
-    pub written: Vec<ProjectId>,
-    /// The projects that were left alone because their container for the profile is running.
-    pub running: Vec<ProjectId>,
+    /// The workspaces whose copy was rewritten.
+    pub written: Vec<WorkspaceId>,
+    /// The workspaces that were left alone because their container for the profile is running.
+    pub running: Vec<WorkspaceId>,
 }
 
 /// Why a refresh did not happen at all.
@@ -205,16 +205,16 @@ impl From<EngineError> for RefreshError {
     }
 }
 
-/// Writes `profile`'s stored login into the home of every project in `projects` that is not
+/// Writes `profile`'s stored login into the home of every workspace in `workspaces` that is not
 /// running the profile right now, and says which were written and which were left.
 ///
-/// A project whose container for the profile is running is skipped rather than stopped. A
+/// A workspace whose container for the profile is running is skipped rather than stopped. A
 /// running container is a harness someone may be in the middle of using; stopping it would end
 /// that work unasked, and rewriting the login under it would leave the harness holding one it
-/// no longer has. Skipping loses nothing: the person stops the container from the project
+/// no longer has. Skipping loses nothing: the person stops the container from the workspace
 /// screen and refreshes again, and the copy that was there stays whole in the meantime.
 ///
-/// The first project the engine refuses ends the round; what was written before it stays
+/// The first workspace the engine refuses ends the round; what was written before it stays
 /// written.
 ///
 /// # Errors
@@ -224,25 +224,25 @@ impl From<EngineError> for RefreshError {
 pub fn refresh_all(
     engine: &Engine,
     profile: &SafeName,
-    projects: &[ProjectId],
+    workspaces: &[WorkspaceId],
     user: HostUser,
 ) -> Result<Refreshed, RefreshError> {
     if !is_stored(&capture(&engine.list_volumes())?, profile) {
         return Err(RefreshError::NotStored);
     }
     let mut done = Refreshed { written: Vec::new(), running: Vec::new() };
-    for project in projects {
-        let home = Home::new(profile.clone(), project.clone());
+    for workspace in workspaces {
+        let home = Home::new(profile.clone(), workspace.clone());
         // A container the engine cannot answer for is one that is not there, and one that is
         // not there is not running.
         let running = capture(&engine.container_state(&home.container()))
             .is_ok_and(|word| ContainerState::parse(&word).is_running());
         if running {
-            done.running.push(project.clone());
+            done.running.push(workspace.clone());
             continue;
         }
         run(&rewrite(engine, &home, user))?;
-        done.written.push(project.clone());
+        done.written.push(workspace.clone());
     }
     Ok(done)
 }
@@ -259,18 +259,18 @@ mod tests {
     fn home() -> Home {
         Home::new(
             SafeName::parse("claude-sub").expect("the name is safe"),
-            ProjectId::parse("my-app").expect("the id is legal"),
+            WorkspaceId::parse("my-app").expect("the id is legal"),
         )
     }
 
     #[test]
-    fn a_home_is_named_after_its_project_and_its_profile() {
+    fn a_home_is_named_after_its_workspace_and_its_profile() {
         let home = home();
         assert_eq!(home.volume(), "qcode-home-my-app-claude-sub");
         assert_eq!(home.container(), "qcode-my-app-claude-sub");
         assert_eq!(home.courier(), "qcode-refresh-my-app-claude-sub");
         assert_eq!(home.profile().as_str(), "claude-sub");
-        assert_eq!(home.project().as_str(), "my-app");
+        assert_eq!(home.workspace().as_str(), "my-app");
     }
 
     #[test]
@@ -353,10 +353,11 @@ mod tests {
     #[test]
     fn an_engine_that_is_not_there_answers_with_the_machines_words() {
         // A binary that does not exist: the round stops at the volume listing, before any
-        // project is touched, and the words are the operating system's.
+        // workspace is touched, and the words are the operating system's.
         let engine = Engine::new(EngineKind::Podman, "/qcode/no/such/engine");
         let profile = SafeName::parse("claude-sub").expect("the name is safe");
-        let outcome = refresh_all(&engine, &profile, &[ProjectId::parse("p").expect("legal")], HostUser::ImageDefault);
+        let outcome =
+            refresh_all(&engine, &profile, &[WorkspaceId::parse("p").expect("legal")], HostUser::ImageDefault);
         match outcome {
             Err(RefreshError::Engine(words)) => assert!(!words.is_empty()),
             other => panic!("expected the engine's failure, got {other:?}"),

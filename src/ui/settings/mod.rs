@@ -4,7 +4,7 @@
 //! Everything the framework keeps for every Quvyta application — language, theme, icons and
 //! reduced motion — is read straight from the environment the screen draws in, which is the one
 //! place that knows what is actually in force. QCode's own settings, the container engine and
-//! the workspace folder, come from [`Config`], which repairs the file it reads; the repairs are
+//! the store folder, come from [`Config`], which repairs the file it reads; the repairs are
 //! shown here rather than swallowed.
 //!
 //! The screen changes nothing outside itself. A choice is applied at once, so it can be seen,
@@ -26,7 +26,7 @@ use crate::backup::BackupEvery;
 use crate::base::apps::{Editor, Sound};
 use crate::engine::EngineKind;
 use crate::profile::SafeName;
-use crate::workspace::{Config, OnClose, Platform};
+use crate::store::{Config, OnClose, Platform};
 
 use engine::{EngineState, Gate, Health};
 use identity::ProfileIdentity;
@@ -74,15 +74,15 @@ pub enum Request {
     Sound(Sound),
     /// Run the setup wizard's engine step on its own. This is what the repair strip asks for.
     OpenEngineStep,
-    /// Run the setup wizard's location step on its own, to move the workspace somewhere else.
+    /// Run the setup wizard's location step on its own, to move the store somewhere else.
     OpenLocationStep,
-    /// Write the profile's stored login into every project that uses it. Confirmed.
+    /// Write the profile's stored login into every workspace that uses it. Confirmed.
     RefreshIdentity(SafeName),
     /// Delete the profile's credentials volume. Confirmed.
     SignOut(SafeName),
     /// Store what happens to the containers once no QCode is open.
     OnClose(OnClose),
-    /// Store how often the open projects are backed up, and back them up that often from now on.
+    /// Store how often the open workspaces are backed up, and back them up that often from now on.
     BackupEvery(BackupEvery),
     /// Install the background service.
     InstallService,
@@ -156,7 +156,7 @@ pub enum Msg {
     Stored(Result<(), String>),
     /// What happens to the containers once no QCode is open was chosen.
     OnClose(OnClose),
-    /// How often the open projects are backed up was chosen.
+    /// How often the open workspaces are backed up was chosen.
     BackupEvery(BackupEvery),
     /// Installing or removing the background service finished: which of the two it was, whether
     /// the service's files are there now, and the words of what failed.
@@ -176,7 +176,7 @@ pub struct Settings {
     engine: EngineState,
     editor: Editor,
     sound: Sound,
-    workspace: Option<PathBuf>,
+    store: Option<PathBuf>,
     repairs: Vec<Diagnostic>,
     repairs_read: bool,
     left_behind: Vec<Diagnostic>,
@@ -197,7 +197,7 @@ impl Settings {
             engine,
             editor: config.editor(),
             sound: config.sound(),
-            workspace: config.workspace_path(),
+            store: config.folder_path(),
             repairs: config.diagnostics().to_vec(),
             repairs_read: false,
             left_behind: Vec::new(),
@@ -223,12 +223,15 @@ impl Settings {
         self.service
     }
 
-    /// The same screen, also reporting `files`: the settings files of an earlier version that
-    /// stayed where they were when the settings moved to the family's folder, each with the
-    /// reason.
+    /// The same screen, also reporting `files`: what an earlier version left behind — a settings
+    /// file that stayed where it was when the settings moved to the family's folder, a folder of
+    /// the store that could not be given the name it has today — each with the reason.
+    ///
+    /// They add up rather than replace one another: the two are found at different moments of the
+    /// start, and the person has read neither.
     #[must_use]
     pub fn with_left_behind(mut self, files: Vec<Diagnostic>) -> Self {
-        self.left_behind = files;
+        self.left_behind.extend(files);
         self
     }
 
@@ -526,16 +529,16 @@ pub fn view(screen: &Settings, ui: &mut View<'_, Msg>) {
                         .id("sound");
                     });
 
-                    list.heading(t!("settings.workspace"));
+                    list.heading(t!("settings.folder"));
                     let folder = screen
-                        .workspace
+                        .store
                         .as_ref()
-                        .map_or_else(|| t!("settings.workspace-unset"), |path| path.display().to_string());
-                    let row = SettingRow::new(t!("settings.workspace-folder"))
+                        .map_or_else(|| t!("settings.folder-unset"), |path| path.display().to_string());
+                    let row = SettingRow::new(t!("settings.folder-path"))
                         .description(folder)
                         .on_activate(Msg::Request(Request::OpenLocationStep));
                     list.row(row, |ui| {
-                        ui.add(Text::new(t!("settings.workspace-change")).role("secondary"));
+                        ui.add(Text::new(t!("settings.folder-change")).role("secondary"));
                     });
                 });
                 list.id("settings");
@@ -680,7 +683,7 @@ pub(crate) mod testing {
     use super::{Msg, Request, Settings};
     use crate::engine::EngineKind;
     use crate::profile::SafeName;
-    use crate::workspace::Config;
+    use crate::store::Config;
 
     /// Runs `body` with QCode's own text loaded, for the functions that translate outside a
     /// running application.
@@ -776,9 +779,9 @@ mod tests {
     use crate::backup::BackupEvery;
     use crate::base::apps::{Editor, Sound};
     use crate::engine::EngineKind;
+    use crate::store::{OnClose, Platform};
     use crate::ui::settings::Request;
     use crate::ui::settings::engine::{Health, Trouble};
-    use crate::workspace::{OnClose, Platform};
 
     const SIZE: (u16, u16) = (100, 34);
 
@@ -884,8 +887,8 @@ mod tests {
     }
 
     #[test]
-    fn the_workspace_row_shows_the_folder_and_opens_the_step_that_moves_it() {
-        let text = "[workspace]\npath = \"/home/ada/Documents/QCode\"\n";
+    fn the_store_row_shows_the_folder_and_opens_the_step_that_moves_it() {
+        let text = "[folder]\npath = \"/home/ada/Documents/QCode\"\n";
         let screen = testing::from_config(text, EngineKind::Podman, Health::Working);
         let mut harness = testing::host(screen, SIZE.0, SIZE.1);
         assert!(harness.screen().contains("/home/ada/Documents/QCode"), "{}", harness.screen());
@@ -894,7 +897,7 @@ mod tests {
     }
 
     #[test]
-    fn a_workspace_that_was_never_chosen_says_so_instead_of_showing_nothing() {
+    fn a_store_that_was_never_chosen_says_so_instead_of_showing_nothing() {
         let harness = testing::host(testing::screen(EngineKind::Podman, Health::Working), SIZE.0, SIZE.1);
         assert!(harness.screen().contains("Not chosen yet"), "{}", harness.screen());
     }
@@ -1138,10 +1141,10 @@ mod tests {
     }
 
     #[test]
-    fn how_often_open_projects_are_backed_up_is_a_choice_of_four() {
+    fn how_often_open_workspaces_are_backed_up_is_a_choice_of_four() {
         let mut harness = with_service(None);
         let screen = harness.screen();
-        for words in ["BACKUP", "Back up open projects", "Off", "5 min", "15 min", "1 hour"] {
+        for words in ["BACKUP", "Back up open workspaces", "Off", "5 min", "15 min", "1 hour"] {
             assert!(screen.contains(words), "`{words}` is missing:\n{screen}");
         }
         harness.click_text("5 min");
@@ -1153,7 +1156,7 @@ mod tests {
         harness.set_locale("tr").render();
         let screen = harness.screen();
         assert!(!screen.contains('…'), "every word fits:\n{screen}");
-        for words in ["YEDEK", "Açık projeleri yedekle", "Kapalı", "5 dk", "15 dk", "1 saat"] {
+        for words in ["YEDEK", "Açık çalışma alanlarını yedekle", "Kapalı", "5 dk", "15 dk", "1 saat"] {
             assert!(screen.contains(words), "`{words}` is missing:\n{screen}");
         }
     }

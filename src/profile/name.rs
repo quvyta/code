@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-/// A name that is safe everywhere QCode puts it: as a file name in the workspace, as part of an
+/// A name that is safe everywhere QCode puts it: as a file name in the store, as part of an
 /// image name, and as a container or volume name.
 ///
 /// It holds lowercase ASCII letters, digits and single hyphens, and begins and ends with a
@@ -17,7 +17,7 @@ impl SafeName {
     /// limit keeps a name readable in a list and leaves room for the prefixes QCode adds.
     pub const MAX_LENGTH: usize = 64;
 
-    /// Makes a name out of text a person typed, such as a project title. Letters fold to ASCII,
+    /// Makes a name out of text a person typed, such as a workspace title. Letters fold to ASCII,
     /// everything else becomes a single hyphen, and the result is cut to [`Self::MAX_LENGTH`].
     /// Text without a single usable character has no name.
     #[must_use]
@@ -90,7 +90,7 @@ mod tests {
     #[test]
     fn display_text_becomes_a_lowercase_ascii_name() {
         assert_eq!(SafeName::from_display("Claude Sub").expect("has letters").as_str(), "claude-sub");
-        assert_eq!(SafeName::from_display("  My   Project  ").expect("has letters").as_str(), "my-project");
+        assert_eq!(SafeName::from_display("  My   Workspace  ").expect("has letters").as_str(), "my-workspace");
         assert_eq!(SafeName::from_display("v2.0/build").expect("has letters").as_str(), "v2-0-build");
     }
 

@@ -5,6 +5,25 @@ Every release of quvyta-code, newest first. The format follows
 [Semantic Versioning](https://semver.org/); while the version starts with 0, a minor release may
 change files qcode writes, and the notes say so when it does.
 
+## 0.1.11 - 2026-09-21
+
+### Added
+
+- The first-run wizard has a step for the container engine. It ticks the engine your machine already has, and when there is none it either installs one for you, in a terminal inside the wizard, or shows you the command to run yourself. Nothing is installed without you asking for it.
+
+### Changed
+
+- The first-run wizard opens in the middle of the screen and already speaks the language your machine is set to; the language list starts with that language and the rest follow in alphabetical order.
+- The way back, the settings and the list of keys are three small buttons at the foot of the workspace rail. The Back row at the top and the Keys row at the bottom are gone, so a terminal has two more lines than before.
+- Making a profile from inside a workspace hands you back to that workspace when you are done, instead of leaving you on the list of profiles.
+- A project is called a **workspace** now, everywhere: on every screen, in all nine languages, in the files qcode writes and in the folders it keeps them in. `Projects/` is `Workspaces/`, a workspace's `project.qcode` is `workspace.qcode`, the folder your code lives in is `Work/` rather than `Project/`, and its backup history is `Backup/Code.git`. The folder that holds all of them, which used to be called the workspace, is the **QCode folder**.
+- Nothing of an older installation is lost on the way. The first qcode that opens gives every old name the name it has today, one rename at a time, so an interruption leaves the old name whole rather than half a move; a name that is already taken is left alone and said on the settings screen. The settings file keeps the place you chose and the list of what you opened last, a profile file that still says `mounts.project` is read without a complaint, and a session written before this release still brings back your workspaces and their tabs.
+- Inside a container your workspace is at `/work` and its material at `/assets`, each a folder of its own at the root. The folder is called `Work/` at home and `/work` in the container, so it is one word in both places and the word "project" is gone from there too. A backup container sees the workspace at `/work` and its backups at `/backup`.
+- Conversations you had before this release are still in the list. Every harness writes the directory it worked in into what it records, and yours say `/work/Project`; each of the four history readers is told that name as well as today's, so nothing you talked about disappears. A disk whose workspaces still keep your files in `Code/` is carried over to `Work/` the first time qcode opens, one rename at a time, like the names before it.
+- **Updating from an older qcode: nothing of yours is lost and nothing needs doing.** The first time this release opens it renames what is on your disk to the words above, one rename at a time: `Projects/` becomes `Workspaces/`, each workspace's `project.qcode` becomes `workspace.qcode`, and a workspace's `Code/` folder becomes `Work/`. A name that is already taken is left exactly as it is and said on the settings screen rather than written over. Your settings, your list of what was open, your files and your earlier conversations all come through.
+- The page a window asks to have opened now goes to your browser without qcode leaving the screen at all. It used to step aside for a shell, which made the screen blink; the browser is started beside qcode instead, so the page you were reading stays on screen while a browser that has yet to start comes up.
+- The question mark at the foot of the rail and the mark of a workspace come from the framework's own icon set, so they look the same in qcode as in every other Quvyta application. A workspace has a mark of its own now, different from the one a project has.
+
 ## 0.1.10 - 2026-09-20
 
 ### Added

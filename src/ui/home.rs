@@ -5,21 +5,21 @@ use qframe::prelude::*;
 use crate::Msg as AppMsg;
 use crate::ui::logo::Logo;
 
-/// Width of the menu. Wide enough for the longest label with a project name beside it, narrow
+/// Width of the menu. Wide enough for the longest label with a workspace name beside it, narrow
 /// enough to read as one column under the logo; a narrower terminal shrinks it.
 const MENU_WIDTH: u16 = 34;
 
 /// A row of the home menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Entry {
-    /// Goes back to the projects that were open, the way a browser brings back its windows.
+    /// Goes back to the workspaces that were open, the way a browser brings back its windows.
     /// Takes the first row whenever there is something to go back to.
     Continue,
-    /// Takes the first row while no project has been opened yet.
-    NewProject,
-    /// All projects.
-    Projects,
-    /// The harness profiles projects are opened with.
+    /// Takes the first row while no workspace has been opened yet.
+    NewWorkspace,
+    /// All workspaces.
+    Workspaces,
+    /// The harness profiles workspaces are opened with.
     Profiles,
     /// Language, theme and the container engine.
     Settings,
@@ -32,18 +32,21 @@ impl Entry {
     pub(crate) fn label(self) -> String {
         match self {
             Self::Continue => t!("home.continue"),
-            Self::NewProject => t!("home.new-project"),
-            Self::Projects => t!("home.projects"),
+            Self::NewWorkspace => t!("home.new-workspace"),
+            Self::Workspaces => t!("home.workspaces"),
             Self::Profiles => t!("home.profiles"),
             Self::Settings => t!("home.settings"),
             Self::Quit => t!("home.quit"),
         }
     }
 
-    /// The icon drawn before the label. Both first rows are about a project, so they share one.
+    /// The icon drawn before the label. Both first rows are about a workspace, so they share one.
+    ///
+    /// `project` is the name the framework's icon set gives that shape; it is the set's word, not
+    /// a word QCode shows anyone.
     pub(crate) fn icon(self) -> &'static str {
         match self {
-            Self::Continue | Self::NewProject | Self::Projects => "project",
+            Self::Continue | Self::NewWorkspace | Self::Workspaces => "workspace",
             Self::Profiles => "profile",
             Self::Settings => "settings",
             Self::Quit => "power",
@@ -61,7 +64,7 @@ pub enum Msg {
     Select(usize),
 }
 
-/// The home screen's state: which projects "Continue" goes back to and where the selection
+/// The home screen's state: which workspaces "Continue" goes back to and where the selection
 /// sits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Home {
@@ -70,27 +73,27 @@ pub struct Home {
 }
 
 impl Home {
-    /// A home screen whose first row goes back to `open`, the names of the projects that were
-    /// open in rail order, or starts a new project when there are none.
+    /// A home screen whose first row goes back to `open`, the names of the workspaces that were
+    /// open in rail order, or starts a new workspace when there are none.
     #[must_use]
     pub fn new(open: Vec<String>) -> Self {
         Self { open, selected: 0 }
     }
 
-    /// Takes `open` as the projects "Continue" goes back to, keeping the selection where it is.
+    /// Takes `open` as the workspaces "Continue" goes back to, keeping the selection where it is.
     pub fn set_open(&mut self, open: Vec<String>) {
         self.open = open;
     }
 
     /// The rows, in order. The first one either continues where the person left off or starts
-    /// their first project.
+    /// their first workspace.
     #[must_use]
     pub fn entries(&self) -> [Entry; 5] {
-        let first = if self.open.is_empty() { Entry::NewProject } else { Entry::Continue };
-        [first, Entry::Projects, Entry::Profiles, Entry::Settings, Entry::Quit]
+        let first = if self.open.is_empty() { Entry::NewWorkspace } else { Entry::Continue };
+        [first, Entry::Workspaces, Entry::Profiles, Entry::Settings, Entry::Quit]
     }
 
-    /// What the "Continue" row says beside its label: the first project, and how many more
+    /// What the "Continue" row says beside its label: the first workspace, and how many more
     /// there are after it.
     fn detail(&self) -> Option<String> {
         let first = self.open.first()?;
@@ -167,9 +170,9 @@ mod tests {
     const SIZE: (u16, u16) = (90, 30);
 
     fn home(recent: Option<&str>, width: u16, height: u16) -> Harness<QCode> {
-        let workspace = testing::scratch("home-workspace");
+        let store = testing::scratch("home-store");
         let recent: Vec<&str> = recent.into_iter().collect();
-        let app = testing::app(testing::config(&workspace, &recent), &testing::settled(), None);
+        let app = testing::app(testing::config(&store, &recent), &testing::settled(), None);
         testing::harness(app, width, height)
     }
 
@@ -178,27 +181,27 @@ mod tests {
         let harness = home(None, SIZE.0, SIZE.1);
         let screen = harness.screen();
         assert!(screen.contains("███▀     ███  ██████"), "the wordmark is drawn:\n{screen}");
-        for label in ["New project", "Projects", "Profiles", "Settings", "Quit"] {
+        for label in ["New workspace", "Workspaces", "Profiles", "Settings", "Quit"] {
             assert!(screen.contains(label), "`{label}` is missing:\n{screen}");
         }
         let (_, logo_row) = harness.find("Coding harnesses").expect("the tagline is on screen");
-        let (_, menu_row) = harness.find("Projects").expect("the menu is on screen");
+        let (_, menu_row) = harness.find("Workspaces").expect("the menu is on screen");
         assert!(logo_row < menu_row, "the tagline sits above the menu:\n{screen}");
     }
 
     #[test]
-    fn a_recent_project_takes_the_first_row_and_names_itself() {
+    fn a_recent_workspace_takes_the_first_row_and_names_itself() {
         let harness = home(Some("firefly"), SIZE.0, SIZE.1);
         let screen = harness.screen();
         assert!(screen.contains("Continue"), "{screen}");
         assert!(screen.contains("firefly"), "{screen}");
-        assert!(!screen.contains("New project"), "{screen}");
+        assert!(!screen.contains("New workspace"), "{screen}");
     }
 
     #[test]
-    fn without_a_recent_project_the_menu_offers_a_new_one() {
+    fn without_a_recent_workspace_the_menu_offers_a_new_one() {
         let screen = home(None, SIZE.0, SIZE.1).screen();
-        assert!(screen.contains("New project"), "{screen}");
+        assert!(screen.contains("New workspace"), "{screen}");
         assert!(!screen.contains("Continue"), "{screen}");
     }
 
@@ -210,8 +213,8 @@ mod tests {
         one.set_open(Vec::new());
         three.selected = 3;
         three.set_open(vec!["Moth".to_owned()]);
-        assert_eq!(one.entries()[0], Entry::NewProject, "nothing to go back to is a new project again");
-        assert_eq!(three.selected, 3, "a new list of projects leaves the selection where it was");
+        assert_eq!(one.entries()[0], Entry::NewWorkspace, "nothing to go back to is a new workspace again");
+        assert_eq!(three.selected, 3, "a new list of workspaces leaves the selection where it was");
     }
 
     #[test]
@@ -222,11 +225,11 @@ mod tests {
         std::fs::create_dir_all(&session).expect("a folder");
         std::fs::write(
             &file,
-            "[[project]]\nid = \"firefly\"\n\n[[project]]\nid = \"moth\"\n\n[[project]]\nid = \"lantern\"\n",
+            "[[workspace]]\nid = \"firefly\"\n\n[[workspace]]\nid = \"moth\"\n\n[[workspace]]\nid = \"lantern\"\n",
         )
         .expect("a session file");
-        let workspace = testing::scratch("home-workspace");
-        let app = testing::app(testing::config(&workspace, &[]), &testing::settled(), None).with_session(Some(file));
+        let store = testing::scratch("home-store");
+        let app = testing::app(testing::config(&store, &[]), &testing::settled(), None).with_session(Some(file));
         let mut harness = testing::harness(app, SIZE.0, SIZE.1);
         assert!(
             harness.screen().contains("Continue") && harness.screen().contains("firefly +2"),
@@ -260,7 +263,7 @@ mod tests {
         let bare = home(None, SIZE.0, 9).screen();
         assert!(!bare.contains("QCode"), "the logo goes rather than the menu:\n{bare}");
         for screen in [&drawn, &named, &bare] {
-            assert!(screen.contains("New project") && screen.contains("Quit"), "the menu is whole:\n{screen}");
+            assert!(screen.contains("New workspace") && screen.contains("Quit"), "the menu is whole:\n{screen}");
         }
     }
 
@@ -304,8 +307,8 @@ mod tests {
             (
                 GlyphMode::Nerd,
                 [
-                    "▌  \u{f1b2} Continue             firefly",
-                    "\u{f1b2} Projects",
+                    "▌  \u{f009} Continue             firefly",
+                    "\u{f009} Workspaces",
                     "\u{f007} Profiles",
                     "\u{f013} Settings",
                     "\u{f011} Quit",
@@ -313,9 +316,12 @@ mod tests {
             ),
             (
                 GlyphMode::Unicode,
-                ["▌  ◈ Continue             firefly", "◈ Projects", "◉ Profiles", "▤ Settings", "○ Quit"],
+                ["▌  ◰ Continue             firefly", "◰ Workspaces", "◉ Profiles", "▤ Settings", "○ Quit"],
             ),
-            (GlyphMode::Ascii, ["# Continue             firefly", "# Projects", "@ Profiles", "* Settings", "x Quit"]),
+            (
+                GlyphMode::Ascii,
+                ["# Continue             firefly", "# Workspaces", "@ Profiles", "* Settings", "x Quit"],
+            ),
         ] {
             harness.set_glyph_mode(mode).render();
             let screen = harness.screen();
@@ -339,7 +345,7 @@ mod tests {
         let mut harness = home(None, SIZE.0, SIZE.1);
         harness.set_reduced_motion(true).press("down").render();
         let screen = harness.screen();
-        assert!(screen.contains("Projects"), "{screen}");
+        assert!(screen.contains("Workspaces"), "{screen}");
         harness.press("end").press("enter");
         assert!(harness.quit_requested(), "{screen}");
     }
@@ -356,7 +362,7 @@ mod tests {
         let mut harness = home(Some("firefly"), SIZE.0, SIZE.1);
         harness.set_locale("tr").render();
         let screen = harness.screen();
-        for label in ["Devam et", "Projeler", "Profiller", "Ayarlar", "Çıkış", "kapsayıcının"] {
+        for label in ["Devam et", "Çalışma alanları", "Profiller", "Ayarlar", "Çıkış", "kapsayıcının"] {
             assert!(screen.contains(label), "`{label}` is missing:\n{screen}");
         }
     }

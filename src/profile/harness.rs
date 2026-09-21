@@ -45,7 +45,7 @@ pub enum AccountKind {
     /// A key the user pastes in.
     ApiKey,
     /// A login the person makes inside the harness's own window, with nothing for QCode to
-    /// make, store or carry: the harness writes it into the project's home volume itself and
+    /// make, store or carry: the harness writes it into the workspace's home volume itself and
     /// finds it there again. QCode's sign-in container and credential volume have no part in it.
     InApp,
 }
@@ -120,18 +120,18 @@ impl Desktop {
         format!("{}/{}", self.install_dir, self.program)
     }
 
-    /// The whole line that opens the window on the project at `project`: the program, the
+    /// The whole line that opens the window on the workspace at `workspace`: the program, the
     /// arguments it always takes, and the folder to open.
     #[must_use]
-    pub fn command_line(&self, project: &str) -> Vec<String> {
+    pub fn command_line(&self, workspace: &str) -> Vec<String> {
         let mut line = vec![self.command()];
         line.extend(self.flags.iter().map(|flag| (*flag).to_owned()));
-        line.push(project.to_owned());
+        line.push(workspace.to_owned());
         line
     }
 }
 
-/// Where a harness reads the MCP servers it starts in every project, and in which shape.
+/// Where a harness reads the MCP servers it starts in every workspace, and in which shape.
 ///
 /// These are the user-level settings, the ones a harness reads without asking for trust or
 /// approval, because QCode registers its bridge between tabs there (see [`crate::bridge`]).
@@ -185,7 +185,7 @@ pub struct Harness {
     /// directory, so a copy never drags settings along with the login.
     ///
     /// Empty for a harness whose login QCode does not carry: one signed in to inside its own
-    /// window ([`AccountKind::InApp`]) writes its login into the project's home volume itself,
+    /// window ([`AccountKind::InApp`]) writes its login into the workspace's home volume itself,
     /// and there is no sign-in container it could be taken out of.
     pub identity: &'static [&'static str],
     /// The configuration the `recommended` template writes, when the harness reads one.
@@ -322,8 +322,8 @@ impl AccountKind {
     /// ready as soon as its image is, and nothing about it waits for a credentials volume.
     ///
     /// An in-app login is none of QCode's: the person makes it inside the harness's own window,
-    /// where it lands in the project's home volume. There is nothing for the sign-in container to
-    /// capture and nothing to carry from project to project, so the profile is ready the moment
+    /// where it lands in the workspace's home volume. There is nothing for the sign-in container to
+    /// capture and nothing to carry from workspace to workspace, so the profile is ready the moment
     /// its image is, exactly like one that signs in to nothing.
     #[must_use]
     pub fn needs_login(self) -> bool {
@@ -418,7 +418,7 @@ static OPENCODE: Harness = Harness {
     mcp: Some(McpSettings { path: ".config/opencode/opencode.json", shape: McpShape::OpenCode }),
 };
 
-/// Gemini CLI. Install and start command from the project's readme, the argument from
+/// Gemini CLI. Install and start command from the workspace's readme, the argument from
 /// `docs/cli/cli-reference.md` (`--yolo` is deprecated in favour of `--approval-mode=yolo`), and
 /// the login files from the source: `services/fileKeychain.ts` writes `gemini-credentials.json`
 /// under `~/.gemini` when no OS keyring answers, `config/storage.ts` keeps
@@ -445,7 +445,7 @@ static OPENCODE: Harness = Harness {
 /// build: `if (!trustedFolder && approvalMode !== "default") { debugLogger.warn('Approval mode
 /// overridden to "default" because the current folder is not trusted.'); approvalMode =
 /// "default" }`, with `isFolderTrustEnabled` in `packages/cli/src/config/trustedFolders.ts`
-/// reading `settings.security?.folderTrust?.enabled ?? true`. The project directory of a fresh container is not trusted, so without the file
+/// reading `settings.security?.folderTrust?.enabled ?? true`. The workspace directory of a fresh container is not trusted, so without the file
 /// below the argument is taken and then undone. The documentation's `docs/cli/settings.md`
 /// lists the key with its default of `true`. Under the `base` template the harness asks once,
 /// in its own trust dialog, and keeps the answer in `~/.gemini/trustedFolders.json`.
@@ -461,7 +461,7 @@ static OPENCODE: Harness = Harness {
 /// Resuming, from `geminicli.com/docs/cli/session-management` (`--resume` takes `latest`, an
 /// index or a session id) and checked against 0.60.0, whose `SessionSelector.findSession` in
 /// the bundle matches the argument against each session's `id` before trying it as an index:
-/// `gemini --approval-mode=yolo --resume <id> --prompt hi` with an id the project's
+/// `gemini --approval-mode=yolo --resume <id> --prompt hi` with an id the workspace's
 /// conversations do not have answers `Error resuming session: Invalid session identifier`, and
 /// with the id [`history`](super::history) lists it goes on to ask for an auth method.
 ///
@@ -496,7 +496,7 @@ static GEMINI_CLI: Harness = Harness {
     mcp: Some(McpSettings { path: ".gemini/settings.json", shape: McpShape::Gemini }),
 };
 
-/// Codex CLI. Install and start command from the project's readme, the argument from the source
+/// Codex CLI. Install and start command from the workspace's readme, the argument from the source
 /// (`codex-rs/cli`), and the login file from the source as well: `login/src/auth/storage.rs`
 /// reads and writes `auth.json` under `CODEX_HOME`, and `config/src/types.rs` makes the file the
 /// default store. `core/src/config` documents `CODEX_HOME` as `~/.codex` unless it is set. The
@@ -591,8 +591,8 @@ static CODEX: Harness = Harness {
 ///
 /// The settings: the `recommended` template turns the maker's telemetry and the application's own
 /// updater off, and nothing else. It is written into the image's home directory like every
-/// template's file, which means the project's home volume gets it when the volume is first filled
-/// and never again, so an edit the person makes afterwards stays. The workspace trust question is
+/// template's file, which means the workspace's home volume gets it when the volume is first filled
+/// and never again, so an edit the person makes afterwards stays. The store trust question is
 /// deliberately left alone: refusing it on someone's behalf is not QCode's to do.
 static ANTIGRAVITY_IDE: Harness = Harness {
     id: "antigravity-ide",
@@ -855,7 +855,7 @@ mod tests {
         assert_eq!(record.environment, [("GEMINI_FORCE_FILE_STORAGE", "true")]);
         assert!(record.install.iter().any(|step| step.contains("@google/gemini-cli")));
         // Without this file the harness puts the approval mode back to "default" in a folder
-        // nobody has trusted, which every fresh container's project directory is.
+        // nobody has trusted, which every fresh container's workspace directory is.
         let settings = record.settings.expect("the folder trust has to be turned off");
         assert_eq!(settings.path, ".gemini/settings.json");
         assert!(settings.contents.contains("\"folderTrust\""), "{}", settings.contents);
@@ -884,7 +884,7 @@ mod tests {
         assert!(!desktop.flags.contains(&"--ignore-gpu-blocklist"), "it left the window empty");
         // Nothing is installed from a registry, and nothing of the archive is carried here.
         assert!(record.install.is_empty() && record.auto_run.is_empty() && record.resume.is_none());
-        assert!(record.identity.is_empty(), "the login lives in the project's home volume");
+        assert!(record.identity.is_empty(), "the login lives in the workspace's home volume");
         let settings = record.settings.expect("the template turns telemetry and the updater off");
         assert!(settings.contents.contains("\"telemetry.telemetryLevel\": \"off\""), "{}", settings.contents);
         assert!(settings.contents.contains("\"update.mode\": \"none\""), "{}", settings.contents);
@@ -894,11 +894,11 @@ mod tests {
     }
 
     #[test]
-    fn a_window_is_opened_on_the_project_with_the_flags_it_always_takes() {
+    fn a_window_is_opened_on_the_workspace_with_the_flags_it_always_takes() {
         let desktop = HarnessKind::AntigravityIde.desktop().expect("it opens a window");
         assert_eq!(
-            desktop.command_line("/work/Project"),
-            ["/opt/antigravity-ide/antigravity-ide", "--ozone-platform=wayland", "/work/Project"]
+            desktop.command_line("/work"),
+            ["/opt/antigravity-ide/antigravity-ide", "--ozone-platform=wayland", "/work"]
         );
     }
 

@@ -1,11 +1,11 @@
 //! What QCode calls the images, containers and volumes it makes.
 //!
-//! The names are a contract with the engine, not a display: the same project and profile always
+//! The names are a contract with the engine, not a display: the same workspace and profile always
 //! lead back to the same container, so QCode finds its own work again after a restart. They are
 //! built in one place so that nothing has to spell them out a second time.
 //!
 //! Every part that goes into a name comes from a [`SafeName`](crate::profile::SafeName) or a
-//! [`ProjectId`](crate::workspace::ProjectId), both of which hold only characters podman and
+//! [`WorkspaceId`](crate::store::WorkspaceId), both of which hold only characters podman and
 //! docker accept; the tests below prove that what those two can produce is a name the engine
 //! takes, so nothing here has to escape anything.
 
@@ -19,8 +19,8 @@ pub const BASE_IMAGE: &str = "qcode/base";
 /// (`packages/core/dist/src/services/fileKeychain.js`) encrypts `gemini-credentials.json` with
 /// `deriveEncryptionKey() { const salt = `${os.hostname()}-${os.userInfo().username}-gemini-cli`;
 /// return crypto.scryptSync("gemini-cli-oauth", salt, 32); }`. A login made in the sign-in
-/// container is copied into every project's home, and it only decrypts there when the sign-in
-/// container, the courier and the project container all report the same machine name.
+/// container is copied into every workspace's home, and it only decrypts there when the sign-in
+/// container, the courier and the workspace container all report the same machine name.
 ///
 /// The other half of that salt, the user name, is already the same everywhere: the image's
 /// user is `qcode` at uid 1000 ([`crate::base::paths::USER`]), and podman's `--userns=keep-id`
@@ -35,49 +35,49 @@ pub fn profile_image(profile: &str) -> String {
     format!("qcode/profile/{profile}")
 }
 
-/// The container a project's profile lives in.
+/// The container a workspace's profile lives in.
 #[must_use]
-pub fn profile_container(project: &str, profile: &str) -> String {
-    format!("qcode-{project}-{profile}")
+pub fn profile_container(workspace: &str, profile: &str) -> String {
+    format!("qcode-{workspace}-{profile}")
 }
 
-/// The container a project's plain shell lives in.
+/// The container a workspace's plain shell lives in.
 #[must_use]
-pub fn base_container(project: &str) -> String {
-    format!("qcode-{project}-base")
+pub fn base_container(workspace: &str) -> String {
+    format!("qcode-{workspace}-base")
 }
 
-/// The container a sound of a project is played in while the tab `tab` plays it.
+/// The container a sound of a workspace is played in while the tab `tab` plays it.
 ///
-/// The dot is what no project id and no profile name can hold, so this name can never be the
+/// The dot is what no workspace id and no profile name can hold, so this name can never be the
 /// container of a profile, whatever the profile is called.
 #[must_use]
-pub fn sound_container(project: &str, tab: u64) -> String {
-    format!("qcode-{project}.play-{tab}")
+pub fn sound_container(workspace: &str, tab: u64) -> String {
+    format!("qcode-{workspace}.play-{tab}")
 }
 
-/// The container the window of a project's desktop profile is open in.
+/// The container the window of a workspace's desktop profile is open in.
 ///
-/// One per project and profile, not one per tab: the application is single-instance for a home
+/// One per workspace and profile, not one per tab: the application is single-instance for a home
 /// directory, so a second container on the same home volume would only tell the first to show
-/// itself. The dot is what no project id and no profile name can hold, so this can never be the
+/// itself. The dot is what no workspace id and no profile name can hold, so this can never be the
 /// container the same profile's command-line work would live in.
 #[must_use]
-pub fn desktop_container(project: &str, profile: &str) -> String {
-    format!("qcode-{project}-{profile}.desk")
+pub fn desktop_container(workspace: &str, profile: &str) -> String {
+    format!("qcode-{workspace}-{profile}.desk")
 }
 
-/// The volume holding a profile's login, shared by every project that uses the profile.
+/// The volume holding a profile's login, shared by every workspace that uses the profile.
 #[must_use]
 pub fn credential_volume(profile: &str) -> String {
     format!("qcode-cred-{profile}")
 }
 
-/// The volume holding one project's copy of a profile's home: its history, memory and settings,
-/// which stay inside that project.
+/// The volume holding one workspace's copy of a profile's home: its history, memory and settings,
+/// which stay inside that workspace.
 #[must_use]
-pub fn home_volume(project: &str, profile: &str) -> String {
-    format!("qcode-home-{project}-{profile}")
+pub fn home_volume(workspace: &str, profile: &str) -> String {
+    format!("qcode-home-{workspace}-{profile}")
 }
 
 #[cfg(test)]
@@ -115,16 +115,16 @@ mod tests {
     }
 
     #[test]
-    fn turkish_project_and_profile_names_still_give_valid_object_names() {
-        let project = safe("İstanbul Şubesi");
+    fn turkish_workspace_and_profile_names_still_give_valid_object_names() {
+        let workspace = safe("İstanbul Şubesi");
         let profile = safe("Günlük Çalışma");
         assert!(is_image_name(&profile_image(profile.as_str())), "{}", profile_image(profile.as_str()));
         assert!(is_image_name(BASE_IMAGE));
         for object in [
-            profile_container(project.as_str(), profile.as_str()),
-            base_container(project.as_str()),
+            profile_container(workspace.as_str(), profile.as_str()),
+            base_container(workspace.as_str()),
             credential_volume(profile.as_str()),
-            home_volume(project.as_str(), profile.as_str()),
+            home_volume(workspace.as_str(), profile.as_str()),
         ] {
             assert!(is_object_name(&object), "{object}");
         }

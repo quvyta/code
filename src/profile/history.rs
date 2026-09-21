@@ -1,19 +1,26 @@
-//! A harness's own record of the conversations it had in a project, and the line that opens one
+//! A harness's own record of the conversations it had in a workspace, and the line that opens one
 //! of them again.
 //!
 //! Every harness keeps its conversations under its home directory, which in QCode is the
-//! project's home volume for the profile. The host cannot read a volume by itself (Docker keeps
+//! workspace's home volume for the profile. The host cannot read a volume by itself (Docker keeps
 //! its volumes where only root reaches), so the reading happens inside the profile's own
 //! container: the base image carries Node, and each harness has one short script, run with
 //! `node -e`, that knows where that harness writes and prints what it found. The script is the
 //! only part that knows a harness's file format; everything it prints has one shape for all of
 //! them, and [`parse`] is where that shape is checked.
 //!
-//! What a script prints, one line per conversation of the project in [`PROJECT_DIR`] and of no
+//! Each script is given two directories: where the workspace's files are today ([`CODE_DIR`])
+//! and where a QCode written earlier mounted them ([`LEGACY_CODE_DIR`]). A harness writes the
+//! working directory it was in into every conversation it records, so a conversation had before
+//! the mount was renamed names the old directory and only the old one; a script that knew a
+//! single name would leave every one of them out and the person would open the history list to
+//! find it empty. Both are looked under, and a conversation found twice is kept once.
+//!
+//! What a script prints, one line per conversation of those directories and of no
 //! other: the conversation's id, a tab, when it was last used in Unix milliseconds, a tab, and
 //! its title, which may be empty. A missing folder, an unreadable file or a record in a shape the
 //! script does not know is left out rather than guessed at, and nothing a script meets makes it
-//! fail: a harness that was never used in the project has simply had no conversations there.
+//! fail: a harness that was never used in the workspace has simply had no conversations there.
 //! Each script reads files a line at a time, never holds a line longer than a mebibyte and stops
 //! a file after 256 MiB, so a transcript grown huge costs time but never the container's memory.
 //!
@@ -24,7 +31,7 @@
 //! them.
 
 use super::HarnessKind;
-use crate::base::paths::PROJECT_DIR;
+use crate::base::paths::{CODE_DIR, LEGACY_CODE_DIR};
 use crate::engine::run::{EngineError, capture};
 use crate::engine::{ContainerState, Engine, EngineCommand, Exec};
 use std::collections::HashSet;
@@ -37,7 +44,7 @@ pub const TITLE_CHARS: usize = 200;
 /// far longer is not an id any of them made.
 const ID_CHARS: usize = 128;
 
-/// One conversation a harness had in the project.
+/// One conversation a harness had in the workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Conversation {
     /// The harness's own id for it, the word its resume argument takes.
@@ -102,7 +109,9 @@ fn tidy(title: &str) -> Option<String> {
 macro_rules! prelude {
     () => {
         r#"const fs = require('fs'), path = require('path'), os = require('os');
-const project = process.argv[1] || '', home = os.homedir();
+const workspace = process.argv[1] || '', was = process.argv[2] || '', home = os.homedir();
+const workspaces = [workspace, was].filter((d, i, all) => d && all.indexOf(d) === i);
+const here = (d) => typeof d === 'string' && workspaces.includes(d);
 const LINE_CAP = 1 << 20, FILE_CAP = 256 << 20, TITLE_CAP = 1000;
 const clean = (s) => typeof s === 'string' ? s.replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, ' ').trim().slice(0, TITLE_CAP) : '';
 const emit = (id, ms, title) => {
@@ -146,10 +155,11 @@ const lines = (file, each) => {
     };
 }
 
-/// Claude Code keeps one file per conversation, `~/.claude/projects/<project>/<id>.jsonl`, where
-/// `<project>` is the working directory with every character that is not a letter or a digit
-/// made `-` (`/work/Project` is `-work-Project`; a path over 200 characters would be cut and
-/// hashed, which [`PROJECT_DIR`] never is). The session docs
+/// Claude Code keeps one file per conversation, `~/.claude/projects/<workspace>/<id>.jsonl`, where
+/// `<workspace>` is the working directory with every character that is not a letter or a digit
+/// made `-` (`/work` is `-work`; a path over 200 characters would be cut and
+/// hashed, which neither [`CODE_DIR`] nor [`LEGACY_CODE_DIR`] is). Both directories have a
+/// folder of their own, so both are listed. The session docs
 /// (`code.claude.com/docs/en/sessions`) name the picker's order: a name the person gave, a
 /// summary, the first prompt. A name is a `{"type":"custom-title","customTitle":...}` line (the
 /// last one counts), older versions wrote `{"type":"summary","summary":...}`, and the first
@@ -161,8 +171,12 @@ const lines = (file, each) => {
 const CLAUDE_CODE: &str = concat!(
     prelude!(),
     r#"try {
-  const dir = path.join(home, '.claude', 'projects', project.replace(/[^A-Za-z0-9]/g, '-'));
-  for (const name of list(dir)) {
+  const found = [];
+  for (const w of workspaces) {
+    const dir = path.join(home, '.claude', 'projects', w.replace(/[^A-Za-z0-9]/g, '-'));
+    for (const name of list(dir)) found.push([dir, name]);
+  }
+  for (const [dir, name] of found) {
     const file = path.join(dir, name), s = stat(file);
     if (!name.endsWith('.jsonl') || !s || !s.isFile()) continue;
     let custom = '', summary = '', first = '', any = false;
@@ -188,9 +202,10 @@ const CLAUDE_CODE: &str = concat!(
 /// (`~/.local/share/opencode/opencode.db`), so it is asked instead: `opencode session list
 /// --format json` (`opencode.ai/docs/cli`) prints `[{"id","title","updated","created",
 /// "projectId","directory"}]` with times in milliseconds, and nothing at all when there are
-/// none. It lists by project, and a folder git will not vouch for (the mounted project belongs
-/// to another user as far as git inside can tell) falls into one `global` project shared with
-/// every other such folder, so the list is narrowed to `directory` here. A conversation nobody
+/// none. It lists by workspace, and a folder git will not vouch for (the mounted workspace belongs
+/// to another user as far as git inside can tell) falls into one `global` workspace shared with
+/// every other such folder, so the list is narrowed to `directory` here — to the workspace's
+/// directory today or the one an older QCode mounted it on. A conversation nobody
 /// named keeps the title `New session - <ISO time>` (`Child session - ` for one the harness
 /// opened on its own), which says nothing a list's time column does not, so it counts as no title.
 /// `--pure` keeps plugins the person configured from loading just to list sessions.
@@ -200,12 +215,12 @@ const OPENCODE: &str = concat!(
   let out = '';
   try {
     out = require('child_process').execFileSync('opencode', ['session', 'list', '--format', 'json', '--pure'], {
-      cwd: project, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 << 20, timeout: 60000,
+      cwd: workspace, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 << 20, timeout: 60000,
     });
   } catch (e) {}
   const all = json(out.slice(Math.max(out.indexOf('['), 0)));
   for (const s of Array.isArray(all) ? all : []) {
-    if (!s || s.directory !== project) continue;
+    if (!s || !here(s.directory)) continue;
     const placeholder = typeof s.title === 'string' && /^(New|Child) session - \d{4}-\d\d-\d\dT[\d:.]+Z$/.test(s.title);
     emit(s.id, s.updated, placeholder ? '' : s.title);
   }
@@ -213,8 +228,10 @@ const OPENCODE: &str = concat!(
 "#
 );
 
-/// Gemini CLI (`geminicli.com/docs/cli/session-management`) keeps a folder per project,
-/// `~/.gemini/tmp/<slug>/chats/`, with the slug for a path in `~/.gemini/projects.json`
+/// Gemini CLI (`geminicli.com/docs/cli/session-management`) keeps a folder per workspace,
+/// `~/.gemini/tmp/<slug>/chats/` — one folder per directory, so the workspace as it is mounted
+/// today and as an older QCode mounted it each have their own — with the slug for a path in
+/// `~/.gemini/projects.json`
 /// (`{"projects":{"<path>":"<slug>"}}`) and the path again in `~/.gemini/tmp/<slug>/.project_root`.
 /// A conversation is a `session-*.jsonl` file (`.json` in older versions, one object); its first
 /// line holds `sessionId`, `projectHash`, `startTime` and `lastUpdated`, each message is a line
@@ -229,9 +246,17 @@ const GEMINI_CLI: &str = concat!(
     r#"try {
   const root = path.join(home, '.gemini');
   const known = json(small(path.join(root, 'projects.json')));
-  let slug = known && known.projects && typeof known.projects[project] === 'string' ? known.projects[project] : '';
-  if (!slug) slug = list(path.join(root, 'tmp')).find((d) => small(path.join(root, 'tmp', d, '.project_root')).trim() === project) || '';
-  const dir = slug && !slug.includes('/') && slug !== '.' && slug !== '..' ? path.join(root, 'tmp', slug, 'chats') : '';
+  const slugs = [];
+  for (const w of workspaces) {
+    let slug = known && known.projects && typeof known.projects[w] === 'string' ? known.projects[w] : '';
+    if (!slug) slug = list(path.join(root, 'tmp')).find((d) => small(path.join(root, 'tmp', d, '.project_root')).trim() === w) || '';
+    if (slug && !slug.includes('/') && slug !== '.' && slug !== '..' && !slugs.includes(slug)) slugs.push(slug);
+  }
+  const found = [];
+  for (const slug of slugs) {
+    const dir = path.join(root, 'tmp', slug, 'chats');
+    for (const name of list(dir)) found.push([dir, name]);
+  }
   const message = (m) => {
     const t = text(m.content).trim();
     const real = m.type === 'user'
@@ -240,7 +265,7 @@ const GEMINI_CLI: &str = concat!(
     return { id: m.id, user: m.type === 'user', text: t, real };
   };
   const messages = (all) => Array.isArray(all) ? all.filter((m) => m && typeof m.id === 'string').map(message) : [];
-  for (const name of dir ? list(dir) : []) {
+  for (const [dir, name] of found) {
     const file = path.join(dir, name), s = stat(file);
     if (!name.startsWith('session-') || !/\.jsonl?$/.test(name) || !s || !s.isFile()) continue;
     let meta = {}, said = [];
@@ -274,10 +299,11 @@ const GEMINI_CLI: &str = concat!(
 "#
 );
 
-/// Codex keeps every project's conversations together, as
+/// Codex keeps every workspace's conversations together, as
 /// `~/.codex/sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl` (`codex-rs/rollout/src/lib.rs` in
 /// `github.com/openai/codex`), so each file's first line is read: `{"type":"session_meta",
-/// "payload":{"id","cwd",...}}`, and only those whose `cwd` is the project count. A name given
+/// "payload":{"id","cwd",...}}`, and only those whose `cwd` is the workspace — as it is
+/// mounted today or as an older QCode mounted it — count. A name given
 /// with `/rename` is in `~/.codex/session_index.jsonl` as `{"id","thread_name","updated_at"}`,
 /// the last line for an id winning (`codex-rs/rollout/src/session_index.rs`). Without one the
 /// title is the first thing the person said: a `user_message` event, or a user
@@ -307,7 +333,7 @@ const CODEX: &str = concat!(
         const r = json(l);
         if (seen++ === 0) {
           const p = r && r.type === 'session_meta' && r.payload;
-          if (!p || p.cwd !== project || typeof p.id !== 'string') return false;
+          if (!p || !here(p.cwd) || typeof p.id !== 'string') return false;
           id = p.id;
           return names.has(id) ? false : undefined;
         }
@@ -327,7 +353,7 @@ const CODEX: &str = concat!(
 );
 
 impl HarnessKind {
-    /// The Node script that prints this harness's conversations in the project whose folder is
+    /// The Node script that prints this harness's conversations in the workspace whose folder is
     /// its first argument, in the shape [`parse`] reads.
     ///
     /// `None` for a harness whose conversations QCode cannot list: the window harness keeps its
@@ -386,7 +412,7 @@ impl HarnessKind {
     }
 }
 
-/// The commands that read a harness's conversations out of a project's container for its
+/// The commands that read a harness's conversations out of a workspace's container for its
 /// profile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reading {
@@ -400,9 +426,12 @@ pub struct Reading {
 
 /// Spells out the commands that read `harness`'s conversations from `container`, or `None` for a
 /// harness whose conversations QCode cannot list.
+///
+/// The script is given both the directory the workspace is mounted on today and the one an older
+/// QCode mounted it on, so a conversation recorded before the change is still found.
 #[must_use]
 pub fn reading(engine: &Engine, container: &str, harness: HarnessKind) -> Option<Reading> {
-    let command = ["node", "-e", harness.history_script()?, PROJECT_DIR];
+    let command = ["node", "-e", harness.history_script()?, CODE_DIR, LEGACY_CODE_DIR];
     Some(Reading {
         state: engine.container_state(container),
         start: engine.start_container(container),
@@ -413,7 +442,7 @@ pub fn reading(engine: &Engine, container: &str, harness: HarnessKind) -> Option
 /// What reading takes, given what the engine said about the container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Steps {
-    /// The container is not there: the project has never run the profile, so it has had no
+    /// The container is not there: the workspace has never run the profile, so it has had no
     /// conversations with it, and nothing is made just to find that out.
     Nothing,
     /// It runs: the script is run in it.
@@ -431,7 +460,7 @@ fn steps(state: Option<&ContainerState>) -> Steps {
     }
 }
 
-/// Reads `harness`'s conversations in the project out of `container`, newest first.
+/// Reads `harness`'s conversations in the workspace out of `container`, newest first.
 ///
 /// A container that is not there has had no conversations, and nothing is created for the
 /// question. One that is stopped is started and left running: the answer is read to open one of
@@ -594,12 +623,13 @@ mod tests {
     }
 
     #[test]
-    fn every_harness_has_a_script_that_reads_the_project_it_is_given() {
+    fn every_harness_has_a_script_that_reads_the_workspace_it_is_given() {
         for harness in HarnessKind::TERMINAL {
             let script = harness.history_script().expect("a command-line harness has a script");
             assert!(script.starts_with(prelude!()), "{harness:?}");
             assert!(script.len() > prelude!().len(), "{harness:?} has only the prelude");
             assert!(script.contains("process.argv[1]"), "{harness:?}");
+            assert!(script.contains("process.argv[2]"), "{harness:?} knows only one name for the workspace");
             assert!(script.contains("emit("), "{harness:?} never prints");
             assert!(!script.contains("process.exit("), "{harness:?}: an early exit could cut the output short");
         }
@@ -649,7 +679,7 @@ mod tests {
     }
 
     #[test]
-    fn the_script_runs_without_a_terminal_in_the_project_folder() {
+    fn the_script_runs_without_a_terminal_in_the_workspace_folder() {
         let engine = Engine::new(EngineKind::Podman, "/usr/bin/podman");
         let reading = reading(&engine, "qcode-my-app-claude-sub", HarnessKind::ClaudeCode).expect("a script");
         assert_eq!(
@@ -660,8 +690,9 @@ mod tests {
         let list = args(&reading.list);
         assert_eq!(list[..4], ["exec", "qcode-my-app-claude-sub", "node", "-e"]);
         assert_eq!(list[4], script(HarnessKind::ClaudeCode));
-        assert_eq!(list[5], PROJECT_DIR);
-        assert_eq!(list.len(), 6);
+        assert_eq!(list[5], CODE_DIR);
+        assert_eq!(list[6], LEGACY_CODE_DIR, "the name of before is handed over too, or old conversations vanish");
+        assert_eq!(list.len(), 7);
         assert!(!list.iter().any(|arg| arg == "--tty" || arg == "--interactive" || arg == "--user"), "{list:?}");
     }
 

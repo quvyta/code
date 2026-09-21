@@ -24,24 +24,24 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use super::{Display, RUNTIME_DIR, SHM_SIZE, WINDOW_GRACE, seccomp};
-use crate::base::paths::{HOME_DIR, PROJECT_DIR};
+use crate::base::paths::{CODE_DIR, HOME_DIR};
 use crate::engine::run::{build_image, capture};
 use crate::engine::{
     Access, ContainerState, Engine, EngineKind, Exec, HostUser, ImageBuild, Mount, MountSource, Network, RunOnce,
     RunWindow, Tmpfs, detect,
 };
 use crate::profile::{AccountKind, HarnessKind, MountAccess, NetworkMode, Profile, SafeName, Template};
+use crate::store::{WorkspaceId, WorkspacePaths};
 use crate::ui::profiles::recipe;
-use crate::ui::project::ContainerPlan;
-use crate::workspace::{ProjectId, ProjectPaths};
+use crate::ui::workspace::ContainerPlan;
 
 /// The image and container these tests make.
 const IMAGE: &str = "qcode/profile/desktoptest";
-/// The project these tests open a window for.
-const PROJECT: &str = "desktoptest";
+/// The workspace these tests open a window for.
+const WORKSPACE: &str = "desktoptest";
 /// The container a window is opened in, named the way the application names it.
 const CONTAINER: &str = "qcode-desktoptest-desktoptest.desk";
-/// The volume that stands in for a project's home volume.
+/// The volume that stands in for a workspace's home volume.
 const VOLUME: &str = "qcode-home-desktoptest-desktoptest";
 
 /// The engines installed on this machine, or nothing at all when the tests are switched off.
@@ -119,22 +119,22 @@ fn running(engine: &Engine) -> bool {
     capture(&engine.container_state(CONTAINER)).is_ok_and(|word| ContainerState::parse(&word).is_running())
 }
 
-/// The command that opens the window of `display` in `engine`, for a project folder and a home
+/// The command that opens the window of `display` in `engine`, for a workspace folder and a home
 /// volume of this test's own.
 ///
 /// It is the application's own command, built by [`ContainerPlan::open_window`] rather than
 /// written again here: a copy written for the test would be the thing tested, and the first copy
 /// of it silently left out the variables that tell the application where the compositor is, so
 /// the window it opened was one no person would ever get.
-fn open_command(engine: &Engine, project: &Path, display: &Display) -> crate::engine::EngineCommand {
-    let paths = ProjectPaths {
-        root: project.parent().expect("the project has a folder").to_path_buf(),
-        file: project.with_file_name("project.qcode"),
-        project: project.to_path_buf(),
-        assets: project.with_file_name("Assets"),
-        harness: project.with_file_name("Harness"),
+fn open_command(engine: &Engine, workspace: &Path, display: &Display) -> crate::engine::EngineCommand {
+    let paths = WorkspacePaths {
+        root: workspace.parent().expect("the workspace has a folder").to_path_buf(),
+        file: workspace.with_file_name("workspace.qcode"),
+        code: workspace.to_path_buf(),
+        assets: workspace.with_file_name("Assets"),
+        harness: workspace.with_file_name("Harness"),
     };
-    let id = ProjectId::parse(PROJECT).expect("a usable project id");
+    let id = WorkspaceId::parse(WORKSPACE).expect("a usable workspace id");
     let plan = ContainerPlan::window(&id, &paths, &profile()).expect("this profile opens a window");
     assert_eq!(plan.name, CONTAINER, "the container these tests clean up is the one the window uses");
     assert_eq!(plan.image, IMAGE, "the image these tests build is the one the window uses");
@@ -150,17 +150,17 @@ impl Scratch {
     fn new() -> Self {
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
         let path = std::env::temp_dir().join(format!("qcode-desktoplive-{stamp}"));
-        std::fs::create_dir_all(path.join("Project")).expect("a project folder");
-        // A window is opened for a whole project, and the application's container is given the
-        // project's other folders as well; they have to be there before it starts.
+        std::fs::create_dir_all(path.join("Work")).expect("a workspace folder");
+        // A window is opened for a whole workspace, and the application's container is given the
+        // workspace's other folders as well; they have to be there before it starts.
         std::fs::create_dir_all(path.join("Assets")).expect("an assets folder");
         std::fs::create_dir_all(path.join("Harness")).expect("a harness folder");
-        std::fs::write(path.join("Project").join("README.md"), "hello\n").expect("a file in the project");
+        std::fs::write(path.join("Work").join("README.md"), "hello\n").expect("a file in the workspace");
         Self(path)
     }
 
-    fn project(&self) -> std::path::PathBuf {
-        self.0.join("Project")
+    fn workspace(&self) -> std::path::PathBuf {
+        self.0.join("Work")
     }
 }
 
@@ -229,7 +229,7 @@ fn the_image_builds_from_the_makers_archive_and_carries_the_application_and_its_
         // The image is its own user again, never root.
         assert_eq!(read("id -un").trim(), crate::base::paths::USER);
         // The settings the template writes are in the image's home, ready to be copied into a
-        // project's home volume the first time one is filled.
+        // workspace's home volume the first time one is filled.
         let settings = read(&format!("cat '{HOME_DIR}/.config/Antigravity IDE/User/settings.json'"));
         assert!(settings.contains("\"telemetry.telemetryLevel\": \"off\""), "{:?}: {settings}", engine.kind());
         assert!(settings.contains("\"update.mode\": \"none\""), "{:?}: {settings}", engine.kind());
@@ -249,8 +249,8 @@ fn the_container_starts_stops_and_leaves_nothing_behind_on_both_engines() {
         clear(&engine);
         build(&engine);
         let mounts = [Mount {
-            source: MountSource::Path(&scratch.project()),
-            target: Path::new(PROJECT_DIR),
+            source: MountSource::Path(&scratch.workspace()),
+            target: Path::new(CODE_DIR),
             access: Access::ReadWrite,
         }];
         let seccomp = engine.needs_sandbox_profile().then(|| seccomp::file().expect("the profile is written"));
@@ -264,7 +264,7 @@ fn the_container_starts_stops_and_leaves_nothing_behind_on_both_engines() {
                 mounts: &mounts,
                 network: Network::None,
                 user: HostUser::current().expect("the current user"),
-                workdir: Some(Path::new(PROJECT_DIR)),
+                workdir: Some(Path::new(CODE_DIR)),
                 command: &["sh", "-c", "trap 'exit 0' TERM; while :; do sleep 1 & wait $!; done"],
             },
             env: &[],
@@ -287,9 +287,9 @@ fn the_container_starts_stops_and_leaves_nothing_behind_on_both_engines() {
         let megabytes: u64 =
             shm.split_whitespace().nth(1).and_then(|word| word.parse().ok()).expect("a size in mebibytes");
         assert!(megabytes >= 1_000, "{:?}: /dev/shm is only {megabytes} MiB", engine.kind());
-        // The program the window would run is there, and the project is where the record says.
+        // The program the window would run is there, and the workspace is where the record says.
         assert_eq!(run(&engine, &format!("test -x '{}' && echo yes", desktop.command())).expect("it is").trim(), "yes");
-        assert_eq!(run(&engine, &format!("cat '{PROJECT_DIR}/README.md'")).expect("the project").trim(), "hello");
+        assert_eq!(run(&engine, &format!("cat '{CODE_DIR}/README.md'")).expect("the workspace").trim(), "hello");
 
         // The stop closes it in its own time rather than being killed at the end of the grace.
         let started = Instant::now();
@@ -328,7 +328,7 @@ fn a_window_really_opens_on_this_screen() {
         clear(&engine);
         build(&engine);
         let started = Instant::now();
-        capture(&open_command(&engine, &scratch.project(), &display))
+        capture(&open_command(&engine, &scratch.workspace(), &display))
             .unwrap_or_else(|error| panic!("{:?}: the window does not open: {error:?}", engine.kind()));
 
         // The window is on its way up. What says the application's own sandbox came up is a
@@ -364,7 +364,7 @@ fn a_window_really_opens_on_this_screen() {
         // Asking it to come forward starts the application a second time, which tells the one
         // already running and exits. Whether the window is raised or only marked is the
         // compositor's; that it does not fail is what can be checked here.
-        let raise = ["sh", "-c", &format!("'{}' {PROJECT_DIR}", desktop.command())];
+        let raise = ["sh", "-c", &format!("'{}' {CODE_DIR}", desktop.command())];
         let _ = capture(&engine.exec_without_terminal(&Exec { container: CONTAINER, command: &raise }));
         assert!(running(&engine), "{:?}: asking it to come forward ended it", engine.kind());
 

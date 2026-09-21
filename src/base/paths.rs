@@ -6,35 +6,41 @@
 //! opens `/home/qcode` and a mount that lands on `/home/user` cost a login that vanishes, and
 //! nothing fails loudly enough to say so.
 
-/// The directory the project's own material lives under. It holds nothing itself; the two
-/// directories below are what is mounted.
-pub const WORK_DIR: &str = "/work";
+/// Where the workspace's own files appear, mounted from the host and always writable. It is the
+/// working directory of everything a container runs, and it carries the name the person sees the
+/// folder under at home, `Work/`, so the two halves read the same.
+pub const CODE_DIR: &str = "/work";
 
-/// Where the project's own files appear, mounted from the host and always writable.
-pub const PROJECT_DIR: &str = "/work/Project";
+/// What a QCode written before this mounted the workspace's own files on.
+///
+/// Nothing is mounted here any more, but every conversation the harnesses recorded before the
+/// change names this path as the directory it was had in, so the history scripts look for a
+/// workspace under this name as well as under [`CODE_DIR`]. Without it a person who has used
+/// QCode before opens the history list and finds it empty.
+pub const LEGACY_CODE_DIR: &str = "/work/Project";
 
-/// Where the project's other material appears, mounted from the host, writable or not as the
+/// Where the workspace's other material appears, mounted from the host, writable or not as the
 /// profile says.
-pub const ASSETS_DIR: &str = "/work/Assets";
+pub const ASSETS_DIR: &str = "/assets";
 
-/// Where a project's `Backup/` folder appears in the one-off container that takes or restores a
+/// Where a workspace's `Backup/` folder appears in the one-off container that takes or restores a
 /// backup. No lasting container mounts it: a harness that could write there could rewrite the
 /// history it would be restored from.
-pub const BACKUP_DIR: &str = "/work/Backup";
+pub const BACKUP_DIR: &str = "/backup";
 
 /// The home directory of whoever the container runs as, and the one place a harness keeps its
 /// login, its settings, its history and its memory.
 ///
-/// A profile container mounts the project's own home volume here, so none of that reaches
-/// another project.
+/// A profile container mounts the workspace's own home volume here, so none of that reaches
+/// another workspace.
 pub const HOME_DIR: &str = "/home/qcode";
 
-/// Where a profile container sees the project's `Containers/MCP/` folder: the socket QCode
+/// Where a profile container sees the workspace's `Containers/MCP/` folder: the socket QCode
 /// answers the bridge between tabs on, and the server a harness starts to reach it.
 ///
-/// Outside the home directory, so no home volume is mounted over it, and outside [`WORK_DIR`],
-/// which is the project's material. It is mounted read-only: the container talks to the socket,
-/// which a read-only mount allows, and may not replace the server every harness of the project
+/// Outside the home directory, and outside [`CODE_DIR`] and [`ASSETS_DIR`], which are the
+/// workspace's own material. It is mounted read-only: the container talks to the socket,
+/// which a read-only mount allows, and may not replace the server every harness of the workspace
 /// starts. The image does not make it; the engine makes the place a mount lands on.
 pub const MCP_DIR: &str = "/run/qcode-mcp";
 
@@ -68,22 +74,26 @@ pub const OPEN_HOME: &str = "qcode-open-home";
 
 #[cfg(test)]
 mod tests {
-    use super::{ASSETS_DIR, BACKUP_DIR, HOME_DIR, KEEP_ALIVE, MCP_DIR, OPEN_HOME, PROJECT_DIR, USER, WORK_DIR};
+    use super::{ASSETS_DIR, BACKUP_DIR, CODE_DIR, HOME_DIR, KEEP_ALIVE, LEGACY_CODE_DIR, MCP_DIR, OPEN_HOME, USER};
     use crate::base::CONTAINERFILE;
 
     #[test]
-    fn every_path_is_absolute_and_the_project_material_is_under_one_roof() {
-        for path in [WORK_DIR, PROJECT_DIR, ASSETS_DIR, BACKUP_DIR, HOME_DIR, MCP_DIR] {
+    fn every_path_is_absolute_and_no_two_of_them_are_the_same_place() {
+        for path in [CODE_DIR, ASSETS_DIR, BACKUP_DIR, HOME_DIR, MCP_DIR, LEGACY_CODE_DIR] {
             assert!(path.starts_with('/'), "{path}");
             assert!(!path.ends_with('/'), "{path}");
         }
-        assert!(PROJECT_DIR.starts_with(&format!("{WORK_DIR}/")), "{PROJECT_DIR}");
-        assert!(ASSETS_DIR.starts_with(&format!("{WORK_DIR}/")), "{ASSETS_DIR}");
-        assert!(BACKUP_DIR.starts_with(&format!("{WORK_DIR}/")), "{BACKUP_DIR}");
-        assert_ne!(PROJECT_DIR, ASSETS_DIR);
-        assert_ne!(PROJECT_DIR, BACKUP_DIR);
-        assert!(!HOME_DIR.starts_with(&format!("{WORK_DIR}/")), "a home inside the project would be mounted over");
-        assert!(!MCP_DIR.starts_with(&format!("{WORK_DIR}/")) && !MCP_DIR.starts_with(&format!("{HOME_DIR}/")));
+        // Each mount is its own root, so none of them may sit inside another: a mount landing on
+        // a directory of another mount hides it, and the workspace loses half its material.
+        let roots = [CODE_DIR, ASSETS_DIR, BACKUP_DIR, HOME_DIR, MCP_DIR];
+        for (index, path) in roots.iter().enumerate() {
+            for other in roots.iter().skip(index + 1) {
+                assert_ne!(path, other);
+                assert!(!path.starts_with(&format!("{other}/")), "{path} is inside {other}");
+                assert!(!other.starts_with(&format!("{path}/")), "{other} is inside {path}");
+            }
+        }
+        assert_ne!(CODE_DIR, LEGACY_CODE_DIR, "the old name is only worth looking for while it differs");
     }
 
     #[test]
@@ -91,10 +101,10 @@ mod tests {
         // The two halves of the contract are the constants and the image. A path changed in one
         // and not the other is a login written where nothing reads it, so they are checked
         // against each other rather than trusted.
-        for path in [PROJECT_DIR, ASSETS_DIR, HOME_DIR] {
+        for path in [CODE_DIR, ASSETS_DIR, HOME_DIR] {
             assert!(CONTAINERFILE.contains(path), "the image never mentions {path}");
         }
-        assert!(CONTAINERFILE.contains(&format!("WORKDIR {PROJECT_DIR}")), "a shell starts somewhere else");
+        assert!(CONTAINERFILE.contains(&format!("WORKDIR {CODE_DIR}")), "a shell starts somewhere else");
         assert!(CONTAINERFILE.contains(&format!("ENV HOME={HOME_DIR}")), "the image names another home");
         assert!(CONTAINERFILE.contains(&format!("USER {USER}")), "the image belongs to another user");
         assert!(CONTAINERFILE.contains(&format!("/usr/local/bin/{OPEN_HOME}")), "the image installs no {OPEN_HOME}");

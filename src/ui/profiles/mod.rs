@@ -1,6 +1,6 @@
-//! The profiles screen: the profiles a workspace holds, and the wizard that makes one.
+//! The profiles screen: the profiles a store holds, and the wizard that makes one.
 //!
-//! A profile is what a project opens a harness with, so this screen answers two questions about
+//! A profile is what a workspace opens a harness with, so this screen answers two questions about
 //! every profile — is its image built, and is it signed in — and never answers either of them
 //! from memory. Both come from the engine, and until the engine has answered the screen says
 //! that it does not know yet.
@@ -32,7 +32,7 @@ use qframe::widgets::{
 use crate::base;
 use crate::engine::Engine;
 use crate::profile::{AccountKind, HarnessKind, MountAccess, NetworkMode, Profile, SafeName, Template};
-use crate::workspace::Workspace;
+use crate::store::Store;
 
 pub use status::{Readiness, Row, Status};
 pub use wizard::{Blocked, Build, Draft, Login, Stage, Unfinished};
@@ -55,7 +55,7 @@ const WIZARD_ROWS: u16 = 25;
 /// view cannot see but which share the terminal with it.
 const CHROME_ROWS: u16 = 2;
 
-/// What was read out of a workspace's `Profiles/` folder.
+/// What was read out of a store's `Profiles/` folder.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Listing {
     /// The profiles whose files could be read.
@@ -67,9 +67,9 @@ pub struct Listing {
 /// Everything that can happen on the profiles screen.
 #[derive(Debug, Clone)]
 pub enum Msg {
-    /// Read the workspace again. This is also how the screen is started.
+    /// Read the store again. This is also how the screen is started.
     Reload,
-    /// The workspace was read.
+    /// The store was read.
     Loaded(Listing),
     /// The engine answered about every profile.
     Probed(Vec<Status>),
@@ -152,12 +152,13 @@ pub struct Profiles {
     selected: usize,
     draft: Option<Draft>,
     signing_out: bool,
+    made: Option<SafeName>,
 }
 
 impl Profiles {
-    /// A profiles screen for the workspace at `root`, using `engine`.
+    /// A profiles screen for the store at `root`, using `engine`.
     ///
-    /// Both are optional because both can be missing on a working machine: a workspace that has
+    /// Both are optional because both can be missing on a working machine: a store that has
     /// not been chosen yet, and an engine that was uninstalled after the setup. The screen opens
     /// either way and says what it cannot do.
     #[must_use]
@@ -171,7 +172,17 @@ impl Profiles {
             selected: 0,
             draft: None,
             signing_out: false,
+            made: None,
         }
+    }
+
+    /// The profile the wizard has just finished making, taken once.
+    ///
+    /// It is how this screen tells the application that the work it was opened for is done. Who
+    /// opened it decides what that means: a workspace waiting behind this screen for a profile it
+    /// can open a tab with gets it back, and nobody else is moved.
+    pub fn just_made(&mut self) -> Option<SafeName> {
+        self.made.take()
     }
 
     /// The profiles and what the engine said about them.
@@ -192,7 +203,7 @@ impl Profiles {
         self.draft.as_ref()
     }
 
-    /// Whether the workspace is still being read.
+    /// Whether the store is still being read.
     #[must_use]
     pub fn is_loading(&self) -> bool {
         self.loading
@@ -204,9 +215,9 @@ impl Profiles {
         &self.problems
     }
 
-    /// The workspace, when there is one.
-    fn workspace(&self) -> Option<Workspace> {
-        self.root.as_ref().map(Workspace::new)
+    /// The store, when there is one.
+    fn store(&self) -> Option<Store> {
+        self.root.as_ref().map(Store::new)
     }
 }
 
@@ -267,6 +278,9 @@ pub fn update(state: &mut Profiles, message: Msg) -> Command<Msg> {
             if state.draft.as_ref().is_some_and(|draft| draft.blocked().is_some()) {
                 return next(state);
             }
+            // Finish is only offered once there is a profile; Cancel is the other way out and
+            // leaves nothing behind, so only this one is a profile having been made.
+            state.made = state.draft.as_ref().and_then(Draft::profile).map(|profile| profile.name);
             leave(state)
         }
         Msg::Back => {
@@ -387,15 +401,15 @@ pub fn update(state: &mut Profiles, message: Msg) -> Command<Msg> {
     }
 }
 
-/// Reads the workspace again, and asks the engine about what it finds.
+/// Reads the store again, and asks the engine about what it finds.
 fn reload(state: &mut Profiles) -> Command<Msg> {
-    let Some(workspace) = state.workspace() else {
+    let Some(store) = state.store() else {
         state.loading = false;
         return Command::none();
     };
     state.loading = true;
     Command::perform(move || {
-        let loaded = workspace.profiles();
+        let loaded = store.profiles();
         Msg::Loaded(Listing { profiles: loaded.value, diagnostics: loaded.diagnostics })
     })
 }
@@ -463,7 +477,7 @@ fn leave(state: &mut Profiles) -> Command<Msg> {
 
 /// Starts the image build.
 fn start_build(state: &mut Profiles) -> Command<Msg> {
-    let (Some(engine), Some(workspace)) = (state.engine.clone(), state.workspace()) else {
+    let (Some(engine), Some(store)) = (state.engine.clone(), state.store()) else {
         return Command::none();
     };
     let Some(draft) = &mut state.draft else { return Command::none() };
@@ -486,10 +500,10 @@ fn start_build(state: &mut Profiles) -> Command<Msg> {
             line(text);
         });
         let built = base.map_err(Problem::from).and_then(|_| work::build(&engine, &profile, &cancel, &mut line));
-        // The definition file is written only once there is an image behind it, so a workspace
+        // The definition file is written only once there is an image behind it, so a store
         // never holds a profile that cannot be opened.
         let result =
-            built.and_then(|()| workspace.write_profile(&profile).map_err(|problem| Problem::Machine(problem.message)));
+            built.and_then(|()| store.write_profile(&profile).map_err(|problem| Problem::Machine(problem.message)));
         Ok(Msg::BuildEnded(result))
     });
     draft.build = Build::Running(task.id());
@@ -621,7 +635,7 @@ fn draw_list(state: &Profiles, ui: &mut View<'_, Msg>) {
     let selected = state.selected().cloned();
     let problems = state.problems().len();
     let loading = state.is_loading();
-    let workspace = state.root.is_some();
+    let store = state.root.is_some();
 
     ui.column(|ui| {
         // Only the title stands above the list: what a profile is for belongs on the empty
@@ -630,8 +644,8 @@ fn draw_list(state: &Profiles, ui: &mut View<'_, Msg>) {
         if engineless {
             ui.add(Text::new(t!("profiles.no-engine")).color("warning")).fill_width();
         }
-        if !workspace {
-            ui.add(Text::new(t!("profiles.no-workspace")).color("warning")).fill_width();
+        if !store {
+            ui.add(Text::new(t!("profiles.no-folder")).color("warning")).fill_width();
             return;
         }
         if problems > 0 {
@@ -924,9 +938,9 @@ fn draw_account(draft: &Draft, ui: &mut View<'_, Msg>) {
 /// What the container may see and reach.
 fn draw_permissions(draft: &Draft, ui: &mut View<'_, Msg>) {
     ui.add(Text::new(t!("profiles.wizard.permissions-lead")).role("secondary")).fill_width();
-    ui.add(Text::new(t!("profiles.wizard.permissions-project")).bold());
+    ui.add(Text::new(t!("profiles.wizard.permissions-code")).bold());
     ui.add(Text::new(t!("profiles.access-rw")).role("secondary"));
-    ui.add(Text::new(t!("profiles.wizard.project-why")).role("secondary")).fill_width();
+    ui.add(Text::new(t!("profiles.wizard.code-why")).role("secondary")).fill_width();
     ui.add(Text::new(t!("profiles.wizard.permissions-assets")).bold());
     ui.add(
         RadioGroup::new(MountAccess::ALL.map(access_word))
@@ -1119,13 +1133,13 @@ mod tests {
         }
     }
 
-    /// A workspace path that is never read: the tests deliver what the disk would have given,
+    /// A store path that is never read: the tests deliver what the disk would have given,
     /// so nothing here touches a file system or an engine.
     fn root() -> PathBuf {
         std::env::temp_dir().join("qcode-profiles-screen")
     }
 
-    /// A screen with a workspace and no engine, on a terminal of `width` by `height`.
+    /// A screen with a store and no engine, on a terminal of `width` by `height`.
     fn screen(width: u16, height: u16) -> Harness<Host> {
         let state = Profiles::new(Some(root()), None);
         let mut harness = Harness::with_env(Host { state }, env(), width, height);
@@ -1134,7 +1148,7 @@ mod tests {
         harness
     }
 
-    /// A screen with a workspace and an engine that is never actually run: every answer the
+    /// A screen with a store and an engine that is never actually run: every answer the
     /// engine would give is delivered as a message instead.
     fn with_engine() -> Harness<Host> {
         // A binary that is not there: an engine QCode holds but never gets an answer out of, so
@@ -1147,7 +1161,7 @@ mod tests {
         harness
     }
 
-    /// A screen holding `profiles`, delivered the way the workspace would deliver them.
+    /// A screen holding `profiles`, delivered the way the store would deliver them.
     fn loaded(profiles: Vec<Profile>) -> Harness<Host> {
         let mut harness = screen(SIZE.0, SIZE.1);
         harness.send(Msg::Loaded(Listing { profiles, diagnostics: Vec::new() })).render();
@@ -1167,14 +1181,14 @@ mod tests {
     }
 
     #[test]
-    fn a_workspace_without_profiles_starts_empty() {
+    fn a_store_without_profiles_starts_empty() {
         let state = Profiles::new(None, None);
         assert!(state.rows().is_empty());
-        assert!(!state.is_loading(), "without a workspace there is nothing to wait for");
+        assert!(!state.is_loading(), "without a store there is nothing to wait for");
     }
 
     #[test]
-    fn an_empty_workspace_says_that_nothing_runs_without_a_profile() {
+    fn an_empty_store_says_that_nothing_runs_without_a_profile() {
         let harness = loaded(Vec::new());
         let screen = harness.screen();
         assert!(screen.contains("No profiles yet"), "{screen}");
@@ -1183,7 +1197,7 @@ mod tests {
     }
 
     #[test]
-    fn a_workspace_being_read_says_so_instead_of_looking_empty() {
+    fn a_store_being_read_says_so_instead_of_looking_empty() {
         let root = std::env::temp_dir().join("qcode-profiles-loading");
         let state = Profiles::new(Some(root), None);
         assert!(state.is_loading());
@@ -1191,7 +1205,7 @@ mod tests {
         harness.set_locale("en").set_glyph_mode(GlyphMode::Unicode).render();
         let screen = harness.screen();
         assert!(screen.contains("Reading the profiles"), "{screen}");
-        assert!(!screen.contains("No profiles yet"), "a workspace being read is not an empty one:\n{screen}");
+        assert!(!screen.contains("No profiles yet"), "a store being read is not an empty one:\n{screen}");
     }
 
     #[test]
@@ -1262,8 +1276,8 @@ mod tests {
         harness.send(Msg::SignOutAsked).render();
         let screen = harness.screen();
         assert!(screen.contains("Sign claude-sub out?"), "{screen}");
-        assert!(screen.contains("Projects that already have a copy keep working"), "{screen}");
-        assert!(screen.contains("new projects get no login"), "{screen}");
+        assert!(screen.contains("Workspaces that already have a copy keep working"), "{screen}");
+        assert!(screen.contains("new workspaces get no login"), "{screen}");
     }
 
     #[test]
@@ -1311,7 +1325,7 @@ mod tests {
     }
 
     #[test]
-    fn the_permissions_page_says_the_project_is_always_writable() {
+    fn the_permissions_page_says_the_workspace_is_always_writable() {
         let mut harness = loaded(Vec::new());
         harness.send(Msg::New);
         for _ in 0..3 {
@@ -1336,7 +1350,7 @@ mod tests {
         harness.send(Msg::Next).render();
         assert!(harness.screen().contains("Build the image"), "a page without an image keeps its place");
         harness.send(Msg::BuildEnded(Ok(()))).render();
-        assert!(harness.screen().contains("written to the workspace"), "{}", harness.screen());
+        assert!(harness.screen().contains("written to the QCode folder"), "{}", harness.screen());
         harness.send(Msg::Next).render();
         assert!(harness.screen().contains("signs in with its own flow"), "{}", harness.screen());
     }

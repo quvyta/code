@@ -1,6 +1,6 @@
 //! The part of the backup no argument list can answer for: that git in the base image, run the
 //! way [`super::job`] runs it, really keeps the snapshots, leaves out what it is told to, and
-//! brings a project back without deleting anything.
+//! brings a workspace back without deleting anything.
 //!
 //! Every test here is `#[ignore]`d and does nothing unless `QCODE_CONTAINER_TESTS=1`, so
 //! `cargo test` stays clean on a machine with no engine.
@@ -20,7 +20,7 @@ use super::{
     snapshot_assets,
 };
 use crate::engine::{Engine, EngineKind, HostUser, detect};
-use crate::workspace::ProjectPaths;
+use crate::store::WorkspacePaths;
 
 /// The engines installed on this machine, or nothing at all when the tests are switched off.
 fn engines() -> Vec<Engine> {
@@ -33,35 +33,35 @@ fn engines() -> Vec<Engine> {
     found
 }
 
-/// A project folder of this test's own, removed by `Drop`.
+/// A workspace folder of this test's own, removed by `Drop`.
 struct Scratch(PathBuf);
 
 impl Scratch {
     fn new(engine: &Engine) -> Self {
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
         let path = std::env::temp_dir().join(format!("qcode-live-backup-{}-{stamp}", engine.kind().name()));
-        fs::create_dir_all(path.join("Project")).expect("a project folder");
+        fs::create_dir_all(path.join("Work")).expect("a workspace folder");
         Self(path)
     }
 
-    fn paths(&self) -> ProjectPaths {
-        ProjectPaths {
+    fn paths(&self) -> WorkspacePaths {
+        WorkspacePaths {
             root: self.0.clone(),
-            file: self.0.join("project.qcode"),
-            project: self.0.join("Project"),
+            file: self.0.join("workspace.qcode"),
+            code: self.0.join("Work"),
             assets: self.0.join("Assets"),
             harness: self.0.join("Containers").join("Harness"),
         }
     }
 
     fn file(&self, name: &str) -> PathBuf {
-        self.0.join("Project").join(name)
+        self.0.join("Work").join(name)
     }
 
     fn write(&self, name: &str, text: &str) {
         let file = self.file(name);
-        fs::create_dir_all(file.parent().expect("inside the project")).expect("a folder");
-        fs::write(file, text).expect("a file in the project");
+        fs::create_dir_all(file.parent().expect("inside the workspace")).expect("a folder");
+        fs::write(file, text).expect("a file in the workspace");
     }
 
     fn read(&self, name: &str) -> String {
@@ -76,8 +76,8 @@ impl Drop for Scratch {
 }
 
 /// The files a snapshot holds, read straight from the backup's git folder.
-fn files_in(engine: &Engine, paths: &ProjectPaths, id: &str) -> Vec<String> {
-    let git_dir = paths.backup().join("Project.git");
+fn files_in(engine: &Engine, paths: &WorkspacePaths, id: &str) -> Vec<String> {
+    let git_dir = paths.backup().join("Code.git");
     // The container wrote the backup as the person, so the person's git — when the machine
     // running the test has one — reads it without the container. Asking the container again
     // would only check the scripts against themselves.
@@ -99,7 +99,7 @@ fn made(outcome: &Snapshot) -> &str {
 
 #[test]
 #[ignore = "needs a container engine; run with QCODE_CONTAINER_TESTS=1"]
-fn a_project_is_backed_up_and_brought_back_without_losing_a_newer_file() {
+fn a_workspace_is_backed_up_and_brought_back_without_losing_a_newer_file() {
     for engine in engines() {
         let user = HostUser::current().expect("the current user");
         let scratch = Scratch::new(&engine);
@@ -108,7 +108,7 @@ fn a_project_is_backed_up_and_brought_back_without_losing_a_newer_file() {
         scratch.write("README.md", "first\n");
         scratch.write("src/main.rs", "fn main() {}\n");
         scratch.write("data/big.bin", "left out\n");
-        scratch.write("node_modules/dep.js", "ignored by the project\n");
+        scratch.write("node_modules/dep.js", "ignored by the workspace\n");
         scratch.write(".gitignore", "node_modules/\n");
         // The person's own repository: the backup must neither read its history nor write it.
         fs::create_dir_all(scratch.file(".git")).expect("a folder");
@@ -174,7 +174,7 @@ fn the_assets_are_backed_up_apart_and_brought_back_without_losing_a_newer_file()
         let first_id = made(&first).to_owned();
         let git_dir = paths.backup().join("Assets.git");
         assert!(git_dir.is_dir(), "the assets have a git folder of their own");
-        assert!(!paths.backup().join("Project.git").exists(), "the project's backup is not touched");
+        assert!(!paths.backup().join("Code.git").exists(), "the workspace's backup is not touched");
         assert_eq!(snapshot_assets(&engine, &paths, user).expect("a second round"), Snapshot::Unchanged);
 
         fs::write(asset("photo.jpg"), "second\n").expect("a changed asset");

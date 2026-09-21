@@ -27,11 +27,11 @@ use crate::engine::{Engine, EngineKind, Exec, HostUser, detect};
 use crate::profile::harness_live::{build, clear};
 use crate::profile::identity::Home;
 use crate::profile::{AccountKind, HarnessKind, MountAccess, NetworkMode, Profile, SafeName, Template};
-use crate::ui::project::{ContainerPlan, MCP_DIR, ensure_running};
-use crate::workspace::{ProjectId, ProjectPaths};
+use crate::store::{WorkspaceId, WorkspacePaths};
+use crate::ui::workspace::{ContainerPlan, MCP_DIR, ensure_running};
 
-/// The project the containers here belong to, which nobody has.
-const PROJECT: &str = "bridgetest";
+/// The workspace the containers here belong to, which nobody has.
+const WORKSPACE: &str = "bridgetest";
 
 /// The engines installed on this machine, or nothing at all when the tests are switched off.
 fn engines() -> Vec<Engine> {
@@ -44,23 +44,23 @@ fn engines() -> Vec<Engine> {
     found
 }
 
-/// A project folder of this test's own, removed when the test ends.
+/// A workspace folder of this test's own, removed when the test ends.
 struct Scratch(PathBuf);
 
 impl Scratch {
     fn new(name: &str) -> Self {
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
         let path = std::env::temp_dir().join(format!("qcode-bridgelive-{name}-{stamp}"));
-        std::fs::create_dir_all(path.join("Project")).expect("a project folder");
+        std::fs::create_dir_all(path.join("Work")).expect("a workspace folder");
         std::fs::create_dir_all(path.join("Assets")).expect("an assets folder");
         Self(path)
     }
 
-    fn paths(&self) -> ProjectPaths {
-        ProjectPaths {
+    fn paths(&self) -> WorkspacePaths {
+        WorkspacePaths {
             root: self.0.clone(),
-            file: self.0.join("project.qcode"),
-            project: self.0.join("Project"),
+            file: self.0.join("workspace.qcode"),
+            code: self.0.join("Work"),
             assets: self.0.join("Assets"),
             harness: self.0.join("Containers").join("Harness"),
         }
@@ -201,14 +201,14 @@ fn verify(harness: HarnessKind) {
         let kind = engine.kind();
         let scratch = Scratch::new(harness.record().id);
         let paths = scratch.paths();
-        let project = ProjectId::parse(PROJECT).expect("a project id");
-        let plan = ContainerPlan::profile(&project, &paths, &profile);
-        let home = Home::new(profile.name.clone(), project.clone());
+        let workspace = WorkspaceId::parse(WORKSPACE).expect("a workspace id");
+        let plan = ContainerPlan::profile(&workspace, &paths, &profile);
+        let home = Home::new(profile.name.clone(), workspace.clone());
         let _ = capture(&engine.remove_container(&plan.name));
         let _ = capture(&engine.remove_volume(&home.volume()));
         build(&engine, &profile);
 
-        let listener = Listener::open(&paths.mcp()).expect("the project's socket opens");
+        let listener = Listener::open(&paths.mcp()).expect("the workspace's socket opens");
         let (seen, questions) = mpsc::channel();
         let answering = answer_as_qcode(&listener, seen);
         let user = HostUser::current().expect("the current user");

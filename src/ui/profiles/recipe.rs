@@ -272,7 +272,7 @@ mod tests {
 
     #[test]
     fn a_window_gets_its_settings_into_the_home_the_same_way_every_harness_does() {
-        // The file lands in the image's home directory, which is copied into the project's home
+        // The file lands in the image's home directory, which is copied into the workspace's home
         // volume the first time a container of the profile starts and never again, so what the
         // person changes afterwards stays theirs.
         let recipe = image(&profile(HarnessKind::AntigravityIde, Template::Recommended));
@@ -285,7 +285,7 @@ mod tests {
 
     #[test]
     fn a_window_has_no_login_for_the_sign_in_container_to_take() {
-        // The person signs in inside the window, where the application stores it in the project's
+        // The person signs in inside the window, where the application stores it in the workspace's
         // home volume; there is no file to copy out and the script would have nothing to do.
         let script = capture_script(&profile(HarnessKind::AntigravityIde, Template::Base));
         assert_eq!(script, "set -e");

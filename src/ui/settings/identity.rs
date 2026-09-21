@@ -1,4 +1,4 @@
-//! Logins, profile by profile: whether one is stored, refreshing it into the projects that use
+//! Logins, profile by profile: whether one is stored, refreshing it into the workspaces that use
 //! it, and signing out.
 
 use qframe::prelude::*;
@@ -8,8 +8,8 @@ use super::Msg;
 use super::engine::Gate;
 use crate::profile::SafeName;
 
-/// How many faint lines stand in for the profiles while the workspace is being read. Three is
-/// what a first workspace tends to hold; the list replaces them in one frame.
+/// How many faint lines stand in for the profiles while the store is being read. Three is
+/// what a first store tends to hold; the list replaces them in one frame.
 const PLACEHOLDER_LINES: u16 = 3;
 
 /// Cells between the two actions.
@@ -44,7 +44,7 @@ impl ProfileIdentity {
 
 /// Draws the logins: one row per profile with its state, and the two actions on the chosen one.
 ///
-/// `profiles` is `None` while the workspace has not been read yet, which is drawn as faint lines
+/// `profiles` is `None` while the store has not been read yet, which is drawn as faint lines
 /// rather than as an empty state: an empty state there would claim there are no profiles before
 /// anyone has looked.
 pub fn view(profiles: Option<&[ProfileIdentity]>, chosen: usize, engine: &Gate, ui: &mut View<'_, Msg>) {
@@ -117,14 +117,14 @@ mod tests {
 
     #[test]
     fn profiles_that_have_not_been_read_yet_do_not_claim_to_be_none() {
-        // The screen opens before the workspace has been read; an empty state there would be a lie.
+        // The screen opens before the store has been read; an empty state there would be a lie.
         let harness = testing::host(testing::screen(EngineKind::Podman, Health::Working), SIZE.0, SIZE.1);
         let screen = harness.screen();
         assert!(!screen.contains("No profiles yet"), "{screen}");
     }
 
     #[test]
-    fn a_workspace_without_profiles_says_where_they_are_made() {
+    fn a_store_without_profiles_says_where_they_are_made() {
         let harness = with_profiles(Health::Working, &[]);
         let screen = harness.screen();
         assert!(screen.contains("No profiles yet"), "{screen}");
@@ -148,7 +148,7 @@ mod tests {
         let screen = harness.screen();
         assert!(screen.contains("Sign claude-sub out?"), "{screen}");
         assert!(screen.contains("is deleted"), "{screen}");
-        assert!(screen.contains("keep working"), "{screen}");
+        assert!(screen.contains("with their own copy"), "{screen}");
         assert!(harness.app().asked.is_empty(), "nothing happens before the answer");
     }
 
@@ -173,7 +173,7 @@ mod tests {
         let mut harness = with_profiles(Health::Working, &[("claude-sub", true)]);
         harness.click_text("Refresh identity").advance(Duration::from_millis(400));
         let screen = harness.screen();
-        assert!(screen.contains("Every project that uses claude-sub"), "{screen}");
+        assert!(screen.contains("Every workspace that uses claude-sub"), "{screen}");
         assert!(screen.contains("memory and settings stay."), "{screen}");
         harness.click_text("Refresh now");
         assert_eq!(harness.app().asked, [Request::RefreshIdentity(named("claude-sub"))]);

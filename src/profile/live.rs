@@ -1,6 +1,6 @@
 //! The part of the identity copy no argument list can answer for: that a login stored in a
-//! profile's volume really reaches the home volume of every project that uses the profile, that
-//! a project whose harness is running is really left alone, and that a profile without a login
+//! profile's volume really reaches the home volume of every workspace that uses the profile, that
+//! a workspace whose harness is running is really left alone, and that a profile without a login
 //! really gives nothing and makes nothing.
 //!
 //! Every test here is `#[ignore]`d and does nothing unless `QCODE_CONTAINER_TESTS=1`, so
@@ -24,7 +24,7 @@ use crate::engine::{
     Access, ContainerCreate, CopyIn, Engine, EngineKind, Exec, HostUser, ImageBuild, Mount, MountSource, Network,
     detect, names,
 };
-use crate::workspace::ProjectId;
+use crate::store::WorkspaceId;
 
 /// The image the stand-in profile image is built on, named in full: podman refuses a short name
 /// without a terminal to ask at.
@@ -33,8 +33,8 @@ const ALPINE: &str = "docker.io/library/alpine:3";
 /// The profile these tests pretend to be, kept away from any real profile on the machine.
 const PROFILE: &str = "identitytest";
 
-/// The projects that use it.
-const PROJECTS: [&str; 2] = ["identitytest-a", "identitytest-b"];
+/// The workspaces that use it.
+const WORKSPACES: [&str; 2] = ["identitytest-a", "identitytest-b"];
 
 /// The file the stand-in login is, where a Claude Code login would be.
 const LOGIN: &str = ".claude/.credentials.json";
@@ -60,12 +60,12 @@ fn profile() -> SafeName {
     SafeName::parse(PROFILE).expect("the name is safe")
 }
 
-fn projects() -> Vec<ProjectId> {
-    PROJECTS.iter().map(|id| ProjectId::parse(id).expect("the id is legal")).collect()
+fn workspaces() -> Vec<WorkspaceId> {
+    WORKSPACES.iter().map(|id| WorkspaceId::parse(id).expect("the id is legal")).collect()
 }
 
 fn homes() -> Vec<Home> {
-    projects().into_iter().map(|project| Home::new(profile(), project)).collect()
+    workspaces().into_iter().map(|workspace| Home::new(profile(), workspace)).collect()
 }
 
 fn user() -> HostUser {
@@ -152,7 +152,7 @@ fn login_in(engine: &Engine, home: &Home) -> Option<String> {
 fn clear(engine: &Engine) {
     for home in homes() {
         let _ = capture(&engine.remove_container(&home.container()));
-        let _ = capture(&engine.remove_container(&format!("qcode-refresh-{}-{}", home.project(), home.profile())));
+        let _ = capture(&engine.remove_container(&format!("qcode-refresh-{}-{}", home.workspace(), home.profile())));
         let _ = capture(&engine.remove_volume(&home.volume()));
     }
     for container in [SEED, READER] {
@@ -164,21 +164,21 @@ fn clear(engine: &Engine) {
 
 #[test]
 #[ignore = "needs a container engine; run with QCODE_CONTAINER_TESTS=1"]
-fn a_stored_login_reaches_the_home_of_every_project_that_uses_the_profile() {
+fn a_stored_login_reaches_the_home_of_every_workspace_that_uses_the_profile() {
     for engine in engines() {
         clear(&engine);
         stand_in_image(&engine);
         seed_login(&engine, "first");
 
-        let done = identity::refresh_all(&engine, &profile(), &projects(), user()).expect("the copies are made");
-        assert_eq!(done, Refreshed { written: projects(), running: Vec::new() }, "{:?}", engine.kind());
+        let done = identity::refresh_all(&engine, &profile(), &workspaces(), user()).expect("the copies are made");
+        assert_eq!(done, Refreshed { written: workspaces(), running: Vec::new() }, "{:?}", engine.kind());
         for home in homes() {
             assert_eq!(login_in(&engine, &home).as_deref(), Some("first"), "{:?}: {}", engine.kind(), home.volume());
         }
 
-        // A second login replaces the first in every project: that is what refreshing means.
+        // A second login replaces the first in every workspace: that is what refreshing means.
         seed_login(&engine, "second");
-        identity::refresh_all(&engine, &profile(), &projects(), user()).expect("the copies are made again");
+        identity::refresh_all(&engine, &profile(), &workspaces(), user()).expect("the copies are made again");
         for home in homes() {
             assert_eq!(login_in(&engine, &home).as_deref(), Some("second"), "{:?}: {}", engine.kind(), home.volume());
         }
@@ -188,14 +188,14 @@ fn a_stored_login_reaches_the_home_of_every_project_that_uses_the_profile() {
 
 #[test]
 #[ignore = "needs a container engine; run with QCODE_CONTAINER_TESTS=1"]
-fn a_project_whose_harness_is_running_is_left_alone_and_named() {
+fn a_workspace_whose_harness_is_running_is_left_alone_and_named() {
     for engine in engines() {
         clear(&engine);
         stand_in_image(&engine);
         seed_login(&engine, "first");
-        identity::refresh_all(&engine, &profile(), &projects(), user()).expect("the copies are made");
+        identity::refresh_all(&engine, &profile(), &workspaces(), user()).expect("the copies are made");
 
-        // The first project's container is up, standing in for a harness someone is using.
+        // The first workspace's container is up, standing in for a harness someone is using.
         let [busy, idle] = homes().try_into().expect("two homes");
         let mounts = [Mount {
             source: MountSource::Volume(&busy.volume()),
@@ -217,10 +217,10 @@ fn a_project_whose_harness_is_running_is_left_alone_and_named() {
         capture(&engine.start_container(&busy.container())).expect("the busy container starts");
 
         seed_login(&engine, "second");
-        let done = identity::refresh_all(&engine, &profile(), &projects(), user()).expect("the round completes");
+        let done = identity::refresh_all(&engine, &profile(), &workspaces(), user()).expect("the round completes");
         assert_eq!(
             done,
-            Refreshed { written: vec![idle.project().clone()], running: vec![busy.project().clone()] },
+            Refreshed { written: vec![idle.workspace().clone()], running: vec![busy.workspace().clone()] },
             "{:?}",
             engine.kind()
         );
@@ -239,7 +239,7 @@ fn a_profile_without_a_login_gives_nothing_and_makes_no_volume() {
         stand_in_image(&engine);
         let store = names::credential_volume(PROFILE);
 
-        let refused = identity::refresh_all(&engine, &profile(), &projects(), user()).expect_err("nothing to give");
+        let refused = identity::refresh_all(&engine, &profile(), &workspaces(), user()).expect_err("nothing to give");
         assert_eq!(refused, RefreshError::NotStored, "{:?}", engine.kind());
 
         let [home, _] = homes().try_into().expect("two homes");

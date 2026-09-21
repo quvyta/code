@@ -2,7 +2,7 @@
 //! there.
 //!
 //! Each harness reads the MCP servers it starts from a settings file in its home directory, which
-//! in QCode is the project's home volume for the profile. The file belongs to the person and to
+//! in QCode is the workspace's home volume for the profile. The file belongs to the person and to
 //! the harness: either may have written servers, options and comments into it. So the file is
 //! never written from scratch. It is read, the one entry named [`SERVER_NAME`] is added when it is
 //! missing, and the file is written back only when that changed it:
@@ -43,7 +43,7 @@ pub enum Unregistered {
 const ABSENT: i32 = 3;
 
 /// Registers the server in the settings of `harness` inside the running container `container`,
-/// whose home is the project's home volume for the profile.
+/// whose home is the workspace's home volume for the profile.
 ///
 /// The file is read and written by a shell in the container, because a volume is only reached
 /// through a container, and the new text goes through the shell's input, because a harness's
@@ -255,7 +255,7 @@ mod tests {
         let existing = r#"{
   "numStartups": 4,
   "mcpServers": { "github": { "type": "stdio", "command": "gh-mcp", "args": [] } },
-  "projects": { "/work/Project": { "allowedTools": [] } }
+  "projects": { "/work": { "allowedTools": [] } }
 }"#;
         let result = json(&written(merge(McpShape::Claude, Some(existing))));
         assert_eq!(result["numStartups"], 4);
@@ -263,7 +263,7 @@ mod tests {
         assert_eq!(result["mcpServers"]["qcode"]["type"], "stdio");
         assert_eq!(result["mcpServers"]["qcode"]["command"], "node");
         assert_eq!(result["mcpServers"]["qcode"]["args"][0], SCRIPT);
-        assert!(result["projects"]["/work/Project"].is_object());
+        assert!(result["projects"]["/work"].is_object());
         let order: Vec<&String> = result.as_object().expect("an object").keys().collect();
         assert_eq!(order, ["numStartups", "mcpServers", "projects"], "keys stay where they were");
     }

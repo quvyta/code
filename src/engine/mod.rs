@@ -18,6 +18,7 @@ pub use command::{
     Access, ContainerCreate, CopyIn, CopyOut, EngineCommand, Exec, HostUser, ImageBuild, Mount, MountSource, Network,
     RunAttached, RunOnce, RunWindow, Socket, Tmpfs,
 };
+pub(crate) use detect::installed;
 pub use detect::{Unavailable, detect};
 pub use state::{Container, ContainerState};
 

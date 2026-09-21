@@ -1,24 +1,24 @@
-//! The conversations backup: each profile's conversations in a project, kept apart from the
-//! project's own backup and brought back from any snapshot.
+//! The conversations backup: each profile's conversations in a workspace, kept apart from the
+//! workspace's own backup and brought back from any snapshot.
 //!
 //! ```text
-//! Projects/<project>/
+//! Workspaces/<workspace>/
 //!   Backup/
 //!     Conversations/
 //!       <profile>.git    the snapshots of one profile's conversations
 //!       <profile>.lock   held while a snapshot or a restore of them runs
 //! ```
 //!
-//! A harness keeps its conversations in the project's home volume for the profile, which the
+//! A harness keeps its conversations in the workspace's home volume for the profile, which the
 //! machine cannot read by itself, so every job is a one-off container of the base image that
 //! mounts the volume at the home directory and `Backup/` beside it. git runs there with the
-//! settings the project's backup gives it, with the home as its tree, and takes only the paths
+//! settings the workspace's backup gives it, with the home as its tree, and takes only the paths
 //! [`HarnessKind::conversation_paths`] names: the home also holds the login, and `Backup/` is a
 //! plain folder on the machine.
 //!
-//! Each profile has a lock of its own rather than the project's `backup.lock`. The git folders
+//! Each profile has a lock of its own rather than the workspace's `backup.lock`. The git folders
 //! are separate, so nothing is gained by one waiting for another, and a round that found the
-//! project's lock taken would be skipped as covered when nothing covers it.
+//! workspace's lock taken would be skipped as covered when nothing covers it.
 //!
 //! Everything public here runs engine commands and waits for them, so it belongs on a
 //! background thread.
@@ -37,7 +37,7 @@ use crate::engine::run::capture;
 use crate::engine::{Access, ContainerState, Engine, EngineCommand, HostUser, Mount, MountSource, Network, RunOnce};
 use crate::profile::HarnessKind;
 use crate::profile::identity::{self, Home};
-use crate::workspace::ProjectPaths;
+use crate::store::WorkspacePaths;
 
 /// The folder inside `Backup/` that holds every profile's git folder and lock.
 const FOLDER: &str = "Conversations";
@@ -45,7 +45,7 @@ const FOLDER: &str = "Conversations";
 /// The preamble of every script here, and the one thing added to it: git reads no settings
 /// from the home it looks at. A `.gitconfig` there was written by whatever ran in the profile's
 /// container, and a setting such as `core.fsmonitor` names a program git would run, in a job
-/// that can write to every backup of the project.
+/// that can write to every backup of the workspace.
 macro_rules! start {
     () => {
         concat!(preamble!(), "export HOME=/tmp XDG_CONFIG_HOME=/tmp GIT_CONFIG_GLOBAL=/dev/null\n")
@@ -57,7 +57,7 @@ macro_rules! start {
 /// A path is taken when it is there, or when the last snapshot had it, so that a file gone
 /// since (a journal SQLite folded back into its database) leaves the snapshot too. A path that
 /// is neither would make git stop at an unknown pathspec, so it is dropped first. The answer is
-/// read as the project's is: `made <id> <time>` or `unchanged`.
+/// read as the workspace's is: `made <id> <time>` or `unchanged`.
 const SNAPSHOT: &str = concat!(
     start!(),
     "m=\"$1\"; shift\n",
@@ -79,7 +79,7 @@ const SNAPSHOT: &str = concat!(
     "g gc --auto --quiet\n",
 );
 
-/// Lists the snapshots, newest first, in the shape the project's list has.
+/// Lists the snapshots, newest first, in the shape the workspace's list has.
 const HISTORY: &str = concat!(
     start!(),
     "[ -d \"$d\" ] || exit 0\n",
@@ -90,7 +90,7 @@ const HISTORY: &str = concat!(
 /// Brings the snapshot `$1` back. `$2` is the harness's database, empty when it has none, and
 /// the rest are its journals.
 ///
-/// `--overlay`, as for the project: a conversation the snapshot does not have stays. The one
+/// `--overlay`, as for the workspace: a conversation the snapshot does not have stays. The one
 /// thing taken away is a journal the snapshot did not have, and only when the snapshot has the
 /// database: a journal belongs to the database it was written with and would be replayed into
 /// an older one. The snapshot taken just before holds it.
@@ -106,11 +106,11 @@ const RESTORE: &str = concat!(
 /// What one round of [`snapshot`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Taken {
-    /// The round ran, or was skipped for another QCode running it, as the project's does.
+    /// The round ran, or was skipped for another QCode running it, as the workspace's does.
     Done(Snapshot),
     /// The harness keeps its conversations in a database and its container is running, so a
     /// copy could be torn. Nothing was touched; the round belongs to when the container stops,
-    /// as the project closes or QCode quits.
+    /// as the workspace closes or QCode quits.
     Running,
 }
 
@@ -122,7 +122,7 @@ pub enum Brought {
     /// The profile's container is running, and the files of a running harness are not changed
     /// under it. Nothing was touched; the container is stopped first.
     Running,
-    /// The project has no home for the profile any more, so there is nowhere to bring the
+    /// The workspace has no home for the profile any more, so there is nowhere to bring the
     /// conversations back to. Nothing was made: a home that comes into being here would never
     /// be given the profile's login.
     NoHome,
@@ -139,7 +139,7 @@ pub enum Brought {
 /// A `Backup/` that cannot be made, and the engine's or git's own words when the job fails.
 pub fn snapshot(
     engine: &Engine,
-    paths: &ProjectPaths,
+    paths: &WorkspacePaths,
     home: &Home,
     harness: HarnessKind,
     user: HostUser,
@@ -160,7 +160,12 @@ pub fn snapshot(
 /// # Errors
 ///
 /// The engine's or git's own words when the listing fails.
-pub fn history(engine: &Engine, paths: &ProjectPaths, home: &Home, user: HostUser) -> Result<Vec<Entry>, BackupError> {
+pub fn history(
+    engine: &Engine,
+    paths: &WorkspacePaths,
+    home: &Home,
+    user: HostUser,
+) -> Result<Vec<Entry>, BackupError> {
     if !git_dir(paths, home).is_dir() {
         return Ok(Vec::new());
     }
@@ -170,7 +175,7 @@ pub fn history(engine: &Engine, paths: &ProjectPaths, home: &Home, user: HostUse
 /// Brings the conversations of the snapshot `id` back into `home`, after a snapshot of how they
 /// are now, while the profile's container is stopped.
 ///
-/// A conversation made after `id` stays, as a file made after a project snapshot does.
+/// A conversation made after `id` stays, as a file made after a workspace snapshot does.
 ///
 /// # Errors
 ///
@@ -178,7 +183,7 @@ pub fn history(engine: &Engine, paths: &ProjectPaths, home: &Home, user: HostUse
 /// backup does not have among them.
 pub fn restore(
     engine: &Engine,
-    paths: &ProjectPaths,
+    paths: &WorkspacePaths,
     home: &Home,
     harness: HarnessKind,
     user: HostUser,
@@ -199,7 +204,7 @@ pub fn restore(
 /// Runs a snapshot job, with the lock already held.
 fn take(
     engine: &Engine,
-    paths: &ProjectPaths,
+    paths: &WorkspacePaths,
     home: &Home,
     harness: HarnessKind,
     user: HostUser,
@@ -225,23 +230,23 @@ fn running(engine: &Engine, home: &Home) -> bool {
     !matches!(state, None | Some(ContainerState::Created | ContainerState::Exited | ContainerState::Dead))
 }
 
-/// Makes `Backup/Conversations/` and takes the profile's lock there, as the project's
+/// Makes `Backup/Conversations/` and takes the profile's lock there, as the workspace's
 /// [`hold`](super::hold) does.
-fn hold(paths: &ProjectPaths, home: &Home) -> Result<Option<Held>, BackupError> {
+fn hold(paths: &WorkspacePaths, home: &Home) -> Result<Option<Held>, BackupError> {
     let folder = paths.backup().join(FOLDER);
     std::fs::create_dir_all(&folder).map_err(BackupError::Host)?;
     lock(&folder.join(format!("{}.lock", home.profile())))
 }
 
 /// The profile's git folder on the machine.
-fn git_dir(paths: &ProjectPaths, home: &Home) -> PathBuf {
+fn git_dir(paths: &WorkspacePaths, home: &Home) -> PathBuf {
     paths.backup().join(FOLDER).join(format!("{}.git", home.profile()))
 }
 
 /// The command that takes a snapshot of `harness`'s conversations in `home`.
 fn snapshot_job(
     engine: &Engine,
-    paths: &ProjectPaths,
+    paths: &WorkspacePaths,
     home: &Home,
     harness: HarnessKind,
     user: HostUser,
@@ -254,14 +259,14 @@ fn snapshot_job(
 
 /// The command that lists the snapshots. It has no use for the home and does not mount it, so
 /// a home that is gone is not made again by asking.
-fn history_job(engine: &Engine, paths: &ProjectPaths, home: &Home, user: HostUser) -> EngineCommand {
+fn history_job(engine: &Engine, paths: &WorkspacePaths, home: &Home, user: HostUser) -> EngineCommand {
     one_off(engine, paths, home, None, user, HISTORY, &[])
 }
 
 /// The command that brings the snapshot `id` back into `home`.
 fn restore_job(
     engine: &Engine,
-    paths: &ProjectPaths,
+    paths: &WorkspacePaths,
     home: &Home,
     harness: HarnessKind,
     user: HostUser,
@@ -282,7 +287,7 @@ fn restore_job(
 /// It starts in the home, because git reads the paths it is given as relative to where it is.
 fn one_off(
     engine: &Engine,
-    paths: &ProjectPaths,
+    paths: &WorkspacePaths,
     home: &Home,
     access: Option<Access>,
     user: HostUser,
@@ -318,28 +323,28 @@ mod tests {
     use crate::engine::{Engine, EngineCommand, EngineKind, HostUser};
     use crate::profile::identity::Home;
     use crate::profile::{HarnessKind, SafeName};
-    use crate::workspace::{ProjectId, ProjectPaths};
+    use crate::store::{WorkspaceId, WorkspacePaths};
     use std::path::PathBuf;
 
     const ID: &str = "0123456789abcdef0123456789abcdef01234567";
     const ME: HostUser = HostUser::Ids { uid: 1000, gid: 1000 };
 
-    fn paths_at(root: PathBuf) -> ProjectPaths {
-        ProjectPaths {
-            file: root.join("project.qcode"),
-            project: root.join("Project"),
+    fn paths_at(root: PathBuf) -> WorkspacePaths {
+        WorkspacePaths {
+            file: root.join("workspace.qcode"),
+            code: root.join("Work"),
             assets: root.join("Assets"),
             harness: root.join("Containers").join("Harness"),
             root,
         }
     }
 
-    fn paths() -> ProjectPaths {
-        paths_at(PathBuf::from("/home/me/QCode/Projects/p"))
+    fn paths() -> WorkspacePaths {
+        paths_at(PathBuf::from("/home/me/QCode/Workspaces/p"))
     }
 
     fn home() -> Home {
-        Home::new(SafeName::parse("chat").expect("a name"), ProjectId::parse("p").expect("an id"))
+        Home::new(SafeName::parse("chat").expect("a name"), WorkspaceId::parse("p").expect("an id"))
     }
 
     fn podman() -> Engine {
@@ -360,7 +365,7 @@ mod tests {
         }
         words.extend([
             "--volume",
-            "/home/me/QCode/Projects/p/Backup:/work/Backup:rw,z",
+            "/home/me/QCode/Workspaces/p/Backup:/backup:rw,z",
             "--workdir",
             "/home/qcode",
             "qcode/base",
@@ -368,7 +373,7 @@ mod tests {
             "-c",
             script,
             "sh",
-            "/work/Backup/Conversations/chat.git",
+            "/backup/Conversations/chat.git",
             "/home/qcode",
         ]);
         words.into_iter().map(str::to_owned).collect()
@@ -451,7 +456,7 @@ mod tests {
         assert!(RESTORE.contains("g cat-file -e \"$id:$db\""), "a journal is only removed beside its database");
     }
 
-    /// A project folder of this test's own, removed again when the test ends.
+    /// A workspace folder of this test's own, removed again when the test ends.
     struct Scratch(PathBuf);
 
     impl Scratch {
@@ -459,7 +464,7 @@ mod tests {
             let stamp =
                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
             let path = std::env::temp_dir().join(format!("qcode-conversations-{name}-{stamp}"));
-            std::fs::create_dir_all(&path).expect("a project folder");
+            std::fs::create_dir_all(&path).expect("a workspace folder");
             Self(path)
         }
     }
@@ -526,14 +531,14 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn the_projects_own_backup_does_not_hold_up_the_conversations_but_the_same_profile_does() {
+    fn the_workspaces_own_backup_does_not_hold_up_the_conversations_but_the_same_profile_does() {
         let scratch = Scratch::new("lock");
         let paths = paths_at(scratch.0.clone());
         let (engine, _) = always_running(&scratch);
-        let project = super::super::hold(&paths).expect("Backup/ is made").expect("nobody holds it");
+        let workspace = super::super::hold(&paths).expect("Backup/ is made").expect("nobody holds it");
         let taken = snapshot(&engine, &paths, &home(), HarnessKind::OpenCode, ME).expect("asked");
-        assert_eq!(taken, Taken::Running, "the project's lock kept the round from even asking");
-        drop(project);
+        assert_eq!(taken, Taken::Running, "the workspace's lock kept the round from even asking");
+        drop(workspace);
 
         // A program another test thread is starting holds a copy of the lock the round above
         // took between `fork` and `exec`, so it is free once that copy closes too.

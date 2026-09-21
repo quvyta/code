@@ -5,7 +5,7 @@
 //! nine files at once rather than trusting anyone to remember.
 
 use qcode::locales;
-use qcode::workspace::Config;
+use qcode::store::Config;
 use qframe::i18n::I18n;
 
 /// The languages QCode speaks, and the order the wizard offers them in. It is the list the
@@ -52,6 +52,25 @@ fn every_language_names_every_language_the_wizard_offers() {
             let name = catalog.translate(&key, &[]);
             assert!(!name.starts_with('⟦'), "{code} has no name for {offered}");
             assert!(!name.is_empty(), "{code} leaves {offered} nameless");
+        }
+    }
+}
+
+#[test]
+fn the_engine_step_speaks_each_language_in_its_own_words() {
+    // Nine files with every key is not nine languages: a file whose values are all English
+    // passes the completeness gate above and still leaves the person reading English. What the
+    // engine step says about installing is new, so it is checked word by word.
+    let mut catalog = catalog();
+    let keys = ["install-here", "install-myself", "installing", "install-failed", "never-installs"];
+    catalog.set_active("en");
+    let english: Vec<String> = keys.iter().map(|key| catalog.translate(&format!("setup.{key}"), &[])).collect();
+    for code in CODES.iter().filter(|code| **code != "en") {
+        catalog.set_active(code);
+        for (key, english) in keys.iter().zip(&english) {
+            let said = catalog.translate(&format!("setup.{key}"), &[]);
+            assert!(!said.starts_with('⟦') && !said.is_empty(), "{code} has no words for setup.{key}");
+            assert_ne!(&said, english, "{code} still says setup.{key} in English");
         }
     }
 }

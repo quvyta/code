@@ -50,8 +50,7 @@ pub enum Unavailable {
 ///
 /// When the engine is missing, or is there and not working, with the two told apart.
 pub fn detect(kind: EngineKind) -> Result<Engine, Unavailable> {
-    let name = format!("{}{}", kind.dialect().binary, std::env::consts::EXE_SUFFIX);
-    let Some(bin) = lookup(&name, &search_dirs(), &|path| path.is_file()) else {
+    let Some(bin) = find(kind.dialect().binary) else {
         return Err(Unavailable::NotInstalled);
     };
     let engine = Engine::new(kind, bin);
@@ -102,6 +101,18 @@ fn classify(kind: EngineKind, code: Option<i32>, output: &str) -> Unavailable {
         }
         _ => Unavailable::InfoFailed { code, output: output.to_owned() },
     }
+}
+
+/// Where `tool` is on this machine, if it is anywhere QCode looks. The platform's executable
+/// suffix is added here, so callers name the program the way people say it.
+fn find(tool: &str) -> Option<PathBuf> {
+    let name = format!("{tool}{}", std::env::consts::EXE_SUFFIX);
+    lookup(&name, &search_dirs(), &|path| path.is_file())
+}
+
+/// Whether `tool` is on this machine, looked for in the same places [`detect`] looks.
+pub(crate) fn installed(tool: &str) -> bool {
+    find(tool).is_some()
 }
 
 /// Finds `name` in `dirs`, in order, asking `exists` about each place.

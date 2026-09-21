@@ -1,26 +1,26 @@
-//! The paths a person names inside `Project/`: a folder to leave out of the backup, a file to
+//! The paths a person names inside `Work/`: a folder to leave out of the backup, a file to
 //! bring back.
 //!
-//! They come from the project file and from the file tree, and they end up in two places that
+//! They come from the workspace file and from the file tree, and they end up in two places that
 //! read them in their own way: git's `info/exclude`, where `*`, `[` or a leading `!` would mean
 //! something, and a git command line. So each one is held to what it is meant to be — a path
-//! inside the project — before it goes anywhere, and is written out so git reads it as the path
+//! inside the workspace — before it goes anywhere, and is written out so git reads it as the path
 //! it is and nothing more.
 
 use std::fmt;
 
-/// A path inside `Project/`, checked, with `/` between its parts and no `/` at either end.
+/// A path inside `Work/`, checked, with `/` between its parts and no `/` at either end.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Place(String);
 
-/// Why a path is not a place inside the project.
+/// Why a path is not a place inside the workspace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaceProblem {
     /// Nothing is named.
     Empty,
-    /// It starts at the root of a drive or of the machine rather than inside the project.
+    /// It starts at the root of a drive or of the machine rather than inside the workspace.
     Absolute,
-    /// A `.` or `..` part: the one could name the whole project, the other leaves it.
+    /// A `.` or `..` part: the one could name the whole workspace, the other leaves it.
     Outside,
     /// A line break or a NUL, which no exclude file and no command line would read as one path.
     LineBreak,
@@ -36,7 +36,7 @@ pub struct BadPlace {
 }
 
 impl Place {
-    /// `path` as a place inside the project, when it is one.
+    /// `path` as a place inside the workspace, when it is one.
     ///
     /// A `/` at the end is dropped, because the file tree names a folder either way; `\` is not
     /// read as a separator, because on the machines whose file names may hold one it is a
@@ -44,7 +44,7 @@ impl Place {
     ///
     /// # Errors
     ///
-    /// The path and why it is not a place inside the project.
+    /// The path and why it is not a place inside the workspace.
     pub fn new(path: &str) -> Result<Self, BadPlace> {
         let refuse = |problem| Err(BadPlace { path: path.to_owned(), problem });
         if path.contains(['\n', '\r', '\0']) {
@@ -77,7 +77,7 @@ impl Place {
 
     /// The line of an exclude file that leaves this place out and nothing else.
     ///
-    /// The leading `/` ties it to the top of the project, so `data` leaves out `data/` and not
+    /// The leading `/` ties it to the top of the workspace, so `data` leaves out `data/` and not
     /// every folder called `data` further down; every character git would read as a pattern is
     /// escaped, and so is every space, because git drops the ones at the end of a line.
     fn exclude_line(&self) -> String {
@@ -104,7 +104,7 @@ fn is_drive(path: &str) -> bool {
     chars.next().is_some_and(|first| first.is_ascii_alphabetic()) && chars.next() == Some(':')
 }
 
-/// Every entry of a skip list as a place inside the project.
+/// Every entry of a skip list as a place inside the workspace.
 ///
 /// # Errors
 ///
@@ -129,7 +129,7 @@ mod tests {
     }
 
     #[test]
-    fn a_path_inside_the_project_is_kept_as_it_is_named() {
+    fn a_path_inside_the_workspace_is_kept_as_it_is_named() {
         assert_eq!(Place::new("data").expect("a folder").as_str(), "data");
         assert_eq!(Place::new("out/big/").expect("a folder").as_str(), "out/big");
         assert_eq!(Place::new("out//big").expect("a folder").as_str(), "out/big");
@@ -138,7 +138,7 @@ mod tests {
     }
 
     #[test]
-    fn a_path_that_leaves_the_project_is_refused() {
+    fn a_path_that_leaves_the_workspace_is_refused() {
         assert_eq!(problem(""), PlaceProblem::Empty);
         assert_eq!(problem("/"), PlaceProblem::Absolute);
         assert_eq!(problem("/etc"), PlaceProblem::Absolute);
@@ -155,7 +155,7 @@ mod tests {
     #[test]
     fn one_bad_entry_refuses_the_whole_list() {
         let skip = ["data".to_owned(), "../home".to_owned()];
-        let bad = places(&skip).expect_err("one entry leaves the project");
+        let bad = places(&skip).expect_err("one entry leaves the workspace");
         assert_eq!(bad.path, "../home");
         assert_eq!(bad.problem, PlaceProblem::Outside);
     }

@@ -22,8 +22,8 @@ use std::path::{Path, PathBuf};
 /// terminal to ask at.
 const ALPINE: &str = "docker.io/library/alpine:3";
 
-/// The project these tests pretend to be, kept away from any real QCode project on the machine.
-const PROJECT: &str = "enginelivetest";
+/// The workspace these tests pretend to be, kept away from any real QCode workspace on the machine.
+const WORKSPACE: &str = "enginelivetest";
 
 /// The profile these tests pretend to be.
 const PROFILE: &str = "live";
@@ -98,8 +98,8 @@ fn an_installed_engine_is_found_and_answers() {
 fn builds_an_image_then_lives_a_container_through_its_whole_life() {
     for engine in engines() {
         let image = profile_image(PROFILE);
-        let container = profile_container(PROJECT, PROFILE);
-        let home = home_volume(PROJECT, PROFILE);
+        let container = profile_container(WORKSPACE, PROFILE);
+        let home = home_volume(WORKSPACE, PROFILE);
         clear(&engine, &[&container], &[&home], &[&image]);
 
         let scratch = Scratch::new("build");
@@ -117,14 +117,10 @@ fn builds_an_image_then_lives_a_container_through_its_whole_life() {
         capture(&engine.image_exists(&image)).expect("the image it just built is there");
 
         capture(&engine.create_volume(&home)).expect("a volume is made");
-        let project = scratch.path().join("Project");
-        std::fs::create_dir_all(&project).expect("a project folder");
+        let workspace = scratch.path().join("Work");
+        std::fs::create_dir_all(&workspace).expect("a workspace folder");
         let mounts = [
-            Mount {
-                source: MountSource::Path(&project),
-                target: Path::new("/work/Project"),
-                access: Access::ReadWrite,
-            },
+            Mount { source: MountSource::Path(&workspace), target: Path::new("/work"), access: Access::ReadWrite },
             Mount { source: MountSource::Volume(&home), target: Path::new("/home/qcode"), access: Access::ReadWrite },
         ];
         capture(&engine.create_container(&ContainerCreate {
@@ -135,7 +131,7 @@ fn builds_an_image_then_lives_a_container_through_its_whole_life() {
             mounts: &mounts,
             network: Network::Full,
             user: HostUser::current().expect("the current user"),
-            workdir: Some(Path::new("/work/Project")),
+            workdir: Some(Path::new("/work")),
             command: &["sleep", "600"],
         }))
         .expect("the container is made");
@@ -149,10 +145,10 @@ fn builds_an_image_then_lives_a_container_through_its_whole_life() {
 
         // The engines only take `exec --tty` from a real terminal, which is how QCode uses it,
         // so this one goes through a pseudo-terminal like a tab does.
-        let exec = engine
-            .exec(&Exec { container: &container, command: &["sh", "-c", "cp /qcode-marker /work/Project/marker"] });
+        let exec =
+            engine.exec(&Exec { container: &container, command: &["sh", "-c", "cp /qcode-marker /work/marker"] });
         assert_eq!(in_a_terminal(&exec), Some(0), "exec ran inside the container");
-        let copied = std::fs::read_to_string(project.join("marker")).expect("the mount reaches the host");
+        let copied = std::fs::read_to_string(workspace.join("marker")).expect("the mount reaches the host");
         assert_eq!(copied.trim(), "built-by-qcode");
 
         capture(&engine.stop_container(&container)).expect("the container stops");
@@ -170,7 +166,7 @@ fn builds_an_image_then_lives_a_container_through_its_whole_life() {
 fn carries_a_credential_into_a_volume_and_back_out() {
     for engine in engines() {
         let volume = credential_volume(PROFILE);
-        let container = base_container(PROJECT);
+        let container = base_container(WORKSPACE);
         clear(&engine, &[&container], &[&volume], &[]);
 
         let scratch = Scratch::new("volume");

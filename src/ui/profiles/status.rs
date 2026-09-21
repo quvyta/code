@@ -56,7 +56,7 @@ impl Row {
         Self { profile, image: Readiness::Unknown, identity: Readiness::Unknown }
     }
 
-    /// Whether a project could open this profile right now: the image is there and so is a
+    /// Whether a workspace could open this profile right now: the image is there and so is a
     /// login, unless the profile signs in to nothing. An unknown answer is not a yes.
     #[must_use]
     pub fn is_runnable(&self) -> bool {

@@ -1,5 +1,5 @@
-//! The project's socket: QCode listens on it while the project is open, and the server in every
-//! profile container of the project asks its questions through it.
+//! The workspace's socket: QCode listens on it while the workspace is open, and the server in every
+//! profile container of the workspace asks its questions through it.
 //!
 //! A unix socket rather than a port, because a profile without the network has no network to
 //! reach a port through, while a socket is a file in a folder the container mounts. One thread
@@ -7,7 +7,7 @@
 //! the screen through the [`Inbox`] and writes back whatever the screen answers. The screen
 //! decides everything; this module only carries lines.
 //!
-//! Where the system has no unix sockets, [`Listener::open`] says so and the project has no
+//! Where the system has no unix sockets, [`Listener::open`] says so and the workspace has no
 //! bridge; nothing else changes.
 
 use std::io;
@@ -69,7 +69,7 @@ impl Inbox {
     }
 }
 
-/// A project's socket, listened on for as long as this value lives.
+/// A workspace's socket, listened on for as long as this value lives.
 #[derive(Debug)]
 pub struct Listener {
     socket: PathBuf,
@@ -79,11 +79,11 @@ pub struct Listener {
 }
 
 impl Listener {
-    /// Listens in `folder`, the project's `Containers/MCP/`: makes the folder, writes the
+    /// Listens in `folder`, the workspace's `Containers/MCP/`: makes the folder, writes the
     /// server beside where the socket goes, and starts waiting for connections.
     ///
     /// A socket left behind by a QCode that ended without clearing it is replaced; one another
-    /// QCode still answers on is left to it, and this QCode has no bridge for the project.
+    /// QCode still answers on is left to it, and this QCode has no bridge for the workspace.
     ///
     /// # Errors
     ///
@@ -115,7 +115,7 @@ impl Listener {
 }
 
 /// Writes the server into `folder` unless it is there already as this QCode carries it, so a
-/// project opened again rewrites nothing.
+/// workspace opened again rewrites nothing.
 fn write_script(folder: &Path) -> io::Result<()> {
     let path = folder.join(SCRIPT_NAME);
     if std::fs::read(&path).is_ok_and(|written| written == SCRIPT.as_bytes()) {
@@ -138,7 +138,7 @@ mod unix {
     use super::{ANSWER_WAIT, Call, Inbox, Listener, MOST_CONNECTIONS, QUESTION_WAIT, SOCKET_NAME, write_script};
 
     /// The longest socket path the system takes, less the byte its terminator needs. A path the
-    /// workspace makes longer is reached through the folder's handle instead (see [`reach`]).
+    /// store makes longer is reached through the folder's handle instead (see [`reach`]).
     const MOST_PATH: usize = 107;
 
     pub(super) fn open(folder: &Path) -> io::Result<Listener> {
@@ -356,7 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn a_workspace_deep_enough_to_outgrow_a_socket_address_still_gets_its_socket() {
+    fn a_store_deep_enough_to_outgrow_a_socket_address_still_gets_its_socket() {
         let scratch = Scratch::new("deep");
         let deep = scratch.0.join("a-folder-name-long-enough".repeat(4)).join("Containers").join("MCP");
         assert!(deep.join(SOCKET_NAME).as_os_str().len() > 108, "{}", deep.display());

@@ -20,7 +20,7 @@ use std::process::Command;
 use qframe::storage::config_dir;
 
 use crate::engine::HostUser;
-use crate::workspace::{Platform, Registry};
+use crate::store::{Platform, Registry};
 
 /// The unit that runs the reaper once.
 pub const SERVICE_UNIT: &str = "qcode-reaper.service";

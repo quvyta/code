@@ -93,10 +93,10 @@ impl NetworkMode {
 }
 
 impl Profile {
-    /// How `Project/` is mounted. The project's own directory is what the harness is there to
+    /// How `Work/` is mounted. The workspace's own directory is what the harness is there to
     /// work on, so it is writable in every profile and the file carries the choice only to be
     /// readable.
-    pub const PROJECT_MOUNT: MountAccess = MountAccess::ReadWrite;
+    pub const CODE_MOUNT: MountAccess = MountAccess::ReadWrite;
 
     /// The image the profile's containers are started from, which follows from the name and is
     /// never stored twice.
@@ -170,7 +170,7 @@ impl Profile {
         Loaded { profile: Some(profile), diagnostics }
     }
 
-    /// The definition file for this profile, as it is written to the workspace.
+    /// The definition file for this profile, as it is written to the store.
     #[must_use]
     pub fn to_toml(&self) -> String {
         let mut settings = Settings::in_memory();
@@ -179,7 +179,7 @@ impl Profile {
         settings.set(TEMPLATE, self.template.id().to_owned());
         settings.set(ACCOUNT, self.account.id().to_owned());
         settings.set(IMAGE, self.image());
-        settings.set(&format!("{MOUNTS}.{PROJECT}"), Self::PROJECT_MOUNT.id().to_owned());
+        settings.set(&format!("{MOUNTS}.{CODE}"), Self::CODE_MOUNT.id().to_owned());
         settings.set(&format!("{MOUNTS}.{ASSETS}"), self.assets.id().to_owned());
         settings.set(&format!("{NETWORK}.{MODE}"), self.network.id().to_owned());
         settings.to_toml()
@@ -198,8 +198,13 @@ const ACCOUNT: &str = "account";
 const IMAGE: &str = "image";
 /// The table of mount accesses.
 const MOUNTS: &str = "mounts";
-/// The key, below `[mounts]`, of the access `Project/` is mounted with.
-const PROJECT: &str = "project";
+/// The key, below `[mounts]`, of the access `Work/` is mounted with. The key keeps the name it
+/// was written under; only the folder was renamed.
+const CODE: &str = "code";
+/// What that key was called while a workspace was still called a project. A profile written by
+/// an older QCode still spells it this way, and it is accepted so that such a file is not
+/// reported as broken; the next write puts [`CODE`] there instead.
+const LEGACY_CODE: &str = "project";
 /// The key, below `[mounts]`, of the access `Assets/` is mounted with.
 const ASSETS: &str = "assets";
 /// The table of network settings.
@@ -212,7 +217,8 @@ const MODE: &str = "mode";
 /// two when they are missing or wrong.
 fn shape() -> Shape {
     let mounts = Shape::new()
-        .optional(PROJECT, ValueKind::choice([Profile::PROJECT_MOUNT.id()]))
+        .optional(CODE, ValueKind::choice([Profile::CODE_MOUNT.id()]))
+        .optional(LEGACY_CODE, ValueKind::choice([Profile::CODE_MOUNT.id()]))
         .optional(ASSETS, ValueKind::choice(MountAccess::ALL.map(MountAccess::id)));
     let network = Shape::new().optional(MODE, ValueKind::choice(NetworkMode::ALL.map(NetworkMode::id)));
     Shape::new()
@@ -240,7 +246,7 @@ account = \"subscription\"
 image = \"qcode/profile/claude-sub\"
 
 [mounts]
-project = \"rw\"
+code = \"rw\"
 assets = \"ro\"
 
 [network]
@@ -270,6 +276,18 @@ mode = \"full\"
         let profile = parse(COMPLETE).profile.expect("the file is complete");
         assert_eq!(profile.to_toml(), COMPLETE);
         assert_eq!(parse(&profile.to_toml()).profile, Some(profile));
+    }
+
+    /// A profile written before workspaces had their name says `project` where the file now says
+    /// `code`. Both name the same mount, so the older file is read without a complaint.
+    #[test]
+    fn a_profile_that_still_calls_the_mount_a_project_reads_without_a_complaint() {
+        let older = COMPLETE.replace("code = ", "project = ");
+        let loaded = parse(&older);
+        assert_eq!(loaded.diagnostics, []);
+        let profile = loaded.profile.expect("the file is complete");
+        assert_eq!(profile.assets, MountAccess::ReadOnly);
+        assert_eq!(profile.to_toml(), COMPLETE, "writing it again puts the new name there");
     }
 
     #[test]

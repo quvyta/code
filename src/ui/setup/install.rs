@@ -1,12 +1,21 @@
 //! What the person has to run to get a container engine, on the system they are actually on.
 //!
-//! QCode never raises its own rights and never installs anything. It works out the one line
-//! that installs the engine on this machine, shows it and lets the person copy it. Working it
-//! out is a pure function of [`InstallHost`], which is plain data, so every system's guidance
-//! is checked from any other system.
+//! QCode works out the one line that installs the engine on this machine and offers it two
+//! ways: the person copies it and runs it themselves, or QCode runs that very line for them on
+//! a terminal they watch. Either way it is the one command they chose, run with the rights they
+//! already have; QCode never raises its own. Working the line out is a pure function of
+//! [`InstallHost`], which is plain data, so every system's guidance is checked from any other
+//! system, and starting it goes through [`Installer`], so a test drives the whole path without
+//! a package manager anywhere near it.
+
+use std::ffi::OsString;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use qframe::widgets::TerminalSession;
 
 use crate::engine::EngineKind;
-use crate::workspace::Platform;
+use crate::store::Platform;
 
 use super::gates::EngineProblem;
 
@@ -74,7 +83,14 @@ pub struct InstallHost {
     pub platform: Platform,
     /// The program that installs software here, when QCode recognises one.
     pub manager: Option<PackageManager>,
+    /// The engines already on this machine, Podman before Docker. It is what the wizard ticks
+    /// when the settings file names no engine: offering to install what is already installed
+    /// would be the wizard ignoring the machine it is standing on.
+    pub engines: Vec<EngineKind>,
 }
+
+/// The engines QCode offers, in the order it offers them.
+const ENGINES: [EngineKind; 2] = [EngineKind::Podman, EngineKind::Docker];
 
 impl InstallHost {
     /// Reads the machine this program runs on.
@@ -82,7 +98,12 @@ impl InstallHost {
     pub fn detect() -> Self {
         let platform = Platform::host();
         let release = (platform == Platform::Linux).then(|| std::fs::read_to_string("/etc/os-release").ok()).flatten();
-        Self::read(platform, release.as_deref(), on_path)
+        // The engine layer's own search, not the bare `PATH`: a terminal started from a desktop
+        // launcher has a `PATH` that names neither Homebrew directory, and Docker Desktop puts
+        // its binary where only its installer knows. Asking `PATH` alone would tell the person
+        // to install an engine they already have, and QCode would then fail to find it twice
+        // for two different reasons.
+        Self::read(platform, release.as_deref(), crate::engine::installed)
     }
 
     /// The host `platform` describes, with `release` the text of the Linux `os-release` file and
@@ -101,7 +122,60 @@ impl InstallHost {
                 manager => manager,
             }),
         };
-        Self { platform, manager }
+        let engines = ENGINES.into_iter().filter(|kind| installed(kind.dialect().binary)).collect();
+        Self { platform, manager, engines }
+    }
+}
+
+/// How the install command the person chose is started.
+///
+/// It is a function rather than a call to [`TerminalSession::spawn`] where the command is run,
+/// so the whole path — the button, the terminal inside the page, the output on it and the end
+/// of the command — is driven by a test that starts a harmless script instead. Nothing a test
+/// runs is ever an installation.
+#[derive(Clone)]
+pub struct Installer(Arc<Start>);
+
+/// What an [`Installer`] does with a command line: it starts it and hands back the terminal it
+/// is running on, or says why it could not be started at all.
+type Start = dyn Fn(&str) -> std::io::Result<TerminalSession> + Send + Sync;
+
+impl std::fmt::Debug for Installer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Installer")
+    }
+}
+
+impl Installer {
+    /// The real one: the line is handed to the person's own shell with the rights they already
+    /// have. Nothing here raises them. A command that needs more asks for it itself, on the
+    /// terminal, where the person is the one who answers.
+    #[must_use]
+    pub fn shell() -> Self {
+        Self::new(|command| {
+            let (program, flag): (OsString, &str) = if cfg!(windows) {
+                (OsString::from("cmd"), "/C")
+            } else {
+                (std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into()), "-c")
+            };
+            let folder = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            TerminalSession::spawn(&program, &[flag, command], &folder)
+        })
+    }
+
+    /// An installer that starts commands the way `start` says.
+    #[must_use]
+    pub fn new(start: impl Fn(&str) -> std::io::Result<TerminalSession> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(start))
+    }
+
+    /// Starts `command` on a terminal of its own.
+    ///
+    /// # Errors
+    ///
+    /// When no pseudo-terminal can be opened or the command cannot be started at all.
+    pub fn start(&self, command: &str) -> std::io::Result<TerminalSession> {
+        (self.0)(command)
     }
 }
 
@@ -127,12 +201,6 @@ fn family(release: &str) -> Option<PackageManager> {
         "opensuse" | "opensuse-tumbleweed" | "opensuse-leap" | "suse" | "sles" => Some(PackageManager::Zypper),
         _ => None,
     })
-}
-
-/// Whether `tool` is on the person's `PATH`.
-fn on_path(tool: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else { return false };
-    std::env::split_paths(&path).any(|dir| dir.join(tool).is_file())
 }
 
 /// What the person has to do before the chosen engine works.
@@ -190,7 +258,7 @@ impl Remedy {
 mod tests {
     use super::*;
     use crate::engine::EngineKind;
-    use crate::workspace::Platform;
+    use crate::store::Platform;
 
     /// A Linux host whose `os-release` says `id`, with `paru` installed or not.
     fn linux(id: &str, paru: bool) -> InstallHost {
@@ -293,6 +361,16 @@ mod tests {
         let host = InstallHost::read(Platform::MacOs, None, |_| false);
         let remedy = Remedy::for_problem(&problem, EngineKind::Podman, &host);
         assert!(matches!(remedy, Remedy::Start { command: Some(ref c) } if c == "podman machine start"));
+    }
+
+    #[test]
+    fn the_engines_this_machine_already_has_are_read_with_the_rest_of_it() {
+        let both = InstallHost::read(Platform::Linux, Some("ID=arch\n"), |tool| matches!(tool, "podman" | "docker"));
+        assert_eq!(both.engines, [EngineKind::Podman, EngineKind::Docker], "podman is named before docker");
+        let docker = InstallHost::read(Platform::Linux, Some("ID=arch\n"), |tool| tool == "docker");
+        assert_eq!(docker.engines, [EngineKind::Docker]);
+        let bare = InstallHost::read(Platform::Linux, Some("ID=arch\n"), |_| false);
+        assert!(bare.engines.is_empty(), "a machine with neither engine says so");
     }
 
     #[test]

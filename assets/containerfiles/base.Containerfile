@@ -92,11 +92,11 @@ ENV PATH=/usr/local/npm/bin:$PATH
 #
 # They are all open to everyone on purpose. The container runs as whichever uid the host user
 # has, which the image cannot know, so anything an image step leaves behind has to be writable
-# by a uid the image never saw. /work/Project and /work/Assets are covered by the mounts over
-# them, and are made here so that a container started without mounts still has them.
-RUN mkdir -p /usr/local/npm/bin /usr/local/npm/lib /var/cache/npm /work/Project /work/Assets \
+# by a uid the image never saw. /work and /assets are covered by the mounts over them, and are
+# made here so that a container started without mounts still has them.
+RUN mkdir -p /usr/local/npm/bin /usr/local/npm/lib /var/cache/npm /work /assets \
  && chmod 0777 /usr/local/npm /usr/local/npm/bin /usr/local/npm/lib /var/cache/npm \
-               /home/qcode /work /work/Project /work/Assets
+               /home/qcode /work /assets
 
 # The one step an image built on this one has to end with.
 #
@@ -109,7 +109,7 @@ RUN printf '%s\n' '#!/bin/sh' 'set -e' 'chmod -R a+rwX "$HOME"' > /usr/local/bin
  && chmod 0755 /usr/local/bin/qcode-open-home
 
 # Where a shell starts when no working directory is given.
-WORKDIR /work/Project
+WORKDIR /work
 
 # Not root, so a harness image is built and run with no more than it needs. It also means a
 # harness is installed with `npm install -g` as this user, which is why the npm prefix above is

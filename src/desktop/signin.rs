@@ -10,24 +10,21 @@
 //! through `BROWSER` to use it. That program writes the address into a folder the window's
 //! container shares with QCode, and QCode opens it in the person's real browser, where their
 //! account is already signed in. Nothing of the machine is handed to the container for this: the
-//! folder is the project's own, and the only thing that travels through it is a line of text.
+//! folder is the workspace's own, and the only thing that travels through it is a line of text.
 //!
 //! The address is written to a temporary name and moved into place, so QCode never reads half a
 //! line; and every address QCode takes is removed as it is read, so a folder left behind cannot
 //! open yesterday's page tomorrow.
 //!
 //! Opening the address on this machine is the one thing here that reaches out of QCode, and it
-//! goes through the framework's handoff rather than being spawned from our own code: the handoff
-//! is the single door to the desktop, and a test run records it instead of running it, so no test
-//! can open a browser on the person's screen.
+//! goes through the framework rather than being spawned from our own code: `Command::open` is the
+//! single door to the desktop, and a test run records the opening instead of carrying it out, so
+//! no test can open a browser on the person's screen.
 //!
-//! What the handoff runs is a shell rather than `xdg-open` itself, for two reasons. `xdg-open`
-//! with a cold browser does not return until that browser ends, and a handoff waiting for it
-//! would hold QCode's screen for the whole session; and a browser that inherited the terminal
-//! would draw its warnings over the screen we just took back. The shell starts `xdg-open` in the
-//! background with both of its streams thrown away and ends at once, so the screen comes back in
-//! milliseconds. The address never enters the script's text — it is handed over as an argument,
-//! where nothing in it can become a command.
+//! That opening never takes the screen. The browser starts beside QCode with its streams thrown
+//! away and a process group of its own, so a cold browser that takes half a minute to come up
+//! holds nothing back and its warnings are never drawn over the page the person is reading. Only
+//! an `http` or `https` address is handed over at all; everything else is said on the tab instead.
 
 use std::path::{Path, PathBuf};
 
@@ -100,32 +97,9 @@ pub fn is_web(address: &str) -> bool {
     (lower.starts_with("http://") || lower.starts_with("https://")) && !address.contains(['\n', '\r', '\0'])
 }
 
-/// The program a handoff runs to open an address here. See the module's own words for why it is
-/// a shell and not `xdg-open`.
-pub const OPEN_HERE: &str = "sh";
-
-/// What that shell runs: `xdg-open` in the background with its streams thrown away, and nothing
-/// left for the handoff to wait for. `$0` is the address, handed over as an argument.
-///
-/// A machine without `xdg-open` ends with a code of its own, so the tab can say the address was
-/// not opened rather than claim a browser that never came up.
-const OPEN_HERE_SCRIPT: &str = "command -v xdg-open >/dev/null 2>&1 || exit 1\n\
-                                xdg-open \"$0\" >/dev/null 2>&1 &\n\
-                                exit 0\n";
-
-/// The arguments that open `address` in the browser of the person at this machine, or `None`
-/// when it is not an address QCode will hand a browser.
-///
-/// The caller puts these into a detached handoff; the tab shows the address either way, so a
-/// person whose machine opened nothing can still read it.
-#[must_use]
-pub fn open_here(address: &str) -> Option<[String; 3]> {
-    is_web(address).then(|| ["-c".to_owned(), OPEN_HERE_SCRIPT.to_owned(), address.to_owned()])
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{OPEN_HERE_SCRIPT, is_web, open_here, script, taken};
+    use super::{is_web, script, taken};
     use std::path::PathBuf;
 
     fn folder(name: &str) -> PathBuf {
@@ -180,20 +154,6 @@ mod tests {
             "",
         ] {
             assert!(!is_web(refused), "{refused}");
-            assert!(open_here(refused).is_none(), "{refused}");
         }
-    }
-
-    #[test]
-    fn the_address_is_an_argument_of_the_opening_and_never_part_of_its_script() {
-        // A line of text from the container must not become a command, so it is handed over as
-        // an argument and the script is the same every time.
-        let address = "https://example.com/; rm -rf $HOME";
-        let words = open_here(address).expect("a web address is opened");
-        assert_eq!(words, ["-c".to_owned(), OPEN_HERE_SCRIPT.to_owned(), address.to_owned()]);
-        assert!(!OPEN_HERE_SCRIPT.contains("example.com"), "the address is not in the script");
-        // Nothing is left running for a waiter to hold the screen for.
-        assert!(OPEN_HERE_SCRIPT.contains(">/dev/null 2>&1 &"), "{OPEN_HERE_SCRIPT}");
-        assert!(OPEN_HERE_SCRIPT.ends_with("exit 0\n"), "{OPEN_HERE_SCRIPT}");
     }
 }

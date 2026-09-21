@@ -25,7 +25,7 @@
 use std::path::Path;
 
 use super::{AccountKind, Harness, HarnessKind, MountAccess, NetworkMode, Profile, SafeName, Template};
-use crate::base::paths::{KEEP_ALIVE, PROJECT_DIR};
+use crate::base::paths::{CODE_DIR, KEEP_ALIVE};
 use crate::engine::names::{BASE_IMAGE, HOSTNAME};
 use crate::engine::run::{build_image, capture};
 use crate::engine::{ContainerCreate, Engine, EngineKind, Exec, HostUser, ImageBuild, Network, detect};
@@ -120,7 +120,7 @@ fn open(engine: Engine, profile: &Profile) -> Lab {
         mounts: &[],
         network: Network::None,
         user: HostUser::current().expect("the current user"),
-        workdir: Some(Path::new(PROJECT_DIR)),
+        workdir: Some(Path::new(CODE_DIR)),
         command: KEEP_ALIVE,
     }))
     .expect("the container is made");

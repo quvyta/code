@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::engine::{EngineKind, Unavailable, detect};
-use crate::workspace::{Config, SetupStep, Workspace};
+use crate::store::{Config, SetupStep, Store};
 
 /// Why the chosen engine cannot be used.
 ///
@@ -90,7 +90,7 @@ pub enum EngineCheck {
     Broken(EngineProblem),
 }
 
-/// Why the workspace folder cannot be used.
+/// Why the store folder cannot be used.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocationProblem {
     /// No folder has been chosen yet.
@@ -101,7 +101,7 @@ pub enum LocationProblem {
     Blocked(String),
 }
 
-/// What the machine answered about the workspace folder.
+/// What the machine answered about the store folder.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum LocationCheck {
     /// Nobody has asked yet.
@@ -125,7 +125,7 @@ pub struct Gates {
     pub language: bool,
     /// What the chosen engine answered.
     pub engine: EngineCheck,
-    /// What the workspace folder answered.
+    /// What the store folder answered.
     pub location: LocationCheck,
 }
 
@@ -172,7 +172,7 @@ impl Gates {
         if gates.engine != EngineCheck::Working {
             return gates;
         }
-        gates.location = match config.workspace_path() {
+        gates.location = match config.folder_path() {
             Some(path) => check_location(&path),
             None => LocationCheck::Broken(LocationProblem::Unset),
         };
@@ -191,10 +191,10 @@ pub fn check_engine(kind: EngineKind) -> EngineCheck {
     }
 }
 
-/// Makes sure the workspace at `path` is there and can be written in.
+/// Makes sure the store at `path` is there and can be written in.
 ///
-/// The folder is made when it is missing: placing the workspace is the wizard's whole job, and
-/// the same call at every later start repairs a workspace whose folders were removed. Writing
+/// The folder is made when it is missing: placing the store is the wizard's whole job, and
+/// the same call at every later start repairs a store whose folders were removed. Writing
 /// is proven by writing, not guessed from permission bits, because a read-only mount and a full
 /// disk both look writable until something is written.
 ///
@@ -204,8 +204,8 @@ pub fn check_location(path: &Path) -> LocationCheck {
     if path.is_file() {
         return LocationCheck::Broken(LocationProblem::NotAFolder);
     }
-    let workspace = Workspace::new(path);
-    if let Err(diagnostic) = workspace.prepare() {
+    let store = Store::new(path);
+    if let Err(diagnostic) = store.prepare() {
         return LocationCheck::Broken(LocationProblem::Blocked(diagnostic.message));
     }
     let probe = path.join(format!(".qcode-write-{}", std::process::id()));
@@ -221,7 +221,7 @@ pub fn check_location(path: &Path) -> LocationCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workspace::{Config, SetupStep};
+    use crate::store::{Config, SetupStep};
 
     fn working() -> Gates {
         Gates { language: true, engine: EngineCheck::Working, location: LocationCheck::Usable }
@@ -292,7 +292,7 @@ mod tests {
     fn a_folder_that_can_be_made_and_written_passes_the_location_gate() {
         let dir = std::env::temp_dir().join(format!("qcode-setup-usable-{}", std::process::id()));
         assert_eq!(check_location(&dir), LocationCheck::Usable);
-        assert!(dir.join("Projects").is_dir(), "the workspace tree is made while it is checked");
+        assert!(dir.join("Workspaces").is_dir(), "the store tree is made while it is checked");
         std::fs::remove_dir_all(&dir).expect("the test cleans up after itself");
     }
 

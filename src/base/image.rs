@@ -209,7 +209,7 @@ mod tests {
 
     #[test]
     fn the_image_brings_what_a_harness_and_a_clone_need_beside_node() {
-        // A project can be made by cloning, and everything a harness does goes over TLS.
+        // A workspace can be made by cloning, and everything a harness does goes over TLS.
         assert!(CONTAINERFILE.contains(" git"), "no git");
         assert!(CONTAINERFILE.contains("ca-certificates"), "no certificates");
     }

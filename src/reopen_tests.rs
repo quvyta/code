@@ -2,7 +2,7 @@
 //!
 //! A close and reopen here is the real thing rather than a message about one. A [`Machine`] is a
 //! folder holding the three things QCode leaves on a disk — the settings file, the session file
-//! and the workspace — and opening it builds an application over them. The application is then
+//! and the store — and opening it builds an application over them. The application is then
 //! dropped where it stands, with no shutdown of any kind, the way a machine that loses power
 //! gives none, and a second application is built over the same folder. What the person finds is
 //! what these tests read.
@@ -22,28 +22,28 @@ use crate::backup::BackupEvery;
 use crate::base::apps::Editor;
 use crate::engine::EngineKind;
 use crate::profile::{AccountKind, HarnessKind, MountAccess, NetworkMode, Profile, SafeName, Template};
-use crate::testing::{env, host};
-use crate::ui::project::ProjectScreen;
-use crate::ui::setup::gates::{EngineCheck, EngineProblem, Gates, LocationCheck, LocationProblem};
-use crate::workspace::{
-    Config, HostDirs, ProjectId, Session, SessionProject, SessionTab, SessionTabKind, Workspace, add_profile,
+use crate::store::{
+    Config, HostDirs, Session, SessionTab, SessionTabKind, SessionWorkspace, Store, WorkspaceId, add_profile,
 };
+use crate::testing::{env, host};
+use crate::ui::setup::gates::{EngineCheck, EngineProblem, Gates, LocationCheck, LocationProblem};
+use crate::ui::workspace::WorkspaceScreen;
 use crate::{Page, QCode};
 
-/// A terminal with room for the settings list and the project screen alike.
+/// A terminal with room for the settings list and the workspace screen alike.
 const SIZE: (u16, u16) = (96, 40);
 
 /// How long the work a click starts is given. Disk writes happen on a task thread, and the
 /// answer comes back as a message; the wait only has to be finite, so it is generous.
 const MOMENT: Duration = Duration::from_millis(250);
 
-/// A machine whose gates all hold: it speaks a language, its engine works, its workspace folder
+/// A machine whose gates all hold: it speaks a language, its engine works, its store folder
 /// can be written.
 fn settled() -> Gates {
     Gates { language: true, engine: EngineCheck::Working, location: LocationCheck::Usable }
 }
 
-/// One person's machine: the settings file, the session file and the workspace, each where QCode
+/// One person's machine: the settings file, the session file and the store, each where QCode
 /// puts it, all under a folder of this test's own.
 struct Machine {
     root: PathBuf,
@@ -60,15 +60,15 @@ impl Machine {
     }
 
     /// The same machine with the setup already through: the settings file says so and names the
-    /// workspace, which is what a person who answered the wizard once leaves behind.
+    /// store, which is what a person who answered the wizard once leaves behind.
     fn set_up(what: &str) -> Self {
         let machine = Self::bare(what);
         let mut config = machine.config();
         config.set_setup_completed(true);
-        config.set_workspace_path(&machine.workspace());
+        config.set_folder_path(&machine.store());
         config.set_language("en");
         config.save().expect("the settings file is written");
-        Workspace::new(machine.workspace()).prepare().expect("the workspace can be made");
+        Store::new(machine.store()).prepare().expect("the store can be made");
         machine
     }
 
@@ -88,15 +88,15 @@ impl Machine {
         self.root.join("data").join("session.toml")
     }
 
-    /// The workspace folder: the projects and the profiles.
-    fn workspace(&self) -> PathBuf {
+    /// The store folder: the workspaces and the profiles.
+    fn store(&self) -> PathBuf {
         self.root.join("Documents").join("Quvyta").join("Code")
     }
 
     /// The folders QCode works the machine's own places out from.
     fn dirs(&self) -> HostDirs {
         let documents = self.root.join("Documents");
-        HostDirs { workspace: Some(self.workspace()), documents: Some(documents) }
+        HostDirs { store: Some(self.store()), documents: Some(documents) }
     }
 
     /// The settings file as it stands on the disk right now.
@@ -118,7 +118,8 @@ impl Machine {
         let config = self.config();
         let worn = config.settings().clone();
         let entry = QCode::entry(&config, gates);
-        let app = QCode::new(config, self.dirs(), host(), gates, None, entry).with_session(Some(self.session_file()));
+        let app =
+            QCode::new(config, self.dirs(), host(), gates, None, None, entry).with_session(Some(self.session_file()));
         let mut harness = Harness::with_env(app, env(), SIZE.0, SIZE.1);
         wear(&mut harness, &worn);
         harness.render();
@@ -195,7 +196,7 @@ fn arrow_on(harness: &Harness<QCode>, y: i32) -> Option<i32> {
     i32::try_from(column).ok()
 }
 
-/// A profile as the profiles screen writes it into the workspace.
+/// A profile as the profiles screen writes it into the store.
 fn profile(name: &str, harness: HarnessKind, account: AccountKind) -> Profile {
     Profile {
         name: SafeName::parse(name).expect("the name is safe"),
@@ -224,13 +225,13 @@ fn the_setup_wizard_is_asked_once_and_never_again() {
     let again = machine.reopen();
     assert_eq!(again.app().page(), Page::Home, "nothing is asked a second time:\n{}", again.screen());
     let screen = again.screen();
-    for asked in ["Pick the language", "Container engine", "one workspace folder"] {
+    for asked in ["Pick the language", "Container engine", "one store folder"] {
         assert!(!screen.contains(asked), "`{asked}` is asked again:\n{screen}");
     }
     let stored = machine.config();
     assert!(stored.setup_completed(), "the file says the wizard is through");
     assert_eq!(stored.engine_kind(), Some("podman"), "the engine it settled on");
-    assert_eq!(stored.workspace_path(), Some(machine.workspace()), "and where it put the workspace");
+    assert_eq!(stored.folder_path(), Some(machine.store()), "and where it put the store");
 }
 
 #[test]
@@ -251,10 +252,10 @@ fn a_gate_that_falls_after_the_setup_does_not_drag_the_person_through_it_again()
 }
 
 #[test]
-fn a_setup_that_was_through_but_left_no_workspace_asks_where_the_workspace_goes() {
+fn a_setup_that_was_through_but_left_no_store_asks_where_the_store_goes() {
     // The one thing that overrides the rule above: a settings file that has been through the
-    // wizard and still names no workspace leaves nothing at all to open.
-    let machine = Machine::bare("no-workspace");
+    // wizard and still names no store leaves nothing at all to open.
+    let machine = Machine::bare("no-store");
     let mut config = machine.config();
     config.set_language("en");
     config.set_setup_completed(true);
@@ -264,7 +265,7 @@ fn a_setup_that_was_through_but_left_no_workspace_asks_where_the_workspace_goes(
     let harness = machine.open(&gates);
     assert_eq!(harness.app().page(), Page::Setup, "{}", harness.screen());
     let screen = harness.screen();
-    assert!(screen.contains("one workspace folder"), "and on the step that places it:\n{screen}");
+    assert!(screen.contains("live in one folder"), "and on the step that places it:\n{screen}");
     assert!(!screen.contains("Pick the language"), "no step before it is asked again:\n{screen}");
 }
 
@@ -348,37 +349,37 @@ fn the_container_engine_chosen_is_the_one_qcode_holds_when_it_opens_again() {
 }
 
 #[test]
-fn the_editor_and_the_backup_interval_reach_a_project_opened_after_qcode_starts_again() {
-    let machine = Machine::set_up("apps-reach-projects");
-    let workspace = Workspace::new(machine.workspace());
-    workspace.create_project("Firefly", Date::today_utc()).expect("the workspace takes a project");
+fn the_editor_and_the_backup_interval_reach_a_workspace_opened_after_qcode_starts_again() {
+    let machine = Machine::set_up("apps-reach-workspaces");
+    let store = Store::new(machine.store());
+    store.create_workspace("Firefly", Date::today_utc()).expect("the store takes a workspace");
     let mut harness = machine.reopen();
     to_settings(&mut harness);
     choose(&mut harness, "Editor", "vim");
-    choose(&mut harness, "Back up open projects", "1 hour");
+    choose(&mut harness, "Back up open workspaces", "1 hour");
     drop(harness);
 
     let mut again = machine.reopen();
-    again.click_text("Projects").advance(MOMENT);
+    again.click_text("Workspaces").advance(MOMENT);
     again.click_text("Firefly").advance(MOMENT);
-    assert_eq!(again.app().page(), Page::Project, "{}", again.screen());
-    let screen = again.app().project.as_ref().expect("a project screen");
-    assert_eq!(screen.editor(), Editor::Vim, "a file of this project opens in the chosen editor");
+    assert_eq!(again.app().page(), Page::Workspace, "{}", again.screen());
+    let screen = again.app().workspace.as_ref().expect("a workspace screen");
+    assert_eq!(screen.editor(), Editor::Vim, "a file of this workspace opens in the chosen editor");
     assert_eq!(screen.backup_every(), BackupEvery::Hour, "and it is backed up as often as was asked");
 }
 
 #[test]
-fn the_profiles_of_the_workspace_come_back_whole() {
+fn the_profiles_of_the_store_come_back_whole() {
     // Making a profile builds a container image, which needs an engine; what the profiles screen
     // leaves behind is the definition file, and that is what has to survive a close.
     let machine = Machine::set_up("profiles");
-    let workspace = Workspace::new(machine.workspace());
+    let store = Store::new(machine.store());
     let written = [
         profile("claude-sub", HarnessKind::ClaudeCode, AccountKind::Subscription),
         profile("gemini-key", HarnessKind::GeminiCli, AccountKind::ApiKey),
     ];
     for profile in &written {
-        workspace.write_profile(profile).expect("the workspace takes a profile");
+        store.write_profile(profile).expect("the store takes a profile");
     }
 
     let mut harness = machine.reopen();
@@ -388,27 +389,27 @@ fn the_profiles_of_the_workspace_come_back_whole() {
     for profile in &written {
         assert!(screen.contains(profile.name.as_str()), "{} is listed:\n{screen}", profile.name.as_str());
     }
-    let read = Workspace::new(machine.workspace()).profiles();
+    let read = Store::new(machine.store()).profiles();
     assert!(read.is_clean(), "{:?}", read.diagnostics);
     assert_eq!(read.value, written, "every field of every profile is the one that was written");
 }
 
 #[test]
-fn the_projects_their_order_and_the_one_that_was_open_come_back() {
-    let machine = Machine::set_up("projects");
-    let workspace = Workspace::new(machine.workspace());
+fn the_workspaces_their_order_and_the_one_that_was_open_come_back() {
+    let machine = Machine::set_up("workspaces");
+    let store = Store::new(machine.store());
     for name in ["Alpha", "Beta", "Gamma"] {
-        workspace.create_project(name, Date::today_utc()).expect("the workspace takes a project");
+        store.create_workspace(name, Date::today_utc()).expect("the store takes a workspace");
     }
-    // A project carries the profiles chosen for it, which the project file is the one record of.
-    workspace.write_profile(&profile("claude-sub", HarnessKind::ClaudeCode, AccountKind::Subscription)).expect("write");
-    let paths = workspace.project_paths(&ProjectId::from_display_name("Beta").expect("a usable id"));
-    add_profile(&paths, "claude-sub", Date::today_utc()).expect("the project takes the profile");
+    // A workspace carries the profiles chosen for it, which the workspace file is the one record of.
+    store.write_profile(&profile("claude-sub", HarnessKind::ClaudeCode, AccountKind::Subscription)).expect("write");
+    let paths = store.workspace_paths(&WorkspaceId::from_display_name("Beta").expect("a usable id"));
+    add_profile(&paths, "claude-sub", Date::today_utc()).expect("the workspace takes the profile");
 
     let mut harness = machine.reopen();
-    harness.click_text("Projects").advance(MOMENT);
+    harness.click_text("Workspaces").advance(MOMENT);
     harness.click_text("Gamma").advance(MOMENT);
-    harness.send(crate::Msg::Project(crate::ui::project::Msg::AddProject)).advance(MOMENT);
+    harness.send(crate::Msg::Workspace(crate::ui::workspace::Msg::AddWorkspace)).advance(MOMENT);
     harness.click_text("Beta").advance(MOMENT);
     assert_eq!(rail(&harness), ["Gamma", "Beta"], "{}", harness.screen());
     drop(harness);
@@ -418,30 +419,33 @@ fn the_projects_their_order_and_the_one_that_was_open_come_back() {
     assert!(again.screen().contains("Continue"), "and offers the way back:\n{}", again.screen());
     let mut again = again;
     again.click_text("Continue").advance(MOMENT);
-    assert_eq!(again.app().page(), Page::Project, "{}", again.screen());
+    assert_eq!(again.app().page(), Page::Workspace, "{}", again.screen());
     assert_eq!(rail(&again), ["Gamma", "Beta"], "the rail keeps its order:\n{}", again.screen());
-    let open = again.app().project.as_ref().and_then(ProjectScreen::project);
-    assert_eq!(open.map(crate::OpenProject::name), Some("Beta"), "the project that was open is open again");
-    assert!(open.is_some_and(|project| project.carries("claude-sub")), "the profile chosen for it is still its own");
+    let open = again.app().workspace.as_ref().and_then(WorkspaceScreen::workspace);
+    assert_eq!(open.map(crate::OpenWorkspace::name), Some("Beta"), "the workspace that was open is open again");
+    assert!(
+        open.is_some_and(|workspace| workspace.carries("claude-sub")),
+        "the profile chosen for it is still its own"
+    );
 }
 
 #[test]
-fn the_tabs_of_a_project_come_back_the_way_they_were_left() {
+fn the_tabs_of_a_workspace_come_back_the_way_they_were_left() {
     // Opening a tab reaches into a container, which no test has; what the person finds again is
     // written in the session file, so that file is what a second QCode is given.
     let machine = Machine::set_up("tabs");
-    let workspace = Workspace::new(machine.workspace());
-    workspace.create_project("Firefly", Date::today_utc()).expect("the workspace takes a project");
-    workspace
+    let store = Store::new(machine.store());
+    store.create_workspace("Firefly", Date::today_utc()).expect("the store takes a workspace");
+    store
         .write_profile(&profile("antigravity", HarnessKind::AntigravityIde, AccountKind::InApp))
-        .expect("the workspace takes a profile");
-    let id = ProjectId::from_display_name("Firefly").expect("a usable id");
-    let paths = workspace.project_paths(&id);
-    add_profile(&paths, "antigravity", Date::today_utc()).expect("the project takes the profile");
+        .expect("the store takes a profile");
+    let id = WorkspaceId::from_display_name("Firefly").expect("a usable id");
+    let paths = store.workspace_paths(&id);
+    add_profile(&paths, "antigravity", Date::today_utc()).expect("the workspace takes the profile");
 
     let left = Session {
         active: Some(id.clone()),
-        projects: vec![SessionProject {
+        workspaces: vec![SessionWorkspace {
             id: id.clone(),
             active_tab: 2,
             tabs: vec![
@@ -455,21 +459,21 @@ fn the_tabs_of_a_project_come_back_the_way_they_were_left() {
 
     let mut harness = machine.reopen();
     harness.click_text("Continue").advance(MOMENT);
-    assert_eq!(harness.app().page(), Page::Project, "{}", harness.screen());
+    assert_eq!(harness.app().page(), Page::Workspace, "{}", harness.screen());
     let screen = harness.screen();
     assert!(!screen.contains("Only part of the last session"), "nothing of it was lost:\n{screen}");
-    let open = harness.app().project.as_ref().and_then(ProjectScreen::project).expect("the project is open");
-    let kinds: Vec<crate::ui::project::TabKind> = open.tabs().iter().map(|tab| tab.kind().clone()).collect();
+    let open = harness.app().workspace.as_ref().and_then(WorkspaceScreen::workspace).expect("the workspace is open");
+    let kinds: Vec<crate::ui::workspace::TabKind> = open.tabs().iter().map(|tab| tab.kind().clone()).collect();
     assert_eq!(
         kinds,
         [
-            crate::ui::project::TabKind::Shell,
-            crate::ui::project::TabKind::Markdown("README.md".to_owned()),
-            crate::ui::project::TabKind::Desktop("antigravity".to_owned()),
+            crate::ui::workspace::TabKind::Shell,
+            crate::ui::workspace::TabKind::Markdown("README.md".to_owned()),
+            crate::ui::workspace::TabKind::Desktop("antigravity".to_owned()),
         ],
         "every tab is back, the window among them"
     );
-    assert_eq!(open.active_tab().map(crate::ui::project::Tab::opened), Some(30), "the tab that was open is open");
+    assert_eq!(open.active_tab().map(crate::ui::workspace::Tab::opened), Some(30), "the tab that was open is open");
 
     // Nothing on this machine is going to open that window: there is no container engine. A tab
     // that keeps saying it is opening one promises something nobody is doing and offers the
@@ -485,30 +489,222 @@ fn what_is_open_is_written_as_it_changes_so_a_drop_with_no_warning_loses_nothing
     // stands, as it would be if the machine lost power. Anything written only on the way out
     // would be gone.
     let machine = Machine::set_up("hard-drop");
-    let workspace = Workspace::new(machine.workspace());
+    let store = Store::new(machine.store());
     for name in ["Alpha", "Beta"] {
-        workspace.create_project(name, Date::today_utc()).expect("the workspace takes a project");
+        store.create_workspace(name, Date::today_utc()).expect("the store takes a workspace");
     }
     let mut harness = machine.reopen();
-    harness.click_text("Projects").advance(MOMENT);
+    harness.click_text("Workspaces").advance(MOMENT);
     harness.click_text("Alpha").advance(MOMENT);
-    assert_eq!(harness.app().page(), Page::Project, "{}", harness.screen());
+    assert_eq!(harness.app().page(), Page::Workspace, "{}", harness.screen());
     std::mem::drop(harness);
 
     let saved = machine.session().expect("what was open is on the disk already");
-    let ids: Vec<String> = saved.projects.iter().map(|project| project.id.as_str().to_owned()).collect();
-    assert_eq!(ids, ["alpha"], "the open project was written the moment it opened");
+    let ids: Vec<String> = saved.workspaces.iter().map(|workspace| workspace.id.as_str().to_owned()).collect();
+    assert_eq!(ids, ["alpha"], "the open workspace was written the moment it opened");
     assert_eq!(saved.active.map(|id| id.as_str().to_owned()), Some("alpha".to_owned()));
     let stored = machine.config();
     assert_eq!(
-        stored.recent_projects().iter().map(|id| id.as_str().to_owned()).collect::<Vec<_>>(),
+        stored.recent_workspaces().iter().map(|id| id.as_str().to_owned()).collect::<Vec<_>>(),
         ["alpha"],
-        "and so was the project opened last"
+        "and so was the workspace opened last"
     );
 }
 
-/// The names of the rail of the open project screen, in order.
+/// A machine as a QCode of before wrote it, in the names it used then: the settings file names
+/// the store under `workspace.path` and the list of the recently opened under `projects.recent`,
+/// the store keeps its workspaces in `Projects/`, each with a `project.qcode`, the person's code
+/// in `Project/` and its backup history in `Backup/Project.git`, the profile's file says
+/// `mounts.project`, and the session file's entries are `[[project]]`.
+///
+/// Written straight to the disk rather than through today's code, because today's code cannot
+/// write a single one of these names any more.
+fn machine_of_before(what: &str) -> Machine {
+    let machine = Machine::bare(what);
+    let store = machine.store();
+    std::fs::create_dir_all(machine.config_dir()).expect("a folder for the settings");
+    std::fs::write(
+        machine.config_dir().join("code.conf"),
+        format!(
+            "language = \"en\"\n\n[setup]\ncompleted = true\n\n[workspace]\npath = \"{}\"\n\n\
+             [projects]\nrecent = [\"firefly\"]\n",
+            store.display()
+        ),
+    )
+    .expect("the settings file is written");
+
+    let workspace = store.join("Projects").join("firefly");
+    for dir in [
+        workspace.join("Project").join("src"),
+        workspace.join("Assets"),
+        workspace.join("Containers").join("Harness").join("claude-sub"),
+        workspace.join("Backup").join("Project.git"),
+        store.join("Profiles"),
+    ] {
+        std::fs::create_dir_all(&dir).expect("a folder of the store of before");
+    }
+    std::fs::write(workspace.join("Project").join("README.md"), "the person's own file\n").expect("a file of theirs");
+    std::fs::write(workspace.join("Backup").join("Project.git").join("HEAD"), "ref: refs/heads/main\n")
+        .expect("a backup history of theirs");
+    std::fs::write(
+        workspace.join("project.qcode"),
+        "id = \"firefly\"\nname = \"Firefly\"\ncreated = \"2026-09-17\"\n\n\
+         [[profile]]\nname = \"claude-sub\"\nadded = \"2026-09-17\"\n",
+    )
+    .expect("the workspace file is written");
+    std::fs::write(
+        store.join("Profiles").join("claude-sub.toml"),
+        "name = \"claude-sub\"\nharness = \"claude-code\"\ntemplate = \"recommended\"\n\
+         account = \"subscription\"\nimage = \"qcode/profile/claude-sub\"\n\n\
+         [mounts]\nproject = \"rw\"\nassets = \"ro\"\n\n[network]\nmode = \"full\"\n",
+    )
+    .expect("the profile is written");
+
+    std::fs::create_dir_all(machine.session_file().parent().expect("a folder")).expect("a folder for the session");
+    std::fs::write(
+        machine.session_file(),
+        "active = \"firefly\"\n\n[[project]]\nid = \"firefly\"\nactive-tab = 0\n\n\
+         [[project.tab]]\nkind = \"markdown\"\nfile = \"README.md\"\nopened = 10\n",
+    )
+    .expect("the session file is written");
+    machine
+}
+
+/// Opening QCode over a machine of before loses nothing: the person finds their workspace, its
+/// file, its profile and the tab they left open, and every name on the disk is the one of today.
+#[test]
+fn a_machine_written_before_workspaces_had_their_name_keeps_everything() {
+    let machine = machine_of_before("before");
+    let mut harness = machine.reopen();
+
+    // What the person meets is their own workspace, not an empty one.
+    assert_eq!(harness.app().page(), Page::Home, "{}", harness.screen());
+    harness.click_text("Continue").advance(MOMENT);
+    assert_eq!(harness.app().page(), Page::Workspace, "{}", harness.screen());
+    assert_eq!(rail(&harness), ["Firefly"], "{}", harness.screen());
+    let open = harness.app().workspace.as_ref().and_then(WorkspaceScreen::workspace).expect("the workspace is open");
+    assert!(open.carries("claude-sub"), "the profile it was given is still its own");
+    let kinds: Vec<crate::ui::workspace::TabKind> = open.tabs().iter().map(|tab| tab.kind().clone()).collect();
+    assert_eq!(kinds, [crate::ui::workspace::TabKind::Markdown("README.md".to_owned())], "the tab they left is back");
+    let screen = harness.screen();
+    assert!(screen.contains("README.md"), "their file is in the tree:\n{screen}");
+    assert!(!screen.contains("Only part of the last session"), "nothing of the session was lost:\n{screen}");
+
+    // And on the disk every name is today's, with the person's bytes inside it.
+    let workspace = machine.store().join("Workspaces").join("firefly");
+    assert!(workspace.join("workspace.qcode").is_file(), "the workspace file has its name of today");
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("Work").join("README.md")).expect("their file moved with the folder"),
+        "the person's own file\n"
+    );
+    assert!(workspace.join("Work").join("src").is_dir(), "and so did what was under it");
+    assert!(workspace.join("Backup").join("Code.git").join("HEAD").is_file(), "the backup history moved too");
+    assert!(!machine.store().join("Projects").exists(), "nothing of the old names is left");
+    assert!(!workspace.join("project.qcode").exists());
+    assert!(!workspace.join("Project").exists());
+    assert!(!workspace.join("Code").exists(), "nor of the name the folder had in between");
+    assert!(!workspace.join("Backup").join("Project.git").exists());
+
+    // The settings keep the place they chose and the list they built, under the keys of today.
+    let stored = machine.config();
+    assert_eq!(stored.folder_path(), Some(machine.store()), "the store is still where they put it");
+    assert_eq!(
+        stored.recent_workspaces().iter().map(|id| id.as_str().to_owned()).collect::<Vec<_>>(),
+        ["firefly"],
+        "and the workspace they opened last is still on the list"
+    );
+    let text = std::fs::read_to_string(machine.config_dir().join("code.conf")).expect("the settings file is there");
+    assert!(!text.contains("[workspace]") && !text.contains("[projects]"), "written back under today's keys:\n{text}");
+
+    // A session brought back is not a session changed, so the file still reads as it was written;
+    // the first thing the person changes writes it again, under today's name.
+    harness.send(crate::Msg::Workspace(crate::ui::workspace::Msg::NewTab)).advance(MOMENT);
+    std::mem::drop(harness);
+    let text = std::fs::read_to_string(machine.session_file()).expect("the session file is there");
+    assert!(text.contains("[[workspace]]") && !text.contains("[[project]]"), "{text}");
+}
+
+/// A machine of the QCode that had already named its workspaces but still kept the person's own
+/// files in `Code/`, which is the folder that is called `Work/` today.
+///
+/// Written straight to the disk, for the same reason as [`machine_of_before`]: today's code
+/// cannot make a workspace with that folder any more.
+fn machine_of_the_code_folder(what: &str) -> Machine {
+    let machine = Machine::bare(what);
+    let store = machine.store();
+    std::fs::create_dir_all(machine.config_dir()).expect("a folder for the settings");
+    std::fs::write(
+        machine.config_dir().join("code.conf"),
+        format!(
+            "language = \"en\"\n\n[setup]\ncompleted = true\n\n[folder]\npath = \"{}\"\n\n\
+             [workspaces]\nrecent = [\"firefly\"]\n",
+            store.display()
+        ),
+    )
+    .expect("the settings file is written");
+
+    let workspace = store.join("Workspaces").join("firefly");
+    for dir in [
+        workspace.join("Code").join("src"),
+        workspace.join("Assets"),
+        workspace.join("Containers").join("Harness").join("claude-sub"),
+        store.join("Profiles"),
+    ] {
+        std::fs::create_dir_all(&dir).expect("a folder of the store of before");
+    }
+    std::fs::write(workspace.join("Code").join("README.md"), "the person's own file\n").expect("a file of theirs");
+    std::fs::write(
+        workspace.join("workspace.qcode"),
+        "id = \"firefly\"\nname = \"Firefly\"\ncreated = \"2026-09-17\"\n\n\
+         [[profile]]\nname = \"claude-sub\"\nadded = \"2026-09-17\"\n",
+    )
+    .expect("the workspace file is written");
+    std::fs::write(
+        store.join("Profiles").join("claude-sub.toml"),
+        "name = \"claude-sub\"\nharness = \"claude-code\"\ntemplate = \"recommended\"\n\
+         account = \"subscription\"\nimage = \"qcode/profile/claude-sub\"\n\n\
+         [mounts]\ncode = \"rw\"\nassets = \"ro\"\n\n[network]\nmode = \"full\"\n",
+    )
+    .expect("the profile is written");
+
+    std::fs::create_dir_all(machine.session_file().parent().expect("a folder")).expect("a folder for the session");
+    std::fs::write(
+        machine.session_file(),
+        "active = \"firefly\"\n\n[[workspace]]\nid = \"firefly\"\nactive-tab = 0\n\n\
+         [[workspace.tab]]\nkind = \"markdown\"\nfile = \"README.md\"\nopened = 10\n",
+    )
+    .expect("the session file is written");
+    machine
+}
+
+/// A disk whose workspaces keep the person's files in `Code/` is carried the rest of the way:
+/// the folder is `Work/` afterwards, with their bytes in it, and what they had open comes back.
+///
+/// The container mounts the folder on `/work`, and the person reads the same word at home; the
+/// rename is only worth anything if nobody's work is left behind by it.
+#[test]
+fn a_machine_that_kept_the_code_folder_finds_it_under_its_name_of_today() {
+    let machine = machine_of_the_code_folder("code-folder");
+    let mut harness = machine.reopen();
+
+    assert_eq!(harness.app().page(), Page::Home, "{}", harness.screen());
+    harness.click_text("Continue").advance(MOMENT);
+    assert_eq!(harness.app().page(), Page::Workspace, "{}", harness.screen());
+    assert_eq!(rail(&harness), ["Firefly"], "{}", harness.screen());
+    let screen = harness.screen();
+    assert!(screen.contains("README.md"), "their file is in the tree:\n{screen}");
+
+    let workspace = machine.store().join("Workspaces").join("firefly");
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("Work").join("README.md")).expect("their file moved with the folder"),
+        "the person's own file\n"
+    );
+    assert!(workspace.join("Work").join("src").is_dir(), "and so did what was under it");
+    assert!(!workspace.join("Code").exists(), "the folder of before is not left beside it");
+}
+
+/// The names of the rail of the open workspace screen, in order.
 fn rail(harness: &Harness<QCode>) -> Vec<String> {
-    let screen = harness.app().project.as_ref().expect("a project screen");
-    screen.projects().iter().map(|project| project.name().to_owned()).collect()
+    let screen = harness.app().workspace.as_ref().expect("a workspace screen");
+    screen.workspaces().iter().map(|workspace| workspace.name().to_owned()).collect()
 }

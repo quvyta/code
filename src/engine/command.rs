@@ -132,7 +132,7 @@ impl Engine {
     /// [`run::capture`](super::run::capture) read what the command printed.
     ///
     /// A lasting container takes its mounts when it is created, so a job that needs other
-    /// mounts than the project's containers have — a backup writing to `Backup/` — would mean
+    /// mounts than the workspace's containers have — a backup writing to `Backup/` — would mean
     /// making those containers again. A container that removes itself when its command ends
     /// needs nothing made again, and nothing is left behind to be cleared away.
     #[must_use]
@@ -523,16 +523,16 @@ pub struct ImageBuild<'a> {
     pub context: &'a Path,
 }
 
-/// Creating the lasting container of a project, on its own or with a profile in it.
+/// Creating the lasting container of a workspace, on its own or with a profile in it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContainerCreate<'a> {
-    /// The container's name, e.g. `qcode-myproject-claude-sub`.
+    /// The container's name, e.g. `qcode-myworkspace-claude-sub`.
     pub name: &'a str,
     /// What the container reports as its machine name. QCode always passes
     /// [`names::HOSTNAME`](super::names::HOSTNAME), so that a login keyed to the machine name
-    /// survives the move from the sign-in container to a project's.
+    /// survives the move from the sign-in container to a workspace's.
     pub hostname: &'a str,
-    /// Labels the container carries, as `(name, value)`; a project's container carries the
+    /// Labels the container carries, as `(name, value)`; a workspace's container carries the
     /// digest of the request it was made from, which is how a changed request is noticed.
     pub labels: &'a [(&'a str, &'a str)],
     /// The image it starts from.
@@ -737,9 +737,9 @@ impl Mount<'_> {
 /// What a mount brings into the container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MountSource<'a> {
-    /// A folder on the host, e.g. the project's own files.
+    /// A folder on the host, e.g. the workspace's own files.
     Path(&'a Path),
-    /// A named volume, e.g. a profile's credential or a project's home.
+    /// A named volume, e.g. a profile's credential or a workspace's home.
     Volume(&'a str),
 }
 
@@ -764,7 +764,7 @@ pub enum Network {
 /// Who a container runs as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostUser {
-    /// The person's own ids. Files the harness writes into the project then belong to them and
+    /// The person's own ids. Files the harness writes into the workspace then belong to them and
     /// not to root.
     Ids {
         /// User id.
@@ -831,14 +831,14 @@ mod tests {
     fn builds_an_image_from_a_containerfile() {
         let request = ImageBuild {
             image: "qcode/profile/claude-sub",
-            containerfile: Path::new("/work/Containerfile"),
-            context: Path::new("/work"),
+            containerfile: Path::new("/build/Containerfile"),
+            context: Path::new("/build"),
         };
         let command = podman().build_image(&request);
         assert_eq!(command.program, Path::new("/usr/bin/podman"));
         assert_eq!(
             args(&command),
-            ["build", "--tag", "qcode/profile/claude-sub", "--file", "/work/Containerfile", "/work"]
+            ["build", "--tag", "qcode/profile/claude-sub", "--file", "/build/Containerfile", "/build"]
         );
         assert_eq!(args(&docker().build_image(&request)), args(&command));
     }
@@ -867,8 +867,8 @@ mod tests {
     fn podman_maps_the_user_with_keep_id_and_relabels_mounts() {
         let mounts = [
             Mount {
-                source: MountSource::Path(Path::new("/home/me/QCode/Projects/p/Project")),
-                target: Path::new("/work/Project"),
+                source: MountSource::Path(Path::new("/home/me/QCode/Workspaces/p/Work")),
+                target: Path::new("/work"),
                 access: Access::ReadWrite,
             },
             Mount {
@@ -885,7 +885,7 @@ mod tests {
             mounts: &mounts,
             network: Network::Full,
             user: HostUser::Ids { uid: 1000, gid: 1000 },
-            workdir: Some(Path::new("/work/Project")),
+            workdir: Some(Path::new("/work")),
             command: &["sleep", "infinity"],
         };
         assert_eq!(
@@ -898,11 +898,11 @@ mod tests {
                 "qcode",
                 "--userns=keep-id",
                 "--volume",
-                "/home/me/QCode/Projects/p/Project:/work/Project:rw,z",
+                "/home/me/QCode/Workspaces/p/Work:/work:rw,z",
                 "--volume",
                 "qcode-home-p-claude:/home/qcode:ro,z",
                 "--workdir",
-                "/work/Project",
+                "/work",
                 "qcode/profile/claude",
                 "sleep",
                 "infinity"
@@ -968,13 +968,13 @@ mod tests {
     fn a_one_off_container_removes_itself_and_maps_the_user_like_a_lasting_one() {
         let mounts = [
             Mount {
-                source: MountSource::Path(Path::new("/home/me/QCode/Projects/p/Project")),
-                target: Path::new("/work/Project"),
+                source: MountSource::Path(Path::new("/home/me/QCode/Workspaces/p/Work")),
+                target: Path::new("/work"),
                 access: Access::ReadOnly,
             },
             Mount {
-                source: MountSource::Path(Path::new("/home/me/QCode/Projects/p/Backup")),
-                target: Path::new("/work/Backup"),
+                source: MountSource::Path(Path::new("/home/me/QCode/Workspaces/p/Backup")),
+                target: Path::new("/backup"),
                 access: Access::ReadWrite,
             },
         ];
@@ -983,7 +983,7 @@ mod tests {
             mounts: &mounts,
             network: Network::None,
             user: HostUser::Ids { uid: 1000, gid: 100 },
-            workdir: Some(Path::new("/work/Project")),
+            workdir: Some(Path::new("/work")),
             command: &["sh", "-c", "git status"],
         };
         assert_eq!(
@@ -994,11 +994,11 @@ mod tests {
                 "--userns=keep-id",
                 "--network=none",
                 "--volume",
-                "/home/me/QCode/Projects/p/Project:/work/Project:ro,z",
+                "/home/me/QCode/Workspaces/p/Work:/work:ro,z",
                 "--volume",
-                "/home/me/QCode/Projects/p/Backup:/work/Backup:rw,z",
+                "/home/me/QCode/Workspaces/p/Backup:/backup:rw,z",
                 "--workdir",
-                "/work/Project",
+                "/work",
                 "qcode/base",
                 "sh",
                 "-c",
@@ -1014,11 +1014,11 @@ mod tests {
                 "1000:100",
                 "--network=none",
                 "--volume",
-                "/home/me/QCode/Projects/p/Project:/work/Project:ro",
+                "/home/me/QCode/Workspaces/p/Work:/work:ro",
                 "--volume",
-                "/home/me/QCode/Projects/p/Backup:/work/Backup:rw",
+                "/home/me/QCode/Workspaces/p/Backup:/backup:rw",
                 "--workdir",
-                "/work/Project",
+                "/work",
                 "qcode/base",
                 "sh",
                 "-c",
@@ -1049,7 +1049,7 @@ mod tests {
             "{command:?}"
         );
         assert!(!command.iter().any(|arg| arg == "/run/user/1000:/run/qcode-display:rw"), "{command:?}");
-        assert_eq!(&command[command.len() - 3..], ["/opt/app/app", "--ozone-platform=wayland", "/work/Project"]);
+        assert_eq!(&command[command.len() - 3..], ["/opt/app/app", "--ozone-platform=wayland", "/work"]);
         // Never the flag that would give up the application's own sandbox.
         assert!(!command.contains(&"--no-sandbox".to_owned()), "{command:?}");
     }
@@ -1109,8 +1109,8 @@ mod tests {
     /// be given: the machine's compositor socket, its graphics device and a seccomp profile.
     fn window(engine: &Engine) -> Vec<String> {
         let mounts = [Mount {
-            source: MountSource::Path(Path::new("/home/me/QCode/Projects/p/Project")),
-            target: Path::new("/work/Project"),
+            source: MountSource::Path(Path::new("/home/me/QCode/Workspaces/p/Work")),
+            target: Path::new("/work"),
             access: Access::ReadWrite,
         }];
         let sockets =
@@ -1124,8 +1124,8 @@ mod tests {
                 mounts: &mounts,
                 network: Network::Full,
                 user: HostUser::Ids { uid: 1000, gid: 1000 },
-                workdir: Some(Path::new("/work/Project")),
-                command: &["/opt/app/app", "--ozone-platform=wayland", "/work/Project"],
+                workdir: Some(Path::new("/work")),
+                command: &["/opt/app/app", "--ozone-platform=wayland", "/work"],
             },
             env: &[("XDG_RUNTIME_DIR", "/run/qcode-display"), ("WAYLAND_DISPLAY", "wayland-1")],
             sockets: &sockets,
@@ -1204,10 +1204,10 @@ mod tests {
     fn execs_without_a_terminal_when_the_answer_is_the_exit_code() {
         // Without a real terminal `docker exec --tty` refuses outright, so a command whose
         // exit code is the whole point asks for no terminal at all.
-        let request = Exec { container: "qcode-p-base", command: &["sh", "-c", "test -f /work/Project/marker"] };
+        let request = Exec { container: "qcode-p-base", command: &["sh", "-c", "test -f /work/marker"] };
         assert_eq!(
             args(&docker().exec_without_terminal(&request)),
-            ["exec", "qcode-p-base", "sh", "-c", "test -f /work/Project/marker"]
+            ["exec", "qcode-p-base", "sh", "-c", "test -f /work/marker"]
         );
         assert_eq!(args(&podman().exec_without_terminal(&request)), args(&docker().exec_without_terminal(&request)));
     }
@@ -1256,8 +1256,8 @@ mod tests {
     #[test]
     fn a_program_run_attached_gets_a_terminal_a_name_its_variables_and_an_unlabelled_socket() {
         let mounts = [Mount {
-            source: MountSource::Path(Path::new("/home/me/QCode/Projects/p/Project")),
-            target: Path::new("/work/Project"),
+            source: MountSource::Path(Path::new("/home/me/QCode/Workspaces/p/Work")),
+            target: Path::new("/work"),
             access: Access::ReadOnly,
         }];
         let sockets = [Socket { host: Path::new("/run/user/1000/pulse/native"), target: Path::new("/run/sound") }];
@@ -1268,8 +1268,8 @@ mod tests {
                 mounts: &mounts,
                 network: Network::None,
                 user: HostUser::Ids { uid: 1000, gid: 100 },
-                workdir: Some(Path::new("/work/Project")),
-                command: &["play", "/work/Project/a song.mp3"],
+                workdir: Some(Path::new("/work")),
+                command: &["play", "/work/a song.mp3"],
             },
             env: &[("PULSE_SERVER", "unix:/run/sound")],
             sockets: &sockets,
@@ -1284,7 +1284,7 @@ mod tests {
             "--env",
             "PULSE_SERVER=unix:/run/sound",
         ];
-        let tail = ["--workdir", "/work/Project", "qcode/base", "play", "/work/Project/a song.mp3"];
+        let tail = ["--workdir", "/work", "qcode/base", "play", "/work/a song.mp3"];
         let podman = args(&podman().run_attached(&request));
         assert_eq!(podman[..8], head);
         assert_eq!(
@@ -1295,7 +1295,7 @@ mod tests {
                 "--userns=keep-id",
                 "--network=none",
                 "--volume",
-                "/home/me/QCode/Projects/p/Project:/work/Project:ro,z",
+                "/home/me/QCode/Workspaces/p/Work:/work:ro,z",
                 "--workdir",
             ],
             "the folder is relabelled like every folder, the socket never"
@@ -1312,7 +1312,7 @@ mod tests {
                 "1000:100",
                 "--network=none",
                 "--volume",
-                "/home/me/QCode/Projects/p/Project:/work/Project:ro",
+                "/home/me/QCode/Workspaces/p/Work:/work:ro",
                 "--workdir",
             ]
         );

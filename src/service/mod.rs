@@ -28,7 +28,7 @@ use qframe::t;
 
 use crate::engine::run::EngineError;
 use crate::engine::{Engine, EngineCommand, EngineKind};
-use crate::workspace::{OnClose, Registry};
+use crate::store::{OnClose, Registry};
 use stop::Reaped;
 
 /// The name of the file every open QCode holds a shared lock on, beside the list.

@@ -13,7 +13,7 @@ use qframe::diagnostics::Diagnostic;
 
 use crate::engine::run::EngineError;
 use crate::engine::{Container, Engine, EngineCommand, EngineKind};
-use crate::workspace::{Loaded, OnClose, PREFIX, Registered, Registry};
+use crate::store::{Loaded, OnClose, PREFIX, Registered, Registry};
 
 /// What came of looking at the list of QCode's containers.
 #[derive(Debug, Clone, PartialEq)]

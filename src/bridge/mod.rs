@@ -1,18 +1,18 @@
-//! The bridge between tabs: the agent of one tab lists the other agent tabs of its project
+//! The bridge between tabs: the agent of one tab lists the other agent tabs of its workspace
 //! and sends one of them a message.
 //!
 //! Three parts, each in its own place:
 //!
 //! - a small MCP server ([`SCRIPT`]) a harness starts inside its container, with two tools,
 //!   `list_tabs` and `send_message`. It decides nothing; it asks QCode through a socket;
-//! - the socket, one per open project in the project's `Containers/MCP/` folder, which profile
+//! - the socket, one per open workspace in the workspace's `Containers/MCP/` folder, which profile
 //!   containers see read-only at [`MCP_DIR`] ([`socket`]), and the
 //!   line of JSON each question and answer is ([`protocol`]);
 //! - the rules QCode answers by ([`rules`]): the person approves the first message between two
 //!   tabs, a tab without the network never sends to one with it, and a chain of messages and a
 //!   busy sender are both cut off.
 //!
-//! The server is registered in each harness's own user settings in the project's home volume
+//! The server is registered in each harness's own user settings in the workspace's home volume
 //! ([`config`]), so the harness starts it like any server the person added.
 //!
 //! Which tab asks is known from a token: every harness tab is started with one in
@@ -34,7 +34,7 @@ use std::hash::{BuildHasher, Hasher};
 use crate::base::paths::MCP_DIR;
 
 /// The MCP server a harness starts, carried inside the binary and written into each open
-/// project's `Containers/MCP/` folder, so the server a container starts is always the one this
+/// workspace's `Containers/MCP/` folder, so the server a container starts is always the one this
 /// QCode speaks with.
 pub const SCRIPT: &str = include_str!("../../assets/bridge/qcode-bridge.mjs");
 

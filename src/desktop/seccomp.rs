@@ -17,7 +17,7 @@
 //!
 //! `--no-sandbox` is not an option here, and the record's flags are tested for its absence. It
 //! would let a page or an extension that takes over a renderer reach everything in the container
-//! with the person's own rights: the project's files, the profile's home volume, the login.
+//! with the person's own rights: the workspace's files, the profile's home volume, the login.
 //!
 //! The file is carried in the binary and written out when it is first needed, named after a digest
 //! of its own content, so a QCode that has been updated never hands the engine an older file left

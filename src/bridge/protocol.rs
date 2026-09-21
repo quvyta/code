@@ -1,4 +1,4 @@
-//! What goes over the project's socket: one line of JSON from the server in a container, one
+//! What goes over the workspace's socket: one line of JSON from the server in a container, one
 //! line of JSON back from QCode, and the connection closes.
 //!
 //! A question:
@@ -26,7 +26,7 @@ use serde_json::{Map, Value, json};
 pub const MOST_LINE: usize = 256 * 1024;
 
 /// The most characters a message may have. A message is something one agent hands another to
-/// act on, a task or an answer; a whole file does not belong in one, the project folder is where
+/// act on, a task or an answer; a whole file does not belong in one, the workspace folder is where
 /// both agents read files.
 pub const MOST_TEXT: usize = 16_000;
 
@@ -42,7 +42,7 @@ pub struct Question {
 /// What a tab's server can ask.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
-    /// The other agent tabs of the project.
+    /// The other agent tabs of the workspace.
     List,
     /// Hand `text` to the tab named `tab`.
     Send {

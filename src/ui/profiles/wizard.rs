@@ -31,7 +31,7 @@ pub enum Stage {
     Permissions,
     /// Building the image the profile's containers start from.
     Image,
-    /// Signing in, so that projects that use the profile have a login to copy.
+    /// Signing in, so that workspaces that use the profile have a login to copy.
     Login,
 }
 
@@ -165,7 +165,7 @@ pub enum Blocked {
 }
 
 impl Draft {
-    /// A new draft for a workspace whose profiles are called `taken`.
+    /// A new draft for a store whose profiles are called `taken`.
     #[must_use]
     pub fn new(taken: impl IntoIterator<Item = String>) -> Self {
         let harness = HarnessKind::ALL[0];

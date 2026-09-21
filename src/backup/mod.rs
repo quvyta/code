@@ -1,23 +1,23 @@
-//! The project backup: frequent snapshots of `Project/` in a git folder of its own under
-//! `Backup/`, and bringing the project or one file back from any of them.
+//! The workspace backup: frequent snapshots of `Work/` in a git folder of its own under
+//! `Backup/`, and bringing the workspace or one file back from any of them.
 //!
 //! ```text
-//! Projects/<project>/
+//! Workspaces/<workspace>/
 //!   Backup/
-//!     Project.git/     the snapshots, git's own folder with no working tree
-//!     Assets.git/      the snapshots of `Assets/`, when the project asks for them
-//!     backup.lock      held while a snapshot or a restore of the project runs
+//!     Code.git/     the snapshots, git's own folder with no working tree
+//!     Assets.git/      the snapshots of `Assets/`, when the workspace asks for them
+//!     backup.lock      held while a snapshot or a restore of the workspace runs
 //!     assets.lock      held while one of `Assets/` runs
 //! ```
 //!
-//! The backup sits beside the project, so it moves and is copied with it. It guards against a
+//! The backup sits beside the workspace, so it moves and is copied with it. It guards against a
 //! wrong delete, a change that breaks things and a harness scattering files, not against a
 //! failing disk.
 //!
 //! git does not run on the machine: QCode promises to run no program there, and the machine may
-//! have no git. Every job runs in a one-off container of the base image that sees the project
+//! have no git. Every job runs in a one-off container of the base image that sees the workspace
 //! and `Backup/` and removes itself when git is done (the `job` module has the commands). The person's
-//! own repository inside `Project/`, if there is one, is never touched: the backup has a git
+//! own repository inside `Work/`, if there is one, is never touched: the backup has a git
 //! folder of its own, and git never takes a folder called `.git` into a snapshot.
 //!
 //! Everything public here runs engine commands and waits for them, so it belongs on a
@@ -40,19 +40,20 @@ use qframe::storage::InstanceLock;
 use crate::base;
 use crate::engine::run::{EngineError, capture};
 use crate::engine::{Engine, HostUser};
-use crate::workspace::ProjectPaths;
+use crate::store::WorkspacePaths;
 
+pub(crate) use job::CODE_SNAPSHOTS;
 use job::Tree;
 
-/// The name of the lock file of the project's own snapshots inside `Backup/`.
+/// The name of the lock file of the workspace's own snapshots inside `Backup/`.
 const LOCK: &str = "backup.lock";
 
 /// The name of the lock file of the snapshots of `Assets/` inside `Backup/`. It is a lock of its
-/// own because a round that found the project's lock taken by a restore would skip the assets
+/// own because a round that found the workspace's lock taken by a restore would skip the assets
 /// as covered when nothing covers them.
 const ASSETS_LOCK: &str = "assets.lock";
 
-/// How often an open project is backed up.
+/// How often an open workspace is backed up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BackupEvery {
     /// Never on a timer.
@@ -104,7 +105,7 @@ impl BackupEvery {
 /// Why a snapshot was taken, kept as its commit message so the list can say it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
-    /// On the timer, or as the project closed.
+    /// On the timer, or as the workspace closed.
     Scheduled,
     /// Just before a restore, so that the restore can be undone too.
     BeforeRestore,
@@ -160,7 +161,7 @@ pub enum Snapshot {
     },
     /// Nothing changed since the last one, so nothing was written.
     Unchanged,
-    /// Another QCode with the same project open is backing it up right now; this round is
+    /// Another QCode with the same workspace open is backing it up right now; this round is
     /// skipped, because that one covers it.
     Busy,
 }
@@ -175,7 +176,7 @@ pub enum Restored {
         /// The snapshot taken first.
         before: Snapshot,
     },
-    /// Another QCode is backing the project up right now; nothing was touched.
+    /// Another QCode is backing the workspace up right now; nothing was touched.
     Busy,
 }
 
@@ -195,7 +196,7 @@ pub struct Entry {
 /// Why a backup job did not do what was asked.
 #[derive(Debug)]
 pub enum BackupError {
-    /// A skip-list entry or a file to restore is not a path inside the project.
+    /// A skip-list entry or a file to restore is not a path inside the workspace.
     Place(BadPlace),
     /// `Backup/` or its lock could not be made.
     Host(io::Error),
@@ -213,45 +214,45 @@ impl From<EngineError> for BackupError {
     }
 }
 
-/// Backs the project up, leaving out every folder or file of `skip` as well as what the
-/// project's own `.gitignore` leaves out.
+/// Backs the workspace up, leaving out every folder or file of `skip` as well as what the
+/// workspace's own `.gitignore` leaves out.
 ///
-/// Makes `Backup/` the first time. When another QCode is backing the same project up at this
+/// Makes `Backup/` the first time. When another QCode is backing the same workspace up at this
 /// moment the round is skipped: the two would only race for git's own lock.
 ///
 /// # Errors
 ///
-/// An entry of `skip` that is not a path inside the project, before anything runs; a
+/// An entry of `skip` that is not a path inside the workspace, before anything runs; a
 /// `Backup/` that cannot be made; and the engine's or git's own words when the job fails.
 pub fn snapshot(
     engine: &Engine,
-    paths: &ProjectPaths,
+    paths: &WorkspacePaths,
     user: HostUser,
     skip: &[String],
 ) -> Result<Snapshot, BackupError> {
     let exclude = place::exclude_file(&place::places(skip).map_err(BackupError::Place)?);
     let Some(_lock) = hold(paths)? else { return Ok(Snapshot::Busy) };
-    take(engine, paths, Tree::Project, user, &exclude, Reason::Scheduled)
+    take(engine, paths, Tree::Code, user, &exclude, Reason::Scheduled)
 }
 
-/// The snapshots of the project, newest first; those that changed `file` when one is named.
-/// A project that has never been backed up has none, and no container is started to say so.
+/// The snapshots of the workspace, newest first; those that changed `file` when one is named.
+/// A workspace that has never been backed up has none, and no container is started to say so.
 ///
 /// # Errors
 ///
-/// A `file` that is not a path inside the project, and the engine's or git's own words when the
+/// A `file` that is not a path inside the workspace, and the engine's or git's own words when the
 /// listing fails.
 pub fn history(
     engine: &Engine,
-    paths: &ProjectPaths,
+    paths: &WorkspacePaths,
     user: HostUser,
     file: Option<&str>,
 ) -> Result<Vec<Entry>, BackupError> {
     let file = file.map(Place::new).transpose().map_err(BackupError::Place)?;
-    list(engine, paths, Tree::Project, user, file.as_ref())
+    list(engine, paths, Tree::Code, user, file.as_ref())
 }
 
-/// Backs `Assets/` up, into a git folder of its own. A project without the folder has nothing to
+/// Backs `Assets/` up, into a git folder of its own. A workspace without the folder has nothing to
 /// back up, and no container is started to say so.
 ///
 /// Nothing is left out but what an `Assets/.gitignore` names: the person asked for the assets.
@@ -259,7 +260,7 @@ pub fn history(
 /// # Errors
 ///
 /// A `Backup/` that cannot be made, and the engine's or git's own words when the job fails.
-pub fn snapshot_assets(engine: &Engine, paths: &ProjectPaths, user: HostUser) -> Result<Snapshot, BackupError> {
+pub fn snapshot_assets(engine: &Engine, paths: &WorkspacePaths, user: HostUser) -> Result<Snapshot, BackupError> {
     if !paths.assets.is_dir() {
         return Ok(Snapshot::Unchanged);
     }
@@ -273,7 +274,7 @@ pub fn snapshot_assets(engine: &Engine, paths: &ProjectPaths, user: HostUser) ->
 /// # Errors
 ///
 /// The engine's or git's own words when the listing fails.
-pub fn assets_history(engine: &Engine, paths: &ProjectPaths, user: HostUser) -> Result<Vec<Entry>, BackupError> {
+pub fn assets_history(engine: &Engine, paths: &WorkspacePaths, user: HostUser) -> Result<Vec<Entry>, BackupError> {
     list(engine, paths, Tree::Assets, user, None)
 }
 
@@ -286,7 +287,7 @@ pub fn assets_history(engine: &Engine, paths: &ProjectPaths, user: HostUser) -> 
 /// when the restore fails.
 pub fn restore_assets(
     engine: &Engine,
-    paths: &ProjectPaths,
+    paths: &WorkspacePaths,
     user: HostUser,
     id: &SnapshotId,
 ) -> Result<Restored, BackupError> {
@@ -301,7 +302,7 @@ pub fn restore_assets(
 /// it was never backed up.
 fn list(
     engine: &Engine,
-    paths: &ProjectPaths,
+    paths: &WorkspacePaths,
     tree: Tree,
     user: HostUser,
     file: Option<&Place>,
@@ -313,8 +314,8 @@ fn list(
     Ok(job::read_history(&output))
 }
 
-/// Brings every file of the snapshot `id` back into the project, after a snapshot of how the
-/// project is now.
+/// Brings every file of the snapshot `id` back into the workspace, after a snapshot of how the
+/// workspace is now.
 ///
 /// Nothing is deleted: a file made after `id` stays where it is. The person removes it if they
 /// want it gone; losing something by accident is worse than one file too many.
@@ -325,7 +326,7 @@ fn list(
 /// backup does not have among them.
 pub fn restore(
     engine: &Engine,
-    paths: &ProjectPaths,
+    paths: &WorkspacePaths,
     user: HostUser,
     skip: &[String],
     id: &SnapshotId,
@@ -333,15 +334,15 @@ pub fn restore(
     bring_back(engine, paths, user, skip, id, None)
 }
 
-/// Brings `file` back as it was in the snapshot `id`, after a snapshot of how the project is
-/// now. The rest of the project is left as it is.
+/// Brings `file` back as it was in the snapshot `id`, after a snapshot of how the workspace is
+/// now. The rest of the workspace is left as it is.
 ///
 /// # Errors
 ///
-/// A `file` that is not a path inside the project, and everything [`restore`] fails for.
+/// A `file` that is not a path inside the workspace, and everything [`restore`] fails for.
 pub fn restore_file(
     engine: &Engine,
-    paths: &ProjectPaths,
+    paths: &WorkspacePaths,
     user: HostUser,
     skip: &[String],
     id: &SnapshotId,
@@ -355,7 +356,7 @@ pub fn restore_file(
 /// no other backup runs between the snapshot before and the restore itself.
 fn bring_back(
     engine: &Engine,
-    paths: &ProjectPaths,
+    paths: &WorkspacePaths,
     user: HostUser,
     skip: &[String],
     id: &SnapshotId,
@@ -363,19 +364,19 @@ fn bring_back(
 ) -> Result<Restored, BackupError> {
     let exclude = place::exclude_file(&place::places(skip).map_err(BackupError::Place)?);
     let Some(_lock) = hold(paths)? else { return Ok(Restored::Busy) };
-    let before = take(engine, paths, Tree::Project, user, &exclude, Reason::BeforeRestore)?;
-    capture(&job::restore(engine, paths, Tree::Project, user, id, what))?;
+    let before = take(engine, paths, Tree::Code, user, &exclude, Reason::BeforeRestore)?;
+    capture(&job::restore(engine, paths, Tree::Code, user, id, what))?;
     Ok(Restored::Done { before })
 }
 
 /// How much `Backup/` holds on the disk, in bytes: every file under it, each counted once. A
-/// project never backed up holds nothing. A file that goes while it is counted is not counted;
+/// workspace never backed up holds nothing. A file that goes while it is counted is not counted;
 /// a symbolic link counts as itself, never as what it points to.
 ///
 /// Reads the machine's disk and nothing else, but a large backup takes a moment, so it belongs
 /// on a background thread.
 #[must_use]
-pub fn size(paths: &ProjectPaths) -> u64 {
+pub fn size(paths: &WorkspacePaths) -> u64 {
     let mut total = 0;
     let mut folders = vec![paths.backup()];
     while let Some(folder) = folders.pop() {
@@ -395,7 +396,7 @@ pub fn size(paths: &ProjectPaths) -> u64 {
 /// Runs a snapshot job of `tree`, with its lock already held.
 fn take(
     engine: &Engine,
-    paths: &ProjectPaths,
+    paths: &WorkspacePaths,
     tree: Tree,
     user: HostUser,
     exclude: &str,
@@ -416,12 +417,12 @@ type Held = Option<InstanceLock>;
 ///
 /// Where the platform has no advisory lock (Windows) the job goes on without one; there git's
 /// own `index.lock` stops a second one, which then fails that round instead of skipping it.
-fn hold(paths: &ProjectPaths) -> Result<Option<Held>, BackupError> {
+fn hold(paths: &WorkspacePaths) -> Result<Option<Held>, BackupError> {
     hold_at(paths, LOCK)
 }
 
 /// Makes `Backup/` and takes the lock `name` in it, as [`hold`] does.
-fn hold_at(paths: &ProjectPaths, name: &str) -> Result<Option<Held>, BackupError> {
+fn hold_at(paths: &WorkspacePaths, name: &str) -> Result<Option<Held>, BackupError> {
     let backup = paths.backup();
     std::fs::create_dir_all(&backup).map_err(BackupError::Host)?;
     lock(&backup.join(name))
@@ -444,11 +445,11 @@ mod tests {
         snapshot_assets,
     };
     use crate::engine::{Engine, EngineKind, HostUser};
-    use crate::workspace::ProjectPaths;
+    use crate::store::WorkspacePaths;
     use std::path::PathBuf;
     use std::time::Duration;
 
-    /// A project folder of this test's own, removed again when the test ends.
+    /// A workspace folder of this test's own, removed again when the test ends.
     struct Scratch(PathBuf);
 
     impl Scratch {
@@ -456,15 +457,15 @@ mod tests {
             let stamp =
                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
             let path = std::env::temp_dir().join(format!("qcode-backup-{name}-{stamp}"));
-            std::fs::create_dir_all(path.join("Project")).expect("a project folder");
+            std::fs::create_dir_all(path.join("Work")).expect("a workspace folder");
             Self(path)
         }
 
-        fn paths(&self) -> ProjectPaths {
-            ProjectPaths {
+        fn paths(&self) -> WorkspacePaths {
+            WorkspacePaths {
                 root: self.0.clone(),
-                file: self.0.join("project.qcode"),
-                project: self.0.join("Project"),
+                file: self.0.join("workspace.qcode"),
+                code: self.0.join("Work"),
                 assets: self.0.join("Assets"),
                 harness: self.0.join("Containers").join("Harness"),
             }
@@ -521,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn a_project_never_backed_up_has_no_history_and_starts_no_container() {
+    fn a_workspace_never_backed_up_has_no_history_and_starts_no_container() {
         let scratch = Scratch::new("history");
         assert_eq!(history(&missing(), &scratch.paths(), ME, None).expect("nothing to ask"), []);
         assert!(matches!(history(&missing(), &scratch.paths(), ME, Some("/etc")), Err(BackupError::Place(_))));
@@ -532,15 +533,15 @@ mod tests {
         let scratch = Scratch::new("size");
         let paths = scratch.paths();
         assert_eq!(size(&paths), 0, "never backed up");
-        std::fs::create_dir_all(paths.backup().join("Project.git").join("objects")).expect("a folder");
+        std::fs::create_dir_all(paths.backup().join("Code.git").join("objects")).expect("a folder");
         std::fs::write(paths.backup().join("backup.lock"), "").expect("a file");
-        std::fs::write(paths.backup().join("Project.git").join("HEAD"), "0123456789").expect("a file");
-        std::fs::write(paths.backup().join("Project.git").join("objects").join("pack"), [0; 1000]).expect("a file");
+        std::fs::write(paths.backup().join("Code.git").join("HEAD"), "0123456789").expect("a file");
+        std::fs::write(paths.backup().join("Code.git").join("objects").join("pack"), [0; 1000]).expect("a file");
         assert_eq!(size(&paths), 1010);
     }
 
     #[test]
-    fn a_project_without_assets_or_their_backup_starts_no_container() {
+    fn a_workspace_without_assets_or_their_backup_starts_no_container() {
         let scratch = Scratch::new("assets");
         assert_eq!(snapshot_assets(&missing(), &scratch.paths(), ME).expect("nothing to take"), Snapshot::Unchanged);
         assert!(!scratch.paths().backup().exists(), "Backup/ was made for nothing");
@@ -549,7 +550,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_second_backup_of_the_same_project_skips_its_round() {
+    fn a_second_backup_of_the_same_workspace_skips_its_round() {
         let scratch = Scratch::new("lock");
         let first = hold(&scratch.paths()).expect("Backup/ is made").expect("nobody holds it");
         assert!(scratch.paths().backup().join("backup.lock").is_file());

@@ -2,10 +2,10 @@
 
 **Run Claude Code, opencode, Gemini CLI and Codex side by side in Podman or Docker containers, with tabs like a browser, from one terminal app.**
 
-![qcode in forty seconds: Continue opens a project, a shell lists its files, an opencode tab answers a question about the project's own code while a Claude Code tab waits beside it on the strip, a new tab lists each profile's recent conversations, the side panel shows the containers and a file made in the shell appearing in the tree, three files are selected with their menu open, and the README opens in a tab of its own](https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/qcode.gif)
+![qcode in forty seconds: Continue opens a workspace, a shell lists its files, an opencode tab answers a question about the workspace's own code while a Claude Code tab waits beside it on the strip, a new tab lists each profile's recent conversations, the side panel shows the containers and a file made in the shell appearing in the tree, three files are selected with their menu open, and the README opens in a tab of its own](https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/qcode.gif)
 
 **quvyta-code** runs coding harnesses inside containers, from the terminal. You set up a
-profile once, sign it in, and from then on open that harness in any of your projects in a few
+profile once, sign it in, and from then on open that harness in any of your workspaces in a few
 seconds, moving between harnesses and shells the way you move between tabs. Nothing the harness
 runs ever runs on your machine itself. qcode is part of the Quvyta family of terminal
 applications, is built on [quvyta-framework](https://github.com/quvyta/framework) and is open
@@ -18,7 +18,7 @@ source under the MIT licence.
 ## What it does
 
 - **Harnesses in containers.** Each harness runs in a container of its own, built from an image
-  made for it. The container sees the project folder and, if you allow it, the project's assets
+  made for it. The container sees the workspace folder and, if you allow it, the workspace's assets
   folder and the network. Because the container is what keeps the work apart from your machine,
   the harness is set up to work without stopping to ask for permission.
 - **Profiles.** A profile is one harness with its settings: which harness, how much of qcode's
@@ -27,21 +27,22 @@ source under the MIT licence.
   half-made image is removed.
 - **Signing in once.** A profile signs in through the harness's own sign-in flow, run in a
   terminal inside a container. qcode then checks that the login file is really there before it
-  keeps it. Each project that uses the profile gets its own copy of the login, so chat history,
-  memory and settings never leak from one project into another. A copy can be refreshed from the
+  keeps it. Each workspace that uses the profile gets its own copy of the login, so chat history,
+  memory and settings never leak from one workspace into another. A copy can be refreshed from the
   profile later, and the profile can be signed out.
-- **Projects.** A project starts empty, from a copy of a folder, or from a git address (the clone
-  runs inside a container, so git does not have to be installed on your machine). The project
-  screen has tabs for shells, harnesses and files, and a side panel with the project's files, its
+- **Workspaces.** A workspace starts empty, from a copy of a folder, or from a git address (the clone
+  runs inside a container, so git does not have to be installed on your machine). The workspace
+  screen has tabs for shells, harnesses and files, and a side panel with the workspace's files, its
   details and its containers, which can be stopped and restarted from there.
-- **Built-in apps.** A file opened from the file tree opens in a tab of its own, in the project's
+- **Built-in apps.** A file opened from the file tree opens in a tab of its own, in the workspace's
   base container, so nothing is installed on your machine for it. See [Built-in apps](#built-in-apps).
 - **Containers stop when you are done.** When the last QCode closes, the containers it started
   are stopped, and an optional background service does the same after a crash. See
   [When QCode closes](#when-qcode-closes).
 - **Podman or Docker.** Either engine works. qcode finds it, tells you when it is missing or not
-  running, and shows the command that installs or starts it. It never installs anything and never
-  raises its own rights.
+  running, and works out the command that installs or starts it. You either run that command
+  yourself or let qcode run it on a terminal inside the setup, where you watch it. Either way it
+  is the one command you chose, run with the rights you already have; qcode never raises its own.
 
 The harnesses qcode knows today:
 
@@ -65,16 +66,16 @@ Turkish are included) and uses the family's themes, icons, keys and mouse behavi
 
 qcode is an everyday place to work with several harnesses, not a security product. What it adds
 is the whole working surface around the containers: profiles you sign in once, a login copy per
-project, tabs, going back to an earlier conversation, a file tree and the containers' state in
+workspace, tabs, going back to an earlier conversation, a file tree and the containers' state in
 one screen. Other good tools solve neighbouring problems:
 
 | Tool | What it does | How qcode differs |
 |---|---|---|
-| Docker Sandboxes (`docker sandbox`) | Runs harnesses in Docker's microVMs | Its isolation is stronger than a container's; it needs Docker Desktop and is a command-line tool, without tabs, a project screen or a list of earlier conversations |
+| Docker Sandboxes (`docker sandbox`) | Runs harnesses in Docker's microVMs | Its isolation is stronger than a container's; it needs Docker Desktop and is a command-line tool, without tabs, a workspace screen or a list of earlier conversations |
 | Dagger container-use | Gives each task of a harness its own container and git branch, over MCP | A base for running tasks in parallel, with no interface of its own; needs Dagger and git |
-| Dev containers | The route the Claude Code documentation suggests | Tied to an editor such as VS Code and set up by hand for each project |
+| Dev containers | The route the Claude Code documentation suggests | Tied to an editor such as VS Code and set up by hand for each workspace |
 | claude-squad and similar | Several harnesses side by side with tmux and git worktrees | No container: the harness still runs on your machine |
-| Single-image scripts (claudebox and others) | One harness in one Docker image | No interface, profiles, per-project logins or conversations to go back to |
+| Single-image scripts (claudebox and others) | One harness in one Docker image | No interface, profiles, per-workspace logins or conversations to go back to |
 
 If what you need is the strongest possible wall between a harness and your machine, a microVM is
 the better tool. If you want to use several harnesses every day without handing them your
@@ -87,19 +88,19 @@ container is what keeps them away from your machine. It helps to know exactly wh
 
 The container keeps the harness away from:
 
-- your home folder, your other projects and every file qcode did not mount: a container sees
-  only its project's `Project/` folder, its `Assets/` folder (read-only unless the profile allows
+- your home folder, your other workspaces and every file qcode did not mount: a container sees
+  only its workspace's `Work/` folder, its `Assets/` folder (read-only unless the profile allows
   writing) and its own home;
-- other projects' logins and conversations: each project has its own copy of a profile's home;
+- other workspaces' logins and conversations: each workspace has its own copy of a profile's home;
 - the container engine itself: its socket is never mounted, containers are not privileged, and
   processes inside run as your own user id, never as root on your machine.
 
 It does not protect:
 
-- **the project folder.** The harness can change or delete anything in `Project/`, and it is
+- **the workspace folder.** The harness can change or delete anything in `Work/`, and it is
   mounted straight from your disk. Keep your work in git and push it somewhere.
 - **your data from leaving over the network.** A profile with network access (the default) can
-  send anything it can read, the project included, anywhere. A profile can be set to have no
+  send anything it can read, the workspace included, anywhere. A profile can be set to have no
   network, but most harnesses need it to reach their model.
 - **the logins.** A profile's login lives in the engine's volumes. Anyone who can use your
   container engine can read them.
@@ -110,24 +111,24 @@ It does not protect:
 
 qcode itself sends nothing anywhere: it has no network code and no network library, collects no
 statistics and checks for no updates. The only network traffic it causes goes through your
-container engine: building images (the base image and the harness packages), cloning a project
+container engine: building images (the base image and the harness packages), cloning a workspace
 from a git address, and whatever the harnesses do inside their containers. The harnesses keep
 their own behaviour, including any telemetry of their own; their documentation says what that is.
 
 ## Screens
 
-![A project open in qcode: a shell tab beside a Claude Code and an opencode tab, and the panel with the file tree, the project and its containers](https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/project.png)
+![A workspace open in qcode: a shell tab beside a Claude Code and an opencode tab, and the panel with the file tree, the workspace and its containers](https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/workspace.png)
 
 <p>
   <img src="https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/new-tab.png" width="49%" alt="A new tab offering a shell and each profile's earlier conversations">
-  <img src="https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/panel.png" width="49%" alt="The panel with the project's details and its containers">
+  <img src="https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/panel.png" width="49%" alt="The panel with the workspace's details and its containers">
 </p>
 <p>
-  <img src="https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/home.png" width="49%" alt="The home screen, ready to continue with the projects left open">
-  <img src="https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/projects.png" width="49%" alt="The list of projects">
+  <img src="https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/home.png" width="49%" alt="The home screen, ready to continue with the workspaces left open">
+  <img src="https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/workspaces.png" width="49%" alt="The list of workspaces">
 </p>
 <p>
-  <img src="https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/apps.png" width="49%" alt="The project's README read in a Markdown tab, opened from the file tree">
+  <img src="https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/apps.png" width="49%" alt="The workspace's README read in a Markdown tab, opened from the file tree">
   <img src="https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/files.png" width="49%" alt="Three files selected in the file tree, with the menu that cuts or deletes them">
 </p>
 
@@ -164,24 +165,24 @@ The program is installed as `qcode` and also as `quvyta-code`.
 ## Using it
 
 1. **Setup.** The first time qcode opens it asks three things: the language, the container engine
-   and where the workspace folder goes. It checks each answer before going on, and checks them
+   and where the QCode folder goes. It checks each answer before going on, and checks them
    again every time it starts.
 2. **A profile.** Open **Profiles** and make a new profile: pick the harness, the template, the
    account type and the permissions, then build the image. When it is built, sign in in the
    terminal that opens and press **I have signed in**.
-3. **A project.** Open **Projects** and make a new project, empty, from a folder or from a git
+3. **A workspace.** Open **Workspaces** and make a new workspace, empty, from a folder or from a git
    address.
-4. **Tabs.** In the project, the `+` after the last tab (or `ctrl+t`) opens a new tab at once.
-   It lists the shell of the project's own container and, for every profile, **New chat** and
-   the profile's latest conversations in this project, newest first, with when each was last
+4. **Tabs.** In the workspace, the `+` after the last tab (or `ctrl+t`) opens a new tab at once.
+   It lists the shell of the workspace's own container and, for every profile, **New chat** and
+   the profile's latest conversations in this workspace, newest first, with when each was last
    used. Choosing a conversation opens the harness on it again, where it left off; Claude Code,
-   opencode, Gemini CLI and Codex CLI all resume a conversation this way. A profile the project
-   does not have yet is added to it the moment you open it, and is written into the project's
-   `project.qcode`. With no profile at all, the list offers **New profile**, which leads to the
+   opencode, Gemini CLI and Codex CLI all resume a conversation this way. A profile the workspace
+   does not have yet is added to it the moment you open it, and is written into the workspace's
+   `workspace.qcode`. With no profile at all, the list offers **New profile**, which leads to the
    profiles screen.
-5. **Continue.** The rail on the left holds the projects you have open, like the windows of a
+5. **Continue.** The rail on the left holds the workspaces you have open, like the windows of a
    browser: `+` at its end adds another one, and each can be closed. **Continue** on the home
-   screen brings back the open projects with their tabs as you left them, even after qcode was
+   screen brings back the open workspaces with their tabs as you left them, even after qcode was
    closed; a tab's container starts when you first switch to that tab.
 
 | Key | What it does |
@@ -190,7 +191,7 @@ The program is installed as `qcode` and also as `quvyta-code`.
 | `ctrl+shift+←` `ctrl+shift+→` | Move the open tab left or right |
 | `ctrl+t` | Open a new tab |
 | `ctrl+w` | Close the tab |
-| `ctrl+alt+space` | Inside a harness or shell tab: leave it for the tab strip. Anywhere else on the project screen: go back into the open tab's terminal |
+| `ctrl+alt+space` | Inside a harness or shell tab: leave it for the tab strip. Anywhere else on the workspace screen: go back into the open tab's terminal |
 | `alt+b` | Show or hide the side panel |
 | `tab` `shift+tab` | Move to the next or previous control; `shift+tab` also leaves a terminal |
 | `ctrl+p` | Command palette |
@@ -214,7 +215,7 @@ While a harness or shell tab has the keyboard, keys go to it, `esc` and `?` incl
 
 ## Built-in apps
 
-Every project has one small container of its own, the base container, which is also where the
+Every workspace has one small container of its own, the base container, which is also where the
 shell tab runs. It starts the first time something needs it, so a session that opens no shell and
 no file starts nothing. A file chosen in the file tree (`enter` or a click) opens in a new
 tab named after the file; choosing it again goes back to that tab.
@@ -229,7 +230,7 @@ tab named after the file; choosing it again goes back to that tab.
 | Sound: `mp3`, `ogg`, `oga`, `opus`, `flac`, `wav` | `sox`, which plays it in the tab and shows how far it has got; **Play again** plays it once more. `m4a` and `aac` are not supported |
 
 A sound does not play in the base container. Each time it plays, qcode starts a container of its
-own for it, which sees the project read-only, has no network and reaches only this machine's
+own for it, which sees the workspace read-only, has no network and reaches only this machine's
 sound server (PulseAudio, or PipeWire through its PulseAudio socket). On a machine with no such
 server, which includes macOS and Windows, the tab shows the sound's details (length, rate,
 channels) instead. If no container should ever reach the sound server, set **Sounds** to
@@ -247,7 +248,7 @@ that has gone since is reported in its tab.
 ## Desktop harnesses
 
 Most harnesses draw in the tab's terminal. One does not: **Antigravity IDE** is a desktop
-application, and qcode runs it the same way it runs the others — in a container, on your project
+application, and qcode runs it the same way it runs the others — in a container, on your workspace
 and nothing else — except that its window opens on your own screen instead of in a tab.
 
 A profile for it is made like any other, in **Profiles**. The image is built on qcode's base image
@@ -263,7 +264,7 @@ The tab is one line of status with two things you can do to the window:
 |---|---|
 | **Opening the window…** | The container is starting. The first time takes a few seconds longer |
 | **Window open** | The window is on your screen. **Bring to front** asks it to show itself, **Close the window** closes it |
-| **Window closed** | It is not open. **Open the window** opens it again. Nothing was lost: the settings, the history and the sign-in are in the project's home volume |
+| **Window closed** | It is not open. **Open the window** opens it again. Nothing was lost: the settings, the history and the sign-in are in the workspace's home volume |
 | **The window did not open** | Why, in the engine's own words |
 
 The window is a container's, which is what makes it worth having and also where its limits come
@@ -296,13 +297,13 @@ next time and either taken over, if its window is still up, or cleared away.
 
 ## File manager
 
-The file tree of the side panel is also a file manager. It works on the project's own folder
+The file tree of the side panel is also a file manager. It works on the workspace's own folder
 directly on your machine, so it needs no container and works with no engine running.
 
 - **Context menu.** Right-click an entry, or select it and press `shift+f10` or the menu key. On a
   folder: **New file**, **New folder**, **Rename**, **Cut**, **Paste here** (once something is cut)
   and **Delete**. On a file: **Rename**, **Cut** and **Delete**. The first row of the tree is the
-  project folder itself; its menu has **New file**, **New folder**, **Paste here** and **Refresh**.
+  workspace folder itself; its menu has **New file**, **New folder**, **Paste here** and **Refresh**.
   With several entries selected, the menu cuts or deletes all of them. Folders and files also
   offer **Don't back up** (or **Back up again**), and files **Earlier versions**; see
   [Backups](#backups).
@@ -318,42 +319,42 @@ directly on your machine, so it needs no container and works with no engine runn
 - **Several entries.** `ctrl`+click adds or removes an entry, `shift`+click selects a range, and
   `shift` with the arrow keys extends it; `space` adds or removes the entry under the cursor and
   `esc` goes back to one. Cut, paste, delete and dragging act on all of them.
-- **Dragging** entries onto a folder, or onto the project folder's row, moves them there.
+- **Dragging** entries onto a folder, or onto the workspace folder's row, moves them there.
 - **Live.** The tree follows the disk: the folders on screen are watched, and when something
   changes in one, by qcode, a harness or any other program, only that folder is read again.
   Nothing is read on a timer. Where the system has no watch to give (so far, anywhere but Linux),
   the tree is read again after qcode's own changes, when you come back to the screen, and on
   **Refresh**.
 
-A link inside the project is handled as an entry of its own: deleting or moving it touches the
+A link inside the workspace is handled as an entry of its own: deleting or moving it touches the
 link, never what it points to.
 
 ## Backups
 
-qcode keeps copies of every open project's `Project/` folder in `Backup/`, next to it in the
-project's own folder, so the backup moves and is copied with the project.
+qcode keeps copies of every open workspace's `Work/` folder in `Backup/`, next to it in the
+workspace's own folder, so the backup moves and is copied with the workspace.
 
-- **How often.** Every 15 minutes while the project is open, once more when you close it from the
-  rail, and once more when qcode quits. **Settings**, **Back up open projects** chooses **Off**,
+- **How often.** Every 15 minutes while the workspace is open, once more when you close it from the
+  rail, and once more when qcode quits. **Settings**, **Back up open workspaces** chooses **Off**,
   **5 min**, **15 min** or **1 hour**. A round in which nothing changed writes nothing.
-- **How.** Each backup is a git commit in `Backup/Project.git`, made by git in a short-lived
+- **How.** Each backup is a git commit in `Backup/Code.git`, made by git in a short-lived
   container of the base image, so nothing runs on your machine and your machine needs no git.
-  Your own repository inside `Project/`, if you have one, is never touched, and what your
+  Your own repository inside `Work/`, if you have one, is never touched, and what your
   `.gitignore` leaves out stays out.
 - **Leaving things out.** Right-click a folder or a file in the file tree and choose
-  **Don't back up**; **Back up again** takes it back in. The list is kept in `project.qcode`.
-  Left-out entries are drawn faded with a coloured icon, and the **Project** part of the side panel
+  **Don't back up**; **Back up again** takes it back in. The list is kept in `workspace.qcode`.
+  Left-out entries are drawn faded with a coloured icon, and the **Workspace** part of the side panel
   names them.
-- **Assets.** `Assets/` is left out unless you turn on **Back up Assets too** in the **Project**
+- **Assets.** `Assets/` is left out unless you turn on **Back up Assets too** in the **Workspace**
   part of the side panel. It is then backed up in every round into `Backup/Assets.git`, apart
-  from the project, and the choice is kept in `project.qcode`.
+  from the workspace, and the choice is kept in `workspace.qcode`.
 - **Conversations.** Each round also backs up the conversations of every profile whose tab was
   open since the round before, each profile into `Backup/Conversations/<profile>.git`. Only the
   harness's conversation files are taken, never its login. opencode keeps its conversations in a
   database, so they are backed up only while its container is stopped: when qcode quits and
   stops it.
-- **Bringing things back.** **Backups** in the **Project** part of the side panel lists every
-  backup with its time and how many files it changed; choose one to bring the project back to it.
+- **Bringing things back.** **Backups** in the **Workspace** part of the side panel lists every
+  backup with its time and how many files it changed; choose one to bring the workspace back to it.
   **Earlier versions** in a file's menu does the same for that one file. The choice at the top of
   the list switches it to the assets, when they are backed up, or to a profile's conversations.
   qcode asks first, then backs up how things are now, so bringing something back can be undone
@@ -361,21 +362,21 @@ project's own folder, so the backup moves and is copied with the project.
   Conversations are brought back only while the profile's container is stopped; if it runs, qcode
   offers to stop it first.
 - **What it is for.** A backup protects against a wrong delete, a change that breaks things or a
-  harness scattering files. It sits on the same disk as the project, so it does not protect
+  harness scattering files. It sits on the same disk as the workspace, so it does not protect
   against losing the disk.
 
-The **Project** part of the side panel also shows when the last backup was made and how much
-`Backup/` holds. If a backup fails, qcode says so once for that project, not at every round.
+The **Workspace** part of the side panel also shows when the last backup was made and how much
+`Backup/` holds. If a backup fails, qcode says so once for that workspace, not at every round.
 
-![The list of a project's backups, the newest taken just before a restore, with the choice of the project's files, its assets or a profile's conversations above it](https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/backups.png)
+![The list of a workspace's backups, the newest taken just before a restore, with the choice of the workspace's files, its assets or a profile's conversations above it](https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/backups.png)
 
 ## Tabs talking to each other
 
-The agents in a project's harness tabs can hand each other work: the one in a Claude Code tab can
+The agents in a workspace's harness tabs can hand each other work: the one in a Claude Code tab can
 ask the one in a Codex tab to write a test, and hear back. qcode gives every harness two tools for
 this, `list_tabs` and `send_message`, through a small MCP server it registers in each harness's
 own settings, next to anything you added there. The server runs inside the container and talks
-to qcode through a socket in the project's `Containers/MCP/` folder, so it works in a profile
+to qcode through a socket in the workspace's `Containers/MCP/` folder, so it works in a profile
 without the network too.
 
 Three rules hold for every message:
@@ -420,19 +421,19 @@ so the containers keep running; Settings says so.
 | What | Where |
 |---|---|
 | Settings | `code.conf` in the Quvyta folder of the platform's configuration folder: `~/.config/quvyta/code.conf` on Linux, `~/Library/Application Support/Quvyta/code.conf` on macOS, `%APPDATA%\Quvyta\code.conf` on Windows. Settings from before (`~/.config/quvyta/code/settings.toml`) move there once, at start |
-| Open projects and tabs | `session.toml` in the platform's data folder, `~/.local/share/quvyta/code` on Linux |
+| Open workspaces and tabs | `session.toml` in the platform's data folder, `~/.local/share/quvyta/code` on Linux |
 | Containers QCode started | `containers.toml` in the same data folder, with `instances.lock`, which every open QCode holds |
 | Background service | `~/.config/systemd/user/qcode-reaper.service` and `qcode-reaper.path` on Linux, `~/Library/LaunchAgents/io.quvyta.code.reaper.plist` on macOS, while it is installed |
-| Workspace | `Quvyta/Code` in your Documents folder by default (`~/Documents/Quvyta/Code`, or `~/Belgeler/Quvyta/Code` where the desktop names it so), or the folder you chose; a folder chosen before stays where it is |
-| Profiles | `Profiles/<profile>.toml` in the workspace |
-| Projects | `Projects/<project>/` in the workspace: `project.qcode`, the code in `Project/`, your material in `Assets/` |
-| Tabs talking to each other | `Projects/<project>/Containers/MCP/` in the workspace: the server the harnesses start and, while the project is open, the socket qcode listens on; each harness's own settings in `qcode-home-<project>-<profile>` hold the entry `qcode` |
-| Backups | `Projects/<project>/Backup/` in the workspace: `Project.git`, the backups of `Project/`; `Assets.git`, those of `Assets/` when it is backed up; `Conversations/<profile>.git`, each profile's conversations; and the lock files that keep two QCodes from backing up the same thing at once |
+| QCode folder | `Quvyta/Code` in your Documents folder by default (`~/Documents/Quvyta/Code`, or `~/Belgeler/Quvyta/Code` where the desktop names it so), or the folder you chose; a folder chosen before stays where it is |
+| Profiles | `Profiles/<profile>.toml` in the QCode folder |
+| Workspaces | `Workspaces/<workspace>/` in the QCode folder: `workspace.qcode`, the code in `Work/`, your material in `Assets/` |
+| Tabs talking to each other | `Workspaces/<workspace>/Containers/MCP/` in the QCode folder: the server the harnesses start and, while the workspace is open, the socket qcode listens on; each harness's own settings in `qcode-home-<workspace>-<profile>` hold the entry `qcode` |
+| Backups | `Workspaces/<workspace>/Backup/` in the QCode folder: `Code.git`, the backups of `Work/`; `Assets.git`, those of `Assets/` when it is backed up; `Conversations/<profile>.git`, each profile's conversations; and the lock files that keep two QCodes from backing up the same thing at once |
 | Images | `qcode/base` and `qcode/profile/<profile>`, in the engine |
-| Logins | engine volumes: `qcode-cred-<profile>` for the profile, `qcode-home-<project>-<profile>` for each project's copy |
+| Logins | engine volumes: `qcode-cred-<profile>` for the profile, `qcode-home-<workspace>-<profile>` for each workspace's copy |
 
 Files are plain TOML. A file qcode cannot read is reported with its line and column instead of
-stopping the program, and a broken project stays on the list so it can be repaired.
+stopping the program, and a broken workspace stays on the list so it can be repaired.
 
 ## Building from source
 

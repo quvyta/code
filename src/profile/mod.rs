@@ -1,7 +1,7 @@
 //! Profiles: a harness, the template it is set up with, the account it signs in with and the
 //! permissions it runs under.
 //!
-//! A profile is a definition file in the workspace (`Profiles/<profile>.toml`), an image built
+//! A profile is a definition file in the store (`Profiles/<profile>.toml`), an image built
 //! from that definition, and a login that lives in a volume of its own. The modules here hold
 //! the definition and the facts every harness brings with it; building images and running
 //! containers is the engine's work.
@@ -15,6 +15,8 @@ mod harness;
 pub(crate) mod harness_live;
 #[cfg(test)]
 mod history_live;
+#[cfg(all(test, unix))]
+mod history_scripts;
 #[cfg(test)]
 mod live;
 mod name;

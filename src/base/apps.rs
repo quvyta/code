@@ -1,9 +1,9 @@
-//! The built-in apps: the programs the base image carries for opening a project's files, which
+//! The built-in apps: the programs the base image carries for opening a workspace's files, which
 //! file each of them opens, and the exact command line each is started with.
 //!
-//! A file opened from the file tree runs in a tab like every other program: inside the project's
+//! A file opened from the file tree runs in a tab like every other program: inside the workspace's
 //! own container, entered through the engine. This module only decides which program and which
-//! words; the tab and the container belong to the project screen.
+//! words; the tab and the container belong to the workspace screen.
 
 use std::path::{Path, PathBuf};
 
@@ -499,7 +499,7 @@ mod tests {
 
     #[test]
     fn the_editor_opens_the_path_as_one_word() {
-        let path = "/work/Project/a file with 'quotes' and $HOME.txt";
+        let path = "/work/a file with 'quotes' and $HOME.txt";
         assert_eq!(Editor::Nano.command(path), ["nano", path]);
         assert_eq!(Editor::Vim.command(path), ["vim", path]);
         assert_eq!(Editor::default(), Editor::Nano, "nano is the editor nobody has to choose");
@@ -511,7 +511,7 @@ mod tests {
 
     #[test]
     fn a_picture_is_drawn_once_in_character_cells_and_the_path_is_the_last_word() {
-        let path = "/work/Project/-looks like an option.png";
+        let path = "/work/-looks like an option.png";
         let command = picture(path);
         assert_eq!(command.first().map(String::as_str), Some("chafa"));
         assert_eq!(command.last().map(String::as_str), Some(path));
@@ -523,23 +523,23 @@ mod tests {
 
     #[test]
     fn a_pdf_gives_its_text_with_the_layout_to_standard_output() {
-        let path = "/work/Project/a paper; rm -rf $HOME.pdf";
+        let path = "/work/a paper; rm -rf $HOME.pdf";
         assert_eq!(pdf_text(path), ["pdftotext", "-layout", path, "-"]);
     }
 
     #[test]
     fn an_office_document_gives_its_text_to_standard_output_with_the_path_as_one_word() {
-        let path = "/work/Project/it's a $(report).docx";
+        let path = "/work/it's a $(report).docx";
         assert_eq!(office_text(path), Some(vec!["docx2txt".to_owned(), path.to_owned(), "-".to_owned()]));
-        let path = "/work/Project/Letter.ODT";
+        let path = "/work/Letter.ODT";
         assert_eq!(office_text(path), Some(vec!["odt2txt".to_owned(), path.to_owned()]));
-        assert_eq!(office_text("/work/Project/budget.xlsx"), None);
-        assert_eq!(office_text("/work/Project/docx"), None);
+        assert_eq!(office_text("/work/budget.xlsx"), None);
+        assert_eq!(office_text("/work/docx"), None);
     }
 
     #[test]
     fn a_sound_plays_or_is_described_with_the_path_as_one_word() {
-        let path = "/work/Project/it's a $(song).mp3";
+        let path = "/work/it's a $(song).mp3";
         assert_eq!(play(path), ["play", path]);
         assert_eq!(sound_details(path), ["soxi", path]);
     }
@@ -577,13 +577,13 @@ mod tests {
 
     #[test]
     fn a_page_is_drawn_by_a_script_that_never_changes_and_takes_the_page_and_path_as_arguments() {
-        let path = "/work/Project/it's \"$(quoted)\".pdf";
+        let path = "/work/it's \"$(quoted)\".pdf";
         let first = pdf_page(path, 3);
         assert_eq!(first[..2], ["sh", "-c"]);
         assert_eq!(first[3..], ["sh", "3", path], "the page and the path are arguments, each one word");
         let script = &first[2];
         assert!(!script.contains("quoted"), "the file's name is never part of the script: {script}");
-        assert_eq!(pdf_page("/work/Project/other.pdf", 9)[2], *script, "the script is the same for every file");
+        assert_eq!(pdf_page("/work/other.pdf", 9)[2], *script, "the script is the same for every file");
         assert!(script.starts_with("pdftoppm -f \"$1\" -l \"$1\" "), "{script}");
         // The page is drawn exactly the way a picture is.
         let drawn = picture("x");
