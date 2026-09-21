@@ -87,6 +87,7 @@ fn profile(harness: HarnessKind) -> Profile {
         assets: MountAccess::ReadOnly,
         network: NetworkMode::None,
         without: Vec::new(),
+        os: crate::base::Os::Debian,
     }
 }
 
@@ -458,6 +459,7 @@ fn provider_profile_under(model: &str, template: Template) -> Profile {
         assets: MountAccess::ReadOnly,
         network: NetworkMode::None,
         without: Vec::new(),
+        os: crate::base::Os::Debian,
     }
 }
 

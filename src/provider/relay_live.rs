@@ -121,8 +121,18 @@ impl Drop for Scratch {
 /// network. The network is off on purpose — everything the harness reaches, it reaches through
 /// the relay, so a container that could have gone around it could not have.
 fn profile(harness: HarnessKind, model: &str) -> Profile {
+    on(harness, model, crate::base::Os::Debian)
+}
+
+/// The same profile with its image built on `os`, named after the system too, so the images of
+/// two systems never stand in for each other.
+fn on(harness: HarnessKind, model: &str, os: crate::base::Os) -> Profile {
+    let name = match os {
+        crate::base::Os::Debian => format!("relaytest-{}", harness.record().id),
+        _ => format!("relaytest-{}-{}", harness.record().id, os.id()),
+    };
     Profile {
-        name: SafeName::parse(&format!("relaytest-{}", harness.record().id)).expect("the name is safe"),
+        name: SafeName::parse(&name).expect("the name is safe"),
         harness,
         template: Template::Recommended,
         account: AccountKind::Provider,
@@ -130,6 +140,7 @@ fn profile(harness: HarnessKind, model: &str) -> Profile {
         assets: MountAccess::ReadOnly,
         network: NetworkMode::None,
         without: Vec::new(),
+        os,
     }
 }
 
@@ -253,6 +264,18 @@ impl Road {
             assert!(!found.contains(key.expose()), "{kind:?}: the key was found in {what}");
             println!("{kind:?}: no trace of the key in {what} ({} bytes read)", found.len());
         }
+    }
+
+    /// How large the profile's image is, as the engine reports it, in bytes.
+    fn image_bytes(&self) -> String {
+        let command = crate::engine::EngineCommand {
+            program: self.engine.bin().to_path_buf(),
+            args: ["image", "inspect", "--format", "{{.Size}}", &self.profile.image()]
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect(),
+        };
+        capture(&command).map(|size| size.trim().to_owned()).unwrap_or_default()
     }
 
     /// What the relay was told so far.
@@ -489,4 +512,71 @@ fn claude_code_hears_that_a_busy_provider_asked_it_to_wait() {
             "{kind:?}: {events:?}"
         );
     }
+}
+
+/// `harness` on each system `QCODE_OS` names (all four when it names none), through the relay to
+/// the model service of this machine, in a container with no network: the image of the profile is
+/// built on that system's own base with the product's recipe, and the harness answers a question
+/// and reads a file of the workspace with its own tools. Claude Code is asked only to read, since
+/// that alone needs a tool; opencode, like its own test above, also writes one.
+fn answers_on_every_system(harness: HarnessKind) {
+    let (base, model) = provider();
+    let entry = ProviderEntry::new(Tag::parse(TAG).expect("a tag"), ProviderKind::Ollama, &base);
+    for engine in engines() {
+        for os in crate::base::live::systems() {
+            let kind = engine.kind();
+            let profile = on(harness, &model, os);
+            assert!(os.refuses(harness).is_none(), "{harness:?} is not offered on {os:?}");
+            let built = std::time::Instant::now();
+            let road = Road::open(engine.clone(), &profile, entry.clone(), Upstream::network());
+            println!(
+                "{kind:?} {os:?} {harness:?}: base and profile image ready in {} s, profile image {} bytes",
+                built.elapsed().as_secs(),
+                road.image_bytes()
+            );
+            std::fs::write(road.work().join("parola.txt"), "kirlangic\n").expect("a file for the harness to read");
+
+            let started = std::time::Instant::now();
+            let said = road
+                .ask_once("Reply with just the digits: what is 2+2?")
+                .unwrap_or_else(|trouble| panic!("{kind:?} {os:?}: the harness said nothing: {trouble}"));
+            assert!(said.contains('4'), "{kind:?} {os:?}: the model answered through the relay: {said}");
+            println!("{kind:?} {os:?} {harness:?}: {model} answered 2+2 in {} s", started.elapsed().as_secs());
+
+            let started = std::time::Instant::now();
+            let asked = match harness {
+                HarnessKind::OpenCode => {
+                    "Read the file parola.txt in this folder. Then create a file named cevap.txt in this folder \
+                     whose only content is that same word. Reply with only the word."
+                }
+                _ => "Read the file parola.txt in this folder and reply with only the word inside it.",
+            };
+            let said = road
+                .ask_once(asked)
+                .unwrap_or_else(|trouble| panic!("{kind:?} {os:?}: the harness said nothing: {trouble}"));
+            if harness == HarnessKind::OpenCode {
+                let written = std::fs::read_to_string(road.work().join("cevap.txt")).unwrap_or_default();
+                assert!(written.contains("kirlangic"), "{kind:?} {os:?}: opencode wrote with its tools: {said}");
+            } else {
+                assert!(said.contains("kirlangic"), "{kind:?} {os:?}: the agent read the file with its tools: {said}");
+            }
+            println!("{kind:?} {os:?} {harness:?}: {model} used a tool in {} s", started.elapsed().as_secs());
+            assert!(
+                road.events().iter().any(|event| matches!(event, super::RelayEvent::Forwarded { status: 200, .. })),
+                "{kind:?} {os:?}: QCode carried the requests itself"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a container engine, the network to build each system's images, and a model service; run with QCODE_CONTAINER_TESTS=1"]
+fn claude_code_answers_on_every_system_through_a_provider_of_this_machine() {
+    answers_on_every_system(HarnessKind::ClaudeCode);
+}
+
+#[test]
+#[ignore = "needs a container engine, the network to build each system's images, and a model service; run with QCODE_CONTAINER_TESTS=1"]
+fn opencode_answers_on_every_system_through_a_provider_of_this_machine() {
+    answers_on_every_system(HarnessKind::OpenCode);
 }

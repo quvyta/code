@@ -5,6 +5,29 @@ Every release of quvyta-code, newest first. The format follows
 [Semantic Versioning](https://semver.org/); while the version starts with 0, a minor release may
 change files qcode writes, and the notes say so when it does.
 
+## 0.1.14 - 2026-09-22
+
+### Added
+
+- **Choose the system a profile is built on.** The profile wizard has a System step: Debian (as before, and the default), Arch Linux, Ubuntu 24.04 LTS, or Alpine. Each shows the size of its image. Alpine is the smallest but is marked *not recommended*: it is built on musl rather than glibc, and Gemini CLI and Antigravity IDE do not run on it, so the wizard does not offer them there. Where a system lacks a tool, the wizard says so: Arch has no sound player (its package would bring about 470 MB of ffmpeg with it), Alpine has no reader for Word files, and Ubuntu's sound player does not read opus. Files you open from the file tree still open in the workspace's own Debian container, so none of this changes how they open. Profiles you already have stay exactly as they are.
+- **When a profile's image is missing, qcode offers to build it.** Opening a tab whose image the engine does not have used to end in the engine's raw error, such as `short-name "qcode/profile/claude-code" did not resolve to an alias`. Now the tab says the image is not there, offers **Build it now**, shows the build, and opens the tab when it is done. qcode also never looks for its own images on the internet any more.
+- **Switching between Podman and Docker takes your things with you.** When you change the engine in Settings, or when qcode starts and finds that the saved engine no longer answers but the other one does, a page lists the profiles whose images the new engine lacks, each with **Build**, and offers to **Copy** each profile's home, where its settings and sign-ins live, to the new engine. The copy on the old engine is never deleted, so you can go back. It also says how many qcode containers are left on the old engine and how much room they take; removing them is your choice.
+- **When the engine refuses for a known reason, you read what to do.** An image that is missing, an engine that is not running, an account that is not in the `docker` group, or a Podman account without id ranges now gets a plain sentence and the line that fixes it, with the engine's own words underneath.
+- **Antigravity signs in inside its own container.** The sign-in page opens in a small window inside the container instead of your browser, so Google's return to the application arrives and the sign-in completes. The first time, you sign in to Google once for that profile; after that it is remembered. Antigravity profiles made before this release still send the page to your browser, where the sign-in cannot come back; make the profile again to get the window.
+- **qcode says when a newer version is out.** At start, at most once a day, it asks crates.io for the published versions of `quvyta-code` and, when one is newer than yours, shows which and how to update. The request carries the package name and, as its `User-Agent`, `quvyta-code/<your version>`; nothing about you or your machine. It is on by default and is turned off with **Say when an update is out** in **Settings**, a switch shared by every Quvyta application; while it is off, nothing is asked. It is the only connection qcode makes of its own accord, and the README's network section now says exactly what goes out.
+
+### Changed
+
+- Installing Docker from the first-run wizard now also starts its service and adds you to the `docker` group, and says that you need to log out and back in. A Podman account without the id ranges it needs is shown the line that adds them.
+- Tabs send each other messages without asking you first. **Ask before the first message**, under **Messages between tabs** in **Settings**, brings the question back; a settings file written before it existed reads as not asking. A tab without the network still never sends to one with it, and an exchange still ends after 6 messages. When it does, both tabs now say so in a line under their terminal until you press **Got it**, and a notice tells you once, whichever tab you are looking at.
+- The three buttons at the foot of the workspace rail have room around them: an empty row above the question mark keeps them apart from the last workspace, and an empty row between the settings and the way back keeps a hand going for one from landing on the other. The workspaces take every other row of the rail.
+
+### Fixed
+
+- Building a profile image with Docker could close qcode: Docker's progress lines carry carriage returns, and the build log fell over them. It no longer does.
+- The Chinese and Russian screens called the Providers page by one name on the page and by another in the profile wizard that sends you there. Each language now uses one name everywhere: 提供方 in Chinese and Провайдеры in Russian, the words the wizard already used.
+- The notes for 0.1.10 named Italian among the nine languages; the ninth is Japanese, and those notes now say so.
+
 ## 0.1.13 - 2026-09-21
 
 ### Fixed
@@ -74,7 +97,7 @@ change files qcode writes, and the notes say so when it does.
 
 ### Added
 
-- qcode speaks nine languages: English, Turkish, German, Spanish, French, Italian, Portuguese, Russian and Chinese. The language is asked for on the first screen and changed in **Settings**; the one you pick is the one qcode opens in next time. A gate keeps every language complete and keeps each one in its own words, so a file that quietly held English would not pass.
+- qcode speaks nine languages: English, Turkish, German, Spanish, French, Japanese, Portuguese, Russian and Chinese. The language is asked for on the first screen and changed in **Settings**; the one you pick is the one qcode opens in next time. A gate keeps every language complete and keeps each one in its own words, so a file that quietly held English would not pass.
 - Signing in from a desktop window works. The window's application asks its desktop to open a page, as every Linux program does; qcode takes that address through a folder the container shares with it and opens it in your own browser, where your accounts already are. The address is always shown on the tab as well, so a machine with no browser to be had can still be signed in from somewhere else. Only `http` and `https` addresses are opened; anything else is refused and said aloud.
 - Closing qcode and opening it again finds everything where you left it: the projects that were open, their tabs in their order, and the tab you were on. A window tab comes back with the others and waits to be asked before it opens its window again, because opening qcode is not asking for that window.
 

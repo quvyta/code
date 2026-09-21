@@ -102,7 +102,7 @@ mod tests {
     use crate::ui::settings::testing::{self, Host};
     use crate::ui::settings::{Msg, Request};
 
-    const SIZE: (u16, u16) = (100, 36);
+    const SIZE: (u16, u16) = (100, 42);
 
     fn named(name: &str) -> SafeName {
         SafeName::parse(name).expect("the test names are already safe")

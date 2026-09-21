@@ -3,13 +3,18 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use qframe::widgets::TerminalSession;
+use qframe::runtime::TaskId;
+use qframe::widgets::{LogBuffer, LogLevel, LogLine, TerminalSession};
 
 use crate::base::apps::Quiet;
 use crate::bridge;
 
 use super::bridge::{Letter, Undelivered};
 use super::plan::LaunchFailure;
+
+/// How many lines of an image build a tab keeps: a build prints thousands, and the ones that
+/// matter when it fails are the last.
+const BUILD_LINES: usize = 2000;
 
 /// A tab's identity, which stays the same while tabs are closed and dragged around it.
 ///
@@ -101,6 +106,19 @@ impl Default for Pages {
     }
 }
 
+/// Where the page a window asked to have opened was shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shown {
+    /// In the sign-in window inside the window's own container, where a sign-in comes back to the
+    /// application by itself.
+    InWindow,
+    /// In the person's own browser, because the sign-in window could not be started; a sign-in
+    /// from there cannot come back.
+    InBrowser,
+    /// Nowhere: the person is given the address to read.
+    Nowhere,
+}
+
 /// Where a tab stands.
 ///
 /// Nothing here is a guess: a tab is `Running` only once a session is really attached to a
@@ -126,6 +144,11 @@ pub enum TabState {
     Stopped,
     /// The engine refused, and said why.
     Failed(LaunchFailure),
+    /// The engine does not have the image of the tab's profile, so nothing was made; the tab
+    /// offers to build it.
+    NoImage,
+    /// The profile's image is being built by this task, for the tab to open once it is there.
+    Building(TaskId),
     /// The file the tab opens is not in the workspace any more.
     Missing,
     /// The file the tab opens could not be read, for this reason.
@@ -143,7 +166,10 @@ impl TabState {
     /// restart, so its restart is never offered.
     #[must_use]
     pub fn can_restart(&self) -> bool {
-        matches!(self, Self::Ended { .. } | Self::Stopped | Self::Failed(_) | Self::Missing | Self::Unreadable(_))
+        matches!(
+            self,
+            Self::Ended { .. } | Self::Stopped | Self::Failed(_) | Self::NoImage | Self::Missing | Self::Unreadable(_)
+        )
     }
 }
 
@@ -171,9 +197,9 @@ pub struct Tab {
     /// Whether a sound tab waits to be asked before it plays: a tab brought back from the last
     /// session does, because opening QCode again is not asking to hear the sound again.
     held: bool,
-    /// The web address the window asked to have opened, and whether QCode managed to open it in
-    /// the person's browser — `None` while the opening is still on its way. A window tab only.
-    sign_in: Option<(String, Option<bool>)>,
+    /// The web address the window asked to have opened, and where it was shown — `None` while
+    /// the opening is still on its way. A window tab only.
+    sign_in: Option<(String, Option<Shown>)>,
     /// Counts the sessions this tab has started, so the watch of a session that was replaced by
     /// a restart is recognised and ignored.
     run: u64,
@@ -186,6 +212,11 @@ pub struct Tab {
     /// Why the oldest waiting message could not be typed into the harness, when an attempt was
     /// made and failed. Cleared as soon as one is typed in.
     undelivered: Option<Undelivered>,
+    /// The other tab of an exchange of messages the loop limit ended, named as the person knows
+    /// it, until the person has read the line that says so.
+    stopped: Option<String>,
+    /// What the build of the profile's image said, when this tab built it.
+    build_log: LogBuffer,
 }
 
 impl Tab {
@@ -212,6 +243,8 @@ impl Tab {
             letters: Vec::new(),
             letters_shown: false,
             undelivered: None,
+            stopped: None,
+            build_log: LogBuffer::new(BUILD_LINES),
         }
     }
 
@@ -329,10 +362,10 @@ impl Tab {
         self.held = held;
     }
 
-    /// The web address the window asked to have opened, with whether it was opened here; that
-    /// is `None` until the opening answers.
+    /// The web address the window asked to have opened, with where it was shown; that is `None`
+    /// until the opening answers.
     #[must_use]
-    pub fn sign_in(&self) -> Option<(&str, Option<bool>)> {
+    pub fn sign_in(&self) -> Option<(&str, Option<Shown>)> {
         self.sign_in.as_ref().map(|(address, opened)| (address.as_str(), *opened))
     }
 
@@ -343,7 +376,7 @@ impl Tab {
     }
 
     /// Records how the opening of that address went, if it is still the address being opened.
-    pub fn opened_here(&mut self, address: &str, opened: bool) {
+    pub fn opened_here(&mut self, address: &str, opened: Shown) {
         if let Some((waiting, how)) = self.sign_in.as_mut()
             && waiting == address
         {
@@ -415,6 +448,22 @@ impl Tab {
         self.undelivered = None;
     }
 
+    /// The other tab of the exchange the loop limit ended, while the tab still says so.
+    #[must_use]
+    pub fn stopped(&self) -> Option<&str> {
+        self.stopped.as_deref()
+    }
+
+    /// Records that the loop limit ended this tab's exchange with the tab named `other`.
+    pub fn stop(&mut self, other: String) {
+        self.stopped = Some(other);
+    }
+
+    /// Stops saying that an exchange was ended, once the person has read it.
+    pub fn unstop(&mut self) {
+        self.stopped = None;
+    }
+
     /// Turns a blank tab into a tab of `kind` showing `conversation`, opened now and waiting for
     /// its container. The key stays, so the tab keeps its place in the strip.
     pub fn choose(&mut self, kind: TabKind, conversation: Option<String>) {
@@ -434,6 +483,24 @@ impl Tab {
         self.close_session();
         self.state = TabState::Starting;
         self.run += 1;
+    }
+
+    /// The tab builds its profile's image in `task`; the log starts empty.
+    pub fn building(&mut self, task: TaskId) {
+        self.build_log.clear();
+        self.state = TabState::Building(task);
+    }
+
+    /// Adds a line the image build said to the tab's log.
+    pub fn build_line(&mut self, text: &str, failed: bool) {
+        let level = if failed { LogLevel::Error } else { LogLevel::Info };
+        self.build_log.push(LogLine::new(level, text));
+    }
+
+    /// What the image build said so far.
+    #[must_use]
+    pub fn build_log(&self) -> &LogBuffer {
+        &self.build_log
     }
 
     /// Starts a tab that was waiting to be shown: it now waits for its container instead.

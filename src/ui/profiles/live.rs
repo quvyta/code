@@ -55,6 +55,7 @@ fn profile() -> Profile {
         assets: MountAccess::ReadOnly,
         network: NetworkMode::Full,
         without: Vec::new(),
+        os: crate::base::Os::Debian,
     }
 }
 

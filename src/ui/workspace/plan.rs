@@ -17,7 +17,9 @@ use crate::bridge::config::{self, Unregistered};
 use crate::desktop::{self, Display};
 use crate::engine::{
     Access, Container, ContainerCreate, ContainerState, Engine, EngineCommand, Exec, HostUser, Mount, MountSource,
-    Network, RunOnce, RunWindow, Socket, Tmpfs, names,
+    Network, RunOnce, RunWindow, Socket, Tmpfs,
+    known::{self, Known},
+    names,
     run::{self, EngineError},
 };
 use crate::profile::guidance::{self, Unguided};
@@ -311,6 +313,19 @@ impl ContainerPlan {
         let command: Vec<&str> = program.iter().map(String::as_str).collect();
         Some(engine.exec_without_terminal(&Exec { container: &self.name, command: &command }))
     }
+
+    /// The command that shows `address` in the sign-in window, inside the container the window
+    /// is open in: `localhost` there is where the application waits for the sign-in to come
+    /// back. Started with the application's own flags, so it reaches the same compositor.
+    ///
+    /// `None` for a plan that opens no window.
+    #[must_use]
+    pub fn open_page(&self, engine: &Engine, address: &str) -> Option<EngineCommand> {
+        let desktop = self.window?;
+        let command = desktop::signin::page_command(desktop.flags, address);
+        let command: Vec<&str> = command.iter().map(String::as_str).collect();
+        Some(engine.exec_without_terminal(&Exec { container: &self.name, command: &command }))
+    }
 }
 
 /// An engine command that did not do what was asked, kept as text so a tab can show the engine's
@@ -324,6 +339,9 @@ pub struct LaunchFailure {
     pub command: String,
     /// Everything the engine said, or the reason it could not be started.
     pub output: String,
+    /// Whether what failed is that the engine does not have the profile's image, which was asked
+    /// before anything was made: the one failure the tab can put right by itself, by building it.
+    pub image_missing: bool,
 }
 
 impl LaunchFailure {
@@ -331,7 +349,7 @@ impl LaunchFailure {
     /// how a tab learns that the engine binary went missing between two frames.
     #[must_use]
     pub fn spawn(command: &EngineCommand, error: &std::io::Error) -> Self {
-        Self { command: written(command), output: error.to_string() }
+        Self { command: written(command), output: error.to_string(), image_missing: false }
     }
 
     /// The failure of the base image build, in the words the person is shown.
@@ -340,7 +358,9 @@ impl LaunchFailure {
     /// command is left empty and only the machine's words are shown.
     pub(super) fn base(failure: &base::Failure) -> Self {
         match failure {
-            base::Failure::Host(error) => Self { command: String::new(), output: error.to_string() },
+            base::Failure::Host(error) => {
+                Self { command: String::new(), output: error.to_string(), image_missing: false }
+            }
             base::Failure::Engine(error) => Self::from(error),
         }
     }
@@ -348,17 +368,21 @@ impl LaunchFailure {
     /// The failure of this machine itself rather than of the engine, which has no command to show
     /// above its words.
     pub(super) fn from_host(error: &std::io::Error) -> Self {
-        Self { command: String::new(), output: error.to_string() }
+        Self { command: String::new(), output: error.to_string(), image_missing: false }
     }
 
     /// The failure of an engine command, in the words the person is shown.
     pub(super) fn from(error: &EngineError) -> Self {
         match error {
             EngineError::NotRunnable { command, error } => {
-                Self { command: written(command), output: error.to_string() }
+                Self { command: written(command), output: error.to_string(), image_missing: false }
             }
-            EngineError::Failed(failure) => Self { command: written(&failure.command), output: failure.output.clone() },
-            EngineError::Cancelled { command } => Self { command: written(command), output: String::new() },
+            EngineError::Failed(failure) => {
+                Self { command: written(&failure.command), output: failure.output.clone(), image_missing: false }
+            }
+            EngineError::Cancelled { command } => {
+                Self { command: written(command), output: String::new(), image_missing: false }
+            }
         }
     }
 }
@@ -422,6 +446,16 @@ pub fn ensure_running(engine: &Engine, plan: &ContainerPlan, user: HostUser) -> 
         None => false,
     };
     if !exists {
+        // A profile's image is QCode's to build, and only the person can say it may take the
+        // minutes that takes; so an engine without it is asked before anything is made, and the
+        // tab offers the build rather than failing on `create` with the engine's riddle about it.
+        if plan.home.is_some()
+            && let Err(error) = run::capture(&engine.image_exists(&plan.image))
+        {
+            let missing = matches!(&error, EngineError::Failed(failure)
+                if known::recognise(&failure.output) == Some(Known::ImageMissing));
+            return Err(LaunchFailure { image_missing: missing, ..LaunchFailure::from(&error) });
+        }
         if plan.image == names::BASE_IMAGE {
             base::ensure(engine, &|| false, &mut |_| {}).map_err(|failure| LaunchFailure::base(&failure))?;
         }
@@ -431,6 +465,7 @@ pub fn ensure_running(engine: &Engine, plan: &ContainerPlan, user: HostUser) -> 
             std::fs::create_dir_all(&bridge.folder).map_err(|error| LaunchFailure {
                 command: String::new(),
                 output: format!("{}: {error}", bridge.folder.display()),
+                image_missing: false,
             })?;
         }
         // Asked before the creation, because the creation is what makes the volume.
@@ -709,6 +744,23 @@ pub fn close_window(engine: &Engine, name: &str) -> Result<(), LaunchFailure> {
 pub fn raise_window(engine: &Engine, plan: &ContainerPlan) -> Result<(), LaunchFailure> {
     let Some(command) = plan.raise_window(engine) else { return Ok(()) };
     run::capture(&command).map(|_| ()).map_err(|error| LaunchFailure::from(&error))
+}
+
+/// Shows `address` in the sign-in window inside the container of `plan`, and answers whether it
+/// is up: `false` when the image has no sign-in window, which an image built before it existed
+/// does not.
+///
+/// Runs an engine command and waits for it, which takes as long as starting a program in the
+/// container and no longer: the window is left running on its own. So it belongs on a background
+/// thread.
+///
+/// # Errors
+///
+/// The engine's own words when the container is not there any more or refuses.
+pub fn open_page(engine: &Engine, plan: &ContainerPlan, address: &str) -> Result<bool, LaunchFailure> {
+    let Some(command) = plan.open_page(engine, address) else { return Ok(false) };
+    let said = run::capture(&command).map_err(|error| LaunchFailure::from(&error))?;
+    Ok(!said.contains(desktop::signin::NO_BROWSER))
 }
 
 /// Whether the container of `plan` is running right now.

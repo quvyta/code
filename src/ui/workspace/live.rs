@@ -214,6 +214,7 @@ fn verify_guided(harness: crate::profile::HarnessKind, check: impl Fn(&dyn Fn(&s
             assets: MountAccess::ReadOnly,
             network: NetworkMode::None,
             without: Vec::new(),
+            os: crate::base::Os::Debian,
         };
         let workspace = WorkspaceId::parse("uiguidelive").expect("a workspace id");
         let paths = WorkspacePaths {

@@ -10,7 +10,6 @@ use std::path::PathBuf;
 
 use crate::base::paths::{OPEN_HOME, USER};
 use crate::desktop::signin;
-use crate::engine::names::BASE_IMAGE;
 use crate::profile::guidance;
 use crate::profile::{
     Addition, CLAUDE_MARKETPLACES, Desktop, GRAPHIFY_HOME, GRAPHIFY_PACKAGE, HarnessKind, OH_MY_OPENAGENT, Profile,
@@ -55,7 +54,9 @@ pub fn image(profile: &Profile) -> Recipe {
     let harness = profile.harness.record();
     // Less whatever the person switched off: a part they went without is not downloaded at all.
     let additions = profile.additions();
-    let mut lines = vec![format!("FROM {BASE_IMAGE}")];
+    // The base image of the system the profile chose: Debian's is `qcode/base`, the name every
+    // profile image was built from before there was a choice.
+    let mut lines = vec![format!("FROM {}", profile.os.image())];
     let desktop = profile.harness.desktop();
     if let Some(desktop) = desktop {
         // Root, because system packages and /opt are not the image user's to write. The image
@@ -147,15 +148,13 @@ pub const HIGH_FAILED: &str = "QCode high:";
 /// with a part missing.
 fn addition_step(addition: Addition, profile: &Profile) -> String {
     let (what, commands) = match addition {
+        // Python and pipx from the system's own repositories, under its own names, then graphify
+        // into the same place on every system.
         Addition::Graphify => (
             "graphify",
             vec![
-                "apt-get update".to_owned(),
-                "apt-get install --yes --no-install-recommends python3 pipx".to_owned(),
-                "rm -rf /var/lib/apt/lists/*".to_owned(),
-                format!(
-                    "PIPX_GLOBAL_HOME={GRAPHIFY_HOME} PIPX_GLOBAL_BIN_DIR=/usr/local/bin pipx install --global {GRAPHIFY_PACKAGE}"
-                ),
+                profile.os.install(profile.os.python()),
+                profile.os.pipx(GRAPHIFY_HOME, GRAPHIFY_PACKAGE),
                 "graphify --version".to_owned(),
             ],
         ),
@@ -192,6 +191,9 @@ fn addition_step(addition: Addition, profile: &Profile) -> String {
 /// The steps that put a desktop application into the image: the packages it needs, then the
 /// archive from its maker's address.
 ///
+/// The packages are Debian's, installed with apt: a window is offered on Debian only
+/// ([`crate::base::Os::refuses`]), because that is the one system it was measured on.
+///
 /// The download and the check are one step, so a build never keeps an archive that is not the one
 /// this version of QCode was written against: the digest is verified before anything is unpacked,
 /// and the archive is removed in the same step so it does not become a layer of its own. The
@@ -210,11 +212,15 @@ fn desktop_steps(desktop: &Desktop) -> Vec<String> {
     // The script is written with `printf '%b'` from a single line: a `RUN` step is one line, so
     // the script's own line breaks travel as `\n` and are turned back into breaks by printf.
     let opener = format!(
-        "RUN printf '%b' '{script}' > '{program}' \\\n && chmod 0755 '{program}' \\\n && mkdir -p '{folder}'",
-        script = signin::script().replace('\\', "\\\\").replace('\'', "'\\''").replace('\n', "\\n"),
+        "RUN {write} \\\n && chmod 0755 '{program}' \\\n && mkdir -p '{folder}'",
+        write = signin::written(&signin::script(), signin::OPEN_PROGRAM),
         program = signin::OPEN_PROGRAM,
         folder = signin::OPEN_DIR,
     );
+    // The sign-in window's browser is linked in the step that unpacks the application, and only
+    // there: in a step of its own, the layer would copy the 200 MB executable it links to.
+    let browser: String =
+        signin::browser_install(dir, desktop.program).iter().map(|command| format!(" \\\n && {command}")).collect();
     vec![
         opener,
         format!(
@@ -227,7 +233,7 @@ fn desktop_steps(desktop: &Desktop) -> Vec<String> {
              && mkdir -p '{dir}' \\\n \
              && tar --extract --gzip --file /tmp/desktop.tar.gz --directory '{dir}' --strip-components=1 \\\n \
              && rm /tmp/desktop.tar.gz \\\n \
-             && test -x '{program}'",
+             && test -x '{program}'{browser}",
             archive = desktop.archive,
             sha = desktop.sha256,
             program = desktop.command(),
@@ -264,6 +270,9 @@ mod tests {
         AccountKind, CLAUDE_PLUGINS, Extra, HarnessKind, MountAccess, NetworkMode, SafeName, Template,
     };
 
+    use crate::base::Os;
+    use crate::engine::names::BASE_IMAGE;
+
     fn profile(harness: HarnessKind, template: Template) -> Profile {
         Profile {
             name: SafeName::parse("claude-sub").expect("the name is safe"),
@@ -274,6 +283,7 @@ mod tests {
             assets: MountAccess::ReadOnly,
             network: NetworkMode::Full,
             without: Vec::new(),
+            os: crate::base::Os::Debian,
         }
     }
 
@@ -283,6 +293,49 @@ mod tests {
         let first = recipe.containerfile.lines().next().expect("the file has a line");
         assert_eq!(first, format!("FROM {BASE_IMAGE}"));
         assert!(recipe.containerfile.contains("npm install -g @anthropic-ai/claude-code"), "{recipe:?}");
+    }
+
+    #[test]
+    fn a_profile_on_debian_is_built_exactly_as_before_there_was_a_choice() {
+        // Every recipe of a Debian profile starts from the image it always started from, and its
+        // graphify step is the very text it was: the choice of a system changes nothing for anyone
+        // who does not make it.
+        let file = image(&profile(HarnessKind::ClaudeCode, Template::High)).containerfile;
+        assert!(file.starts_with("FROM qcode/base\n"), "{file}");
+        assert!(
+            file.contains(
+                "RUN { apt-get update \\\n && apt-get install --yes --no-install-recommends python3 pipx \\\n \
+                 && rm -rf /var/lib/apt/lists/* \\\n && PIPX_GLOBAL_HOME=/opt/pipx PIPX_GLOBAL_BIN_DIR=/usr/local/bin \
+                 pipx install --global graphifyy \\\n && graphify --version; }"
+            ),
+            "{file}"
+        );
+    }
+
+    #[test]
+    fn a_profile_on_another_system_is_built_on_its_base_and_installs_with_its_package_manager() {
+        let on =
+            |os: Os, harness: HarnessKind| image(&Profile { os, ..profile(harness, Template::High) }).containerfile;
+        let arch = on(Os::Arch, HarnessKind::ClaudeCode);
+        assert!(arch.starts_with("FROM qcode/base-arch\n"), "{arch}");
+        assert!(arch.contains("pacman -Syu --noconfirm --needed python python-pipx"), "{arch}");
+        assert!(!arch.contains("apt-get"), "Arch has no apt: {arch}");
+        let ubuntu = on(Os::Ubuntu, HarnessKind::Codex);
+        assert!(ubuntu.starts_with("FROM qcode/base-ubuntu\n"), "{ubuntu}");
+        assert!(ubuntu.contains("apt-get install --yes --no-install-recommends python3 pipx"), "{ubuntu}");
+        assert!(ubuntu.contains("PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin pipx install graphifyy"), "{ubuntu}");
+        let alpine = on(Os::Alpine, HarnessKind::OpenCode);
+        assert!(alpine.starts_with("FROM qcode/base-alpine\n"), "{alpine}");
+        assert!(alpine.contains("apk add --no-cache python3 pipx"), "{alpine}");
+        for os in Os::ALL {
+            let file = on(os, HarnessKind::ClaudeCode);
+            assert_eq!(file.lines().filter(|line| line.starts_with("FROM ")).count(), 1, "{os:?}");
+            assert!(
+                file.contains("npm install -g @anthropic-ai/claude-code"),
+                "{os:?}: the harness installs the same way"
+            );
+            assert!(file.contains("graphify --version"), "{os:?}");
+        }
     }
 
     #[test]
@@ -665,6 +718,24 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn the_sign_in_window_is_linked_in_the_very_step_that_unpacks_the_application() {
+        let recipe = image(&profile(HarnessKind::AntigravityIde, Template::Recommended));
+        let unpack = recipe
+            .containerfile
+            .split("\nRUN ")
+            .find(|step| step.contains("tar --extract"))
+            .expect("the image unpacks the application")
+            .to_owned();
+        // In a step of its own the layer would copy the 200 MB executable instead of linking it.
+        assert!(unpack.contains("cp -al"), "{unpack}");
+        assert!(unpack.contains(crate::desktop::signin::BROWSER_PROGRAM), "{unpack}");
+        assert!(unpack.find("tar --extract") < unpack.find("cp -al"), "linked after it is unpacked: {unpack}");
+        assert!(unpack.contains(&format!("&& test -x '{}'", crate::desktop::signin::BROWSER_PROGRAM)), "{unpack}");
+        let steps = recipe.containerfile.matches(crate::desktop::signin::BROWSER_DIR).count();
+        assert_eq!(steps, unpack.matches(crate::desktop::signin::BROWSER_DIR).count(), "no other step touches it");
+    }
+
     #[test]
     fn the_image_writes_the_opener_and_a_shell_turns_it_back_into_the_script() {
         let recipe = image(&profile(HarnessKind::AntigravityIde, Template::Recommended));

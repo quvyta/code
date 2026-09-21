@@ -140,8 +140,11 @@ fn a_pdf_that_cannot_be_read_says_so_in_the_engines_words_and_reads_again() {
     let scratch = with_pdf("pdf-failed");
     let mut screen = one_workspace(&scratch);
     let key = open_pdf(&mut screen);
-    let failure =
-        LaunchFailure { command: "podman exec".to_owned(), output: "Syntax Error: Couldn't find trailer".to_owned() };
+    let failure = LaunchFailure {
+        command: "podman exec".to_owned(),
+        output: "Syntax Error: Couldn't find trailer".to_owned(),
+        image_missing: false,
+    };
     apply(&mut screen, Msg::TextRead(key, 0, Err(failure)));
     let mut harness = harness(screen, SIZE.0, SIZE.1);
     let text = harness.screen();

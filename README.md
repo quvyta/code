@@ -117,10 +117,24 @@ It does not protect:
 
 ## No telemetry, and what goes over the network
 
-qcode collects no statistics, checks for no updates and sends nothing anywhere of its own accord.
+qcode collects no statistics and sends nothing about you, your machine or your work anywhere.
 
-It connects to the network itself only after you have added a provider on the **Providers** page,
-and then only to that provider's address:
+It asks one question of its own accord: whether a newer qcode is out. When qcode starts, at most
+once a day, it reads the list of published versions of `quvyta-code` from crates.io, the same file
+`cargo install` reads: one HTTPS `GET` of `https://index.crates.io/qu/vy/quvyta-code`. The request
+carries no cookie and no identifier; its headers are `User-Agent: quvyta-code/<the version you
+run>`, `Accept: */*` and `Accept-Encoding: gzip`. crates.io sees, as with any connection, the
+address it comes from. When a newer version is out, a notice says which one and how to update. When
+there is no network, or crates.io does not answer within ten seconds, nothing is said and the next
+day asks again. Nothing is asked while the first-run setup is open. The time of the last question is
+kept in `~/.local/state/quvyta/code/update-check` on Linux.
+
+To turn it off, switch off **Say when an update is out** in **Settings**. The switch belongs to the
+whole Quvyta family: it is `update-notice = false` in `~/.config/quvyta/quvyta.conf`, and turning it
+off stops the question in every Quvyta application. While it is off, qcode asks nothing at all.
+
+Apart from that question, qcode connects to the network itself only after you have added a
+provider on the **Providers** page, and then only to that provider's address:
 
 - **When you ask on the Providers page.** **Try the connection**, **Ask what it offers** and
   **Measure the real window** each send their requests at the moment you press them, never
@@ -169,7 +183,9 @@ which it adds.
 - **An account** with the harness you want to use: a subscription or an API key from its provider,
   or, for Claude Code and opencode, a model service of your own (an ollama server or OpenRouter).
 - **Disk space and a network connection** for the first images. The base image is Debian with
-  Node.js; each profile adds its harness on top of it.
+  Node.js (about 520 MB); each profile adds its harness on top of it. A profile can instead be
+  built on Arch Linux (about 810 MB), Ubuntu 24.04 LTS (about 510 MB) or Alpine (about 310 MB,
+  not recommended: Gemini CLI and Antigravity IDE do not run on it).
 - Rust 1.95 or later to install from source.
 
 qcode is developed and tested on Linux. The paths, engine checks and container settings for macOS
@@ -410,16 +426,24 @@ own settings, next to anything you added there. The server runs inside the conta
 to qcode through a socket in the workspace's `Containers/MCP/` folder, so it works in a profile
 without the network too.
 
-Three rules hold for every message:
+Messages go from tab to tab without asking you: you set the agents to work, and handing it to
+each other is part of that work. Two rules hold for every message all the same, and no setting
+turns them off:
 
-- **You approve the first one.** The first message from one tab to another asks you, with the
-  message shown. Your answer holds for those two tabs, in that direction, until qcode closes, and
-  is never written to disk. Esc denies.
 - **A tab without the network never sends to a tab with it.** The second tab could carry out what
   it is given, which is what taking the network away was meant to prevent. The other way round is
   allowed.
 - **Loops stop.** An exchange between tabs ends after 6 messages, and one tab sends at most 5
-  messages a minute. The sending agent is told why its message was refused.
+  messages a minute, so two agents cannot keep each other busy, and spend your balance, forever.
+  The sending agent is told why its message was refused. When an exchange is ended, both tabs say
+  so in a line under their terminal until you press **Got it**, and a notice tells you once,
+  whichever tab you are looking at.
+
+If you would rather approve the first message between two tabs, turn on **Ask before the first
+message** under **Messages between tabs** in **Settings**. The first message from one tab to
+another then asks you, with the message shown. Your answer holds for those two tabs, in that
+direction, until qcode closes, and is never written to disk. Esc denies. A pair you denied stays
+denied until qcode closes, even if you turn asking off again.
 
 A message that is taken is typed into the receiving harness's own prompt, on a line that says
 which tab sent it, as soon as that tab is quiet: you are not typing in it and its program has

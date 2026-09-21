@@ -101,6 +101,7 @@ fn a_sound_plays_in_a_container_of_its_own_that_reaches_nothing_but_the_sound_se
             &format!("{workspace}:/work:ro,z"),
             "--workdir",
             "/work",
+            "--pull=never",
             "qcode/base",
             "play",
             &format!("{CODE_DIR}/{SONG}"),

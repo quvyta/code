@@ -1,6 +1,12 @@
 //! The bridge between tabs on the workspace screen: each open workspace listens on its socket, the
-//! calls of its tabs' agents are answered here by the rules, the person is asked about the first
-//! message between two tabs, and a message that is taken waits in the tab it was sent to.
+//! calls of its tabs' agents are answered here by the rules, and a message that is taken waits in
+//! the tab it was sent to.
+//!
+//! Tabs send each other messages without asking the person, unless the person turned asking on
+//! in the settings; then the first message between two tabs asks. Either way the rules that do
+//! not need the person hold: a tab without the network never sends to one with it, and an
+//! exchange that goes on too long is ended. An ended exchange is not ended silently: both tabs
+//! say so under their terminal, and the person is told once wherever they are looking.
 //!
 //! A taken message is typed into the receiving harness itself, as soon as that tab is quiet:
 //! the person is not typing in it and its program has stopped writing. Until then, and whenever
@@ -102,6 +108,8 @@ pub enum Letters {
     Show(bool),
     /// Throw them away.
     Discard,
+    /// The person read that the tab's exchange was ended; stop saying so.
+    Seen,
 }
 
 /// Opens the socket of every open workspace that has none yet, when the screen bridges, and waits
@@ -335,10 +343,19 @@ fn send(
         Ok(hop) => hop,
         Err(refusal) => {
             call.answer(Answer::refused(refused(refusal, &receiver_name)));
+            if refusal == Refusal::Chain {
+                return ended(screen, (from, sender_name), (to, receiver_name));
+            }
             return Command::none();
         }
     };
-    match screen.rules.decision(from.0, to.0) {
+    // Without asking, a pair nobody was asked about is taken as allowed. What the person did
+    // answer while asking was on still holds: a pair they denied stays denied until QCode closes.
+    let decision = match screen.rules.decision(from.0, to.0) {
+        None if !screen.ask_first => Some(Decision::Allowed),
+        decision => decision,
+    };
+    match decision {
         Some(Decision::Denied) => {
             call.answer(Answer::refused(refused(Refusal::Denied, &receiver_name)));
             Command::none()
@@ -363,6 +380,29 @@ fn send(
             Command::batch([ask(&sender_name, &receiver_name, &text, from, to), remind(from, to)])
         }
     }
+}
+
+/// Says that the exchange between `from` and `to`, each with the name the person knows it by,
+/// was ended by the loop limit: under both tabs, until the person has read it, and once in a
+/// notice wherever the person is looking, because neither tab may be the one on screen.
+///
+/// An agent that keeps trying is refused each time; the notice is not given again for that.
+fn ended(screen: &mut WorkspaceScreen, from: (TabKey, String), to: (TabKey, String)) -> Command<Msg> {
+    let ((from, from_name), (to, to_name)) = (from, to);
+    let mut new = false;
+    for (key, other) in [(from, &to_name), (to, &from_name)] {
+        if let Some((_, tab)) = screen.owner_mut(key).and_then(|workspace| workspace.find(key)) {
+            new |= tab.stopped() != Some(other.as_str());
+            tab.stop(other.clone());
+        }
+    }
+    if !new {
+        return Command::none();
+    }
+    let most = crate::bridge::rules::MOST_HOPS;
+    let toast = Toast::warning(t!("bridge.stopped.title", from = from_name.as_str(), to = to_name.as_str()))
+        .body(t!("bridge.stopped.why", most = most));
+    Command::toast(toast)
 }
 
 /// The words that tell the sending agent why its message to `to` was refused.
@@ -544,6 +584,7 @@ pub(super) fn letters(screen: &mut WorkspaceScreen, key: TabKey, action: Letters
         match action {
             Letters::Show(open) => tab.show_letters(open),
             Letters::Discard => tab.discard_letters(),
+            Letters::Seen => tab.unstop(),
         }
     }
 }
@@ -561,9 +602,37 @@ pub(super) fn unregistered(harness: HarnessKind, trouble: &Unregistered) -> Comm
     Command::toast(Toast::warning(title).body(body))
 }
 
+/// What the bridge shows under a tab: that the loop limit ended its exchange with another tab,
+/// and which messages wait in it.
+pub(super) fn view(tab: &Tab, ui: &mut View<'_, Msg>) {
+    ui.column(|ui| {
+        stopped(tab, ui);
+        waiting(tab, ui);
+    })
+    .gap(1)
+    .fill_width();
+}
+
+/// The line under a tab whose exchange with another the loop limit ended, with the way to say it
+/// was read.
+fn stopped(tab: &Tab, ui: &mut View<'_, Msg>) {
+    let Some(other) = tab.stopped() else { return };
+    let most = crate::bridge::rules::MOST_HOPS;
+    ui.row(|ui| {
+        let line = t!("bridge.stopped.line", tab = other, most = most);
+        ui.add(Text::new(line).role("secondary")).fill_width();
+        ui.add(Button::new(t!("bridge.stopped.seen")).on_press(Msg::Letters(tab.key(), Letters::Seen)))
+            .id("workspace-stopped-seen");
+    })
+    .gap(2)
+    .padding(Padding { left: 2, right: 1, ..Padding::default() })
+    .fill_width()
+    .id("workspace-stopped");
+}
+
 /// The line under a tab that says which messages wait in it, with the way to read them and the
 /// way to throw them away; with the letters themselves above it when they are shown.
-pub(super) fn view(tab: &Tab, ui: &mut View<'_, Msg>) {
+fn waiting(tab: &Tab, ui: &mut View<'_, Msg>) {
     let letters = tab.letters();
     let Some(last) = letters.last() else { return };
     let key = tab.key();

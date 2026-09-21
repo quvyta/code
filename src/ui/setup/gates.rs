@@ -9,7 +9,10 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::engine::known::{self, Known};
 use crate::engine::{EngineKind, Unavailable, detect};
+
+use super::install::IdRanges;
 use crate::store::{Config, SetupStep, Store};
 
 /// Why the chosen engine cannot be used.
@@ -37,6 +40,24 @@ pub enum EngineProblem {
         /// What it said.
         output: String,
     },
+    /// Docker answers and this account may not use it: it is not in the `docker` group, or it
+    /// was just added and this login began before that.
+    NoPermission {
+        /// What docker said.
+        output: String,
+        /// Whether `/etc/group` already names the account in `docker`, so only a new login is
+        /// missing.
+        in_group: bool,
+    },
+    /// Podman works without root and this account has no subordinate id ranges, which every
+    /// image with more than one user needs.
+    NoIdRanges {
+        /// The line that adds them, with a range no other account holds.
+        line: String,
+        /// What podman said, when it was a refusal that told; empty when the wizard found it
+        /// in the files before podman had to refuse anything.
+        output: String,
+    },
     /// A binary was found and could not be started at all.
     NotRunnable {
         /// The binary QCode found.
@@ -53,9 +74,11 @@ impl EngineProblem {
     pub fn output(&self) -> Option<&str> {
         match self {
             Self::NotInstalled => None,
-            Self::DaemonStopped { output } | Self::MachineStopped { output } | Self::Refused { output, .. } => {
-                Some(output).filter(|text| !text.is_empty()).map(String::as_str)
-            }
+            Self::DaemonStopped { output }
+            | Self::MachineStopped { output }
+            | Self::Refused { output, .. }
+            | Self::NoPermission { output, .. }
+            | Self::NoIdRanges { output, .. } => Some(output).filter(|text| !text.is_empty()).map(String::as_str),
             Self::NotRunnable { message, .. } => Some(message),
         }
     }
@@ -187,8 +210,60 @@ impl Gates {
 pub fn check_engine(kind: EngineKind) -> EngineCheck {
     match detect(kind) {
         Ok(_) => EngineCheck::Working,
-        Err(unavailable) => EngineCheck::Broken(EngineProblem::from(unavailable)),
+        Err(unavailable) => {
+            let group = std::fs::read_to_string("/etc/group").unwrap_or_default();
+            let user = IdRanges::here().user;
+            EngineCheck::Broken(refine(EngineProblem::from(unavailable), &group, &user))
+        }
     }
+}
+
+/// What the setup wizard's engine step asks: [`check_engine`], and for podman on Linux also
+/// whether the account has the id ranges podman needs to run QCode's images without root.
+///
+/// Only the wizard asks the second question. An engine that answers is left working everywhere
+/// else, and a container it then cannot make says why in a sentence of its own; the wizard is
+/// where the person is putting their engine in order, and where the line that adds the ranges
+/// can be run for them.
+#[must_use]
+pub fn check_engine_for_setup(kind: EngineKind) -> EngineCheck {
+    let check = check_engine(kind);
+    let linux = crate::store::Platform::host() == crate::store::Platform::Linux;
+    if check == EngineCheck::Working && kind == EngineKind::Podman && linux {
+        return with_ranges(check, &IdRanges::here());
+    }
+    check
+}
+
+/// A working podman on an account without id ranges is not working yet.
+fn with_ranges(check: EngineCheck, ranges: &IdRanges) -> EngineCheck {
+    if check == EngineCheck::Working && !ranges.present() {
+        return EngineCheck::Broken(EngineProblem::NoIdRanges { line: ranges.line(), output: String::new() });
+    }
+    check
+}
+
+/// Reads a refusal whose words QCode recognises as the problem it is: an account docker will
+/// not let in, told apart by whether `/etc/group` (`group`) already names `user` in `docker`;
+/// or an account podman has no id ranges for.
+fn refine(problem: EngineProblem, group: &str, user: &str) -> EngineProblem {
+    let EngineProblem::Refused { output, .. } = &problem else { return problem };
+    match known::recognise(output) {
+        Some(Known::NoPermission) => {
+            EngineProblem::NoPermission { output: output.clone(), in_group: in_group(group, "docker", user) }
+        }
+        Some(Known::NoIdRanges) => EngineProblem::NoIdRanges { line: IdRanges::here().line(), output: output.clone() },
+        _ => problem,
+    }
+}
+
+/// Whether the text of `/etc/group` names `user` among the members of `name`.
+fn in_group(text: &str, name: &str, user: &str) -> bool {
+    text.lines().any(|line| {
+        let mut fields = line.split(':');
+        fields.next() == Some(name)
+            && fields.nth(2).is_some_and(|members| members.split(',').any(|member| member.trim() == user))
+    })
 }
 
 /// Makes sure the store at `path` is there and can be written in.
@@ -335,5 +410,36 @@ mod tests {
         let EngineProblem::NotRunnable { bin, message } = unrunnable else { panic!("it stays unrunnable") };
         assert_eq!(bin, std::path::PathBuf::from("/usr/bin/podman"));
         assert!(!message.is_empty());
+    }
+
+    #[test]
+    fn a_docker_socket_this_account_may_not_open_asks_for_the_group_or_only_for_a_new_login() {
+        let output = "permission denied while trying to connect to the docker API at unix:///var/run/docker.sock";
+        let refused = || EngineProblem::Refused { code: Some(1), output: output.to_owned() };
+        let group = "wheel:x:998:ada\ndocker:x:951:bob,ada\n";
+        assert_eq!(
+            super::refine(refused(), group, "ada"),
+            EngineProblem::NoPermission { output: output.to_owned(), in_group: true }
+        );
+        assert_eq!(
+            super::refine(refused(), group, "carol"),
+            EngineProblem::NoPermission { output: output.to_owned(), in_group: false }
+        );
+        let other = EngineProblem::Refused { code: Some(1), output: "no tty".to_owned() };
+        assert_eq!(super::refine(other.clone(), group, "ada"), other, "anything else is left as it was");
+    }
+
+    #[test]
+    fn a_working_podman_on_an_account_without_id_ranges_is_not_ready_yet() {
+        let ranges = |subuid: &str| super::IdRanges {
+            user: "ada".to_owned(),
+            uid: 1001,
+            subuid: subuid.to_owned(),
+            subgid: subuid.to_owned(),
+        };
+        let missing = super::with_ranges(EngineCheck::Working, &ranges(""));
+        let EngineCheck::Broken(EngineProblem::NoIdRanges { line, .. }) = missing else { panic!("{missing:?}") };
+        assert!(line.contains("--add-subuids 100000-165535"), "{line}");
+        assert_eq!(super::with_ranges(EngineCheck::Working, &ranges("ada:100000:65536\n")), EngineCheck::Working);
     }
 }

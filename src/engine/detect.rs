@@ -7,6 +7,7 @@
 //! are told that and not something else.
 
 use super::command::EngineCommand;
+use super::known;
 use super::run::{EngineError, capture};
 use super::{Engine, EngineKind};
 use std::path::{Path, PathBuf};
@@ -84,21 +85,8 @@ fn classify(kind: EngineKind, code: Option<i32>, output: &str) -> Unavailable {
     let said = output.to_lowercase();
     let says = |marks: &[&str]| marks.iter().any(|mark| said.contains(mark));
     match kind {
-        EngineKind::Docker
-            if says(&[
-                "cannot connect to the docker daemon",
-                "failed to connect to the docker api",
-                "is the docker daemon running",
-                "error during connect",
-                "docker_engine",
-                "dockerdesktoplinuxengine",
-            ]) =>
-        {
-            Unavailable::DaemonStopped { output: output.to_owned() }
-        }
-        EngineKind::Podman if says(&["cannot connect to podman", "podman machine start", "podman machine init"]) => {
-            Unavailable::MachineStopped { output: output.to_owned() }
-        }
+        EngineKind::Docker if says(known::DOCKER_DOWN) => Unavailable::DaemonStopped { output: output.to_owned() },
+        EngineKind::Podman if says(known::PODMAN_DOWN) => Unavailable::MachineStopped { output: output.to_owned() },
         _ => Unavailable::InfoFailed { code, output: output.to_owned() },
     }
 }

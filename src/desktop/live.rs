@@ -67,6 +67,7 @@ fn profile() -> Profile {
         assets: MountAccess::ReadOnly,
         network: NetworkMode::Full,
         without: Vec::new(),
+        os: crate::base::Os::Debian,
     }
 }
 
@@ -129,6 +130,14 @@ fn running(engine: &Engine) -> bool {
 /// of it silently left out the variables that tell the application where the compositor is, so
 /// the window it opened was one no person would ever get.
 fn open_command(engine: &Engine, workspace: &Path, display: &Display) -> crate::engine::EngineCommand {
+    let plan = window_plan(workspace);
+    let seccomp = engine.needs_sandbox_profile().then(|| seccomp::file().expect("the profile is written"));
+    plan.open_window(engine, HostUser::current().expect("the current user"), display, seccomp.as_deref())
+        .expect("this plan opens a window")
+}
+
+/// The plan of the window, for a workspace folder of this test's own.
+fn window_plan(workspace: &Path) -> ContainerPlan {
     let paths = WorkspacePaths {
         root: workspace.parent().expect("the workspace has a folder").to_path_buf(),
         file: workspace.with_file_name("workspace.qcode"),
@@ -140,9 +149,7 @@ fn open_command(engine: &Engine, workspace: &Path, display: &Display) -> crate::
     let plan = ContainerPlan::window(&id, &paths, &profile()).expect("this profile opens a window");
     assert_eq!(plan.name, CONTAINER, "the container these tests clean up is the one the window uses");
     assert_eq!(plan.image, IMAGE, "the image these tests build is the one the window uses");
-    let seccomp = engine.needs_sandbox_profile().then(|| seccomp::file().expect("the profile is written"));
-    plan.open_window(engine, HostUser::current().expect("the current user"), display, seccomp.as_deref())
-        .expect("this plan opens a window")
+    plan
 }
 
 /// A folder of this test's own, removed when the test ends.
@@ -157,6 +164,10 @@ impl Scratch {
         // workspace's other folders as well; they have to be there before it starts.
         std::fs::create_dir_all(path.join("Assets")).expect("an assets folder");
         std::fs::create_dir_all(path.join("Harness")).expect("a harness folder");
+        // And the folders of the workspace's containers: the bridge's and the one the window
+        // leaves the addresses it wants opened in.
+        std::fs::create_dir_all(path.join("Containers").join("MCP")).expect("the bridge's folder");
+        std::fs::create_dir_all(path.join("Containers").join("Browser")).expect("the addresses' folder");
         std::fs::write(path.join("Work").join("README.md"), "hello\n").expect("a file in the workspace");
         Self(path)
     }
@@ -376,6 +387,97 @@ fn a_window_really_opens_on_this_screen() {
             .unwrap_or_else(|error| panic!("{:?}: the window will not close: {error:?}", engine.kind()));
         println!("{:?}: the window closed in {:?}", engine.kind(), stopped.elapsed());
         assert!(!running(&engine), "{:?}", engine.kind());
+        clear(&engine);
+    }
+}
+
+/// The port the stand-in of the application's own sign-in listener answers on inside the
+/// container, as Antigravity's listens on one of its own choosing.
+const CALLBACK_PORT: u16 = 45_049;
+
+/// A listener of the application's kind, run inside the container: `/start` sends the browser
+/// back to `localhost` the way a finished Google sign-in does, and `/callback` writes down what
+/// came back.
+const CALLBACK_SERVER: &str = "require('http').createServer((ask, answer) => { \
+     require('fs').appendFileSync('/tmp/qcode-callback.log', ask.url + '\\n'); \
+     if (ask.url.startsWith('/start')) { answer.writeHead(302, { Location: 'http://localhost:' + process.argv[1] + '/callback?code=test' }); answer.end(); } \
+     else { answer.writeHead(200, { 'Content-Type': 'text/html' }); answer.end('<title>Signed in</title>signed in'); } \
+   }).listen(Number(process.argv[1]), '127.0.0.1');";
+
+#[test]
+#[ignore = "opens a window on a compositor of the test's own; run with QCODE_CONTAINER_TESTS=1 QCODE_TEST_WAYLAND=<socket>"]
+fn the_sign_in_window_opens_inside_the_container_and_the_return_to_localhost_is_answered_there() {
+    // A compositor of the test's own, never the person's: a headless one started for the test,
+    // named by the path of its socket. A socket that is the session's own is refused.
+    let Some(socket) = std::env::var_os("QCODE_TEST_WAYLAND").map(std::path::PathBuf::from) else { return };
+    if let Ok(own) = super::current() {
+        assert_ne!(own.socket, socket, "this test never opens anything on the person's own screen");
+    }
+    let name = socket.file_name().and_then(|name| name.to_str()).expect("a socket name").to_owned();
+    let display = Display { socket: socket.clone(), name, device: None };
+    let scratch = Scratch::new();
+    let plan = window_plan(&scratch.workspace());
+    let only = std::env::var("QCODE_TEST_ENGINE").ok();
+    for engine in engines()
+        .into_iter()
+        .filter(|engine| only.as_deref().is_none_or(|only| format!("{:?}", engine.kind()).eq_ignore_ascii_case(only)))
+    {
+        clear(&engine);
+        build(&engine);
+        capture(&open_command(&engine, &scratch.workspace(), &display))
+            .unwrap_or_else(|error| panic!("{:?}: the window does not open: {error:?}", engine.kind()));
+        assert!(running(&engine), "{:?}", engine.kind());
+
+        // The application's side: a listener on the container's `localhost`, and the address the
+        // application hands `BROWSER` when the person presses sign in.
+        let port = CALLBACK_PORT.to_string();
+        let listen = format!("nohup node -e \"{CALLBACK_SERVER}\" {port} </dev/null >/dev/null 2>&1 &");
+        run(&engine, &listen).expect("the listener starts");
+        let address = format!("http://localhost:{port}/start?state=qcode");
+        run(&engine, &format!("\"$BROWSER\" '{address}'")).expect("the application's way of opening a page");
+
+        // QCode's side, the functions the tab calls: take the address, show it inside.
+        let mut taken = Vec::new();
+        for _ in 0..100 {
+            taken = super::signin::taken(plan.browser.as_deref().expect("the window has a folder"));
+            if !taken.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(taken, std::slice::from_ref(&address), "{:?}: the address reached QCode", engine.kind());
+        let started = Instant::now();
+        let shown = crate::ui::workspace::open_page(&engine, &plan, &address);
+        assert_eq!(shown, Ok(true), "{:?}: the sign-in window starts inside", engine.kind());
+
+        // The sign-in window runs inside the container, with the address, and the return to
+        // `localhost` reached the listener there.
+        let mut log = String::new();
+        for _ in 0..240 {
+            std::thread::sleep(Duration::from_millis(250));
+            log = run(&engine, "cat /tmp/qcode-callback.log 2>/dev/null").unwrap_or_default();
+            if log.contains("/callback?code=test") {
+                break;
+            }
+        }
+        println!("{:?}: the return reached the listener in {:?}", engine.kind(), started.elapsed());
+        let processes = run(&engine, "ps -e -o pid=,args=").unwrap_or_default();
+        println!("{:?}: inside the container:\n{processes}", engine.kind());
+        println!("{:?}: the listener heard:\n{log}", engine.kind());
+        assert!(
+            processes.lines().any(|line| line.contains(super::signin::BROWSER_PROGRAM) && line.contains(&address)),
+            "{:?}: the sign-in window is not running inside with the address: {processes}",
+            engine.kind()
+        );
+        assert!(!processes.contains("--no-sandbox"), "{:?}: {processes}", engine.kind());
+        assert!(log.contains("/start?state=qcode"), "{:?}: the page was not loaded: {log}", engine.kind());
+        assert!(log.contains("/callback?code=test"), "{:?}: the return did not arrive: {log}", engine.kind());
+        let cookies = run(&engine, &format!("ls '{HOME_DIR}/.config/qcode-browser'")).unwrap_or_default();
+        println!("{:?}: the sign-in window keeps in the home volume: {cookies}", engine.kind());
+        assert!(!cookies.trim().is_empty(), "{:?}: nothing of the sign-in window is in the home", engine.kind());
+
+        capture(&engine.stop_container_within(CONTAINER, WINDOW_GRACE))
+            .unwrap_or_else(|error| panic!("{:?}: the window will not close: {error:?}", engine.kind()));
         clear(&engine);
     }
 }

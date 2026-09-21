@@ -25,7 +25,7 @@ use crate::desktop::{self, Display, NoDisplay, signin};
 use crate::engine::Network;
 
 use super::plan::{self, ContainerPlan, LaunchFailure};
-use super::{Msg, OpenWorkspace, Tab, TabKey, TabKind, TabState, WorkspaceScreen};
+use super::{Msg, OpenWorkspace, Shown, Tab, TabKey, TabKind, TabState, WorkspaceScreen};
 
 /// The name the tab's one action is focused by, whichever action the tab's state offers.
 pub(super) const WINDOW_ID: &str = "workspace-window";
@@ -49,7 +49,7 @@ fn no_display(reason: &NoDisplay) -> LaunchFailure {
         NoDisplay::NoWayland => t!("workspace.window.no-wayland"),
         NoDisplay::NoSocket(path) => t!("workspace.window.no-socket", socket = path.display().to_string()),
     };
-    LaunchFailure { command: String::new(), output }
+    LaunchFailure { command: String::new(), output, image_missing: false }
 }
 
 /// The plan of the window the tab `key` opens, when that is what the tab opens.
@@ -157,14 +157,20 @@ pub(super) fn watch_browser(screen: &WorkspaceScreen, key: TabKey, run: u64) -> 
     })
 }
 
-/// Takes the addresses the window asked to have opened: the newest one is opened in the person's
-/// own browser, and the watch is set again for the next one.
+/// Takes the addresses the window asked to have opened: the newest one is shown in the sign-in
+/// window inside the window's own container, and the watch is set again for the next one.
+///
+/// Inside, because that is where a sign-in comes back to: the application waits for it on the
+/// container's `localhost`. When that window cannot be started, the page goes to the person's own
+/// browser instead ([`sign_in_elsewhere`]), and the tab says what that cannot do.
 pub(super) fn sign_in_wanted(
     screen: &mut WorkspaceScreen,
     key: TabKey,
     run: u64,
     addresses: &[String],
 ) -> Command<Msg> {
+    let plan = plan_of(screen, key).map(|(plan, _)| plan);
+    let engine = screen.engine.clone();
     let Some((_, tab)) = screen.owner_mut(key).and_then(|workspace| workspace.find(key)) else {
         return Command::none();
     };
@@ -173,36 +179,46 @@ pub(super) fn sign_in_wanted(
         return Command::none();
     }
     let Some(address) = addresses.last().cloned() else { return Command::none() };
-    // The address is put on the tab at once: whatever the browser does, the person can read it.
+    // The address is put on the tab at once: whatever the window does, the person can read it.
     tab.asked_to_open(address.clone());
     if !signin::is_web(&address) {
-        // Not an address QCode hands a browser. The tab says so rather than opening it quietly.
-        tab.opened_here(&address, false);
+        // Not an address QCode shows anywhere. The tab says so rather than opening it quietly.
+        tab.opened_here(&address, Shown::Nowhere);
         return watch_browser(screen, key, run);
     }
-    // The one door to the desktop: an opening the framework carries out beside QCode and a test
-    // run records instead. The screen is never given away, so nothing blinks while a browser
-    // that has yet to start comes up.
-    let answer = address.clone();
-    let opening = Command::open_with(Open::new(address).answer(move |outcome| {
-        let opened = outcome == OpenOutcome::Opened;
-        Msg::SignInOpened(key, run, answer, opened)
-    }));
-    Command::batch([opening, watch_browser(screen, key, run)])
+    let (Some(plan), Some(engine)) = (plan, engine) else { return watch_browser(screen, key, run) };
+    let showing = Command::perform(move || match plan::open_page(&engine, &plan, &address) {
+        Ok(true) => Msg::SignInOpened(key, run, address, Shown::InWindow),
+        Ok(false) | Err(_) => Msg::SignInElsewhere(key, run, address),
+    });
+    Command::batch([showing, watch_browser(screen, key, run)])
 }
 
-/// Takes the answer of that opening: whether a browser came up here for the address.
+/// Opens in the person's own browser an address the sign-in window could not show.
+///
+/// The one door to the desktop: an opening the framework carries out beside QCode and a test run
+/// records instead. The screen is never given away, so nothing blinks while a browser that has
+/// yet to start comes up.
+pub(super) fn sign_in_elsewhere(key: TabKey, run: u64, address: String) -> Command<Msg> {
+    let answer = address.clone();
+    Command::open_with(Open::new(address).answer(move |outcome| {
+        let shown = if outcome == OpenOutcome::Opened { Shown::InBrowser } else { Shown::Nowhere };
+        Msg::SignInOpened(key, run, answer, shown)
+    }))
+}
+
+/// Takes the answer of that opening: where the address was shown.
 pub(super) fn sign_in_opened(
     screen: &mut WorkspaceScreen,
     key: TabKey,
     run: u64,
     address: &str,
-    opened: bool,
+    shown: Shown,
 ) -> Command<Msg> {
     if let Some((_, tab)) = screen.owner_mut(key).and_then(|workspace| workspace.find(key))
         && tab.run() == run
     {
-        tab.opened_here(address, opened);
+        tab.opened_here(address, shown);
     }
     Command::none()
 }
@@ -331,9 +347,12 @@ pub(super) fn view(screen: &WorkspaceScreen, tab: &Tab, profile: &str, ui: &mut 
             if let Some((address, opened)) = tab.sign_in() {
                 // While the opening is still on its way there is nothing true to say about the
                 // browser, so only the address is shown; the sentence joins it a moment later.
-                if let Some(opened) = opened {
-                    let said =
-                        if opened { "workspace.window.signin-opened" } else { "workspace.window.signin-open-yourself" };
+                if let Some(shown) = opened {
+                    let said = match shown {
+                        Shown::InWindow => "workspace.window.signin-opened",
+                        Shown::InBrowser => "workspace.window.signin-in-browser",
+                        Shown::Nowhere => "workspace.window.signin-open-yourself",
+                    };
                     ui.add(Text::new(t!(said)).role("secondary")).fill_width();
                 }
                 ui.add(Text::new(address.to_owned())).selectable(true).fill_width();
@@ -376,9 +395,10 @@ fn words(tab: &Tab, profile: &str, offline: bool) -> (&'static str, String, Opti
         }
         TabState::Running => {
             let mut detail = t!("workspace.window.open-detail", profile = profile);
-            // The application has nothing to work with until the person signs in, and that sign-in
-            // is not something QCode can do for them yet; saying so on the tab is the least it owes
-            // them, because the window itself is the only place it can be done.
+            // The application has nothing to work with until the person signs in, and the first
+            // sign-in asks for their password and second step in a window whose cookie jar starts
+            // empty. Said before it happens, so the window that comes up is expected, and so is
+            // the one time it asks.
             detail.push(' ');
             detail.push_str(&t!("workspace.window.sign-in"));
             if offline {

@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use super::apps::{PROGRAMS, office_text, pages, pdf_page, pdf_text, picture, sound_details};
 use super::paths::{ASSETS_DIR, CODE_DIR, HOME_DIR, KEEP_ALIVE, OPEN_HOME};
-use super::{Outcome, Presence, containerfile, ensure, presence};
+use super::{Os, Outcome, Presence, containerfile, containerfile_of, ensure, presence};
 use crate::engine::names::HOSTNAME;
 use crate::engine::run::{build_image, capture};
 use crate::engine::{
@@ -43,12 +43,17 @@ const CONTAINER: &str = "qcode-basetest-container";
 const HOME_VOLUME: &str = "qcode-basetest-home";
 
 /// The engines installed on this machine, or nothing at all when the tests are switched off.
+/// `QCODE_CONTAINER_ENGINE` keeps one of them (`podman` or `docker`).
 fn engines() -> Vec<Engine> {
     if std::env::var("QCODE_CONTAINER_TESTS").as_deref() != Ok("1") {
         return Vec::new();
     }
-    let found: Vec<Engine> =
-        [EngineKind::Podman, EngineKind::Docker].into_iter().filter_map(|kind| detect(kind).ok()).collect();
+    let only = std::env::var("QCODE_CONTAINER_ENGINE").ok();
+    let found: Vec<Engine> = [EngineKind::Podman, EngineKind::Docker]
+        .into_iter()
+        .filter(|kind| only.as_deref().is_none_or(|only| format!("{kind:?}").eq_ignore_ascii_case(only)))
+        .filter_map(|kind| detect(kind).ok())
+        .collect();
     assert!(!found.is_empty(), "these tests were asked for and no engine answered");
     found
 }
@@ -222,6 +227,91 @@ fn the_image_builds_and_keeps_a_container_that_writes_where_the_contract_says() 
         );
 
         clear(&engine);
+    }
+}
+
+/// The systems a run builds: every one, or those `QCODE_OS` names, separated by commas
+/// (`QCODE_OS=arch,alpine`), because each is a build of its own and one is often all a run needs.
+pub(crate) fn systems() -> Vec<Os> {
+    let only = std::env::var("QCODE_OS").ok();
+    Os::ALL
+        .into_iter()
+        .filter(|os| only.as_deref().is_none_or(|only| only.split(',').any(|id| id.trim() == os.id())))
+        .collect()
+}
+
+#[test]
+#[ignore = "needs a container engine and the network; run with QCODE_CONTAINER_TESTS=1"]
+fn every_system_builds_keeps_the_contract_and_carries_what_it_says() {
+    // What the wizard says of a system is only true if its image is: the same user, home and
+    // mounts as Debian's, a Node the harnesses install with, every built-in program it promises,
+    // and — so a gap is never said of a program that is really there, or missed of one that is
+    // not — none of the programs it is said to lack. The size is printed, since the wizard shows
+    // it and it is measured nowhere else.
+    for engine in engines() {
+        // Every system runs the npm the harnesses were checked with: Arch's own npm 12 runs no
+        // install script it was not told to, which left Claude Code without its program.
+        let mut npms = Vec::new();
+        for os in systems() {
+            let kind = engine.kind();
+            clear(&engine);
+            let scratch = Scratch::new(&format!("system-{}", os.id()));
+            let started = std::time::Instant::now();
+            build(&engine, TEST_BASE, &containerfile_of(os), &scratch);
+            let took = started.elapsed().as_secs();
+            let size = capture(&engine_command(&engine, &["image", "inspect", "--format", "{{.Size}}", TEST_BASE]))
+                .unwrap_or_default();
+            println!("{kind:?} {os:?}: base image built in {took} s, {} bytes", size.trim());
+
+            let workspace = scratch.dir("Work");
+            start(&engine, TEST_BASE, &workspace, &scratch.dir("Assets"));
+            run_in(&engine, &format!("echo from-{} > {CODE_DIR}/marker", os.id()));
+            assert_eq!(
+                std::fs::read_to_string(workspace.join("marker")).expect("the host sees the file").trim(),
+                format!("from-{}", os.id()),
+                "{kind:?} {os:?}"
+            );
+            run_in(&engine, &format!("mkdir -p {HOME_DIR}/.probe && echo kept > {HOME_DIR}/.probe/file"));
+            assert_eq!(run_in(&engine, "echo $HOME").trim(), HOME_DIR, "{kind:?} {os:?}");
+            assert_eq!(run_in(&engine, "id -un").trim(), "qcode", "{kind:?} {os:?}: uid 1000 is the image's user");
+            run_in(&engine, &format!("command -v {OPEN_HOME} && test -w /usr/local/npm/lib && test -w /var/cache/npm"));
+            let node = run_in(&engine, "node --version");
+            let major: u32 =
+                node.trim().trim_start_matches('v').split('.').next().and_then(|n| n.parse().ok()).unwrap_or(0);
+            assert!(major >= 22, "{kind:?} {os:?}: Claude Code needs Node 22 or later, the image has {node}");
+            run_in(&engine, "git --version && bash --version");
+            npms.push((os, run_in(&engine, "npm --version").trim().to_owned()));
+
+            let lacking: Vec<&str> = os.gaps().iter().flat_map(|gap| gap.programs()).copied().collect();
+            for program in PROGRAMS {
+                let answer = capture(&engine.exec_without_terminal(&Exec { container: CONTAINER, command: program }));
+                let missing = lacking.iter().any(|name| program.iter().any(|word| word.contains(name)));
+                if missing {
+                    assert!(
+                        answer.is_err(),
+                        "{kind:?} {os:?}: `{}` is said to be missing and is there",
+                        program.join(" ")
+                    );
+                } else {
+                    assert!(answer.is_ok(), "{kind:?} {os:?}: `{}` does not answer: {answer:?}", program.join(" "));
+                }
+            }
+            let _ = capture(&engine.remove_container(CONTAINER));
+            let _ = capture(&engine.remove_volume(HOME_VOLUME));
+            clear(&engine);
+        }
+        println!("{:?}: npm {npms:?}", engine.kind());
+        let first = npms.first().map(|(_, version)| version.clone()).unwrap_or_default();
+        assert!(npms.iter().all(|(_, version)| *version == first), "{:?}: one npm everywhere: {npms:?}", engine.kind());
+        assert!(first.starts_with("11."), "{:?}: the npm bundled with Node 24: {npms:?}", engine.kind());
+    }
+}
+
+/// An engine command of `args`, for the one question here the engine layer has no command for.
+fn engine_command(engine: &Engine, args: &[&str]) -> crate::engine::EngineCommand {
+    crate::engine::EngineCommand {
+        program: engine.bin().to_path_buf(),
+        args: args.iter().map(std::ffi::OsString::from).collect(),
     }
 }
 

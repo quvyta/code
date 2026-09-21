@@ -368,6 +368,7 @@ mod tests {
             "/home/me/QCode/Workspaces/p/Backup:/backup:rw,z",
             "--workdir",
             "/home/qcode",
+            "--pull=never",
             "qcode/base",
             "sh",
             "-c",

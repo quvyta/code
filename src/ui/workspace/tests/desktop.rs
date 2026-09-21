@@ -67,12 +67,28 @@ struct Recording {
 
 impl Recording {
     fn new(name: &str) -> Self {
+        Self::answering(name, "")
+    }
+
+    /// The same stand-in, answering an exec that starts the sign-in window the way an image built
+    /// before there was one does.
+    fn without_browser(name: &str) -> Self {
+        let answer = format!(
+            "for word in \"$@\"; do [ \"$word\" = {program} ] && {{ echo {said}; exit 0; }}; done\n",
+            program = crate::desktop::signin::BROWSER_PROGRAM,
+            said = crate::desktop::signin::NO_BROWSER,
+        );
+        Self::answering(name, &answer)
+    }
+
+    fn answering(name: &str, first: &str) -> Self {
         let scratch = Scratch::new(name);
         let (binary, calls, written) = (scratch.0.join("engine"), scratch.0.join("calls"), scratch.0.join("written"));
         let script = format!(
             "#!/bin/sh\n\
              printf '%s\\n' \"$*\" >> {calls}\n\
              [ \"$1\" = run ] && exit 1\n\
+             {first}\
              for word in \"$@\"; do\n\
              case \"$word\" in\n\
              *'exit 3'*) exit 3 ;;\n\
@@ -200,37 +216,86 @@ fn the_window_is_told_where_to_leave_an_address_it_wants_opened() {
     assert!(words.contains(&format!("BROWSER={}", crate::desktop::signin::OPEN_PROGRAM)), "{words:?}");
 }
 
-#[test]
-fn an_address_the_window_leaves_is_shown_on_the_tab_with_a_way_to_open_it() {
-    let session = Session::new("window-signin");
-    let mut screen = session.screen();
+/// The tab of a window that is open, on the stand-in engine `engine`, in a harness.
+fn open_window_on(engine: &Recording) -> (Harness<Screen>, TabKey) {
+    let mut screen = engine.screen();
     open(&mut screen, window());
     let key = key(&screen, 0);
     apply(&mut screen, Msg::WindowOpened(key, 0, Ok(Opening::Up)));
     assert_eq!(state(&screen, 0, 0), TabState::Running);
-    let mut harness = harness(screen, SIZE.0, SIZE.1);
+    (harness(screen, SIZE.0, SIZE.1), key)
+}
 
-    // The address arrives the way the window's own program leaves it, and a browser comes up for
-    // it. Nothing is opened here: the harness records the opening instead of carrying it out, so
-    // this test never reaches the desktop of whoever runs it.
+#[test]
+fn an_address_the_window_leaves_is_shown_in_a_sign_in_window_inside_its_own_container() {
+    let engine = Recording::new("window-signin-inside");
+    let (mut harness, key) = open_window_on(&engine);
+
+    // The address arrives the way the window's own program leaves it.
+    let address = "https://accounts.google.com/o/oauth2/auth?client_id=x&redirect_uri=http%3A%2F%2Flocalhost%3A45049";
+    harness.send(Msg::SignInWanted(key, 0, vec![address.to_owned()]));
+
+    // It is shown by the application's own Electron, started inside the window's container, where
+    // the `localhost` the sign-in returns to is the application's.
+    let calls = engine.calls();
+    let shown = calls
+        .iter()
+        .find(|call| call.starts_with("exec qcode-firefly-anti.desk sh -c "))
+        .unwrap_or_else(|| panic!("the page is shown inside the window's container: {calls:?}"));
+    assert!(
+        shown.ends_with(&format!("{} --ozone-platform=wayland {address}", crate::desktop::signin::BROWSER_PROGRAM)),
+        "the sign-in window, on the same compositor, with the address: {shown}"
+    );
+    assert!(!shown.contains("--tty"), "nothing is typed at it: {shown}");
+    // And nothing reaches the desktop of this machine: its browser would land on a `localhost`
+    // where nobody listens.
+    assert_eq!(harness.opens(), [], "nothing is opened on this machine");
+
+    harness.render();
+    let text = harness.screen();
+    assert!(text.contains("accounts.google.com"), "the address is on the tab:\n{text}");
+    assert!(text.contains("small sign-in window opened beside"), "{text}");
+    assert!(!text.contains("in your browser"), "{text}");
+}
+
+#[test]
+fn an_image_without_the_sign_in_window_sends_the_page_to_the_browser_and_says_what_that_cannot_do() {
+    let engine = Recording::without_browser("window-signin-old-image");
+    let (mut harness, key) = open_window_on(&engine);
     let address = "https://accounts.google.com/o/oauth2/auth?client_id=x";
     harness.set_open_outcome(OpenOutcome::Opened);
     harness.send(Msg::SignInWanted(key, 0, vec![address.to_owned()]));
+
+    // The window was asked first, and said it has none.
+    assert!(engine.calls().iter().any(|call| call.starts_with("exec qcode-firefly-anti.desk sh -c ")));
+    // So the page goes to this machine's browser, through the framework's one door, which the
+    // harness records instead of carrying out.
     let asked = harness.opens().last().expect("the address was handed over to be opened");
     assert_eq!(asked.target.as_deref(), Some(OsStr::new(address)), "the address is what is opened: {asked:?}");
     harness.render();
     let text = harness.screen();
     assert!(text.contains(address), "the address is on the tab:\n{text}");
-    assert!(text.contains("opened its page in your browser"), "{text}");
+    assert!(text.contains("opened in your browser"), "{text}");
+    assert!(text.contains("reach the application"), "what that browser cannot do is said: {text}");
+}
 
-    // A machine with no browser to be had says so, and the address is still there to be read.
-    let other = "https://accounts.google.com/o/oauth2/auth?client_id=y";
+#[test]
+fn a_page_that_can_be_shown_nowhere_leaves_the_address_to_be_read() {
+    // An engine that cannot be run at all: the sign-in window cannot start, and this machine has
+    // no browser to be had either.
+    let session = Session::new("window-signin-nowhere");
+    let mut screen = session.screen();
+    open(&mut screen, window());
+    let key = key(&screen, 0);
+    apply(&mut screen, Msg::WindowOpened(key, 0, Ok(Opening::Up)));
+    let mut harness = harness(screen, SIZE.0, SIZE.1);
+    let address = "https://accounts.google.com/o/oauth2/auth?client_id=y";
     harness.set_open_outcome(OpenOutcome::Failed("no opener on this machine".to_owned()));
-    harness.send(Msg::SignInWanted(key, 0, vec![other.to_owned()]));
+    harness.send(Msg::SignInWanted(key, 0, vec![address.to_owned()]));
     harness.render();
     let text = harness.screen();
-    assert!(text.contains(other), "the address is on the tab:\n{text}");
-    assert!(text.contains("Open this page in your browser"), "{text}");
+    assert!(text.contains(address), "the address is on the tab:\n{text}");
+    assert!(text.contains("it could not be shown here"), "{text}");
 }
 
 #[test]
@@ -275,9 +340,11 @@ fn the_open_window_is_said_plainly_with_the_two_things_that_can_be_done_to_it() 
     let shown = harness.screen();
     assert!(shown.contains("Window open"), "{shown}");
     assert!(shown.contains("Bring to front") && shown.contains("Close the window"), "{shown}");
-    // The one thing QCode cannot do for the person is said on the tab rather than left to be found
-    // out in the window.
-    assert!(shown.contains("sign in"), "{shown}");
+    // The one sign-in the window asks for is said before it comes: a window of its own, the
+    // password and second step once, and remembered after that.
+    assert!(shown.contains("small sign-in window"), "{shown}");
+    assert!(shown.contains("password and second step"), "{shown}");
+    assert!(shown.contains("profile remembers you"), "{shown}");
     // No box, no bracket: the state is said in words and colour.
     assert!(!shown.contains('[') && !shown.contains('\u{250c}'), "{shown}");
 }
@@ -462,6 +529,7 @@ fn a_profile_whose_harness_draws_in_a_terminal_has_no_window_to_plan() {
         assert!(plan.window.is_none(), "{kind:?}");
         assert_eq!(plan.open_window(screen.engine().expect("an engine"), screen_user(), &no_display(), None), None);
         assert_eq!(plan.raise_window(screen.engine().expect("an engine")), None);
+        assert_eq!(plan.open_page(screen.engine().expect("an engine"), "https://example.com/"), None);
     }
 }
 

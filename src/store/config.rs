@@ -142,6 +142,8 @@ impl Config {
     const EDITOR: &'static str = "apps.editor";
     /// The key of what opening a sound does.
     const SOUND: &'static str = "apps.sound";
+    /// The key of whether the person is asked before one tab's agent first sends to another.
+    const ASK_FIRST: &'static str = "bridge.ask-first";
 
     /// Every language QCode speaks, in the order the setup wizard offers them.
     ///
@@ -238,6 +240,11 @@ impl Config {
             .choice(Self::BACKUP_EVERY, BackupEvery::ALL.map(BackupEvery::key), BackupEvery::default().key())
             .choice(Self::EDITOR, Editor::ALL.map(Editor::key), Editor::default().key())
             .choice(Self::SOUND, Sound::ALL.map(Sound::key), Sound::default().key())
+            // Not asking is the default: the person set the agents to work and wants them to hand
+            // it to each other. What stops two agents keeping each other busy is the loop limit,
+            // and what keeps a tab without the network from sending out is the network rule;
+            // neither depends on this. A file written before the key existed reads as not asking.
+            .flag(Self::ASK_FIRST, false)
     }
 
     /// Every problem found while reading the file, including every repair that was made.
@@ -449,6 +456,24 @@ impl Config {
             return self.settings.set(Self::SOUND, sound.key().to_owned());
         }
         self.settings.remove(Self::SOUND)
+    }
+
+    /// Whether the person is asked before one tab's agent sends its first message to another.
+    /// Off until the person turns it on.
+    #[must_use]
+    pub fn ask_first(&self) -> bool {
+        self.settings.get::<bool>(Self::ASK_FIRST).unwrap_or(false)
+    }
+
+    /// Records whether the person is asked before the first message between two tabs. Answers
+    /// whether anything changed.
+    ///
+    /// Not asking is the default and is taken out rather than written down, as with the editor.
+    pub fn set_ask_first(&mut self, ask: bool) -> bool {
+        if ask {
+            return self.settings.set(Self::ASK_FIRST, true);
+        }
+        self.settings.remove(Self::ASK_FIRST)
     }
 
     fn recent_ids(&self) -> Vec<String> {
@@ -864,6 +889,31 @@ mod tests {
         let unknown = Config::parse_str(FILE, "[apps]\nsound = \"loud\"\n");
         assert_eq!(unknown.sound(), Sound::Play);
         assert_eq!(unknown.diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn tabs_send_without_asking_until_asking_is_turned_on_and_not_asking_is_never_written() {
+        // A file written before the key existed, with other settings in it, reads as it did and
+        // as not asking; nothing in it needs repairing.
+        let older = "[apps]\neditor = \"vim\"\n\n[containers]\non-close = \"keep\"\n";
+        let config = Config::parse_str(FILE, older);
+        assert!(config.is_clean(), "{:?}", config.diagnostics());
+        assert!(!config.ask_first());
+        assert_eq!((config.editor(), config.on_close()), (Editor::Vim, OnClose::Keep));
+        assert_eq!(config.to_toml(), Config::parse_str(FILE, older).to_toml());
+
+        let mut config = Config::parse_str(FILE, "");
+        assert!(!config.ask_first());
+        assert!(config.set_ask_first(true));
+        assert_eq!(config.to_toml(), "[bridge]\nask-first = true\n");
+        let stored = Config::parse_str(FILE, &config.to_toml());
+        assert!(stored.is_clean(), "{:?}", stored.diagnostics());
+        assert!(stored.ask_first());
+
+        let mut config = stored;
+        assert!(config.set_ask_first(false));
+        assert!(!config.ask_first());
+        assert_eq!(config.to_toml(), "", "not asking is not written down");
     }
 
     #[test]

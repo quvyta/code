@@ -124,6 +124,35 @@ pub fn build(
     result
 }
 
+/// Builds a profile's image the whole way: its system's base image first when the engine does
+/// not have that one either, then the profile's own on top of it.
+///
+/// It is the build the profile wizard runs, and the one a workspace runs when it opens a tab of
+/// a profile whose image this engine lacks, so the two can never build a profile differently.
+/// `base_started` is told once, at the first line of a base image build, because a base that is
+/// already there builds silently and a log that suddenly shows another image needs saying why.
+///
+/// # Errors
+///
+/// When a build context cannot be written, or the engine refuses, fails or is stopped.
+pub fn build_whole(
+    engine: &Engine,
+    profile: &Profile,
+    cancel: &dyn Fn() -> bool,
+    base_started: &mut dyn FnMut(),
+    line: &mut dyn FnMut(&str),
+) -> Result<(), Problem> {
+    let mut announced = false;
+    base::ensure_os(engine, profile.os, cancel, &mut |text| {
+        if !announced {
+            announced = true;
+            base_started();
+        }
+        line(text);
+    })?;
+    build(engine, profile, cancel, line)
+}
+
 /// A container opened for a login, and the directory it drops the login into.
 #[derive(Debug)]
 pub struct LoginContainer {

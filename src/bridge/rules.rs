@@ -11,10 +11,15 @@
 //!    answering each other stop on their own.
 //! 3. **The pace.** One tab sends at most [`MOST_PER_WINDOW`] messages in [`RATE_WINDOW`], so an
 //!    agent that sends in a loop is stopped even when every message starts a new chain.
-//! 4. **The person.** The first message from one tab to another asks the person, who allows or
-//!    denies it; the answer holds for that pair, that direction, until QCode closes. It is kept
-//!    in memory only: a pair of tabs does not outlive QCode, and a new session starts asking
-//!    again.
+//! 4. **The person**, only when they turned asking on in the settings. Then the first message
+//!    from one tab to another asks the person, who allows or denies it; the answer holds for that
+//!    pair, that direction, until QCode closes. It is kept in memory only: a pair of tabs does
+//!    not outlive QCode, and a new session starts asking again. With asking off, which is the
+//!    default, a message the first three rules take is sent.
+//!
+//! The first three are never switched off: the network rule is a boundary rather than a
+//! question, and the chain is what stops two agents keeping each other busy, and the person's
+//! balance with them, when nobody is asked.
 //!
 //! Nothing here reads a clock: every question is given the moment it is asked, which is how the
 //! windows are tested without waiting.

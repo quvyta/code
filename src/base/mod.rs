@@ -6,6 +6,9 @@
 //! runtime the harnesses install with, git, certificates, a shell — the built-in apps a file of
 //! the workspace is opened with, and the directories the rest of QCode mounts onto.
 //!
+//! A profile can have its image built on another system than Debian; [`Os`] is that choice,
+//! with a base image of its own for each system, and what each system cannot carry or run.
+//!
 //! Three things live here. [`paths`] is the contract: where the workspace, its material and the
 //! home directory are, and what a container runs to stay up. [`apps`] is what the image carries
 //! for opening files: which program opens which file, and with which words. [`ensure`] is the
@@ -15,9 +18,12 @@
 pub mod apps;
 mod image;
 #[cfg(test)]
-mod live;
+pub(crate) mod live;
+mod os;
 pub mod paths;
 
 pub use image::{
-    CONTAINERFILE, Failure, Outcome, Presence, REVISION_LABEL, containerfile, digest, ensure, presence, revision,
+    CONTAINERFILE, Failure, Outcome, Presence, REVISION_LABEL, containerfile, containerfile_of, digest, ensure,
+    ensure_os, presence, presence_of, revision, revision_of,
 };
+pub use os::{Gap, Os, Refusal};

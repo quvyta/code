@@ -26,7 +26,7 @@ use std::path::Path;
 
 use super::{AccountKind, Harness, HarnessKind, MountAccess, NetworkMode, Profile, SafeName, Template};
 use crate::base::paths::{CODE_DIR, KEEP_ALIVE};
-use crate::engine::names::{BASE_IMAGE, HOSTNAME};
+use crate::engine::names::HOSTNAME;
 use crate::engine::run::{build_image, capture};
 use crate::engine::{ContainerCreate, Engine, EngineKind, Exec, HostUser, ImageBuild, Network, detect};
 use crate::ui::profiles::recipe;
@@ -61,6 +61,7 @@ fn profile(harness: HarnessKind) -> Profile {
         assets: MountAccess::ReadOnly,
         network: NetworkMode::Full,
         without: Vec::new(),
+        os: crate::base::Os::Debian,
     }
 }
 
@@ -130,22 +131,25 @@ fn open(engine: Engine, profile: &Profile) -> Lab {
     Lab { engine, container }
 }
 
-/// Builds the image of `profile` from its recipe, on a copy of the base image named
-/// [`TEST_BASE`] so the machine's own `qcode/base` is never replaced. [`clear`] takes both away.
+/// Builds the image of `profile` from its recipe, on a copy of the base image of the profile's
+/// system named [`TEST_BASE`], so the machine's own base image is never replaced. [`clear`] takes
+/// both away.
 pub(crate) fn build(engine: &Engine, profile: &Profile) {
     let record = profile.harness.record();
+    let base = profile.os.image();
     let _ = capture(&engine.remove_image(&profile.image()));
     let _ = capture(&engine.remove_image(TEST_BASE));
 
-    crate::base::ensure(engine, &|| false, &mut |_| {})
-        .unwrap_or_else(|error| panic!("the base image does not build on {:?}: {error:?}", engine.kind()));
+    crate::base::ensure_os(engine, profile.os, &|| false, &mut |_| {}).unwrap_or_else(|error| {
+        panic!("the base image of {:?} does not build on {:?}: {error:?}", profile.os, engine.kind())
+    });
 
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
     let folder = std::env::temp_dir().join(format!("qcode-harnesstest-{}-{stamp}", record.id));
     std::fs::create_dir_all(&folder).expect("a folder in the temporary folder");
 
     let copy = folder.join("base.Containerfile");
-    std::fs::write(&copy, format!("FROM {BASE_IMAGE}\n")).expect("a Containerfile");
+    std::fs::write(&copy, format!("FROM {base}\n")).expect("a Containerfile");
     build_image(
         engine,
         &ImageBuild { image: TEST_BASE, containerfile: &copy, context: &folder },
@@ -155,7 +159,7 @@ pub(crate) fn build(engine: &Engine, profile: &Profile) {
     .expect("the copy of the base image builds");
 
     let recipe = recipe::image(profile);
-    let from = format!("FROM {BASE_IMAGE}");
+    let from = format!("FROM {base}");
     assert!(recipe.containerfile.starts_with(&from), "the recipe builds on the base image: {}", recipe.containerfile);
     let containerfile = recipe.containerfile.replacen(&from, &format!("FROM {TEST_BASE}"), 1);
     std::fs::write(folder.join("Containerfile"), &containerfile).expect("a Containerfile");

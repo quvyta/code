@@ -70,7 +70,6 @@ impl Engine {
         self.command(args)
     }
 
-    /// Asks after an image. It answers only when the image is there, which is how a profile
     /// How many bytes an image takes, as the engine reports it. Both engines answer the same
     /// field of the same command.
     ///
@@ -88,6 +87,7 @@ impl Engine {
         self.command(args)
     }
 
+    /// Asks after an image. It answers only when the image is there, which is how a profile
     /// knows whether it still has one to start containers from.
     #[must_use]
     pub fn image_exists(&self, image: &str) -> EngineCommand {
@@ -140,6 +140,29 @@ impl Engine {
         let mut args = Args::new();
         args.push("run");
         args.push("--rm");
+        self.contained(
+            &mut args,
+            &Contained {
+                image: request.image,
+                mounts: request.mounts,
+                network: request.network,
+                user: request.user,
+                workdir: request.workdir,
+                command: request.command,
+            },
+        );
+        self.command(args)
+    }
+
+    /// [`Engine::run_once`] with the command's standard input handed to the program, for a
+    /// program that reads what another one writes: the half of a copy between two engines that
+    /// unpacks what the other half packed.
+    #[must_use]
+    pub fn run_fed(&self, request: &RunOnce<'_>) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("run");
+        args.push("--rm");
+        args.push("--interactive");
         self.contained(
             &mut args,
             &Contained {
@@ -319,6 +342,14 @@ impl Engine {
             args.push("--workdir");
             args.push(workdir);
         }
+        // Every image a container of QCode's is made from is one QCode built on this machine, so
+        // an engine that does not have it must say so rather than look for it elsewhere. Without
+        // this both engines go to a registry: podman then refuses with a sentence about a
+        // "short-name" and a missing registries.conf that tells the person nothing, and docker
+        // asks Docker Hub for a repository of that name. Naming the image `localhost/...` instead
+        // does not help: podman then retries a registry at localhost:443 three times, and docker
+        // takes `localhost` for a registry host and no longer finds images tagged without it.
+        args.push("--pull=never");
         args.push(request.image);
         args.extend(request.command);
     }
@@ -447,6 +478,35 @@ impl Engine {
         args.push("--all");
         args.push("--format");
         args.push("{{.Names}}\t{{.State}}");
+        self.command(args)
+    }
+
+    /// Lists the containers that carry `label`, one name a line: the containers QCode made
+    /// from a plan carry [`PLAN_LABEL`](crate::ui::workspace::PLAN_LABEL), which tells them apart
+    /// from anything else on the engine that merely has a name beginning like theirs.
+    #[must_use]
+    pub fn list_labelled(&self, label: &str) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("ps");
+        args.push("--all");
+        args.push("--filter");
+        args.push(format!("label={label}"));
+        args.push("--format");
+        args.push("{{.Names}}");
+        self.command(args)
+    }
+
+    /// How many bytes a container holds of its own, above its image, as both engines report it
+    /// in bytes.
+    #[must_use]
+    pub fn container_size(&self, name: &str) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("container");
+        args.push("inspect");
+        args.push("--size");
+        args.push("--format");
+        args.push("{{.SizeRw}}");
+        args.push(name);
         self.command(args)
     }
 
@@ -903,6 +963,7 @@ mod tests {
                 "qcode-home-p-claude:/home/qcode:ro,z",
                 "--workdir",
                 "/work",
+                "--pull=never",
                 "qcode/profile/claude",
                 "sleep",
                 "infinity"
@@ -941,6 +1002,7 @@ mod tests {
                 "--network=none",
                 "--volume",
                 "qcode-home-p-claude:/home/qcode:rw",
+                "--pull=never",
                 "qcode/profile/claude"
             ]
         );
@@ -959,7 +1021,7 @@ mod tests {
             workdir: None,
             command: &[],
         };
-        let expected = ["create", "--name", "qcode-p-base", "--hostname", "box", "qcode/base"];
+        let expected = ["create", "--name", "qcode-p-base", "--hostname", "box", "--pull=never", "qcode/base"];
         assert_eq!(args(&podman().create_container(&request)), expected);
         assert_eq!(args(&docker().create_container(&request)), expected);
     }
@@ -999,6 +1061,7 @@ mod tests {
                 "/home/me/QCode/Workspaces/p/Backup:/backup:rw,z",
                 "--workdir",
                 "/work",
+                "--pull=never",
                 "qcode/base",
                 "sh",
                 "-c",
@@ -1019,6 +1082,7 @@ mod tests {
                 "/home/me/QCode/Workspaces/p/Backup:/backup:rw",
                 "--workdir",
                 "/work",
+                "--pull=never",
                 "qcode/base",
                 "sh",
                 "-c",
@@ -1192,7 +1256,17 @@ mod tests {
         };
         assert_eq!(
             args(&podman().create_container(&request)),
-            ["create", "--name", "qcode-p-base", "--hostname", "box", "--label", "qcode.plan=0123", "qcode/base"]
+            [
+                "create",
+                "--name",
+                "qcode-p-base",
+                "--hostname",
+                "box",
+                "--label",
+                "qcode.plan=0123",
+                "--pull=never",
+                "qcode/base"
+            ]
         );
         assert_eq!(
             args(&docker().container_label("qcode-p-base", "qcode.plan")),
@@ -1284,7 +1358,7 @@ mod tests {
             "--env",
             "PULSE_SERVER=unix:/run/sound",
         ];
-        let tail = ["--workdir", "/work", "qcode/base", "play", "/work/a song.mp3"];
+        let tail = ["--workdir", "/work", "--pull=never", "qcode/base", "play", "/work/a song.mp3"];
         let podman = args(&podman().run_attached(&request));
         assert_eq!(podman[..8], head);
         assert_eq!(
@@ -1317,5 +1391,94 @@ mod tests {
             ]
         );
         assert_eq!(docker[15..], tail);
+    }
+
+    #[test]
+    fn no_container_is_made_from_an_image_the_engine_would_go_and_fetch() {
+        // Every command that makes a container of an image says `--pull=never` right before the
+        // image, on both engines: an image QCode built and this engine lacks is a missing image,
+        // never a name to look up on a registry.
+        let once = RunOnce {
+            image: "qcode/base",
+            mounts: &[],
+            network: Network::Full,
+            user: HostUser::ImageDefault,
+            workdir: None,
+            command: &["true"],
+        };
+        let create = ContainerCreate {
+            name: "qcode-p-claude",
+            hostname: "qcode",
+            labels: &[],
+            image: "qcode/profile/claude",
+            mounts: &[],
+            network: Network::Full,
+            user: HostUser::Ids { uid: 1000, gid: 1000 },
+            workdir: None,
+            command: &["true"],
+        };
+        let attached = RunAttached { name: "qcode-p.play-1", once, env: &[], sockets: &[] };
+        let window = RunWindow {
+            name: "qcode-p-anti.desk",
+            once,
+            env: &[],
+            sockets: &[],
+            tmpfs: &[],
+            devices: &[],
+            shm: "1g",
+            seccomp: None,
+        };
+        for engine in [podman(), docker()] {
+            for (command, image) in [
+                (engine.create_container(&create), "qcode/profile/claude"),
+                (engine.run_once(&once), "qcode/base"),
+                (engine.run_attached(&attached), "qcode/base"),
+                (engine.run_window(&window), "qcode/base"),
+            ] {
+                let spelled = args(&command);
+                let at = spelled.iter().position(|arg| arg == image).expect("the image is named");
+                assert_eq!(spelled[at - 1], "--pull=never", "{spelled:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_fed_run_takes_its_input_and_is_made_like_any_other() {
+        let once = RunOnce {
+            image: "qcode/base",
+            mounts: &[],
+            network: Network::None,
+            user: HostUser::Ids { uid: 1000, gid: 1000 },
+            workdir: None,
+            command: &["tar", "-xf", "-"],
+        };
+        assert_eq!(
+            args(&docker().run_fed(&once)),
+            [
+                "run",
+                "--rm",
+                "--interactive",
+                "--user",
+                "1000:1000",
+                "--network=none",
+                "--pull=never",
+                "qcode/base",
+                "tar",
+                "-xf",
+                "-"
+            ]
+        );
+    }
+
+    #[test]
+    fn qcodes_own_containers_are_listed_by_their_label_and_sized_in_bytes() {
+        assert_eq!(
+            args(&podman().list_labelled("qcode.plan")),
+            ["ps", "--all", "--filter", "label=qcode.plan", "--format", "{{.Names}}"]
+        );
+        assert_eq!(
+            args(&docker().container_size("qcode-p-base")),
+            ["container", "inspect", "--size", "--format", "{{.SizeRw}}", "qcode-p-base"]
+        );
     }
 }

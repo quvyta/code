@@ -370,7 +370,7 @@ fn step_index(step: SetupStep) -> usize {
 
 /// Asks the chosen engine whether it works, off the render path.
 fn ask_engine(kind: EngineKind) -> Command<Msg> {
-    Command::perform(move || Msg::EngineChecked(kind, gates::check_engine(kind)))
+    Command::perform(move || Msg::EngineChecked(kind, gates::check_engine_for_setup(kind)))
 }
 
 /// Makes sure the store folder is there and writable, off the render path.
@@ -529,10 +529,9 @@ fn start_install(setup: &mut Setup) -> Command<Msg> {
         return Command::none();
     }
     let EngineCheck::Broken(problem) = &setup.engine_check else { return Command::none() };
-    let Remedy::Install { command: Some(command), .. } = Remedy::for_problem(problem, setup.kind(), &setup.host) else {
-        return Command::none();
-    };
-    match setup.installer.start(&command) {
+    let remedy = Remedy::for_problem(problem, setup.kind(), &setup.host);
+    let Some(command) = remedy.runnable() else { return Command::none() };
+    match setup.installer.start(command) {
         Ok(session) => {
             let watch = session.watch();
             setup.install = Install::Running(session);
@@ -733,6 +732,9 @@ fn engine_problem(setup: &Setup, problem: &EngineProblem, name: &str, ui: &mut V
         EngineProblem::DaemonStopped { .. } => t!("setup.daemon-stopped"),
         EngineProblem::MachineStopped { .. } => t!("setup.machine-stopped"),
         EngineProblem::Refused { .. } => t!("setup.refused", engine = name.to_owned()),
+        EngineProblem::NoPermission { in_group: false, .. } => t!("known.no-permission", engine = name.to_owned()),
+        EngineProblem::NoPermission { in_group: true, .. } => t!("setup.host.relogin-now", engine = name.to_owned()),
+        EngineProblem::NoIdRanges { .. } => t!("known.no-id-ranges", engine = name.to_owned()),
         EngineProblem::NotRunnable { bin, .. } => {
             t!("setup.unreachable", engine = name.to_owned(), path = bin.display().to_string())
         }
@@ -741,14 +743,29 @@ fn engine_problem(setup: &Setup, problem: &EngineProblem, name: &str, ui: &mut V
     ui.spacer().height(Length::Cells(1));
 
     match Remedy::for_problem(problem, setup.kind(), &setup.host) {
-        Remedy::Install { command: Some(command), .. } => install_choice(setup, &command, ui),
-        Remedy::Install { command: None, docs } => {
+        Remedy::Install { command: Some(command), relogin, .. } => {
+            install_choice(setup, &command, Choice::Install, ui);
+            if relogin {
+                ui.add(Text::new(t!("setup.host.relogin-after")).role("secondary")).fill_width();
+            }
+        }
+        Remedy::Install { command: None, docs, .. } => {
             ui.add(Text::new(t!("setup.no-manager", url = docs.to_owned())).role("secondary")).fill_width();
         }
-        Remedy::Start { command: Some(command) } => line(ui, &t!("setup.start-with"), &command),
+        // A service QCode can start is started the way anything is installed: here, on a terminal
+        // the person watches, or by the person from the line.
+        Remedy::Start { command: Some(command) } => install_choice(setup, &command, Choice::Start, ui),
         Remedy::Start { command: None } => {
             ui.add(Text::new(t!("setup.start-desktop")).role("secondary")).fill_width();
         }
+        Remedy::Grant { command, relogin } => {
+            install_choice(setup, &command, Choice::Run, ui);
+            if relogin {
+                ui.add(Text::new(t!("setup.host.relogin-after")).role("secondary")).fill_width();
+            }
+        }
+        // Nothing runs a new login; saying so is the whole of the help.
+        Remedy::Relogin => {}
         // Nothing is offered for a refusal QCode cannot read: the engine's own words below are
         // the only honest help there is.
         Remedy::Unknown => {}
@@ -771,14 +788,18 @@ fn engine_problem(setup: &Setup, problem: &EngineProblem, name: &str, ui: &mut V
 ///
 /// Neither happens until the person says which one they want. While the command is running the
 /// choice is gone, because the terminal below is the whole of what is happening.
-fn install_choice(setup: &Setup, command: &str, ui: &mut View<'_, Msg>) {
+fn install_choice(setup: &Setup, command: &str, choice: Choice, ui: &mut View<'_, Msg>) {
     if matches!(setup.install, Install::Running(_)) {
         return;
     }
+    let (here, myself, with) = match choice {
+        Choice::Install => (t!("setup.install-here"), t!("setup.install-myself"), t!("setup.install-with")),
+        Choice::Start => (t!("setup.host.start-here"), t!("setup.host.run-myself"), t!("setup.start-with")),
+        Choice::Run => (t!("setup.host.run-here"), t!("setup.host.run-myself"), t!("setup.host.run-with")),
+    };
     ui.row(|ui| {
-        ui.add(Button::new(t!("setup.install-here")).variant("primary").on_press(Msg::InstallHere))
-            .id("setup-install-here");
-        ui.add(Button::new(t!("setup.install-myself")).on_press(Msg::ShowCommand)).id("setup-install-myself");
+        ui.add(Button::new(here).variant("primary").on_press(Msg::InstallHere)).id("setup-install-here");
+        ui.add(Button::new(myself).on_press(Msg::ShowCommand)).id("setup-install-myself");
         ui.spacer();
     })
     .gap(2)
@@ -786,8 +807,19 @@ fn install_choice(setup: &Setup, command: &str, ui: &mut View<'_, Msg>) {
     // Right under the button that asked for it, as that button's answer. The row a gap would
     // take is one the promise at the foot of the step needs in an 80 by 24 terminal.
     if matches!(setup.install, Install::Shown) {
-        line(ui, &t!("setup.install-with"), command);
+        line(ui, &with, command);
     }
+}
+
+/// What the line the engine step offers does, which is what its two buttons are named after.
+#[derive(Debug, Clone, Copy)]
+enum Choice {
+    /// Installs the engine.
+    Install,
+    /// Starts what the engine needs.
+    Start,
+    /// Sets this account up for the engine.
+    Run,
 }
 
 /// A command the person runs themselves, with its few words of explanation in front of it on
@@ -1208,7 +1240,7 @@ mod tests {
         until(&mut harness, "the engine answered", |harness| {
             harness.app().setup.engine_check() != &EngineCheck::Running
         });
-        let asked = super::gates::check_engine(EngineKind::Podman);
+        let asked = super::gates::check_engine_for_setup(EngineKind::Podman);
         assert_eq!(
             harness.app().setup.engine_check(),
             &asked,
@@ -1232,20 +1264,24 @@ mod tests {
     fn a_stopped_docker_daemon_is_a_different_story_from_a_missing_docker() {
         let config = "language = \"en\"\n\n[engine]\nkind = \"docker\"\n";
         let problem = EngineProblem::DaemonStopped { output: "cannot connect to the docker daemon".to_owned() };
-        let harness = on_engine(config, problem);
+        let mut harness = on_engine_tall(config, problem);
         let screen = harness.screen();
         assert!(screen.contains("Docker is installed"), "{screen}");
         assert!(!screen.contains("not installed"), "nothing is missing, so nothing says so:\n{screen}");
-        assert!(screen.contains("sudo systemctl start docker"), "{screen}");
+        assert!(screen.contains("Start it here"), "{screen}");
+        harness.click_text("I'll run it myself").render();
+        // Enabled as well as started, so it is there again after the next boot.
+        assert!(harness.screen().contains("sudo systemctl enable --now docker"), "{}", harness.screen());
     }
 
     #[test]
     fn a_podman_machine_that_is_not_running_asks_for_the_machine_and_not_an_install() {
         let problem = EngineProblem::MachineStopped { output: "podman machine start".to_owned() };
-        let harness = on_engine("language = \"en\"\n", problem);
+        let mut harness = on_engine_tall("language = \"en\"\n", problem);
         let screen = harness.screen();
         assert!(screen.contains("virtual machine"), "{screen}");
-        assert!(screen.contains("podman machine start"), "{screen}");
+        harness.click_text("I'll run it myself").render();
+        assert!(harness.screen().contains("podman machine start"), "{}", harness.screen());
     }
 
     #[test]
@@ -1489,5 +1525,81 @@ mod tests {
         for text in ["Kapsayıcı motoru", "kurulu değil", "Burada kur", "Komutu göster", "yetkisini yükseltmez"] {
             assert!(screen.contains(text), "`{text}` is missing:\n{screen}");
         }
+    }
+
+    /// An installer that writes down the line it was handed and runs something harmless in its
+    /// place: nothing a test starts installs anything, adds a group or touches a system file.
+    fn recording(seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> Installer {
+        Installer::new(move |command| {
+            seen.lock().expect("the list").push(command.to_owned());
+            TerminalSession::spawn("/bin/sh".as_ref(), &["-c", "echo done-here"], Path::new("/"))
+        })
+    }
+
+    /// The wizard on the engine step of the Arch machine, with `config`'s engine broken the way
+    /// `problem` says and an installer that writes down what it is handed.
+    fn recorded(
+        config: &str,
+        problem: EngineProblem,
+    ) -> (Harness<Wizard>, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let gates = gates(EngineCheck::Broken(problem), LocationCheck::Unknown);
+        let harness = on(config, &gates, Some(temporary("home")), TALL, host(), recording(seen.clone()));
+        (harness, seen)
+    }
+
+    const DOCKER: &str = "language = \"en\"\n\n[engine]\nkind = \"docker\"\n";
+
+    #[test]
+    fn installing_docker_here_also_starts_its_service_and_lets_the_account_in() {
+        let (mut harness, seen) = recorded(DOCKER, EngineProblem::NotInstalled);
+        let screen = harness.screen();
+        assert!(screen.contains("log out and back in"), "what is left after it is said before:\n{screen}");
+        harness.click_text("Install it here").render();
+        assert_eq!(
+            *seen.lock().expect("the list"),
+            ["paru -S docker && sudo systemctl enable --now docker && sudo usermod -aG docker $USER"]
+        );
+    }
+
+    #[test]
+    fn a_stopped_docker_is_started_here_through_the_same_terminal() {
+        let (mut harness, seen) = recorded(DOCKER, EngineProblem::DaemonStopped { output: String::new() });
+        harness.click_text("Start it here").render();
+        assert_eq!(*seen.lock().expect("the list"), ["sudo systemctl enable --now docker"]);
+    }
+
+    #[test]
+    fn an_account_outside_the_docker_group_is_added_to_it_here() {
+        let problem = EngineProblem::NoPermission { output: "permission denied".to_owned(), in_group: false };
+        let (mut harness, seen) = recorded(DOCKER, problem);
+        let screen = harness.screen();
+        assert!(screen.contains("Your account may not use Docker yet"), "{screen}");
+        harness.click_text("Run it here").render();
+        assert_eq!(*seen.lock().expect("the list"), ["sudo usermod -aG docker $USER"]);
+    }
+
+    #[test]
+    fn an_account_already_in_the_group_is_only_asked_to_log_in_again() {
+        let problem = EngineProblem::NoPermission { output: "permission denied".to_owned(), in_group: true };
+        let (harness, seen) = recorded(DOCKER, problem);
+        let screen = harness.screen();
+        assert!(screen.contains("this login began before it"), "{screen}");
+        assert!(!screen.contains("Run it here"), "no command logs anyone out:\n{screen}");
+        assert!(seen.lock().expect("the list").is_empty());
+    }
+
+    #[test]
+    fn podman_without_id_ranges_offers_the_line_that_adds_them_and_runs_it_here() {
+        let line =
+            "sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER && podman system migrate";
+        let problem = EngineProblem::NoIdRanges { line: line.to_owned(), output: String::new() };
+        let (mut harness, seen) = recorded("language = \"en\"\n", problem);
+        let screen = harness.screen();
+        assert!(screen.contains("no user id ranges for your account"), "{screen}");
+        harness.click_text("I'll run it myself").render();
+        assert!(harness.screen().contains("--add-subuids 100000-165535"), "the line is shown:\n{}", harness.screen());
+        harness.click_text("Run it here").render();
+        assert_eq!(*seen.lock().expect("the list"), [line]);
     }
 }

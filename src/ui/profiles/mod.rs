@@ -16,7 +16,7 @@ mod live;
 pub(crate) mod recipe;
 mod status;
 mod wizard;
-mod work;
+pub(crate) mod work;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,13 +29,14 @@ use qframe::widgets::{
     Terminal, TerminalEvent, TerminalSession, TextInput, Toast, Wizard,
 };
 
-use crate::base;
+use crate::base::{Gap, Os, Refusal};
 use crate::engine::Engine;
 use crate::profile::{
     ASSUMED_CONTEXT_TOKENS, AccountKind, Extra, HarnessKind, MountAccess, NetworkMode, Profile, SafeName, Template,
 };
 use crate::provider::{ProviderEntry, Providers};
 use crate::store::Store;
+use crate::ui::settings::engine::help;
 
 pub use status::{Readiness, Row, Status};
 pub use wizard::{Blocked, Build, Draft, Login, Stage, Unfinished};
@@ -44,7 +45,12 @@ pub use work::Problem;
 /// Width of the wizard's pages: wide enough for every step to keep its name in the row of
 /// steps, and still one column of text. A narrower terminal shrinks it, and the steps fall back
 /// to their markers.
-const PAGE_WIDTH: u16 = 100;
+///
+/// Measured against the seven English steps, whose row is 104 cells, with the frame around it;
+/// German, French, Turkish, Russian, Portuguese and Chinese fit too. Spanish and Japanese name
+/// their steps longer and show the markers with the current step's name, as a narrow terminal
+/// does.
+const PAGE_WIDTH: u16 = 110;
 
 /// Rows the build log and the login terminal are given, so the buttons under them stay put.
 const VIEWPORT_ROWS: u16 = 16;
@@ -112,6 +118,8 @@ pub enum Msg {
     Name(String),
     /// A harness was chosen.
     PickHarness(usize),
+    /// An operating system was chosen, by its place in [`Os::ALL`].
+    PickOs(usize),
     /// A template was chosen.
     PickTemplate(usize),
     /// A part of QCode high's additions was switched on (`true`) or off.
@@ -380,6 +388,12 @@ pub fn update(state: &mut Profiles, message: Msg) -> Command<Msg> {
             }
             Command::none()
         }
+        Msg::PickOs(index) => {
+            if let (Some(draft), Some(os)) = (&mut state.draft, Os::ALL.get(index)) {
+                draft.os = *os;
+            }
+            Command::none()
+        }
         Msg::PickTemplate(index) => {
             if let (Some(draft), Some(template)) = (&mut state.draft, Template::ALL.get(index)) {
                 draft.template = *template;
@@ -569,6 +583,7 @@ fn next(state: &mut Profiles) -> Command<Msg> {
         Some(Blocked::NameEmpty | Blocked::NameTaken) => Command::focus("profile-name"),
         Some(Blocked::NoImage) => Command::focus("build-start"),
         Some(Blocked::NoProvider) => Command::focus("profile-provider"),
+        Some(Blocked::Unsupported(_)) => Command::focus("profile-system"),
         None if draft.stage == Stage::Image && draft.build == Build::Waiting => start_build(state),
         None => Command::none(),
     }
@@ -609,17 +624,9 @@ fn start_build(state: &mut Profiles) -> Command<Msg> {
     let task = Task::new(t!("profiles.wizard.step-image"), move |cx| {
         let cancel = || cx.is_cancelled();
         let mut line = |text: &str| cx.send(Msg::BuildLine(text.to_owned()));
-        // The base image says nothing at all when it is already there, so its first word is
-        // the moment a build of it began, and that is when the log is told what it is watching.
-        let mut announced = false;
-        let base = base::ensure(&engine, &cancel, &mut |text| {
-            if !announced {
-                announced = true;
-                cx.send(Msg::BaseImageStarted);
-            }
-            line(text);
-        });
-        let built = base.map_err(Problem::from).and_then(|_| work::build(&engine, &profile, &cancel, &mut line));
+        // The base image of the profile's own system comes first: a profile on Arch is built on
+        // Arch's, and the log is told when that one starts building.
+        let built = work::build_whole(&engine, &profile, &cancel, &mut || cx.send(Msg::BaseImageStarted), &mut line);
         // The definition file is written only once there is an image behind it, so a store
         // never holds a profile that cannot be opened.
         let result =
@@ -719,6 +726,15 @@ fn failure_toast(key: &str, problem: &Problem) -> Toast<Msg> {
     match problem.output().and_then(|output| output.lines().next()) {
         Some(line) => toast.body(line.to_owned()),
         None => toast,
+    }
+}
+
+/// Says plainly what an engine refusal QCode recognises means and what puts it right, above the
+/// engine's own words, which the log or the line below keeps as they were.
+fn recognised(state: &Profiles, problem: &Problem, ui: &mut View<'_, Msg>) {
+    let kind = state.engine.as_ref().map(Engine::kind);
+    if let Some(help) = kind.zip(problem.output()).and_then(|(kind, output)| help(kind, output)) {
+        help.show(ui);
     }
 }
 
@@ -861,12 +877,19 @@ fn summary(profile: &Profile) -> String {
         }
         None => account_word(profile.account),
     };
-    t!(
+    let summary = t!(
         "profiles.summary",
         harness = profile.harness.record().display_name,
         template = template.as_str(),
         account = account.as_str()
-    )
+    );
+    // Debian goes unsaid, as it did before there was a choice; any other system is named, since
+    // it is the one thing about the profile the rest of the line does not show.
+    if profile.os == Os::Debian {
+        summary
+    } else {
+        t!("profiles.summary-system", summary = summary.as_str(), system = profile.os.display_name())
+    }
 }
 
 /// What a profile's containers may see and reach, in one line.
@@ -974,6 +997,7 @@ fn draw_steps(state: &Profiles, draft: &Draft, ui: &mut View<'_, Msg>) {
     wizard
         .show(ui, |ui| match draft.stage {
             Stage::Harness => draw_harness(draft, ui),
+            Stage::System => draw_system(draft, ui),
             Stage::Template => draw_template(draft, ui),
             Stage::Account => draw_account(draft, ui),
             Stage::Permissions => draw_permissions(draft, ui),
@@ -987,6 +1011,7 @@ fn draw_steps(state: &Profiles, draft: &Draft, ui: &mut View<'_, Msg>) {
 fn step_word(stage: Stage) -> String {
     t!(match stage {
         Stage::Harness => "profiles.wizard.step-harness",
+        Stage::System => "profiles.wizard.step-system",
         Stage::Template => "profiles.wizard.step-template",
         Stage::Account => "profiles.wizard.step-account",
         Stage::Permissions => "profiles.wizard.step-permissions",
@@ -1010,6 +1035,11 @@ fn draw_harness(draft: &Draft, ui: &mut View<'_, Msg>) {
             .on_select(Msg::PickHarness),
     )
     .id("profile-harness");
+    // A person who went back from the system page to change the harness learns at once that the
+    // system they chose there cannot run this one, not only when they reach it again.
+    if let Some(refusal) = draft.os.refuses(draft.harness) {
+        ui.add(Text::new(refusal_line(refusal, draft)).color("warning")).fill_width();
+    }
     ui.add_with(
         Field::new(t!("profiles.wizard.name"))
             .hint(t!("profiles.wizard.name-hint"))
@@ -1032,6 +1062,55 @@ fn draw_harness(draft: &Draft, ui: &mut View<'_, Msg>) {
     {
         ui.add(Text::new(t!("profiles.wizard.name-folded", name = safe.as_str())).role("secondary"));
     }
+}
+
+/// Which operating system the image is built on: each with the size its base image was measured
+/// at, Alpine with the words that it is not recommended, and under the choice what that system
+/// means, what its image does not carry, and — when it cannot run the chosen harness — why, in the
+/// colour of a problem, with the page held until something else is chosen.
+fn draw_system(draft: &Draft, ui: &mut View<'_, Msg>) {
+    let chosen = Os::ALL.iter().position(|os| *os == draft.os);
+    ui.add(Text::new(t!("profiles.wizard.system-lead")).role("secondary")).fill_width();
+    ui.add(RadioGroup::new(Os::ALL.map(system_option)).selected(chosen).on_select(Msg::PickOs)).id("profile-system");
+    let detail = t!(match draft.os {
+        Os::Debian => "profiles.wizard.system-debian-detail",
+        Os::Arch => "profiles.wizard.system-arch-detail",
+        Os::Ubuntu => "profiles.wizard.system-ubuntu-detail",
+        Os::Alpine => "profiles.wizard.system-alpine-detail",
+    });
+    ui.add(Text::new(detail).role("secondary")).fill_width();
+    for gap in draft.os.gaps() {
+        let said = t!(match gap {
+            Gap::Docx2txt => "profiles.wizard.system-gap-docx2txt",
+            Gap::Sox => "profiles.wizard.system-gap-sox",
+            Gap::SoxOpus => "profiles.wizard.system-gap-sox-opus",
+        });
+        ui.add(Text::new(said).color("warning")).fill_width();
+    }
+    if let Some(refusal) = draft.os.refuses(draft.harness) {
+        ui.add(Text::new(refusal_line(refusal, draft)).color("danger")).fill_width();
+    }
+}
+
+/// One system as the wizard offers it: its name, how large its image is, and for Alpine that it is
+/// not recommended.
+fn system_option(os: Os) -> String {
+    let key = if os.recommended() {
+        "profiles.wizard.system-option"
+    } else {
+        "profiles.wizard.system-option-not-recommended"
+    };
+    t!(key, name = os.display_name(), mb = os.image_mb().to_string())
+}
+
+/// Why the chosen system does not run the chosen harness, in words.
+fn refusal_line(refusal: Refusal, draft: &Draft) -> String {
+    let key = match refusal {
+        Refusal::TerminalLibrary => "profiles.wizard.system-refused-terminal",
+        Refusal::GlibcProgram => "profiles.wizard.system-refused-glibc",
+        Refusal::WindowOnDebianOnly => "profiles.wizard.system-refused-window",
+    };
+    t!(key, harness = draft.harness.record().display_name, system = draft.os.display_name())
 }
 
 /// The harness as it comes, or set up the way QCode runs it.
@@ -1087,7 +1166,9 @@ fn draw_download(draft: &Draft, ui: &mut View<'_, Msg>) {
         ui.add(Text::new(t!("profiles.wizard.high-none")).role("secondary")).fill_width();
         return;
     }
-    ui.add(Text::new(t!("profiles.wizard.high-download")).color("warning")).fill_width();
+    // The system's own repositories are named, since the packages come from there.
+    let download = t!("profiles.wizard.high-download", system = draft.os.display_name());
+    ui.add(Text::new(download).color("warning")).fill_width();
     if let Some(offline) = offline_line(draft) {
         ui.add(Text::new(offline).color("warning")).fill_width();
     }
@@ -1225,6 +1306,9 @@ fn draw_image(state: &Profiles, draft: &Draft, ui: &mut View<'_, Msg>) {
     };
     ui.add(Text::new(lead).role(if matches!(draft.build, Build::Failed(_)) { "danger" } else { "secondary" }))
         .fill_width();
+    if let Build::Failed(problem) = &draft.build {
+        recognised(state, problem, ui);
+    }
     if draft.build == Build::Done && !draft.account.needs_login() {
         let harness = draft.harness.record().display_name;
         let ready = match draft.account {
@@ -1337,6 +1421,7 @@ fn draw_login(state: &Profiles, draft: &Draft, ui: &mut View<'_, Msg>) {
         }
         Login::Failed(problem) => {
             ui.add(Text::new(t!("profiles.wizard.login-failed")).color("danger")).fill_width();
+            recognised(state, problem, ui);
             if let Some(output) = problem.output() {
                 ui.add(Text::new(output.to_owned()).role("secondary")).fill_width();
             }
@@ -1390,6 +1475,7 @@ mod tests {
             assets: MountAccess::ReadOnly,
             network: NetworkMode::Full,
             without: Vec::new(),
+            os: crate::base::Os::Debian,
         }
     }
 
@@ -1504,6 +1590,15 @@ mod tests {
     }
 
     #[test]
+    fn a_profile_on_another_system_names_it_in_the_list_and_one_on_debian_does_not() {
+        let arch = Profile { os: Os::Arch, ..profile("claude-arch", HarnessKind::ClaudeCode) };
+        let harness = loaded(vec![arch, profile("claude-sub", HarnessKind::ClaudeCode)]);
+        let screen = harness.screen();
+        assert!(screen.contains("Claude Code, QCode basic, subscription, on Arch Linux"), "{screen}");
+        assert!(!screen.contains("Debian"), "a profile on Debian reads as it did before:\n{screen}");
+    }
+
+    #[test]
     fn a_profile_summary_says_what_it_runs_and_what_it_may_reach() {
         let harness = loaded(vec![profile("claude-sub", HarnessKind::ClaudeCode)]);
         let screen = harness.screen();
@@ -1553,16 +1648,20 @@ mod tests {
     }
 
     #[test]
-    fn the_wizard_walks_through_its_six_pages_in_order() {
+    fn the_wizard_walks_through_its_seven_pages_in_order() {
         let mut harness = loaded(Vec::new());
         harness.send(Msg::New).render();
         let screen = harness.screen();
         assert!(screen.contains("Harness"), "the first step names itself:\n{screen}");
         assert!(screen.contains("Claude Code") && screen.contains("Codex"), "{screen}");
         assert!(screen.contains("Name"), "{screen}");
-        for expected in
-            ["How much of the harness", "What this profile signs in with", "may see and reach", "Build the image"]
-        {
+        for expected in [
+            "The operating system this profile",
+            "How much of the harness",
+            "What this profile signs in with",
+            "may see and reach",
+            "Build the image",
+        ] {
             harness.send(Msg::Next).render();
             assert!(harness.screen().contains(expected), "`{expected}` is missing:\n{}", harness.screen());
         }
@@ -1588,8 +1687,8 @@ mod tests {
         let mut harness = loaded(Vec::new());
         harness.send(Msg::ProvidersLoaded(vec![provider_entry("ev1", &["qwen3.8", "qwen3.8-32k"])]));
         harness.send(Msg::New).render();
-        // Claude Code is the harness already offered first; Template and Account are next.
-        harness.send(Msg::Next).send(Msg::Next).render();
+        // Claude Code is the harness already offered first; System, Template and Account are next.
+        harness.send(Msg::Next).send(Msg::Next).send(Msg::Next).render();
         assert!(harness.screen().contains("What this profile signs in with"), "{}", harness.screen());
         // Pressed exactly where the person would: the row that names the account, then the rows
         // that name the provider and its model, never the message sent by hand.
@@ -1618,6 +1717,7 @@ mod tests {
         harness.click_text("New profile").render();
         next(&mut harness);
         next(&mut harness);
+        next(&mut harness);
         harness.click_text("a provider of your own").render();
         harness.click_text("ev1").render();
         // Read across the rows the sentence wraps onto, the way a person reads it.
@@ -1637,7 +1737,7 @@ mod tests {
     fn with_no_provider_added_the_account_page_says_so_and_offers_no_empty_list() {
         let mut harness = loaded(Vec::new());
         harness.send(Msg::New).render();
-        harness.send(Msg::Next).send(Msg::Next).render();
+        harness.send(Msg::Next).send(Msg::Next).send(Msg::Next).render();
         harness.click_text("a provider of your own").render();
         let screen = harness.screen();
         assert!(screen.contains("You have not added a provider yet"), "{screen}");
@@ -1654,6 +1754,7 @@ mod tests {
         harness.click_text("New profile").render();
         harness.click_text("opencode").render();
         assert_eq!(harness.app().state.draft().expect("open").harness, HarnessKind::OpenCode);
+        next(&mut harness);
         next(&mut harness);
         next(&mut harness);
         assert!(harness.screen().contains("What this profile signs in with"), "{}", harness.screen());
@@ -1677,6 +1778,7 @@ mod tests {
             harness.click_text(name).render();
             next(&mut harness);
             next(&mut harness);
+            next(&mut harness);
             assert!(harness.screen().contains("What this profile signs in with"), "{name}: {}", harness.screen());
             assert!(!harness.screen().contains("a provider of your own"), "{name}: {}", harness.screen());
         }
@@ -1692,14 +1794,14 @@ mod tests {
         harness.send(Msg::Name("Günlük İş".to_owned())).render();
         assert!(harness.screen().contains("It is written as gunluk-is"), "{}", harness.screen());
         harness.send(Msg::Next).render();
-        assert!(harness.screen().contains("How much of the harness"), "{}", harness.screen());
+        assert!(harness.screen().contains("The operating system this profile"), "{}", harness.screen());
     }
 
     #[test]
     fn the_permissions_page_says_the_workspace_is_always_writable() {
         let mut harness = loaded(Vec::new());
         harness.send(Msg::New);
-        for _ in 0..3 {
+        for _ in 0..4 {
             harness.send(Msg::Next);
         }
         harness.render();
@@ -1723,7 +1825,7 @@ mod tests {
         assert!(screen.contains("Work writable"), "the list names the folder:\n{screen}");
         assert!(!screen.contains("Code writable"), "{screen}");
         harness.click_text("New profile").render();
-        for _ in 0..3 {
+        for _ in 0..4 {
             next(&mut harness);
         }
         let screen = harness.screen();
@@ -1740,7 +1842,7 @@ mod tests {
     fn the_image_page_cannot_be_left_until_there_is_an_image() {
         let mut harness = loaded(Vec::new());
         harness.send(Msg::New);
-        for _ in 0..4 {
+        for _ in 0..5 {
             harness.send(Msg::Next);
         }
         harness.render();
@@ -1754,10 +1856,26 @@ mod tests {
     }
 
     #[test]
+    fn a_build_refused_for_a_reason_qcode_recognises_says_it_plainly_above_the_engines_words() {
+        let mut harness = with_engine();
+        harness.send(Msg::New);
+        for _ in 0..5 {
+            harness.send(Msg::Next);
+        }
+        let said = "Error: cannot find UID/GID for user ada: no subuid ranges found for user \"ada\" in /etc/subuid";
+        harness.send(Msg::BuildEnded(Err(Problem::Refused(said.to_owned())))).render();
+        let screen = harness.screen();
+        assert!(screen.contains("The build failed"), "{screen}");
+        assert!(screen.contains("no user id ranges for your account"), "{screen}");
+        assert!(screen.contains("--add-subuids"), "the line that adds them is there to copy:\n{screen}");
+        assert!(screen.contains("no subuid ranges found"), "the engine is still quoted:\n{screen}");
+    }
+
+    #[test]
     fn a_failed_build_shows_the_engines_own_words_and_leaves_no_image() {
         let mut harness = loaded(Vec::new());
         harness.send(Msg::New);
-        for _ in 0..4 {
+        for _ in 0..5 {
             harness.send(Msg::Next);
         }
         harness.send(Msg::BuildLine("STEP 1/3: FROM qcode/base".to_owned()));
@@ -1776,7 +1894,7 @@ mod tests {
     fn a_stopped_build_says_that_nothing_was_written() {
         let mut harness = loaded(Vec::new());
         harness.send(Msg::New);
-        for _ in 0..4 {
+        for _ in 0..5 {
             harness.send(Msg::Next);
         }
         harness.send(Msg::BuildEnded(Err(Problem::Cancelled))).render();
@@ -1789,7 +1907,7 @@ mod tests {
     fn the_login_page_says_why_a_terminal_opens_what_to_do_and_how_it_is_checked() {
         let mut harness = loaded(Vec::new());
         harness.send(Msg::New);
-        for _ in 0..4 {
+        for _ in 0..5 {
             harness.send(Msg::Next);
         }
         harness.send(Msg::BuildEnded(Ok(()))).send(Msg::Next).render();
@@ -1804,7 +1922,7 @@ mod tests {
     fn a_harness_that_closed_without_a_login_is_never_counted_as_signed_in() {
         let mut harness = loaded(Vec::new());
         harness.send(Msg::New);
-        for _ in 0..4 {
+        for _ in 0..5 {
             harness.send(Msg::Next);
         }
         harness.send(Msg::BuildEnded(Ok(()))).send(Msg::Next);
@@ -1821,7 +1939,7 @@ mod tests {
     fn an_interrupted_login_says_that_nothing_was_kept() {
         let mut harness = loaded(Vec::new());
         harness.send(Msg::New);
-        for _ in 0..4 {
+        for _ in 0..5 {
             harness.send(Msg::Next);
         }
         harness.send(Msg::BuildEnded(Ok(()))).send(Msg::Next);
@@ -1837,7 +1955,7 @@ mod tests {
     fn a_stored_login_says_how_much_was_kept_and_what_happens_to_it() {
         let mut harness = loaded(Vec::new());
         harness.send(Msg::New);
-        for _ in 0..4 {
+        for _ in 0..5 {
             harness.send(Msg::Next);
         }
         harness.send(Msg::BuildEnded(Ok(()))).send(Msg::Next);
@@ -1918,6 +2036,8 @@ mod tests {
         let screen = harness.screen();
         assert!(screen.contains("Claude Code"), "{screen}");
         harness.send(Msg::Next).render();
+        assert!(harness.screen().contains("Debian 13"), "{}", harness.screen());
+        harness.send(Msg::Next).render();
         assert!(harness.screen().contains("recommended"), "{}", harness.screen());
     }
 
@@ -1948,7 +2068,7 @@ mod tests {
     fn reduced_motion_keeps_the_wizard_working() {
         let mut harness = loaded(Vec::new());
         harness.set_reduced_motion(true).send(Msg::New).render();
-        harness.send(Msg::Next).send(Msg::Next).render();
+        harness.send(Msg::Next).send(Msg::Next).send(Msg::Next).render();
         assert!(harness.screen().contains("What this profile signs in with"), "{}", harness.screen());
     }
 
@@ -2016,9 +2136,11 @@ mod tests {
 
     #[test]
     fn a_short_terminal_keeps_the_wizard_at_the_top() {
-        let mut harness = wizard_on(4);
+        let mut harness = wizard_on(5);
         harness.resize(SIZE.0, 24).render();
-        let (_, y) = harness.find("Harness").expect("the first step is named");
+        // Seven steps do not keep their names in a terminal this narrow, so the row of steps shows
+        // their markers and the current step's name.
+        let (_, y) = harness.find("Image").expect("the current step is named");
         assert!(y <= 1, "no room to spare means no rows given away:\n{}", harness.screen());
     }
 
@@ -2026,7 +2148,7 @@ mod tests {
     fn the_tallest_page_fits_the_rows_the_wizard_is_placed_by() {
         // The image page without an engine is the tallest; if it grows past the constant the
         // wizard would be placed too low and its buttons pushed towards the bottom edge.
-        let mut harness = wizard_on(4);
+        let mut harness = wizard_on(5);
         harness.resize(PAGE_WIDTH, 60).render();
         let (_, top) = harness.find("Harness").expect("the steps are drawn");
         let (_, bottom) = harness.find("Cancel").expect("the buttons are drawn");
@@ -2045,15 +2167,17 @@ mod tests {
         let other = radio_mark(&harness, "Codex");
         assert_ne!(harness.fg(chosen.0, chosen.1), harness.fg(other.0, other.1), "{}", harness.screen());
         let harness = wizard_on(1);
+        assert_eq!(harness.screen().matches(square.as_str()).count(), Os::ALL.len(), "{}", harness.screen());
+        let harness = wizard_on(2);
         assert_eq!(harness.screen().matches(square.as_str()).count(), Template::ALL.len(), "{}", harness.screen());
-        let harness = wizard_on(3);
+        let harness = wizard_on(4);
         let options = MountAccess::ALL.len() + NetworkMode::ALL.len();
         assert_eq!(harness.screen().matches(square.as_str()).count(), options, "{}", harness.screen());
     }
 
     #[test]
     fn the_assets_come_writable_and_chosen_from_the_first_frame() {
-        let harness = wizard_on(3);
+        let harness = wizard_on(4);
         assert_eq!(harness.app().state.draft().expect("the wizard is open").assets, MountAccess::ReadWrite);
         let writable = radio_mark(&harness, "writable");
         let read_only = radio_mark(&harness, "read-only");
@@ -2065,11 +2189,11 @@ mod tests {
 
     #[test]
     fn the_qcode_templates_carry_the_names_the_owner_chose() {
-        let harness = wizard_on(1);
+        let harness = wizard_on(2);
         assert!(harness.screen().contains("QCode basic (recommended)"), "{}", harness.screen());
         assert!(harness.screen().contains("QCode high"), "{}", harness.screen());
         assert_eq!(harness.app().state.draft().expect("open").template, Template::Recommended, "basic is chosen");
-        let mut harness = wizard_on(1);
+        let mut harness = wizard_on(2);
         harness.set_locale("tr").render();
         assert!(harness.screen().contains("QCode basic (önerilen)"), "{}", harness.screen());
         assert!(harness.screen().contains("QCode high"), "{}", harness.screen());
@@ -2079,7 +2203,8 @@ mod tests {
     fn opencode_is_offered_free_first_and_finishes_without_a_sign_in() {
         let mut harness = wizard_on(0);
         let opencode = HarnessKind::ALL.iter().position(|harness| *harness == HarnessKind::OpenCode);
-        harness.send(Msg::PickHarness(opencode.expect("opencode is offered"))).send(Msg::Next).send(Msg::Next).render();
+        harness.send(Msg::PickHarness(opencode.expect("opencode is offered")));
+        harness.send(Msg::Next).send(Msg::Next).send(Msg::Next).render();
         let screen = harness.screen();
         assert!(screen.contains("free, no account"), "{screen}");
         assert!(screen.contains("nothing to sign in to"), "{screen}");
@@ -2110,7 +2235,7 @@ mod tests {
         harness.click_text("New profile").render();
         harness.click_text("opencode").render();
         let name = harness.app().state.draft().expect("the wizard is open").name.clone();
-        for _ in 0..4 {
+        for _ in 0..5 {
             next(&mut harness);
         }
         assert!(harness.screen().contains("Build the image"), "{}", harness.screen());
@@ -2166,6 +2291,7 @@ mod tests {
         harness.set_locale("en").set_glyph_mode(GlyphMode::Unicode).set_reduced_motion(true);
         harness.send(Msg::Loaded(Listing { profiles: Vec::new(), diagnostics: Vec::new() })).render();
         harness.click_text("New profile").render();
+        harness.click_text("Next").render();
         harness.click_text("Next").render();
         assert!(harness.screen().contains("How much of the harness"), "{}", harness.screen());
         assert!(!harness.screen().contains("graphify"), "basic installs nothing more:\n{}", harness.screen());
@@ -2234,13 +2360,12 @@ mod tests {
         (i32::from(cell) - 1, i32::from(y))
     }
 
-    #[test]
-    fn a_plugin_switched_off_in_the_wizard_is_saved_with_the_profile_and_left_out_of_its_image() {
-        // Driven from where the person's hand is: the buttons, the template's row, the switch
-        // itself, the key on it, and the build button. The engine is a script that keeps every
-        // Containerfile it is asked to build, so what reaches the image is read from there.
+    /// A profiles screen on a store in a scratch folder of its own, with an engine that is a script
+    /// keeping every Containerfile it is asked to build, under the image's tag with the slashes
+    /// turned into dashes, so what reaches an image is read from there. Nothing is built for real.
+    fn recording(name: &str) -> (PathBuf, Harness<Host>) {
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
-        let folder = std::env::temp_dir().join(format!("qcode-profiles-switch-{stamp}"));
+        let folder = std::env::temp_dir().join(format!("qcode-profiles-{name}-{stamp}"));
         std::fs::create_dir_all(&folder).expect("a scratch folder");
         // Each image's Containerfile is kept under its tag, with the slashes turned into dashes.
         let script = format!(
@@ -2261,7 +2386,96 @@ mod tests {
             Harness::with_env(Host { state: Profiles::new(Some(folder.clone()), Some(engine)) }, env(), 96, 60);
         harness.set_locale("en").set_glyph_mode(GlyphMode::Unicode).set_reduced_motion(true);
         harness.send(Msg::Loaded(Listing { profiles: Vec::new(), diagnostics: Vec::new() })).render();
+        (folder, harness)
+    }
+
+    #[test]
+    fn choosing_arch_where_the_hand_is_saves_it_and_builds_the_image_on_arch_with_pacman() {
+        let (folder, mut harness) = recording("arch");
         harness.click_text("New profile").render();
+        harness.click_text("Next").render();
+        let screen = harness.screen();
+        assert!(screen.contains("Debian 13, 517 MB"), "every system is offered with its size:\n{screen}");
+        assert!(screen.contains("Alpine 3.24, 312 MB, not recommended"), "{screen}");
+        assert_eq!(harness.app().state.draft().expect("open").os, Os::Debian, "Debian is chosen until changed");
+        harness.click_text("Arch Linux, 809 MB").render();
+        assert_eq!(harness.app().state.draft().expect("open").os, Os::Arch, "{}", harness.screen());
+        assert!(
+            harness.screen().contains("This image has no sox"),
+            "what Arch leaves out is said:\n{}",
+            harness.screen()
+        );
+        harness.click_text("Next").render();
+        harness.click_text("QCode high").render();
+        assert!(harness.screen().contains("downloaded from Arch Linux, PyPI"), "{}", harness.screen());
+        harness.click_text("Next").render();
+        harness.click_text("Next").render();
+        // Arriving on the image page is what starts the build.
+        harness.click_text("Next").render();
+        let build = &harness.app().state.draft().expect("open").build;
+        assert!(matches!(build, Build::Done), "the build ended well: {build:?}\n{}", harness.screen());
+
+        let text =
+            std::fs::read_to_string(folder.join("Profiles").join("claude-code.toml")).expect("the profile is saved");
+        assert!(text.contains("\nos = \"arch\"\n"), "{text}");
+        let saved = crate::profile::Profile::parse("claude-code.toml", &text).profile.expect("it reads back");
+        assert_eq!(saved.os, Os::Arch);
+
+        let base = std::fs::read_to_string(folder.join("built-qcode-base-arch")).expect("Arch's base image was built");
+        assert!(base.starts_with(Os::Arch.containerfile()), "from Arch's own description");
+        assert!(!folder.join("built-qcode-base").exists(), "Debian's base is not what this profile needed");
+        let image = std::fs::read_to_string(folder.join("built-qcode-profile-claude-code"))
+            .expect("the profile's image was built from a Containerfile");
+        assert!(image.starts_with("FROM qcode/base-arch\n"), "{image}");
+        assert!(image.contains("pacman -Syu --noconfirm --needed python python-pipx"), "{image}");
+        assert!(!image.contains("apt-get"), "{image}");
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn on_alpine_a_harness_that_does_not_run_there_is_explained_and_never_built() {
+        let (folder, mut harness) = recording("alpine");
+        harness.click_text("New profile").render();
+        harness.click_text("Gemini CLI").render();
+        harness.click_text("Next").render();
+        harness.click_text("Alpine 3.24, 312 MB, not recommended").render();
+        let read = |harness: &Harness<Host>| harness.screen().split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            read(&harness).contains("Gemini CLI does not run on Alpine 3.24: the terminal library"),
+            "the reason is said where the system is chosen:\n{}",
+            harness.screen()
+        );
+        assert!(read(&harness).contains("Kept for other work; not recommended."), "{}", harness.screen());
+        harness.click_text("Next").render();
+        assert_eq!(harness.app().state.draft().expect("open").stage, Stage::System, "it cannot be built there");
+        assert!(harness.is_focused("profile-system"), "the focus goes to the choice:\n{}", harness.screen());
+
+        // Back on the first page, the harness that cannot run there says so right under the list.
+        harness.click_text("Back").render();
+        assert!(read(&harness).contains("Gemini CLI does not run on Alpine 3.24"), "{}", harness.screen());
+        harness.click_text("Antigravity IDE").render();
+        assert!(read(&harness).contains("its program is built for glibc"), "{}", harness.screen());
+        harness.click_text("Codex").render();
+        assert!(!read(&harness).contains("does not run on"), "Codex runs on Alpine:\n{}", harness.screen());
+        harness.click_text("Next").render();
+        assert!(
+            read(&harness).contains("Alpine packages no docx2txt"),
+            "what Alpine lacks is said:\n{}",
+            harness.screen()
+        );
+        harness.click_text("Next").render();
+        assert_eq!(harness.app().state.draft().expect("open").stage, Stage::Template, "Codex goes on");
+        assert!(!folder.join("Profiles").exists(), "nothing was saved on the way");
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn a_plugin_switched_off_in_the_wizard_is_saved_with_the_profile_and_left_out_of_its_image() {
+        // Driven from where the person's hand is: the buttons, the template's row, the switch
+        // itself, the key on it, and the build button.
+        let (folder, mut harness) = recording("switch");
+        harness.click_text("New profile").render();
+        harness.click_text("Next").render();
         harness.click_text("Next").render();
         harness.click_text("QCode high").render();
 
@@ -2310,6 +2524,7 @@ mod tests {
         let mut harness = wizard_on(0);
         harness.click_text("opencode").render();
         harness.click_text("Next").render();
+        harness.click_text("Next").render();
         harness.click_text("QCode high").render();
         let screen = harness.screen();
         assert!(screen.contains("oh-my-openagent"), "{screen}");
@@ -2319,7 +2534,7 @@ mod tests {
 
     #[test]
     fn a_build_of_qcode_high_that_could_not_download_says_so() {
-        let mut harness = wizard_on(1);
+        let mut harness = wizard_on(2);
         harness.click_text("QCode high").render();
         for _ in 0..3 {
             harness.send(Msg::Next);
@@ -2335,9 +2550,92 @@ mod tests {
         let screen = harness.screen();
         assert!(screen.contains("could not download what it adds"), "{screen}");
         // Any other failure keeps the plain words.
-        let mut harness = wizard_on(4);
+        let mut harness = wizard_on(5);
         harness.send(Msg::BuildEnded(Err(Problem::Refused("no space left".to_owned())))).render();
         assert!(!harness.screen().contains("could not download what it adds"), "{}", harness.screen());
+    }
+
+    #[test]
+    fn the_lines_of_the_system_page_are_really_in_every_language() {
+        // As for QCode high's lines: every key being there says nothing about the language it is
+        // in. With the names of the systems and the tools taken out, most of what each language
+        // says must be words of its own.
+        let keys = [
+            "profiles.wizard.step-system",
+            "profiles.wizard.system-lead",
+            "profiles.wizard.system-option-not-recommended",
+            "profiles.wizard.system-debian-detail",
+            "profiles.wizard.system-arch-detail",
+            "profiles.wizard.system-ubuntu-detail",
+            "profiles.wizard.system-alpine-detail",
+            "profiles.wizard.system-gap-docx2txt",
+            "profiles.wizard.system-gap-sox",
+            "profiles.wizard.system-gap-sox-opus",
+            "profiles.wizard.system-refused-terminal",
+            "profiles.wizard.system-refused-glibc",
+            "profiles.wizard.system-refused-window",
+            "profiles.summary-system",
+        ];
+        let names = [
+            "Debian",
+            "Arch",
+            "Ubuntu",
+            "Alpine",
+            "Linux",
+            "glibc",
+            "musl",
+            "docx2txt",
+            "sox",
+            "ffmpeg",
+            "opus",
+            "Word",
+            "Node",
+            "Node-Projekt",
+            "Gemini",
+            "CLI",
+            "Antigravity",
+            "IDE",
+            "MB",
+            "Mo",
+            "МБ",
+            "System",
+            "{harness}",
+            "{system}",
+            "{name}",
+            "{mb}",
+            "{summary}",
+            "24.04",
+            "24",
+        ];
+        let words = |text: &str| -> Vec<String> {
+            text.split(|c: char| !c.is_alphanumeric() && c != '-' && c != '.' && c != '{' && c != '}')
+                .map(|word| word.trim_matches('.').to_lowercase())
+                .filter(|word| !word.is_empty() && word.chars().any(char::is_alphabetic))
+                .filter(|word| !names.iter().any(|name| name.to_lowercase() == *word))
+                .collect()
+        };
+        let mut catalog = qframe::i18n::I18n::builtin();
+        for (file, text) in crate::locales() {
+            catalog.add_source(&file, &text);
+        }
+        catalog.set_active("en");
+        let english: Vec<(String, Vec<String>)> =
+            keys.iter().map(|key| (catalog.translate(key, &[]), words(&catalog.translate(key, &[])))).collect();
+        for code in crate::store::Config::LANGUAGES.into_iter().filter(|code| *code != "en") {
+            catalog.set_active(code);
+            for (key, (english_text, english_words)) in keys.iter().zip(&english) {
+                let text = catalog.translate(key, &[]);
+                assert!(!text.starts_with('⟦') && !text.is_empty(), "{code} has no words for `{key}`");
+                // The step's name is one word, and German calls it what English does.
+                if *key == "profiles.wizard.step-system" {
+                    continue;
+                }
+                assert_ne!(&text, english_text, "{code}: `{key}` is the English line");
+                let own = words(&text);
+                let borrowed = own.iter().filter(|word| english_words.contains(word)).count();
+                assert!(borrowed * 2 < own.len().max(1), "{code}: `{key}` reads as English: {text}");
+            }
+        }
     }
 
     #[test]
@@ -2378,6 +2676,7 @@ mod tests {
             "GitHub",
             "MB",
             "{plugins}",
+            "{system}",
         ];
         let words = |text: &str| -> Vec<String> {
             text.split(|c: char| !c.is_alphanumeric() && c != '-' && c != '.' && c != '{' && c != '}')

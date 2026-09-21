@@ -1,4 +1,4 @@
-//! The profile wizard's state: the six steps (five for a profile that signs in to nothing), what
+//! The profile wizard's state: the seven steps (six for a profile that signs in to nothing), what
 //! has been chosen on each of them, and how far the image build and the login have got.
 //!
 //! The state changes by message only. Nothing here starts work or waits for it, so every state
@@ -10,6 +10,7 @@ use std::sync::Arc;
 use qframe::runtime::TaskId;
 use qframe::widgets::{LogBuffer, TerminalSession};
 
+use crate::base::{Os, Refusal};
 use crate::profile::{
     AccountKind, Extra, HarnessKind, MountAccess, NetworkMode, Profile, ProviderChoice, SafeName, Template,
 };
@@ -27,6 +28,9 @@ const LOG_LINES: usize = 4000;
 pub enum Stage {
     /// Which harness, and what the profile is called.
     Harness,
+    /// Which operating system the image is built on. Right after the harness, because a system
+    /// can refuse a harness, and the person should learn that before choosing anything else.
+    System,
     /// The harness as it comes, or set up the way QCode runs it.
     Template,
     /// What the profile signs in with.
@@ -41,12 +45,13 @@ pub enum Stage {
 
 impl Stage {
     /// Every page, in order.
-    pub const ALL: [Self; 6] =
-        [Self::Harness, Self::Template, Self::Account, Self::Permissions, Self::Image, Self::Login];
+    pub const ALL: [Self; 7] =
+        [Self::Harness, Self::System, Self::Template, Self::Account, Self::Permissions, Self::Image, Self::Login];
 
     /// The pages of a profile that has no login: everything up to the image. The sign-in page is
     /// last so that leaving it out moves no other page.
-    pub const WITHOUT_LOGIN: [Self; 5] = [Self::Harness, Self::Template, Self::Account, Self::Permissions, Self::Image];
+    pub const WITHOUT_LOGIN: [Self; 6] =
+        [Self::Harness, Self::System, Self::Template, Self::Account, Self::Permissions, Self::Image];
 
     /// Which page this is, counting from the first.
     #[must_use]
@@ -156,6 +161,8 @@ pub struct Draft {
     /// is looked at, so going back finds them as they were left; only the ones the chosen
     /// template and harness add reach the profile.
     pub without: Vec<Extra>,
+    /// The system the image is built on.
+    pub os: Os,
     /// How far the build has got.
     pub build: Build,
     /// Every line the build has printed.
@@ -179,6 +186,8 @@ pub enum Blocked {
     NoImage,
     /// The account is a provider of one's own, and no provider and model have both been chosen.
     NoProvider,
+    /// The chosen system does not run the chosen harness, for this reason.
+    Unsupported(Refusal),
 }
 
 impl Draft {
@@ -202,6 +211,7 @@ impl Draft {
             assets: MountAccess::ReadWrite,
             network: NetworkMode::Full,
             without: Vec::new(),
+            os: Os::Debian,
             build: Build::Waiting,
             log: LogBuffer::new(LOG_LINES),
             login: Login::Waiting,
@@ -229,6 +239,7 @@ impl Draft {
             assets: profile.assets,
             network: profile.network,
             without: profile.without.clone(),
+            os: profile.os,
             build: Build::Done,
             log: LogBuffer::new(LOG_LINES),
             login: Login::Waiting,
@@ -350,6 +361,7 @@ impl Draft {
             assets: self.assets,
             network: self.network,
             without: self.without.iter().copied().filter(|extra| self.offers(*extra)).collect(),
+            os: self.os,
         })
     }
 
@@ -395,6 +407,9 @@ impl Draft {
                 Some(name) if self.taken.iter().any(|taken| taken == name.as_str()) => Some(Blocked::NameTaken),
                 Some(_) => None,
             },
+            // A harness the system cannot run is never built there: the page says why and stays
+            // until the person picks another system or goes back for another harness.
+            Stage::System => self.os.refuses(self.harness).map(Blocked::Unsupported),
             Stage::Account if self.account == AccountKind::Provider && self.profile_provider().is_none() => {
                 Some(Blocked::NoProvider)
             }
@@ -661,6 +676,30 @@ mod tests {
         let provider = profile.provider.expect("a provider profile carries one");
         assert_eq!(provider.tag, "ev1");
         assert_eq!(provider.model, "qwen3.8");
+    }
+
+    #[test]
+    fn a_system_that_cannot_run_the_harness_keeps_its_page_and_says_why() {
+        let mut draft = Draft::new([], Vec::new());
+        draft.choose_harness(HarnessKind::GeminiCli);
+        draft.advance();
+        assert_eq!(draft.stage, Stage::System, "the system is chosen right after the harness");
+        draft.os = Os::Alpine;
+        assert_eq!(draft.advance(), Some(Blocked::Unsupported(Refusal::TerminalLibrary)));
+        assert_eq!(draft.stage, Stage::System, "Gemini CLI is never built on Alpine");
+        draft.os = Os::Arch;
+        assert_eq!(draft.advance(), None);
+        assert_eq!(draft.stage, Stage::Template);
+        assert_eq!(draft.profile().map(|profile| profile.os), Some(Os::Arch));
+    }
+
+    #[test]
+    fn a_new_draft_is_built_on_debian_and_a_login_draft_keeps_its_profiles_system() {
+        let mut draft = Draft::new([], Vec::new());
+        assert_eq!(draft.os, Os::Debian);
+        draft.os = Os::Ubuntu;
+        let profile = draft.profile().expect("a profile");
+        assert_eq!(Draft::for_login(&profile).os, Os::Ubuntu);
     }
 
     #[test]

@@ -238,7 +238,7 @@ pub(super) fn size_text(workspace: &OpenWorkspace) -> String {
 /// `count` bytes in the person's words: the unit that keeps the number below a thousand, with one
 /// decimal below ten so a small backup still shows it grow.
 #[must_use]
-pub(super) fn bytes(count: u64) -> String {
+pub(crate) fn bytes(count: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut unit = 0;
     let mut tenths = u128::from(count) * 10;

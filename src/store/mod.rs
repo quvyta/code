@@ -23,7 +23,7 @@ mod paths;
 mod session;
 mod workspace;
 
-pub use config::{Config, OnClose, SetupStep};
+pub use config::{APP, Config, OnClose, SetupStep};
 pub use containers::{PREFIX, Registered, Registry};
 pub use identity::{WorkspaceId, WorkspaceIdError};
 pub use layout::{

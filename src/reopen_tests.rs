@@ -207,6 +207,7 @@ fn profile(name: &str, harness: HarnessKind, account: AccountKind) -> Profile {
         assets: MountAccess::ReadWrite,
         network: NetworkMode::None,
         without: Vec::new(),
+        os: crate::base::Os::Debian,
     }
 }
 

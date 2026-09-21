@@ -34,6 +34,7 @@ mod live;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use backups::bytes;
 pub use backups::{BackupOf, BackupTrouble, Farewell, Leaving, Part, leaving};
 pub use blank::Choice;
 pub use bridge::{Letter, Letters, Undelivered};
@@ -44,9 +45,9 @@ pub use history::HistoryKey;
 pub use panel::{Panel, PanelWidget};
 pub use plan::{
     ASSETS_DIR, Bridge, CODE_DIR, ContainerPlan, HOME_DIR, KEEP_ALIVE, LaunchFailure, MCP_DIR, PLAN_LABEL, SHELL,
-    ensure_running,
+    ensure_running, open_page,
 };
-pub use tab::{Pages, Tab, TabKey, TabKind, TabState};
+pub use tab::{Pages, Shown, Tab, TabKey, TabKind, TabState};
 pub use viewer::{MOST_TEXT, Taken};
 
 use std::collections::{HashMap, HashSet};
@@ -59,8 +60,8 @@ use qframe::prelude::*;
 use qframe::runtime::Task;
 use qframe::storage::FolderChange;
 use qframe::widgets::{
-    CollapsedMarker, EmptyState, Markdown, RailTab, ScrollView, Side, SidePanel, Spinner, TabEdit, TabRail, TabWidth,
-    Terminal, TerminalEvent, TerminalSession, Toast,
+    CollapsedMarker, EmptyState, LogView, Markdown, RailTab, ScrollView, Side, SidePanel, Spinner, TabEdit, TabRail,
+    TabWidth, Terminal, TerminalEvent, TerminalSession, Toast,
 };
 
 use std::path::{Path, PathBuf};
@@ -79,6 +80,8 @@ use crate::store::{
     Registry, Session, SessionTab, SessionTabKind, SessionWorkspace, WorkspaceFile, WorkspaceId, WorkspacePaths,
     add_profile,
 };
+use crate::ui::profiles::work::Problem;
+use crate::ui::settings::engine::{Help, help, name as engine_name};
 
 /// Width of the workspace rail: the framework's collapsed strip, which is the same four cells on
 /// every screen. The rail never gives way to a narrow terminal, because losing it would mean
@@ -146,6 +149,18 @@ pub enum Msg {
     ProfileAdded(String, Result<WorkspaceFile, String>),
     /// The container of a tab is up, or the engine refused.
     Ready(TabKey, u64, Result<(), LaunchFailure>),
+    /// Build the image of the profile of this tab, which the engine does not have.
+    BuildImage(TabKey),
+    /// A line the build of a tab's image said.
+    ImageLine(TabKey, String),
+    /// The build of a tab's image ended: done, or what went wrong in the engine's words, or
+    /// `None` when the person stopped it.
+    ImageBuilt(TabKey, Result<(), Option<String>>),
+    /// Stop building a tab's image.
+    StopBuild(TabKey),
+    /// Do not open this tab after all: its image is missing and the person would rather not
+    /// build it now.
+    CancelOpen(TabKey),
     /// The container of a new-chat tab brought back from the last session is up, or the engine
     /// refused; with the profile's conversations when they could be read, to find the one the
     /// tab was showing.
@@ -216,8 +231,11 @@ pub enum Msg {
     WindowEnded(TabKey, u64, Option<u32>),
     /// The window of this tab, in this run, asked for these web addresses to be opened.
     SignInWanted(TabKey, u64, Vec<String>),
-    /// The opening of that address on this machine answered: whether a browser was started here.
-    SignInOpened(TabKey, u64, String, bool),
+    /// The opening of that address answered, saying where it was shown.
+    SignInOpened(TabKey, u64, String, Shown),
+    /// The sign-in window inside the window's container could not show that address, so it is
+    /// opened in the person's own browser instead.
+    SignInElsewhere(TabKey, u64, String),
     /// The open window of a tab was asked to show itself.
     RaiseWindow(TabKey),
     /// That asking finished; a refusal is worth saying, because nothing else would show it.
@@ -661,6 +679,8 @@ pub struct WorkspaceScreen {
     /// Whether a look at the tabs that hold messages is already timed, so that one is timed at a
     /// time and none at all while no tab holds a message.
     delivering: bool,
+    /// Whether the person is asked before one tab first sends to another.
+    ask_first: bool,
 }
 
 impl WorkspaceScreen {
@@ -700,6 +720,7 @@ impl WorkspaceScreen {
             rules: Rules::default(),
             asking: Vec::new(),
             delivering: false,
+            ask_first: false,
         }
     }
 
@@ -791,6 +812,18 @@ impl WorkspaceScreen {
     #[must_use]
     pub fn sound(&self) -> Sound {
         self.sound
+    }
+
+    /// Makes the first message from one tab to another ask the person when `ask` is true, and
+    /// go without asking otherwise. What the person already answered about a pair still holds.
+    pub fn set_ask_first(&mut self, ask: bool) {
+        self.ask_first = ask;
+    }
+
+    /// Whether the first message from one tab to another asks the person.
+    #[must_use]
+    pub fn ask_first(&self) -> bool {
+        self.ask_first
     }
 
     /// The same screen, looking for the sound server's socket in `runtime` rather than in the
@@ -1208,6 +1241,31 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
             Err(reason) => Command::toast(Toast::warning(t!("workspace.add-failed")).body(reason)),
         },
         Msg::Ready(key, run, result) => ready(screen, key, run, &result),
+        Msg::BuildImage(key) => build_image(screen, key),
+        Msg::ImageLine(key, text) => {
+            if let Some((_, tab)) = screen.owner_mut(key).and_then(|workspace| workspace.find(key)) {
+                tab.build_line(&text, false);
+            }
+            Command::none()
+        }
+        Msg::ImageBuilt(key, result) => image_built(screen, key, result),
+        Msg::StopBuild(key) => {
+            let Some((_, tab)) = screen.owner_mut(key).and_then(|workspace| workspace.find(key)) else {
+                return Command::none();
+            };
+            let TabState::Building(task) = *tab.state() else { return Command::none() };
+            // The build takes its half-made image away itself once it notices; the tab goes back
+            // to offering it.
+            tab.settled(TabState::NoImage);
+            Command::cancel_task(task)
+        }
+        Msg::CancelOpen(key) => {
+            let index = screen.workspace().and_then(|workspace| workspace.tabs.iter().position(|tab| tab.key() == key));
+            match index {
+                Some(index) => update(screen, Msg::CloseTab(index)),
+                None => Command::none(),
+            }
+        }
         Msg::Woken(key, run, result, found) => {
             if let Some(found) = found {
                 resume_newest(screen, key, run, &found);
@@ -1316,6 +1374,7 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
         Msg::WindowEnded(key, run, code) => desktop::ended(screen, key, run, code),
         Msg::SignInWanted(key, run, addresses) => desktop::sign_in_wanted(screen, key, run, &addresses),
         Msg::SignInOpened(key, run, address, opened) => desktop::sign_in_opened(screen, key, run, &address, opened),
+        Msg::SignInElsewhere(key, run, address) => desktop::sign_in_elsewhere(key, run, address),
         Msg::RaiseWindow(key) => desktop::raise(screen, key),
         // Nothing is said when it worked: the window came forward, or the compositor marked it,
         // and either way the person is looking at their screen rather than at this tab.
@@ -1852,7 +1911,7 @@ fn start(
         };
         if providers.get(&gate.provider.tag).is_none() {
             let message = gate.missing.clone();
-            return answer(Err(LaunchFailure { command: String::new(), output: message }));
+            return answer(Err(LaunchFailure { command: String::new(), output: message, image_missing: false }));
         }
     }
     let result = plan::ensure_running(engine, plan, user);
@@ -2017,7 +2076,13 @@ fn ready(screen: &mut WorkspaceScreen, key: TabKey, run: u64, result: &Result<()
         return Command::none();
     }
     if let Err(failure) = result {
-        tab.settled(TabState::Failed(failure.clone()));
+        // Only a profile's tab is ever told its image is missing, and that one can build it.
+        let state = if failure.image_missing && matches!(tab.kind(), TabKind::Profile(_)) {
+            TabState::NoImage
+        } else {
+            TabState::Failed(failure.clone())
+        };
+        tab.settled(state);
         return containers_of(screen, &id);
     }
     let args: Vec<OsString> = command.args.clone();
@@ -2035,6 +2100,57 @@ fn ready(screen: &mut WorkspaceScreen, key: TabKey, run: u64, result: &Result<()
         }
     };
     Command::batch([attached, containers_of(screen, &id)])
+}
+
+/// Builds the image of the profile of the tab `key`, the same whole build the profile wizard
+/// runs, with every line of it in the tab's log.
+fn build_image(screen: &mut WorkspaceScreen, key: TabKey) -> Command<Msg> {
+    let Some(engine) = screen.engine.clone() else { return Command::none() };
+    let Some(workspace) = screen.owner_mut(key) else { return Command::none() };
+    let Some((_, tab)) = workspace.find(key) else { return Command::none() };
+    let (TabKind::Profile(name), TabState::NoImage) = (tab.kind(), tab.state()) else { return Command::none() };
+    let name = name.clone();
+    let Some(profile) = workspace.profiles.iter().find(|profile| profile.name.as_str() == name).cloned() else {
+        return Command::none();
+    };
+    let task = Task::new(t!("workspace.image.building", profile = name), move |cx| {
+        let cancel = || cx.is_cancelled();
+        let mut line = |text: &str| cx.send(Msg::ImageLine(key, text.to_owned()));
+        let built = crate::ui::profiles::work::build_whole(&engine, &profile, &cancel, &mut || {}, &mut line);
+        Ok(Msg::ImageBuilt(
+            key,
+            built.map_err(|problem| match problem {
+                Problem::Cancelled => None,
+                other => Some(other.output().unwrap_or_default().to_owned()),
+            }),
+        ))
+    });
+    if let Some((_, tab)) = workspace.find(key) {
+        tab.building(task.id());
+    }
+    Command::task(task)
+}
+
+/// Takes the end of a tab's image build: a built image opens the tab, which is what the person
+/// asked for when they chose it; a failed build is the tab's failure, in the engine's words.
+fn image_built(screen: &mut WorkspaceScreen, key: TabKey, result: Result<(), Option<String>>) -> Command<Msg> {
+    let Some((_, tab)) = screen.owner_mut(key).and_then(|workspace| workspace.find(key)) else {
+        return Command::none();
+    };
+    if !matches!(tab.state(), TabState::Building(_)) {
+        return Command::none();
+    }
+    match result {
+        Ok(()) => restart_tab(screen, key),
+        Err(None) => {
+            tab.settled(TabState::NoImage);
+            Command::none()
+        }
+        Err(Some(output)) => {
+            tab.settled(TabState::Failed(LaunchFailure { command: String::new(), output, image_missing: false }));
+            Command::none()
+        }
+    }
 }
 
 /// Keeps a tab's session watched, and asks after its container when the session ends.
@@ -2238,9 +2354,12 @@ fn header(screen: &WorkspaceScreen, ui: &mut View<'_, Msg>) {
 }
 
 /// What the middle shows: the open tab, or why there is nothing to show, and under a tab the
-/// messages other tabs' agents left waiting in it.
+/// messages other tabs' agents left waiting in it and whether the loop limit ended its exchange.
 fn center(screen: &WorkspaceScreen, ui: &mut View<'_, Msg>) {
-    let waiting = screen.workspace().and_then(OpenWorkspace::active_tab).filter(|tab| !tab.letters().is_empty());
+    let waiting = screen
+        .workspace()
+        .and_then(OpenWorkspace::active_tab)
+        .filter(|tab| !tab.letters().is_empty() || tab.stopped().is_some());
     match waiting {
         Some(tab) => {
             ui.column(|ui| {
@@ -2344,10 +2463,65 @@ fn tab_body(screen: &WorkspaceScreen, ui: &mut View<'_, Msg>) {
             } else {
                 format!("{}\n{}", failure.command, failure.output)
             };
-            stopped(ui, tab, &t!("workspace.failed"), Some(&detail), restart);
+            // A refusal QCode recognises is said plainly first, with the line that puts it right;
+            // the engine's words stay underneath for whoever wants to read them.
+            match screen.engine.as_ref().and_then(|engine| help(engine.kind(), &failure.output)) {
+                Some(help) => refused(ui, tab, &help, &detail, restart),
+                None => stopped(ui, tab, &t!("workspace.failed"), Some(&detail), restart),
+            }
         }
+        TabState::NoImage => no_image(screen, tab, ui),
+        TabState::Building(_) => building(tab, ui),
         TabState::Missing | TabState::Unreadable(_) => file_trouble(tab, ui),
     }
+}
+
+/// A profile's tab whose image the engine does not have: what is missing, and the offer to build
+/// it now, the tab opening once it is built, or not to open the tab after all.
+fn no_image(screen: &WorkspaceScreen, tab: &Tab, ui: &mut View<'_, Msg>) {
+    let key = tab.key();
+    let profile = match tab.kind() {
+        TabKind::Profile(name) => name.clone(),
+        _ => String::new(),
+    };
+    let engine = screen.engine.as_ref().map(|engine| engine_name(engine.kind())).unwrap_or_default();
+    ui.column(|ui| {
+        ui.add(Text::new(t!("workspace.image.missing", profile = profile, engine = engine)).bold()).fill_width();
+        ui.add(Text::new(t!("workspace.image.missing-why")).role("secondary")).fill_width();
+        ui.row(|ui| {
+            ui.add(Button::new(t!("workspace.image.build")).variant("primary").on_press(Msg::BuildImage(key)))
+                .id("workspace-build-image");
+            ui.add(Button::new(t!("workspace.image.cancel")).on_press(Msg::CancelOpen(key)))
+                .id("workspace-cancel-open");
+        })
+        .gap(2);
+    })
+    .gap(1)
+    .padding(Padding::symmetric(1, 2))
+    .fill()
+    .id("workspace-no-image");
+}
+
+/// A profile's tab whose image is being built: the build as it speaks, and the way to stop it.
+fn building(tab: &Tab, ui: &mut View<'_, Msg>) {
+    let key = tab.key();
+    let profile = match tab.kind() {
+        TabKind::Profile(name) => name.clone(),
+        _ => String::new(),
+    };
+    ui.column(|ui| {
+        ui.row(|ui| {
+            ui.add(Spinner::new().label(t!("workspace.image.building", profile = profile)));
+            ui.spacer();
+            ui.add(Button::new(t!("workspace.image.stop")).on_press(Msg::StopBuild(key))).id("workspace-stop-build");
+        })
+        .fill_width();
+        ui.add(LogView::new(tab.build_log())).fill().id("workspace-build-log");
+    })
+    .gap(1)
+    .padding(Padding::symmetric(1, 2))
+    .fill()
+    .id("workspace-building");
 }
 
 /// A picture drawn in the tab: what chafa drew, which stays when chafa is done, and under it a
@@ -2482,6 +2656,25 @@ fn stopped(ui: &mut View<'_, Msg>, tab: &Tab, message: &str, detail: Option<&str
                 ui.add(Text::new(detail.to_owned()).role("faint")).selectable(true);
             }
             ui.add(Button::new(again).variant("primary").on_press(Msg::Restart(key))).id("workspace-restart");
+        })
+        .gap(1)
+        .padding(Padding::symmetric(1, 2))
+        .fill_width();
+    })
+    .fill()
+    .id("workspace-stopped");
+}
+
+/// A tab the engine refused for a reason QCode recognises: the plain sentence, the line to run
+/// when there is one, the engine's own words below them, and the way to try again.
+fn refused(ui: &mut View<'_, Msg>, tab: &Tab, help: &Help, detail: &str, again: String) {
+    let key = tab.key();
+    ui.column(|ui| {
+        ui.column(|ui| {
+            help.show(ui);
+            ui.add(Button::new(again).variant("primary").on_press(Msg::Restart(key))).id("workspace-restart");
+            ui.add(Text::new(t!("known.said")).role("faint"));
+            ui.add(Text::new(detail.to_owned()).role("faint")).selectable(true);
         })
         .gap(1)
         .padding(Padding::symmetric(1, 2))

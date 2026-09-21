@@ -8,6 +8,7 @@
 mod command;
 mod detect;
 mod dialect;
+pub mod known;
 #[cfg(test)]
 mod live;
 pub mod names;

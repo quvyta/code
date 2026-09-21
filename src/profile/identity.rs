@@ -312,6 +312,7 @@ mod tests {
                 "qcode-cred-claude-sub:/qcode-credentials:ro,z",
                 "--volume",
                 "qcode-home-my-app-claude-sub:/home/qcode:rw,z",
+                "--pull=never",
                 "qcode/profile/claude-sub",
                 KEEP_ALIVE[0],
                 KEEP_ALIVE[1],

@@ -28,9 +28,11 @@ use super::plan::{CODE_DIR, SHELL};
 mod backups;
 mod bridge;
 mod desktop;
+mod engine_help;
 mod files;
 mod guidance;
 mod history;
+mod missing_image;
 mod registry;
 mod sound;
 mod viewers;
@@ -135,6 +137,7 @@ fn profile(name: &str, harness: HarnessKind) -> Profile {
         assets: MountAccess::ReadOnly,
         network: NetworkMode::Full,
         without: Vec::new(),
+        os: crate::base::Os::Debian,
     }
 }
 
@@ -530,6 +533,28 @@ fn the_container_a_tab_enters_carries_the_workspace_and_the_profiles_permissions
     let base_words: Vec<String> =
         base.create(engine, user).args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
     assert!(!base_words.iter().any(|word| word.contains("qcode-mcp")), "no harness, no bridge: {base_words:?}");
+}
+
+/// A file opened from the tree runs its built-in app in the workspace's own container, which is
+/// always Debian's, whatever system the workspace's profiles were built on. That is why a program
+/// another system's image does not carry (docx2txt on Alpine, sox on Arch) never leaves a file
+/// without its opener: the opener never runs there.
+#[test]
+fn every_file_opens_in_the_debian_container_whatever_system_the_profiles_run_on() {
+    let scratch = Scratch::new("opener");
+    let screen = one_workspace(&scratch);
+    let open = screen.workspace().expect("a workspace is open");
+    for kind in [
+        TabKind::Image("a.png".to_owned()),
+        TabKind::Editor("a.rs".to_owned()),
+        TabKind::Pdf("a.pdf".to_owned()),
+        TabKind::Office("a.docx".to_owned()),
+        TabKind::Shell,
+    ] {
+        let plan = open.plan(&kind).expect("the file is opened in a container");
+        assert_eq!(plan.image, crate::base::Os::Debian.image(), "{kind:?}");
+    }
+    assert_eq!(crate::base::Os::Debian.gaps(), [], "the Debian image carries every opener's program");
 }
 
 #[test]

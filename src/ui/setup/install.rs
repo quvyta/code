@@ -19,6 +19,12 @@ use crate::store::Platform;
 
 use super::gates::EngineProblem;
 
+/// What starts Docker's daemon on Linux, now and at every boot after.
+const DOCKER_SERVICE: &str = "sudo systemctl enable --now docker";
+
+/// What lets this account open Docker's socket. `$USER` is the shell's, which knows the name.
+const DOCKER_GROUP: &str = "sudo usermod -aG docker $USER";
+
 /// The installation guide of each engine, for a system whose package manager QCode does not
 /// know.
 const PODMAN_DOCS: &str = "https://podman.io/docs/installation";
@@ -212,35 +218,77 @@ fn family(release: &str) -> Option<PackageManager> {
 pub enum Remedy {
     /// The engine is not there and has to be installed.
     Install {
-        /// The line that installs it here, when QCode knows this system's package manager.
+        /// The line that installs it here, when QCode knows this system's package manager, with
+        /// what else the engine needs before it answers.
         command: Option<String>,
         /// The engine's own installation guide, which is right on every system.
         docs: &'static str,
+        /// Whether the person has to log out and back in afterwards, as a new group needs.
+        relogin: bool,
     },
     /// The engine is installed and something it needs has to be started.
     Start {
         /// The line that starts it, when this system has one QCode can promise.
         command: Option<String>,
     },
+    /// The engine works and this account is not set up for it yet: it has to join the `docker`
+    /// group, or be given id ranges for podman. The line does it.
+    Grant {
+        /// The line that does it.
+        command: String,
+        /// Whether the change only takes hold at the next login, as a new group does.
+        relogin: bool,
+    },
+    /// The account is set up already and this login began before it was: logging out and back
+    /// in is all that is left, and no command does that.
+    Relogin,
     /// The engine refused for a reason QCode cannot read; only its own words help.
     Unknown,
 }
 
 impl Remedy {
+    /// The line QCode can run for the person on a terminal in the page, when there is one.
+    #[must_use]
+    pub fn runnable(&self) -> Option<&str> {
+        match self {
+            Self::Install { command, .. } | Self::Start { command } => command.as_deref(),
+            Self::Grant { command, .. } => Some(command),
+            Self::Relogin | Self::Unknown => None,
+        }
+    }
+
     /// What to do about `problem` with `kind` on `host`.
     #[must_use]
     pub fn for_problem(problem: &EngineProblem, kind: EngineKind, host: &InstallHost) -> Self {
         match problem {
             EngineProblem::NotInstalled | EngineProblem::NotRunnable { .. } => Self::Install {
-                command: host.manager.map(|manager| manager.install(manager.package(kind))),
+                command: host.manager.map(|manager| {
+                    let install = manager.install(manager.package(kind));
+                    // Docker on Linux is a service with a socket only its group may open, and the
+                    // package sets up neither: without the rest, the next thing the person reads
+                    // is that the daemon is not running, and then that they may not use it.
+                    match (kind, host.platform) {
+                        (EngineKind::Docker, Platform::Linux) => {
+                            format!("{install} && {DOCKER_SERVICE} && {DOCKER_GROUP}")
+                        }
+                        _ => install,
+                    }
+                }),
                 docs: match kind {
                     EngineKind::Podman => PODMAN_DOCS,
                     EngineKind::Docker => DOCKER_DOCS,
                 },
+                relogin: kind == EngineKind::Docker && host.platform == Platform::Linux,
             },
+            EngineProblem::NoPermission { in_group: true, .. } => Self::Relogin,
+            EngineProblem::NoPermission { in_group: false, .. } => {
+                Self::Grant { command: DOCKER_GROUP.to_owned(), relogin: true }
+            }
+            EngineProblem::NoIdRanges { line, .. } => Self::Grant { command: line.clone(), relogin: false },
             EngineProblem::DaemonStopped { .. } => Self::Start {
                 command: match host.platform {
-                    Platform::Linux => Some("sudo systemctl start docker".to_owned()),
+                    // Enabled as well as started, so it is still there after the next boot.
+                    Platform::Linux => Some(DOCKER_SERVICE.to_owned()),
                     Platform::MacOs => Some("open -a Docker".to_owned()),
                     // Docker Desktop on Windows is started from the desktop; there is no line
                     // QCode can promise, so it shows none and says so instead.
@@ -252,6 +300,88 @@ impl Remedy {
             EngineProblem::Refused { .. } => Self::Unknown,
         }
     }
+}
+
+/// The first id a range of subordinate ids is given from when a machine has none yet, and how
+/// many ids a range holds: what `useradd` itself hands a new account on the common
+/// distributions, so a range added here looks like one the system made.
+const FIRST_SUBORDINATE_ID: u64 = 100_000;
+/// See [`FIRST_SUBORDINATE_ID`].
+const SUBORDINATE_IDS: u64 = 65_536;
+
+/// The account QCode runs as and what `/etc/subuid` and `/etc/subgid` say, which is everything
+/// needed to know whether rootless podman can map the ids an image uses.
+///
+/// Plain data, so every case is checked without touching the machine's files; only
+/// [`IdRanges::here`] reads them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdRanges {
+    /// The account's name.
+    pub user: String,
+    /// The account's numeric id; either may stand at the start of a line.
+    pub uid: u32,
+    /// The text of `/etc/subuid`, empty when it is missing.
+    pub subuid: String,
+    /// The text of `/etc/subgid`, empty when it is missing.
+    pub subgid: String,
+}
+
+impl IdRanges {
+    /// Reads this machine: the account from the environment and the owner of this process, the
+    /// two files as they are. A file that cannot be read counts as empty, which is what podman
+    /// makes of it too.
+    #[must_use]
+    pub fn here() -> Self {
+        #[cfg(unix)]
+        let uid = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata("/proc/self").map(|meta| meta.uid()).unwrap_or(u32::MAX)
+        };
+        #[cfg(not(unix))]
+        let uid = u32::MAX;
+        let user = std::env::var("USER").or_else(|_| std::env::var("LOGNAME")).unwrap_or_default();
+        Self {
+            user,
+            uid,
+            subuid: std::fs::read_to_string("/etc/subuid").unwrap_or_default(),
+            subgid: std::fs::read_to_string("/etc/subgid").unwrap_or_default(),
+        }
+    }
+
+    /// Whether both files give this account a range.
+    #[must_use]
+    pub fn present(&self) -> bool {
+        self.has(&self.subuid) && self.has(&self.subgid)
+    }
+
+    fn has(&self, text: &str) -> bool {
+        let uid = self.uid.to_string();
+        entries(text).any(|(owner, _, count)| (owner == self.user || owner == uid) && count > 0)
+    }
+
+    /// The line that gives this account a range in both files, then tells podman to take it up.
+    ///
+    /// The range starts after every range either file already hands out, so it never overlaps
+    /// another account's: two accounts sharing ids could read each other's container files.
+    /// `$USER` is left for the shell, which knows the name for certain.
+    #[must_use]
+    pub fn line(&self) -> String {
+        let taken = entries(&self.subuid).chain(entries(&self.subgid)).map(|(_, start, count)| start + count).max();
+        let start = taken.unwrap_or(0).max(FIRST_SUBORDINATE_ID);
+        let end = start + SUBORDINATE_IDS - 1;
+        format!("sudo usermod --add-subuids {start}-{end} --add-subgids {start}-{end} $USER && podman system migrate")
+    }
+}
+
+/// The `owner:start:count` lines of a subordinate id file, skipping anything that is not one.
+fn entries(text: &str) -> impl Iterator<Item = (&str, u64, u64)> {
+    text.lines().filter_map(|line| {
+        let mut parts = line.trim().split(':');
+        let owner = parts.next()?;
+        let start = parts.next()?.trim().parse().ok()?;
+        let count = parts.next()?.trim().parse().ok()?;
+        (!owner.is_empty() && !owner.starts_with('#')).then_some((owner, start, count))
+    })
 }
 
 #[cfg(test)]
@@ -271,6 +401,34 @@ mod tests {
             Remedy::Install { command, .. } => command,
             other => panic!("a missing engine is installed, not {other:?}"),
         }
+    }
+
+    fn ranges(subuid: &str, subgid: &str) -> IdRanges {
+        IdRanges { user: "ada".to_owned(), uid: 1001, subuid: subuid.to_owned(), subgid: subgid.to_owned() }
+    }
+
+    #[test]
+    fn an_account_has_ranges_only_when_both_files_name_it() {
+        assert!(ranges("ada:100000:65536\n", "ada:100000:65536\n").present());
+        // By number as well as by name, the way shadow-utils reads them.
+        assert!(ranges("1001:100000:65536\n", "ada:100000:65536\n").present());
+        assert!(!ranges("ada:100000:65536\n", "").present(), "a group range is needed too");
+        assert!(!ranges("bob:100000:65536\n", "bob:100000:65536\n").present(), "another account's range");
+        assert!(!ranges("ada:100000:0\n", "ada:100000:0\n").present(), "a range of nothing");
+    }
+
+    #[test]
+    fn the_range_added_starts_after_every_range_already_handed_out() {
+        assert_eq!(
+            ranges("", "").line(),
+            "sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER && podman system migrate"
+        );
+        let crowded = ranges("bob:100000:65536\n# a note\ncarol:165536:65536\n", "bob:100000:65536\n");
+        assert!(
+            crowded.line().contains("--add-subuids 231072-296607 --add-subgids 231072-296607"),
+            "{}",
+            crowded.line()
+        );
     }
 
     #[test]
@@ -296,14 +454,49 @@ mod tests {
     #[test]
     fn debian_installs_docker_under_the_name_debian_gives_it() {
         let host = linux("debian", false);
-        assert_eq!(install(&host, EngineKind::Docker).as_deref(), Some("sudo apt install docker.io"));
+        let line = install(&host, EngineKind::Docker).expect("a line");
+        assert!(line.starts_with("sudo apt install docker.io && "), "{line}");
+    }
+
+    #[test]
+    fn docker_on_linux_is_installed_started_and_let_in_by_one_line() {
+        let host = linux("arch", true);
+        assert_eq!(
+            install(&host, EngineKind::Docker).as_deref(),
+            Some("paru -S docker && sudo systemctl enable --now docker && sudo usermod -aG docker $USER")
+        );
+        let Remedy::Install { relogin, .. } =
+            Remedy::for_problem(&EngineProblem::NotInstalled, EngineKind::Docker, &host)
+        else {
+            panic!("a missing engine is installed")
+        };
+        assert!(relogin, "the new group only holds after a new login, and the person is told so");
+        // Podman needs no service and no group; its line is the package alone.
+        assert_eq!(install(&host, EngineKind::Podman).as_deref(), Some("paru -S podman"));
+        // Docker Desktop on macOS is an application that does both itself.
+        let mac = InstallHost::read(Platform::MacOs, None, |_| false);
+        assert_eq!(install(&mac, EngineKind::Docker).as_deref(), Some("brew install --cask docker"));
+    }
+
+    #[test]
+    fn an_account_docker_will_not_let_in_is_added_to_the_group_or_only_asked_to_log_in_again() {
+        let host = linux("arch", true);
+        let outside = EngineProblem::NoPermission { output: String::new(), in_group: false };
+        let remedy = Remedy::for_problem(&outside, EngineKind::Docker, &host);
+        assert_eq!(remedy, Remedy::Grant { command: "sudo usermod -aG docker $USER".to_owned(), relogin: true });
+        assert_eq!(remedy.runnable(), Some("sudo usermod -aG docker $USER"));
+        let inside = EngineProblem::NoPermission { output: String::new(), in_group: true };
+        assert_eq!(Remedy::for_problem(&inside, EngineKind::Docker, &host), Remedy::Relogin);
+        assert_eq!(Remedy::Relogin.runnable(), None, "no command logs anyone out");
     }
 
     #[test]
     fn fedora_and_its_family_install_with_dnf() {
         assert_eq!(install(&linux("fedora", false), EngineKind::Podman).as_deref(), Some("sudo dnf install podman"));
         let rocky = InstallHost::read(Platform::Linux, Some("ID=rocky\nID_LIKE=\"rhel centos fedora\"\n"), |_| false);
-        assert_eq!(install(&rocky, EngineKind::Docker).as_deref(), Some("sudo dnf install docker"));
+        assert!(
+            install(&rocky, EngineKind::Docker).is_some_and(|line| line.starts_with("sudo dnf install docker && "))
+        );
     }
 
     #[test]
@@ -315,7 +508,7 @@ mod tests {
     #[test]
     fn a_system_qcode_does_not_know_is_sent_to_the_engines_own_guide() {
         let host = InstallHost::read(Platform::Linux, None, |_| false);
-        let Remedy::Install { command, docs } =
+        let Remedy::Install { command, docs, .. } =
             Remedy::for_problem(&EngineProblem::NotInstalled, EngineKind::Podman, &host)
         else {
             panic!("a missing engine is installed")
@@ -342,7 +535,7 @@ mod tests {
     fn a_stopped_docker_daemon_is_started_the_way_each_system_starts_it() {
         let problem = EngineProblem::DaemonStopped { output: String::new() };
         let linux = Remedy::for_problem(&problem, EngineKind::Docker, &linux("debian", false));
-        assert!(matches!(linux, Remedy::Start { command: Some(ref c) } if c == "sudo systemctl start docker"));
+        assert!(matches!(linux, Remedy::Start { command: Some(ref c) } if c == "sudo systemctl enable --now docker"));
 
         let mac = InstallHost::read(Platform::MacOs, None, |_| false);
         let mac = Remedy::for_problem(&problem, EngineKind::Docker, &mac);

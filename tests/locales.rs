@@ -75,6 +75,82 @@ fn the_engine_step_speaks_each_language_in_its_own_words() {
     }
 }
 
+/// Checks that every language other than English says each of `keys` in words of its own: a
+/// file whose values were left in English passes the completeness gate and still leaves the
+/// person reading English.
+fn said_in_each_language(keys: &[&str]) {
+    let mut catalog = catalog();
+    catalog.set_active("en");
+    let english: Vec<String> = keys.iter().map(|key| catalog.translate(key, &[])).collect();
+    for code in CODES.iter().filter(|code| **code != "en") {
+        catalog.set_active(code);
+        for (key, english) in keys.iter().zip(&english) {
+            let said = catalog.translate(key, &[]);
+            assert!(!said.starts_with('⟦') && !said.is_empty(), "{code} has no words for {key}");
+            assert_ne!(&said, english, "{code} still says {key} in English");
+        }
+    }
+}
+
+#[test]
+fn what_an_engine_refusal_means_is_said_in_each_language() {
+    said_in_each_language(&[
+        "known.image-missing",
+        "known.not-running",
+        "known.no-permission",
+        "known.no-id-ranges",
+        "known.run",
+        "known.said",
+    ]);
+}
+
+#[test]
+fn a_tab_whose_image_is_missing_speaks_each_language() {
+    said_in_each_language(&[
+        "workspace.image.missing",
+        "workspace.image.missing-why",
+        "workspace.image.build",
+        "workspace.image.cancel",
+        "workspace.image.building",
+        "workspace.image.stop",
+    ]);
+}
+
+#[test]
+fn what_is_left_after_an_engine_is_installed_is_said_in_each_language() {
+    said_in_each_language(&[
+        "setup.host.relogin-now",
+        "setup.host.relogin-after",
+        "setup.host.start-here",
+        "setup.host.run-here",
+        "setup.host.run-myself",
+        "setup.host.run-with",
+    ]);
+}
+
+/// `switch.home-of` is left out: "{profile} in {workspace}" is German as well as English.
+#[test]
+fn the_page_that_follows_a_change_of_engine_speaks_each_language() {
+    said_in_each_language(&[
+        "switch.title",
+        "switch.offer",
+        "switch.offer-nothing-yet",
+        "switch.use",
+        "switch.images-none",
+        "switch.build",
+        "switch.build-all",
+        "switch.old-silent",
+        "switch.homes-there",
+        "switch.login-of",
+        "switch.copy",
+        "switch.copied",
+        "switch.replace-text",
+        "switch.leftover",
+        "switch.removed",
+        "switch.done",
+    ]);
+}
+
 #[test]
 fn the_warning_about_the_key_files_permissions_is_said_in_each_language() {
     // The warning names a place and two modes, so a file that kept the English sentence around
@@ -135,4 +211,17 @@ fn what_claude_code_assumes_of_an_unmeasured_model_is_said_in_each_language() {
             assert!(said.contains(value), "{code} loses {value}: {said}");
         }
     }
+}
+
+#[test]
+fn messages_between_tabs_speak_each_language() {
+    said_in_each_language(&[
+        "settings.bridge",
+        "settings.bridge-ask",
+        "settings.bridge-ask-text",
+        "bridge.stopped.line",
+        "bridge.stopped.seen",
+        "bridge.stopped.title",
+        "bridge.stopped.why",
+    ]);
 }

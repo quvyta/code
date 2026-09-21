@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use qframe::diagnostics::{Diagnostic, Severity};
 use qframe::icons::IconMode;
 use qframe::prelude::*;
+use qframe::storage::Family;
 use qframe::widgets::{ScrollView, Segmented, Select, SettingRow, SettingsList, SettingsRows, Spinner, Switch, Toast};
 
 use crate::backup::BackupEvery;
@@ -53,9 +54,10 @@ const ENGINES: [EngineKind; 2] = [EngineKind::Podman, EngineKind::Docker];
 
 /// What the settings screen asks the application to do, because it reaches past the screen.
 ///
-/// The first five, the editor and the sound choice are choices already applied to the running application and only waiting to be
-/// written down. The rest are work only the layers that own it can do: the setup wizard's steps
-/// and the engine's volumes.
+/// The first five, the editor, the sound choice and asking before messages between tabs are
+/// choices already applied to the running application and only waiting to be written down. The
+/// rest are work only the layers that own it can do: the setup wizard's steps and the engine's
+/// volumes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
     /// Store the language. The application already speaks it.
@@ -72,6 +74,9 @@ pub enum Request {
     Editor(Editor),
     /// Store what opening a sound does, and do that from now on.
     Sound(Sound),
+    /// Store whether the first message from one tab to another asks the person, and do that
+    /// from now on.
+    AskFirst(bool),
     /// Run the setup wizard's engine step on its own. This is what the repair strip asks for.
     OpenEngineStep,
     /// Run the setup wizard's location step on its own, to move the store somewhere else.
@@ -84,6 +89,8 @@ pub enum Request {
     OnClose(OnClose),
     /// Store how often the open workspaces are backed up, and back them up that often from now on.
     BackupEvery(BackupEvery),
+    /// Turn the family's update notice on or off, for every Quvyta application.
+    UpdateNotice(bool),
     /// Install the background service.
     InstallService,
     /// Remove the background service.
@@ -134,12 +141,16 @@ pub enum Msg {
     Icons(IconMode),
     /// The reduce-motion switch was moved.
     ReduceMotion(bool),
+    /// The switch of the family's update notice was moved.
+    UpdateNotice(bool),
     /// An engine was chosen.
     Engine(EngineKind),
     /// An editor was chosen.
     Editor(Editor),
     /// What opening a sound does was chosen.
     Sound(Sound),
+    /// The switch that asks before the first message between two tabs was moved.
+    AskFirst(bool),
     /// A profile was chosen.
     Profile(usize),
     /// Refreshing the chosen profile's login was asked for; the question follows.
@@ -176,6 +187,7 @@ pub struct Settings {
     engine: EngineState,
     editor: Editor,
     sound: Sound,
+    ask_first: bool,
     store: Option<PathBuf>,
     repairs: Vec<Diagnostic>,
     repairs_read: bool,
@@ -186,6 +198,8 @@ pub struct Settings {
     on_close: OnClose,
     backup_every: BackupEvery,
     service: Option<ServiceRow>,
+    /// The family's update notice, or `None` where there is no family folder to keep it in.
+    update_notice: Option<bool>,
 }
 
 impl Settings {
@@ -197,6 +211,7 @@ impl Settings {
             engine,
             editor: config.editor(),
             sound: config.sound(),
+            ask_first: config.ask_first(),
             store: config.folder_path(),
             repairs: config.diagnostics().to_vec(),
             repairs_read: false,
@@ -207,7 +222,22 @@ impl Settings {
             on_close: config.on_close(),
             backup_every: config.backup_every(),
             service: None,
+            update_notice: None,
         }
+    }
+
+    /// The same screen, showing the family's update notice as `on`; `None` shows no row, which is
+    /// a machine with no family folder to keep the switch in.
+    #[must_use]
+    pub fn with_update_notice(mut self, on: Option<bool>) -> Self {
+        self.update_notice = on;
+        self
+    }
+
+    /// The family's update notice as the screen shows it.
+    #[must_use]
+    pub fn update_notice(&self) -> Option<bool> {
+        self.update_notice
     }
 
     /// The same screen, showing the background service as `row` says; `None` shows no row.
@@ -291,6 +321,13 @@ pub fn update(screen: &mut Settings, message: Msg) -> (Command<Msg>, Option<Requ
         Msg::Theme(id) => (Command::set_theme(id.clone()), Some(Request::Theme(id))),
         Msg::Icons(mode) => (Command::set_icon_mode(mode), Some(Request::Icons(mode))),
         Msg::ReduceMotion(reduced) => (Command::set_reduced_motion(reduced), Some(Request::ReducedMotion(reduced))),
+        Msg::UpdateNotice(on) => {
+            if screen.update_notice.is_none() {
+                return (Command::none(), None);
+            }
+            screen.update_notice = Some(on);
+            (Command::none(), Some(Request::UpdateNotice(on)))
+        }
         Msg::Engine(kind) => {
             // The engine is unknown again until the application has looked for the new one.
             screen.engine = EngineState::new(kind, Health::Checking);
@@ -303,6 +340,10 @@ pub fn update(screen: &mut Settings, message: Msg) -> (Command<Msg>, Option<Requ
         Msg::Sound(sound) => {
             screen.sound = sound;
             (Command::none(), Some(Request::Sound(sound)))
+        }
+        Msg::AskFirst(ask) => {
+            screen.ask_first = ask;
+            (Command::none(), Some(Request::AskFirst(ask)))
         }
         Msg::Profile(index) => {
             if index < screen.profiles.as_ref().map_or(0, Vec::len) {
@@ -454,6 +495,15 @@ pub fn view(screen: &Settings, ui: &mut View<'_, Msg>) {
                         ui.add(Switch::new(reduced).disabled(forced).on_toggle(Msg::ReduceMotion));
                     });
 
+                    // The family's switch, in the family's own words: it is one setting for every
+                    // Quvyta application, and each says the same thing about it.
+                    if let Some(on) = screen.update_notice {
+                        let about = t!("quvyta.appearance.updates-text", family = Family::QUVYTA.title());
+                        list.row(SettingRow::new(t!("quvyta.appearance.updates")).description(about), |ui| {
+                            ui.add(Switch::new(on).on_toggle(Msg::UpdateNotice)).id("update-notice");
+                        });
+                    }
+
                     list.heading(t!("settings.containers"));
                     let row = SettingRow::new(t!("settings.engine")).description(screen.engine.summary());
                     list.row(row, |ui| match screen.engine.health() {
@@ -540,6 +590,12 @@ pub fn view(screen: &Settings, ui: &mut View<'_, Msg>) {
                     list.row(row, |ui| {
                         ui.add(Text::new(t!("settings.folder-change")).role("secondary"));
                     });
+
+                    list.heading(t!("settings.bridge"));
+                    let row = SettingRow::new(t!("settings.bridge-ask")).description(t!("settings.bridge-ask-text"));
+                    list.row(row, |ui| {
+                        ui.add(Switch::new(screen.ask_first).on_toggle(Msg::AskFirst)).id("ask-first");
+                    });
                 });
                 list.id("settings");
                 // Everything under the list keeps the list's own left margin, so the screen reads as
@@ -549,7 +605,14 @@ pub fn view(screen: &Settings, ui: &mut View<'_, Msg>) {
                     // list rather than the strip: here there is a screen to read them on.
                     if let Health::Missing(trouble) = screen.engine.health() {
                         let kind = screen.engine.kind();
-                        ui.add(Text::new(trouble.remedy(kind)).role("secondary")).fill_width();
+                        // A refusal QCode recognises is said plainly, with the line that puts it
+                        // right, in place of the general advice to repair.
+                        match trouble.said().and_then(|said| engine::help(kind, said)) {
+                            Some(help) => help.show(ui),
+                            None => {
+                                ui.add(Text::new(trouble.remedy(kind)).role("secondary")).fill_width();
+                            }
+                        }
                         if let Some(said) = trouble.said() {
                             let words = t!("settings.engine-said", engine = engine::name(kind), output = said);
                             ui.add(Text::new(words).role("faint")).fill_width();
@@ -783,7 +846,7 @@ mod tests {
     use crate::ui::settings::Request;
     use crate::ui::settings::engine::{Health, Trouble};
 
-    const SIZE: (u16, u16) = (100, 34);
+    const SIZE: (u16, u16) = (100, 40);
 
     #[test]
     fn the_common_settings_are_the_frameworks_own() {
@@ -874,6 +937,17 @@ mod tests {
         assert_eq!(harness.app().asked, [Request::Language("tr".to_owned())]);
         let screen = harness.screen();
         assert!(screen.contains("Kapsayıcı motoru"), "the screen speaks it at once:\n{screen}");
+    }
+
+    #[test]
+    fn an_engine_refusing_this_account_says_so_with_the_line_that_lets_it_in() {
+        let said = "permission denied while trying to connect to the docker API at unix:///var/run/docker.sock";
+        let health = Health::Missing(Trouble::Refused(said.to_owned()));
+        let harness = testing::host(testing::screen(EngineKind::Docker, health), 150, 44);
+        let screen = harness.screen();
+        assert!(screen.contains("not in the docker group"), "{screen}");
+        assert!(screen.contains("usermod -aG docker"), "{screen}");
+        assert!(screen.contains("permission denied while"), "what docker said stays:\n{screen}");
     }
 
     #[test]
@@ -1013,6 +1087,26 @@ mod tests {
         // A settings file that chose the details opens the screen on them.
         let screen = testing::from_config("[apps]\nsound = \"details\"\n", EngineKind::Podman, Health::Working);
         assert_eq!(screen.sound, Sound::Details);
+    }
+
+    #[test]
+    fn asking_before_messages_between_tabs_is_off_until_the_person_turns_it_on() {
+        let mut harness = testing::host(testing::screen(EngineKind::Podman, Health::Working), SIZE.0, 70);
+        let screen = harness.screen();
+        for label in [
+            "MESSAGES BETWEEN TABS",
+            "Ask before the first message",
+            "Off, agents in different tabs send each other messages",
+        ] {
+            assert!(screen.contains(label), "`{label}` is missing:\n{screen}");
+        }
+        assert!(!harness.app().screen.ask_first, "a file without the key does not ask");
+        harness.send(testing::wrap(super::Msg::AskFirst(true))).render();
+        assert_eq!(harness.app().asked, [Request::AskFirst(true)]);
+        assert!(harness.app().screen.ask_first);
+
+        let screen = testing::from_config("[bridge]\nask-first = true\n", EngineKind::Podman, Health::Working);
+        assert!(screen.ask_first, "a file that turned it on opens the screen with it on");
     }
 
     #[test]

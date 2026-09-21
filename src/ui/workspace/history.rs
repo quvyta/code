@@ -293,11 +293,12 @@ mod tests {
         let failure = LaunchFailure {
             command: "podman exec x".to_owned(),
             output: "\nError: no such container\nmore".to_owned(),
+            image_missing: false,
         };
         assert_eq!(reason(&failure), "Error: no such container");
-        let long = LaunchFailure { command: String::new(), output: "x".repeat(100) };
+        let long = LaunchFailure { command: String::new(), output: "x".repeat(100), image_missing: false };
         assert_eq!(reason(&long).chars().count(), REASON_CHARS + 1);
-        let silent = LaunchFailure { command: "podman exec x".to_owned(), output: String::new() };
+        let silent = LaunchFailure { command: "podman exec x".to_owned(), output: String::new(), image_missing: false };
         assert_eq!(reason(&silent), "podman exec x");
     }
 }

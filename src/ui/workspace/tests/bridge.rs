@@ -1,5 +1,6 @@
-//! The bridge between tabs on the screen: which tab asks, the person's approval, the rules that
-//! refuse a message and say why, and the messages that wait in the tab they were sent to.
+//! The bridge between tabs on the screen: which tab asks, the person's approval when they turned
+//! asking on, the rules that refuse a message and say why, and the messages that wait in the tab
+//! they were sent to.
 //!
 //! No socket is opened here: a harness would wait on it forever. The calls a socket would carry
 //! are handed to the screen by the test application below, the way the screen's own listener
@@ -26,7 +27,10 @@ use crate::ui::workspace::bridge::{ASK_WAIT, QUIET, RETRY_EVERY};
 use crate::ui::workspace::{Letter, Undelivered};
 
 /// The workspace screen, with one more way in: a call as the workspace's socket would bring it.
-struct Bridged(WorkspaceScreen);
+///
+/// The settings screen can stand over it, the way QCode opens it from the rail, so that a switch
+/// the person moves there is the one the bridge obeys.
+struct Bridged(WorkspaceScreen, Option<crate::ui::settings::Settings>);
 
 #[derive(Debug, Clone)]
 enum Test {
@@ -37,6 +41,10 @@ enum Test {
     Attach(usize, TerminalSession),
     /// Looks at the tabs holding messages as of this moment.
     Deliver(Instant),
+    /// Opens the settings over the screen, or closes them.
+    ShowSettings(bool),
+    /// Something happened on the settings screen.
+    Settings(crate::ui::settings::Msg),
 }
 
 impl App for Bridged {
@@ -56,17 +64,51 @@ impl App for Bridged {
                 Command::none()
             }
             Test::Deliver(now) => super::super::bridge::deliver(&mut self.0, now).map(Test::Screen),
+            Test::ShowSettings(open) => {
+                // The screen shows what the settings file holds, which is what the workspace screen
+                // was last given.
+                let file = if self.0.ask_first() { "[bridge]\nask-first = true\n" } else { "" };
+                self.1 = open.then(|| {
+                    let health = crate::ui::settings::engine::Health::Working;
+                    crate::ui::settings::testing::from_config(file, EngineKind::Podman, health)
+                });
+                Command::none()
+            }
+            Test::Settings(message) => {
+                let Some(settings) = self.1.as_mut() else { return Command::none() };
+                let (command, request) = crate::ui::settings::update(settings, message);
+                // What QCode does with the request: the switch reaches the open workspace screen.
+                if let Some(crate::ui::settings::Request::AskFirst(ask)) = request {
+                    self.0.set_ask_first(ask);
+                }
+                command.map(Test::Settings)
+            }
         }
     }
 
     fn view(&self, ui: &mut View<'_, Test>) {
-        super::super::view(&self.0, ui, Test::Screen, |_| {}, |_| {}, |_| {});
+        match &self.1 {
+            Some(settings) => {
+                ui.map(Test::Settings, |ui| crate::ui::settings::view(settings, ui)).fill();
+            }
+            None => super::super::view(&self.0, ui, Test::Screen, |_| {}, |_| {}, |_| {}),
+        }
     }
 }
 
 /// A workspace with a Claude Code tab and a Codex tab, the first with the network as `claude`
-/// says and the second with it as `codex` says, and a shell tab between them.
+/// says and the second with it as `codex` says, and a shell tab between them. Nobody is asked
+/// before a message, which is how QCode starts.
 fn two_agents(scratch: &Scratch, claude: NetworkMode, codex: NetworkMode) -> Harness<Bridged> {
+    agents(scratch, claude, codex, false)
+}
+
+/// [`two_agents`] with asking turned on, as the person turns it on in the settings.
+fn two_agents_asking(scratch: &Scratch, claude: NetworkMode, codex: NetworkMode) -> Harness<Bridged> {
+    agents(scratch, claude, codex, true)
+}
+
+fn agents(scratch: &Scratch, claude: NetworkMode, codex: NetworkMode, ask: bool) -> Harness<Bridged> {
     let profiles = vec![
         Profile { network: claude, ..profile("claude-sub", HarnessKind::ClaudeCode) },
         Profile { network: codex, ..profile("codex-main", HarnessKind::Codex) },
@@ -79,7 +121,8 @@ fn two_agents(scratch: &Scratch, claude: NetworkMode, codex: NetworkMode) -> Har
     open(&mut screen, Choice::NewChat("claude-sub".to_owned()));
     open(&mut screen, Choice::Shell);
     open(&mut screen, Choice::NewChat("codex-main".to_owned()));
-    let mut harness = Harness::with_env(Bridged(screen), env(), SIZE.0, SIZE.1);
+    screen.set_ask_first(ask);
+    let mut harness = Harness::with_env(Bridged(screen, None), env(), SIZE.0, SIZE.1);
     harness.set_locale("en").set_glyph_mode(GlyphMode::Unicode);
     // The panel is closed so that a dialog's lines read as sentences, with nothing beside them.
     harness.send(Test::Screen(Msg::TogglePanel(false))).send(Test::Screen(Msg::OpenTab(0)));
@@ -117,7 +160,8 @@ fn to_claude(harness: &mut Harness<Bridged>, text: &str) -> Receiver<Answer> {
     ask(harness, 2, Request::Send { tab: claude, text: text.to_owned() })
 }
 
-/// A workspace with a Claude Code tab and, beside it, the window of a desktop profile.
+/// A workspace with a Claude Code tab and, beside it, the window of a desktop profile, with the
+/// person asked before a first message.
 fn an_agent_and_a_window(scratch: &Scratch) -> Harness<Bridged> {
     let profiles = vec![profile("claude-sub", HarnessKind::ClaudeCode), profile("anti", HarnessKind::AntigravityIde)];
     let mut screen = WorkspaceScreen::new(
@@ -127,7 +171,8 @@ fn an_agent_and_a_window(scratch: &Scratch) -> Harness<Bridged> {
     );
     open(&mut screen, Choice::NewChat("claude-sub".to_owned()));
     open(&mut screen, Choice::Window("anti".to_owned()));
-    let mut harness = Harness::with_env(Bridged(screen), env(), SIZE.0, SIZE.1);
+    screen.set_ask_first(true);
+    let mut harness = Harness::with_env(Bridged(screen, None), env(), SIZE.0, SIZE.1);
     harness.set_locale("en").set_glyph_mode(GlyphMode::Unicode);
     harness.send(Test::Screen(Msg::TogglePanel(false))).send(Test::Screen(Msg::OpenTab(0)));
     harness.advance(Duration::from_secs(1)).render();
@@ -196,9 +241,9 @@ fn a_question_from_no_tab_of_the_workspace_or_not_a_question_at_all_is_refused()
 }
 
 #[test]
-fn the_first_message_between_two_tabs_asks_the_person_and_is_taken_when_allowed() {
+fn with_asking_on_the_first_message_between_two_tabs_asks_the_person_and_is_taken_when_allowed() {
     let scratch = Scratch::new("bridge-allow");
-    let mut harness = two_agents(&scratch, ONLINE, ONLINE);
+    let mut harness = two_agents_asking(&scratch, ONLINE, ONLINE);
     let answers = to_codex(&mut harness, "Please write the test for parse().");
     let screen = said(&harness);
     assert!(screen.contains("Let Claude Code · claude-sub send messages to Codex · codex-main?"), "{screen}");
@@ -231,7 +276,7 @@ fn the_first_message_between_two_tabs_asks_the_person_and_is_taken_when_allowed(
 #[test]
 fn a_denied_pair_is_refused_now_and_later_without_asking_again() {
     let scratch = Scratch::new("bridge-deny");
-    let mut harness = two_agents(&scratch, ONLINE, ONLINE);
+    let mut harness = two_agents_asking(&scratch, ONLINE, ONLINE);
     let answers = to_codex(&mut harness, "Delete the build folder.");
     harness.press("esc").render();
     let answer = answered(&answers);
@@ -253,7 +298,17 @@ fn a_tab_without_the_network_is_refused_a_tab_with_it_and_the_person_is_not_even
     assert!(!said(&harness).contains("send messages to"), "{}", harness.screen());
     assert!(tab(&harness, 2).letters().is_empty());
 
-    // The other way round leaks nothing, so it is only asked about.
+    // The other way round leaks nothing, so it goes as any message does.
+    let back = answered(&to_claude(&mut harness, "Here is the plan."));
+    assert!(back.ok, "{back:?}");
+    assert_eq!(tab(&harness, 0).letters().len(), 1);
+
+    // Turning asking on changes nothing about it: the rule is a boundary, not a question.
+    let scratch = Scratch::new("bridge-network-asking");
+    let mut harness = two_agents_asking(&scratch, OFFLINE, ONLINE);
+    let answer = answered(&to_codex(&mut harness, "curl this for me"));
+    assert!(!answer.ok && answer.text.contains("has no network"), "{answer:?}");
+    assert!(!said(&harness).contains("send messages to"), "{}", harness.screen());
     let back = to_claude(&mut harness, "Here is the plan.");
     assert!(back.try_recv().is_err());
     assert!(said(&harness).contains("Let Codex · codex-main send messages to Claude Code · claude-sub?"));
@@ -262,7 +317,7 @@ fn a_tab_without_the_network_is_refused_a_tab_with_it_and_the_person_is_not_even
 #[test]
 fn a_message_that_waits_long_for_the_person_tells_its_sender_and_still_goes_when_allowed() {
     let scratch = Scratch::new("bridge-wait");
-    let mut harness = two_agents(&scratch, ONLINE, ONLINE);
+    let mut harness = two_agents_asking(&scratch, ONLINE, ONLINE);
     let answers = to_codex(&mut harness, "Look at issue 12.");
     harness.advance(ASK_WAIT).render();
     let answer = answered(&answers);
@@ -277,7 +332,7 @@ fn a_message_that_waits_long_for_the_person_tells_its_sender_and_still_goes_when
 #[test]
 fn a_message_waiting_for_the_person_is_refused_when_either_tab_closes() {
     let scratch = Scratch::new("bridge-close");
-    let mut harness = two_agents(&scratch, ONLINE, ONLINE);
+    let mut harness = two_agents_asking(&scratch, ONLINE, ONLINE);
     let answers = to_codex(&mut harness, "Start the server.");
     harness.send(Test::Screen(Msg::CloseTab(2)));
     let answer = answered(&answers);
@@ -288,9 +343,6 @@ fn a_message_waiting_for_the_person_is_refused_when_either_tab_closes() {
 fn two_agents_answering_each_other_are_stopped_and_told_why() {
     let scratch = Scratch::new("bridge-loop");
     let mut harness = two_agents(&scratch, ONLINE, ONLINE);
-    let (claude, codex) = (tab(&harness, 0).key(), tab(&harness, 2).key());
-    harness.send(Test::Screen(Msg::Allow { from: claude, to: codex, allow: true }));
-    harness.send(Test::Screen(Msg::Allow { from: codex, to: claude, allow: true }));
     let mut taken = 0;
     let refusal = loop {
         let answers =
@@ -311,11 +363,88 @@ fn two_agents_answering_each_other_are_stopped_and_told_why() {
 }
 
 #[test]
+fn an_exchange_the_loop_limit_ends_is_said_under_both_tabs_and_once_wherever_the_person_looks() {
+    let scratch = Scratch::new("bridge-loop-line");
+    let mut harness = two_agents(&scratch, ONLINE, ONLINE);
+    // The person is looking at the shell between the two, so neither tab is on screen. Motion is
+    // off, so a notice is on screen as soon as it is sent.
+    harness.set_reduced_motion(true);
+    harness.send(Test::Screen(Msg::OpenTab(1))).resize(180, SIZE.1).render();
+    let mut turn = 0;
+    loop {
+        let answers =
+            if turn % 2 == 0 { to_codex(&mut harness, "your turn") } else { to_claude(&mut harness, "yours") };
+        if !answered(&answers).ok {
+            break;
+        }
+        turn += 1;
+        assert!(turn <= MOST_HOPS, "the exchange was never cut");
+    }
+    // Before the cut, neither tab said anything of the kind.
+    let screen = said(&harness);
+    // The notice wraps its words, so they are looked for in parts.
+    for part in ["Claude Code · claude-sub and Codex", "codex-main stopped sending each other messages"] {
+        assert!(screen.contains(part), "the person is told where they are looking:\n{}", harness.screen());
+    }
+    assert!(screen.contains(&format!("after {MOST_HOPS} messages")), "{screen}");
+    assert_eq!(tab(&harness, 0).stopped(), Some("Codex · codex-main"));
+    assert_eq!(tab(&harness, 2).stopped(), Some("Claude Code · claude-sub"));
+
+    let line = |other: &str| {
+        format!("The exchange of messages between this tab and {other} was ended after {MOST_HOPS} messages")
+    };
+    harness.send(Test::Screen(Msg::OpenTab(0))).render();
+    assert!(said(&harness).contains(&line("Codex · codex-main")), "{}", harness.screen());
+    harness.send(Test::Screen(Msg::OpenTab(2))).render();
+    assert!(said(&harness).contains(&line("Claude Code · claude-sub")), "{}", harness.screen());
+    harness.send(Test::Screen(Msg::OpenTab(1))).render();
+    assert!(!said(&harness).contains("The exchange of messages"), "the shell took no part:\n{}", harness.screen());
+
+    // An agent that keeps trying is refused again, and the notice is not given a second time.
+    harness.advance(Duration::from_secs(30)).render();
+    assert!(!answered(&to_codex(&mut harness, "one more")).ok);
+    assert!(!said(&harness).contains("stopped sending each other"), "told once:\n{}", harness.screen());
+
+    // The line stays until the person has read it, in each tab on its own.
+    harness.send(Test::Screen(Msg::OpenTab(2))).render();
+    harness.click_text("Got it").render();
+    assert!(!said(&harness).contains("The exchange of messages"), "{}", harness.screen());
+    assert!(tab(&harness, 2).stopped().is_none());
+    assert_eq!(tab(&harness, 0).stopped(), Some("Codex · codex-main"), "the other tab still says so");
+}
+
+#[test]
+fn the_line_of_an_ended_exchange_reads_in_turkish_too() {
+    let scratch = Scratch::new("bridge-loop-tr");
+    let mut harness = two_agents(&scratch, ONLINE, ONLINE);
+    harness.set_locale("tr");
+    harness.resize(180, SIZE.1).render();
+    let mut turn = 0;
+    while answered(&if turn % 2 == 0 {
+        to_codex(&mut harness, "sıra sende")
+    } else {
+        to_claude(&mut harness, "sende")
+    })
+    .ok
+    {
+        turn += 1;
+        assert!(turn <= MOST_HOPS, "the exchange was never cut");
+    }
+    harness.send(Test::Screen(Msg::OpenTab(2))).render();
+    let screen = said(&harness);
+    assert!(
+        screen.contains(&format!(
+            "Bu sekmeyle Claude Code · claude-sub arasındaki yazışma {MOST_HOPS} mesajdan sonra bitirildi"
+        )),
+        "{screen}"
+    );
+    assert!(screen.contains("Anladım"), "{screen}");
+}
+
+#[test]
 fn a_tab_sending_too_fast_is_slowed_down_and_told_so() {
     let scratch = Scratch::new("bridge-pace");
     let mut harness = two_agents(&scratch, ONLINE, ONLINE);
-    let (claude, codex) = (tab(&harness, 0).key(), tab(&harness, 2).key());
-    harness.send(Test::Screen(Msg::Allow { from: claude, to: codex, allow: true }));
     for n in 0..MOST_PER_WINDOW {
         assert!(answered(&to_codex(&mut harness, &format!("task {n}"))).ok);
     }
@@ -338,8 +467,9 @@ fn messages_that_cannot_be_sent_say_why_and_nothing_is_sent() {
     let answer = answered(&to_codex(&mut harness, &long));
     assert!(!answer.ok && answer.text.contains("longer than"), "{answer:?}");
     // By its title, when only one tab has it.
-    let answer = ask(&mut harness, 0, Request::Send { tab: "codex-main".to_owned(), text: "hi".to_owned() });
-    assert!(answer.try_recv().is_err() && said(&harness).contains("send messages to"), "the title names the tab");
+    let answer = answered(&ask(&mut harness, 0, Request::Send { tab: "codex-main".to_owned(), text: "hi".to_owned() }));
+    assert!(answer.ok, "the title names the tab: {answer:?}");
+    assert_eq!(tab(&harness, 2).letters().len(), 1);
 }
 
 #[test]
@@ -394,7 +524,7 @@ fn on_a_narrow_screen_the_line_gives_way_before_its_buttons() {
 #[test]
 fn the_line_of_waiting_messages_reads_in_turkish_too() {
     let scratch = Scratch::new("bridge-turkish");
-    let mut harness = two_agents(&scratch, ONLINE, ONLINE);
+    let mut harness = two_agents_asking(&scratch, ONLINE, ONLINE);
     harness.set_locale("tr");
     let answers = to_codex(&mut harness, "Merhaba");
     assert!(
@@ -692,7 +822,7 @@ fn a_window_tab_is_never_a_tab_a_message_can_be_sent_to() {
     );
     open(&mut screen, Choice::NewChat("claude-sub".to_owned()));
     open(&mut screen, Choice::Window("antigravity".to_owned()));
-    let mut harness = Harness::with_env(Bridged(screen), env(), SIZE.0, SIZE.1);
+    let mut harness = Harness::with_env(Bridged(screen, None), env(), SIZE.0, SIZE.1);
     harness.set_locale("en").set_glyph_mode(GlyphMode::Unicode);
     harness.advance(Duration::from_secs(1)).render();
     assert!(matches!(tab(&harness, 1).kind(), TabKind::Desktop(_)), "{:?}", tab(&harness, 1).kind());
@@ -752,4 +882,86 @@ fn a_window_is_never_somewhere_a_message_can_be_left() {
         assert!(!said(&harness).contains("send messages to"), "the person is not even asked: {}", harness.screen());
         assert!(tab(&harness, 1).letters().is_empty(), "{named}");
     }
+}
+
+#[test]
+fn by_default_an_agent_sends_to_another_tab_without_asking_and_the_message_lands_in_its_prompt() {
+    let scratch = Scratch::new("bridge-no-asking");
+    let mut harness = two_agents(&scratch, ONLINE, ONLINE);
+    let file = scratch.0.join("codex-read.txt");
+    harness_in(&mut harness, &scratch, 2, &file, "");
+    // The tab has been quiet since it started, so the message goes in as it is taken.
+    std::thread::sleep(QUIET + Duration::from_millis(300));
+
+    let answer = answered(&to_codex(&mut harness, "Please write the test for parse()."));
+    assert!(answer.ok && answer.text.starts_with("Delivered."), "no question stood in the way: {answer:?}");
+    assert!(!said(&harness).contains("send messages to"), "nobody was asked:\n{}", harness.screen());
+    assert!(!said(&harness).contains("Allow"), "{}", harness.screen());
+    let read = written(&file, "parse()");
+    assert!(read.contains("Through QCode, from the Claude Code · claude-sub tab:"), "{read:?}");
+    assert!(read.contains("Please write the test for parse()."), "{read:?}");
+
+    // The answer back goes the same way.
+    assert!(answered(&to_claude(&mut harness, "Done.")).ok);
+    assert!(!said(&harness).contains("send messages to"), "{}", harness.screen());
+    assert_eq!(tab(&harness, 0).letters().len(), 1);
+}
+
+/// Moves the switch of the settings row labelled `label`, with the pointer, where it is drawn: at
+/// the right edge of the settings column, which the language drop-down's arrow marks. A switch
+/// is drawn in colour alone, so there is no glyph of its own to look for.
+fn click_switch(harness: &mut Harness<Bridged>, label: &str) {
+    let (_, y) = harness.find(label).unwrap_or_else(|| panic!("`{label}` is on screen:\n{}", harness.screen()));
+    let (edge, _) = harness.find("▾").expect("the language drop-down marks the column's edge");
+    harness.click(edge - 1, y).render();
+}
+
+#[test]
+fn turning_asking_on_in_the_settings_brings_the_question_back() {
+    let scratch = Scratch::new("bridge-ask-setting");
+    let mut harness = two_agents(&scratch, ONLINE, ONLINE);
+    assert!(!harness.app().0.ask_first(), "QCode starts without asking");
+
+    harness.send(Test::ShowSettings(true)).resize(SIZE.0, 70).render();
+    let screen = said(&harness);
+    assert!(screen.contains("MESSAGES BETWEEN TABS") && screen.contains("Ask before the first message"), "{screen}");
+    click_switch(&mut harness, "Ask before the first message");
+    assert!(harness.app().0.ask_first(), "the switch reached the workspace screen:\n{}", harness.screen());
+    harness.send(Test::ShowSettings(false)).resize(SIZE.0, SIZE.1).render();
+
+    let answers = to_codex(&mut harness, "Please write the test for parse().");
+    assert!(
+        said(&harness).contains("Let Claude Code · claude-sub send messages to Codex · codex-main?"),
+        "{}",
+        harness.screen()
+    );
+    assert!(answers.try_recv().is_err(), "the agent waits for the person");
+    harness.click_text("Allow").render();
+    assert!(answered(&answers).ok);
+    assert_eq!(tab(&harness, 2).letters().len(), 1);
+
+    // Off again, a pair nobody was asked about goes without a question.
+    harness.send(Test::ShowSettings(true)).resize(SIZE.0, 70).render();
+    click_switch(&mut harness, "Ask before the first message");
+    assert!(!harness.app().0.ask_first());
+    harness.send(Test::ShowSettings(false)).resize(SIZE.0, SIZE.1).render();
+    assert!(answered(&to_claude(&mut harness, "Done.")).ok);
+    assert!(!said(&harness).contains("send messages to"), "{}", harness.screen());
+}
+
+#[test]
+fn a_pair_the_person_denied_while_asking_was_on_stays_denied_once_it_is_off() {
+    let scratch = Scratch::new("bridge-denied-kept");
+    let mut harness = two_agents_asking(&scratch, ONLINE, ONLINE);
+    let answers = to_codex(&mut harness, "Delete the build folder.");
+    harness.click_text("Deny").render();
+    assert!(!answered(&answers).ok);
+
+    harness.send(Test::ShowSettings(true)).resize(SIZE.0, 70).render();
+    click_switch(&mut harness, "Ask before the first message");
+    harness.send(Test::ShowSettings(false)).resize(SIZE.0, SIZE.1).render();
+    assert!(!harness.app().0.ask_first());
+    let answer = answered(&to_codex(&mut harness, "Please?"));
+    assert!(!answer.ok && answer.text.contains("did not allow"), "the person's no still holds: {answer:?}");
+    assert!(tab(&harness, 2).letters().is_empty());
 }

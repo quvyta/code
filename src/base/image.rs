@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use crate::engine::names::BASE_IMAGE;
+use super::Os;
 use crate::engine::run::{EngineError, build_image, capture};
 use crate::engine::{Engine, EngineCommand, ImageBuild};
 
@@ -51,7 +51,13 @@ pub enum Failure {
 /// The label cannot be written into the file itself, because its value is what the file says.
 #[must_use]
 pub fn containerfile() -> String {
-    format!("{CONTAINERFILE}LABEL {REVISION_LABEL}=\"{}\"\n", revision())
+    containerfile_of(Os::Debian)
+}
+
+/// The Containerfile of `os`'s base image as the engine is given it, labelled the same way.
+#[must_use]
+pub fn containerfile_of(os: Os) -> String {
+    format!("{}LABEL {REVISION_LABEL}=\"{}\"\n", os.containerfile(), revision_of(os))
 }
 
 /// Which description the image on the machine should have been built from.
@@ -62,7 +68,14 @@ pub fn containerfile() -> String {
 /// a short non-cryptographic digest is enough.
 #[must_use]
 pub fn revision() -> String {
-    format!("{:016x}", digest(CONTAINERFILE))
+    revision_of(Os::Debian)
+}
+
+/// Which description `os`'s base image should have been built from: the digest of its own
+/// Containerfile, so a change to one system's file rebuilds that system's image and no other.
+#[must_use]
+pub fn revision_of(os: Os) -> String {
+    format!("{:016x}", digest(os.containerfile()))
 }
 
 /// FNV-1a over the bytes of `text`: a short digest that tells two descriptions apart, where
@@ -74,22 +87,30 @@ pub fn digest(text: &str) -> u64 {
     text.bytes().fold(OFFSET, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(PRIME))
 }
 
-/// What the machine has under [`BASE_IMAGE`].
+/// What the machine has under [`BASE_IMAGE`](crate::engine::names::BASE_IMAGE), Debian's base image.
 ///
 /// Runs an engine command and waits for it, so it belongs on a background thread.
 #[must_use]
 pub fn presence(engine: &Engine) -> Presence {
+    presence_of(engine, Os::Debian)
+}
+
+/// What the machine has under the name of `os`'s base image.
+///
+/// Runs an engine command and waits for it, so it belongs on a background thread.
+#[must_use]
+pub fn presence_of(engine: &Engine, os: Os) -> Presence {
     // The engine layer asks whether an image is there; this is the one place that also has to
     // know which description it was built from, and the label is where that is written.
-    let asked = capture(&revision_query(engine));
+    let asked = capture(&revision_query(engine, os));
     match asked {
         Err(_) => Presence::Missing,
-        Ok(answer) if answer.trim() == revision() => Presence::Current,
+        Ok(answer) if answer.trim() == revision_of(os) => Presence::Current,
         Ok(_) => Presence::Stale,
     }
 }
 
-/// Makes sure [`BASE_IMAGE`] is on the machine and is the one described here, building it when
+/// Makes sure [`BASE_IMAGE`](crate::engine::names::BASE_IMAGE) is on the machine and is the one described here, building it when
 /// it is not.
 ///
 /// The build takes minutes and says what it is doing, so every line goes to `line` as it
@@ -108,18 +129,37 @@ pub fn presence(engine: &Engine) -> Presence {
 /// When the build context cannot be written, or the engine cannot be started, refuses, or is
 /// stopped.
 pub fn ensure(engine: &Engine, cancel: &dyn Fn() -> bool, line: &mut dyn FnMut(&str)) -> Result<Outcome, Failure> {
-    if presence(engine) == Presence::Current {
+    ensure_os(engine, Os::Debian, cancel, line)
+}
+
+/// Makes sure `os`'s base image is on the machine and is the one described here, building it
+/// when it is not, the way [`ensure`] does for Debian's.
+///
+/// Runs engine commands and waits for them, so it belongs on a background thread.
+///
+/// # Errors
+///
+/// When the build context cannot be written, or the engine cannot be started, refuses, or is
+/// stopped.
+pub fn ensure_os(
+    engine: &Engine,
+    os: Os,
+    cancel: &dyn Fn() -> bool,
+    line: &mut dyn FnMut(&str),
+) -> Result<Outcome, Failure> {
+    if presence_of(engine, os) == Presence::Current {
         return Ok(Outcome::AlreadyThere);
     }
     let context = context_dir();
     let _ = std::fs::remove_dir_all(&context);
     std::fs::create_dir_all(&context).map_err(Failure::Host)?;
     let written = context.join("Containerfile");
-    let result = match std::fs::write(&written, containerfile()) {
-        // Nothing is copied into the image, so the context is the one file and the directory
-        // that holds it.
+    let result = match std::fs::write(&written, containerfile_of(os)) {
+        // Nothing is copied into the image from the context, so the context is the one file and
+        // the directory that holds it. (Ubuntu's copies Node in from another image, which is
+        // not the context.)
         Ok(()) => {
-            let request = ImageBuild { image: BASE_IMAGE, containerfile: &written, context: &context };
+            let request = ImageBuild { image: os.image(), containerfile: &written, context: &context };
             build_image(engine, &request, cancel, line).map(|()| Outcome::Built).map_err(Failure::Engine)
         }
         Err(error) => Err(Failure::Host(error)),
@@ -138,7 +178,7 @@ fn context_dir() -> PathBuf {
 ///
 /// It is spelled out here rather than in the engine layer because it is the only question in
 /// QCode that reads a label; when a second one appears, both belong there.
-fn revision_query(engine: &Engine) -> EngineCommand {
+fn revision_query(engine: &Engine, os: Os) -> EngineCommand {
     EngineCommand {
         program: engine.bin().to_path_buf(),
         args: [
@@ -146,7 +186,7 @@ fn revision_query(engine: &Engine) -> EngineCommand {
             "inspect",
             "--format",
             &format!("{{{{index .Config.Labels \"{REVISION_LABEL}\"}}}}"),
-            BASE_IMAGE,
+            os.image(),
         ]
         .into_iter()
         .map(std::ffi::OsString::from)
@@ -156,7 +196,8 @@ fn revision_query(engine: &Engine) -> EngineCommand {
 
 #[cfg(test)]
 mod tests {
-    use super::{BASE_IMAGE, CONTAINERFILE, REVISION_LABEL, containerfile, digest, revision, revision_query};
+    use super::{CONTAINERFILE, REVISION_LABEL, containerfile, digest, revision, revision_query};
+    use crate::engine::names::BASE_IMAGE;
     use crate::engine::{Engine, EngineKind};
     use crate::profile::HarnessKind;
 
@@ -182,13 +223,33 @@ mod tests {
     #[test]
     fn the_image_is_asked_for_the_label_of_the_name_the_design_settled_on() {
         let engine = Engine::new(EngineKind::Podman, "/usr/bin/podman");
-        let command = revision_query(&engine);
+        let command = revision_query(&engine, crate::base::Os::Debian);
         let args: Vec<String> = command.args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
         assert_eq!(
             args,
             ["image", "inspect", "--format", "{{index .Config.Labels \"qcode.base.revision\"}}", "qcode/base"]
         );
         assert_eq!(BASE_IMAGE, "qcode/base");
+        let arch = revision_query(&engine, crate::base::Os::Arch);
+        assert_eq!(arch.args.last().map(|arg| arg.to_string_lossy().into_owned()).as_deref(), Some("qcode/base-arch"));
+    }
+
+    #[test]
+    fn debians_revision_is_the_one_every_image_on_a_machine_was_labelled_with() {
+        // The choice of a system must not make every machine rebuild the Debian image it has:
+        // its revision is still the digest of the same file, and each system has its own.
+        use crate::base::{Os, containerfile_of, revision_of};
+        assert_eq!(revision_of(Os::Debian), revision());
+        assert_eq!(revision(), format!("{:016x}", digest(CONTAINERFILE)), "the digest of the file alone, as before");
+        assert_eq!(containerfile_of(Os::Debian), containerfile());
+        let revisions: Vec<String> = Os::ALL.map(revision_of).to_vec();
+        for (index, revision) in revisions.iter().enumerate() {
+            assert!(!revisions[..index].contains(revision), "two systems share a revision");
+        }
+        for os in Os::ALL {
+            assert!(containerfile_of(os).starts_with(os.containerfile()));
+            assert!(containerfile_of(os).ends_with(&format!("LABEL {REVISION_LABEL}=\"{}\"\n", revision_of(os))));
+        }
     }
 
     #[test]

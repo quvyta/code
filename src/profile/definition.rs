@@ -4,6 +4,7 @@ use qframe::diagnostics::Diagnostic;
 use qframe::document::{Document, Shape, ValueKind};
 use qframe::storage::Settings;
 
+use crate::base::Os;
 use crate::engine::names;
 use crate::profile::{AccountKind, Addition, ConfigFile, Extra, HarnessKind, SafeName, Template};
 
@@ -169,6 +170,9 @@ pub struct Profile {
     /// The parts of QCode high's additions the person switched off for this profile. Empty means
     /// everything its template adds, which is what a file without the choice reads as.
     pub without: Vec<Extra>,
+    /// The system the profile's image is built on. Debian, which every profile was built on before
+    /// there was a choice, is what a file that names none reads as.
+    pub os: Os,
 }
 
 /// What reading a definition file gave: the profile when the file holds one, and everything
@@ -257,6 +261,7 @@ impl Profile {
         let harness = root.text(HARNESS).and_then(HarnessKind::parse);
         let account = root.text(ACCOUNT).and_then(AccountKind::parse);
         let template = root.text(TEMPLATE).and_then(Template::parse).unwrap_or(Template::Base);
+        let os = root.text(OS).and_then(Os::parse).unwrap_or_default();
         let mounts = root.table(MOUNTS);
         let assets = mounts.and_then(|mounts| mounts.text(ASSETS)).and_then(MountAccess::parse);
         let network = root.table(NETWORK).and_then(|network| network.text(MODE)).and_then(NetworkMode::parse);
@@ -294,6 +299,18 @@ impl Profile {
         } else {
             None
         };
+        // A harness the system cannot run was never offered with it, so a file that pairs them was
+        // written by hand; the profile cannot be built, which is not something to fall back from
+        // quietly onto another system the person did not choose.
+        if os.refuses(harness).is_some() {
+            let message = format!(
+                "`{OS}` is `{}`, on which {} does not run; the profile cannot be built",
+                os.id(),
+                harness.record().display_name
+            );
+            diagnostics.push(Diagnostic::error(root.value_location(OS).cloned(), message));
+            return Loaded { profile: None, diagnostics };
+        }
         if harness.withdrawn(account) {
             let message = format!(
                 "`{ACCOUNT}` is `{}`: {} stopped this sign-in for personal accounts on 2026-06-18; \
@@ -314,6 +331,7 @@ impl Profile {
             assets: assets.unwrap_or(MountAccess::ReadOnly),
             network: network.unwrap_or(NetworkMode::Full),
             without,
+            os,
         };
         let derived = profile.image();
         if let Some(stored) = root.text(IMAGE)
@@ -331,6 +349,11 @@ impl Profile {
         let mut settings = Settings::in_memory();
         settings.set(NAME, self.name.as_str().to_owned());
         settings.set(HARNESS, self.harness.record().id.to_owned());
+        // Debian is not written: a profile on it is the file it was before there was a choice,
+        // byte for byte, so no file on anybody's disk changes by being saved again.
+        if self.os != Os::Debian {
+            settings.set(OS, self.os.id().to_owned());
+        }
         settings.set(TEMPLATE, self.template.id().to_owned());
         settings.set(ACCOUNT, self.account.id().to_owned());
         settings.set(IMAGE, self.image());
@@ -402,6 +425,8 @@ const NAME: &str = "name";
 const HARNESS: &str = "harness";
 /// The key of the template.
 const TEMPLATE: &str = "template";
+/// The key of the system the image is built on; missing means Debian.
+const OS: &str = "os";
 /// The key of the account type.
 const ACCOUNT: &str = "account";
 /// The key of the profile image.
@@ -447,6 +472,7 @@ fn shape() -> Shape {
         .required(NAME, ValueKind::text())
         .required(HARNESS, ValueKind::choice(HarnessKind::ALL.map(|harness| harness.record().id)))
         .optional(TEMPLATE, ValueKind::choice(Template::ALL.map(Template::id)))
+        .optional(OS, ValueKind::choice(Os::ALL.map(Os::id)))
         .required(ACCOUNT, ValueKind::choice(AccountKind::ALL.map(AccountKind::id)))
         .optional(IMAGE, ValueKind::text())
         .table(MOUNTS, mounts)
@@ -635,6 +661,62 @@ mode = \"full\"
         let profile = loaded.profile.expect("the older file is still complete");
         assert_eq!(profile.provider, None);
         assert!(!profile.to_toml().contains("[provider]"), "{}", profile.to_toml());
+    }
+
+    /// Every file written before a profile could choose its system names none, and nobody's
+    /// profile on disk may change because of the choice: each older shape reads as Debian without
+    /// a word and is written back byte for byte as it was.
+    #[test]
+    fn a_file_written_before_the_system_could_be_chosen_is_debian_and_written_back_unchanged() {
+        let high =
+            COMPLETE.replace("template = \"recommended\"", "template = \"high\"") + "\n[additions]\ncontext7 = false\n";
+        let provider = "name = \"ev\"\nharness = \"claude-code\"\ntemplate = \"recommended\"\naccount = \"provider\"\n\
+                        image = \"qcode/profile/ev\"\n\n[mounts]\ncode = \"rw\"\nassets = \"rw\"\n\n[network]\n\
+                        mode = \"none\"\n\n[provider]\ntag = \"ev1\"\nmodel = \"qwen3.8\"\n";
+        for older in [COMPLETE.to_owned(), high, provider.to_owned()] {
+            let loaded = Profile::parse("older.toml", &older);
+            assert_eq!(loaded.diagnostics, [], "{older}");
+            let profile = loaded.profile.expect("the older file is complete");
+            assert_eq!(profile.os, Os::Debian, "{older}");
+            assert_eq!(profile.to_toml(), older, "the file is written back exactly as it was");
+            assert_eq!(profile.image(), names::profile_image(profile.name.as_str()), "and names the same image");
+        }
+    }
+
+    #[test]
+    fn a_profile_on_another_system_says_so_and_reads_back_as_the_same_profile() {
+        let text = COMPLETE.replace("harness = \"claude-code\"\n", "harness = \"claude-code\"\nos = \"arch\"\n");
+        let loaded = parse(&text);
+        assert_eq!(loaded.diagnostics, []);
+        let profile = loaded.profile.expect("complete");
+        assert_eq!(profile.os, Os::Arch);
+        assert_eq!(profile.to_toml(), text, "the system is written where it was read");
+        for os in Os::ALL {
+            let mut again = profile.clone();
+            again.os = os;
+            assert_eq!(parse(&again.to_toml()).profile, Some(again), "{os:?}");
+        }
+    }
+
+    #[test]
+    fn a_system_that_is_not_one_is_reported_at_its_place_and_debian_is_used() {
+        let text = COMPLETE.replace("harness = \"claude-code\"\n", "harness = \"claude-code\"\nos = \"gentoo\"\n");
+        let loaded = parse(&text);
+        let at = loaded.diagnostics.iter().find_map(|d| d.location.clone()).expect("the value has a place");
+        assert_eq!(at.to_string(), "claude-sub.toml:3:6");
+        assert_eq!(loaded.profile.expect("the rest is usable").os, Os::Debian);
+    }
+
+    #[test]
+    fn a_harness_its_system_cannot_run_is_refused_with_the_reason() {
+        let text = "name = \"g\"\nharness = \"gemini-cli\"\nos = \"alpine\"\naccount = \"api-key\"\n";
+        let loaded = Profile::parse("g.toml", text);
+        assert_eq!(loaded.profile, None, "a Gemini CLI image on Alpine would crash at its first command");
+        let refused = loaded.diagnostics.iter().find(|d| d.severity == Severity::Error).expect("the reason is given");
+        assert!(refused.message.contains("alpine") && refused.message.contains("Gemini CLI"), "{}", refused.message);
+        assert_eq!(refused.location.as_ref().map(ToString::to_string).as_deref(), Some("g.toml:3:6"));
+        let fine = text.replace("gemini-cli", "codex");
+        assert_eq!(Profile::parse("c.toml", &fine).profile.map(|profile| profile.os), Some(Os::Alpine));
     }
 
     /// A profile written before QCode high's parts could be switched off holds no choice, and

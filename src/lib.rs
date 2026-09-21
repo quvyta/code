@@ -18,6 +18,7 @@ pub mod profile;
 pub mod provider;
 pub mod service;
 pub mod store;
+pub mod switch;
 pub mod ui;
 
 #[cfg(test)]
@@ -28,7 +29,8 @@ use std::path::PathBuf;
 
 use qframe::keymap::{KeyChord, Scope};
 use qframe::prelude::*;
-use qframe::runtime::{Runtime, Task};
+use qframe::runtime::{Runtime, Task, Update, UpdateCheck};
+use qframe::storage::Family;
 use qframe::widgets::{HelpLayer, IconButton, PageTransition, Toast};
 
 use engine::run::capture;
@@ -171,6 +173,9 @@ pub enum Page {
     Workspace,
     /// What the person can change about QCode.
     Settings,
+    /// What moving to the other container engine involves: images to build, homes to copy and
+    /// what is left in the engine before.
+    Switch,
 }
 
 impl Page {
@@ -185,6 +190,7 @@ impl Page {
             Self::Providers => "providers",
             Self::Workspace => "workspace",
             Self::Settings => "settings",
+            Self::Switch => "switch",
         }
     }
 }
@@ -232,6 +238,8 @@ pub enum Msg {
     Workspace(ui::workspace::Msg),
     /// Something happened on the settings screen.
     Settings(ui::settings::Msg),
+    /// Something happened on the page that follows a change of engine.
+    Switch(ui::switch::Msg),
     /// Leave the screen that is open and go back to the one before it.
     Back,
     /// Leave QCode, however that was asked for.
@@ -248,6 +256,32 @@ pub enum Msg {
     SignedOut(Result<(), String>),
     /// A profile's stored login was written into the workspaces that use it, or it was not.
     Refreshed(SafeName, Result<Refreshed, RefreshError>),
+    /// A newer version of QCode is out.
+    NewVersion(Update),
+}
+
+/// Where the family's update notice is kept and where QCode remembers when it last asked for a
+/// newer version of itself.
+///
+/// The switch is the family's, one for every Quvyta application, so it is read from the family's
+/// folder rather than from QCode's settings. A test gives folders of its own, so nothing it does
+/// reads or turns off the person's own switch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateFolders {
+    /// The family's configuration folder, whose shared file holds the switch.
+    pub config: PathBuf,
+    /// QCode's state folder, which remembers when the question was last asked.
+    pub state: PathBuf,
+}
+
+impl UpdateFolders {
+    /// This machine's folders, or `None` without a home folder, where nothing could remember the
+    /// switch or the last question and so nothing is asked.
+    #[must_use]
+    pub fn here() -> Option<Self> {
+        let family = Family::QUVYTA;
+        family.config_dir().zip(family.state_dir(store::APP)).map(|(config, state)| Self { config, state })
+    }
 }
 
 /// The application.
@@ -292,6 +326,15 @@ pub struct QCode {
     /// Where the workspaces open as QCode quits are left, to be backed up once the screen is
     /// given back.
     farewell: Farewell,
+    /// The page that follows a change of engine, while it is open.
+    switch: Option<ui::switch::Switch>,
+    /// The engine the settings were just changed away from, until the new one has answered and
+    /// the page that follows the change has been opened.
+    switching_from: Option<EngineKind>,
+    /// How the page that follows a change of engine finds the two engines.
+    finder: ui::switch::Finder,
+    /// Where the family's update notice is kept, or `None` where QCode asks for no newer version.
+    updates: Option<UpdateFolders>,
 }
 
 impl QCode {
@@ -308,10 +351,22 @@ impl QCode {
             _ => None,
         };
         let entry = Self::entry(&config, &gates);
+        // The saved engine does not answer and the other one does: the same page a change in the
+        // settings opens is offered, and nothing is changed until the person takes it. Only
+        // asked of a setup that is through, since the wizard is where an engine is first chosen.
+        let offer = match (kind, entry) {
+            (Some(saved), None) if gates.engine != EngineCheck::Working => {
+                let other = switch::other(saved);
+                switch::offer_at_start(saved, false, detect(other).is_ok()).map(|to| (saved, to))
+            }
+            _ => None,
+        };
         Self::new(config, dirs, host, &gates, found, ui::setup::languages::system_here(), entry)
+            .with_switch_offer(offer)
             .with_session(Session::file())
             .with_registry(Registry::file())
             .with_service(ServiceHost::detect(), Platform::host())
+            .with_update_notice(UpdateFolders::here())
             .following_files()
     }
 
@@ -383,6 +438,10 @@ impl QCode {
             registry: None,
             service: None,
             farewell: Farewell::default(),
+            switch: None,
+            switching_from: None,
+            finder: ui::switch::Finder::detecting(),
+            updates: None,
         }
         .refreshed_home()
     }
@@ -393,6 +452,35 @@ impl QCode {
     pub fn with_left_behind(mut self, files: Vec<qframe::diagnostics::Diagnostic>) -> Self {
         self.settings = self.settings.with_left_behind(files);
         self
+    }
+
+    /// The same application opening on the offer to move from the first engine to the second,
+    /// which QCode makes at start when the saved engine does not answer and the other one does;
+    /// `None` opens as it would have.
+    #[must_use]
+    pub fn with_switch_offer(mut self, offer: Option<(EngineKind, EngineKind)>) -> Self {
+        if let Some(engines) = offer {
+            self.open_switch(engines, true);
+        }
+        self
+    }
+
+    /// The same application finding the engines of the page that follows a change of engine
+    /// with `finder`, which is how a test hands it engines of its own.
+    #[must_use]
+    pub fn with_finder(mut self, finder: ui::switch::Finder) -> Self {
+        self.finder = finder;
+        self
+    }
+
+    /// Opens the page that follows a change of engine from the first to the second. It looks
+    /// at both engines as soon as it is shown.
+    fn open_switch(&mut self, engines: (EngineKind, EngineKind), offered: bool) {
+        let profiles = self.store().map(|store| store.profiles().value).unwrap_or_default();
+        self.switch = Some(ui::switch::Switch::new(engines, offered, self.user, profiles, self.finder.clone()));
+        if self.page() != Page::Switch {
+            self.router.push(Page::Switch);
+        }
     }
 
     /// The same application, remembering its open workspaces in the session file at `path`: the
@@ -458,6 +546,47 @@ impl QCode {
         self
     }
 
+    /// The same application, asking at start whether a newer version is out while the family's
+    /// update notice in `folders` is on, and showing that switch in the settings. `None` asks
+    /// nothing and shows no switch, which is every test that has not said otherwise.
+    #[must_use]
+    pub fn with_update_notice(mut self, folders: Option<UpdateFolders>) -> Self {
+        let on = folders.as_ref().map(|folders| Family::QUVYTA.update_notice_in(&folders.config));
+        self.settings = self.settings.with_update_notice(on);
+        self.updates = folders;
+        self
+    }
+
+    /// The question for a newer version of QCode, when the family's update notice is on.
+    ///
+    /// The switch is read here, not only where the question is sent: a family that turned it off
+    /// asks nothing at all, whoever runs the question.
+    fn ask_for_update(&self) -> Command<Msg> {
+        let Some(folders) = &self.updates else { return Command::none() };
+        if !Family::QUVYTA.update_notice_in(&folders.config) {
+            return Command::none();
+        }
+        let check = UpdateCheck::new(
+            Family::QUVYTA,
+            store::APP,
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+            Msg::NewVersion,
+        )
+        .in_folders(folders.config.clone(), folders.state.clone());
+        Command::check_for_update(check)
+    }
+
+    /// Turns the family's update notice on or off in its shared file, off the render path.
+    fn store_update_notice(&self, on: bool) -> Command<Msg> {
+        let Some(folders) = &self.updates else { return Command::none() };
+        let folder = folders.config.clone();
+        Command::perform(move || {
+            let stored = Family::QUVYTA.set_update_notice_in(&folder, on).map_err(|error| error.to_string());
+            Msg::Settings(ui::settings::Msg::Stored(stored))
+        })
+    }
+
     /// The same application on the workspace screen `screen`, the way a restored session opens
     /// it; for a screen built by hand, such as a demonstration's. The screen's first work, reading
     /// the open workspace's folder and asking after its containers, starts when
@@ -520,6 +649,7 @@ impl QCode {
             Page::Providers => self.providers.as_ref().and_then(ui::providers::entry),
             Page::Workspace => self.workspace.as_ref().map(ui::workspace::entry),
             Page::Settings => Some(ui::settings::entry(&self.settings)),
+            Page::Switch => self.switch.as_ref().map(ui::switch::entry),
         };
         control.map_or_else(Command::none, Command::focus)
     }
@@ -655,13 +785,7 @@ impl QCode {
         let entered = match self.workspace.as_mut() {
             Some(screen) => ui::workspace::add(screen, workspace),
             None => {
-                let mut screen = WorkspaceScreen::new(self.found.clone(), self.user, vec![workspace])
-                    .with_registry(self.registry.clone())
-                    .backing_up(self.config.backup_every())
-                    .watching(self.live_files)
-                    .bridging(self.live_files);
-                screen.set_editor(self.config.editor());
-                screen.set_sound(self.config.sound());
+                let mut screen = self.workspace_screen(vec![workspace]);
                 let entered = ui::workspace::opened(&mut screen);
                 self.workspace = Some(screen);
                 entered
@@ -670,6 +794,20 @@ impl QCode {
         self.enter_workspace();
         self.config.remember_workspace(id);
         Command::batch([entered.map(Msg::Workspace), self.take_focus(), self.save(), self.keep_session()])
+    }
+
+    /// A workspace screen of `workspaces`, set the way the settings file says. Opening one
+    /// workspace and bringing a session back both make theirs here, so neither can miss a setting.
+    fn workspace_screen(&self, workspaces: Vec<OpenWorkspace>) -> WorkspaceScreen {
+        let mut screen = WorkspaceScreen::new(self.found.clone(), self.user, workspaces)
+            .with_registry(self.registry.clone())
+            .backing_up(self.config.backup_every())
+            .watching(self.live_files)
+            .bridging(self.live_files);
+        screen.set_editor(self.config.editor());
+        screen.set_sound(self.config.sound());
+        screen.set_ask_first(self.config.ask_first());
+        screen
     }
 
     /// Brings back the workspaces and tabs of `session` that the store still has, and says
@@ -697,13 +835,7 @@ impl QCode {
         let ids: Vec<WorkspaceId> = contents.iter().map(|one| one.file.id.clone()).collect();
         let workspaces: Vec<OpenWorkspace> =
             contents.into_iter().map(|one| OpenWorkspace::new(&one.file, one.paths, one.profiles)).collect();
-        let mut screen = WorkspaceScreen::new(self.found.clone(), self.user, workspaces)
-            .with_registry(self.registry.clone())
-            .backing_up(self.config.backup_every())
-            .watching(self.live_files)
-            .bridging(self.live_files);
-        screen.set_editor(self.config.editor());
-        screen.set_sound(self.config.sound());
+        let mut screen = self.workspace_screen(workspaces);
         for (index, id) in ids.iter().enumerate() {
             if let Some(record) = session.workspaces.iter().find(|record| record.id == *id) {
                 screen.restore_tabs(index, record);
@@ -813,8 +945,11 @@ impl QCode {
         self.refresh_home();
         let service = self.settings.service();
         let left_behind = self.settings.left_behind().to_vec();
-        self.settings =
-            SettingsScreen::new(&self.config, self.engine.clone()).with_service(service).with_left_behind(left_behind);
+        let update_notice = self.settings.update_notice();
+        self.settings = SettingsScreen::new(&self.config, self.engine.clone())
+            .with_service(service)
+            .with_left_behind(left_behind)
+            .with_update_notice(update_notice);
         if !self.router.back() {
             self.router.replace(Page::Home);
         }
@@ -845,7 +980,49 @@ impl QCode {
         self.workspace = None;
         self.refresh_home();
         let (command, _) = ui::settings::update(&mut self.settings, ui::settings::Msg::Checked(health));
-        command.map(Msg::Settings)
+        let command = command.map(Msg::Settings);
+        // The engine chosen in the settings answers: the page that follows the change opens. One
+        // that does not answer yet keeps it waiting, so it still opens once the engine is started.
+        let from = match self.switching_from {
+            Some(from) if from != kind && self.found.is_some() => self.switching_from.take(),
+            _ => None,
+        };
+        match from {
+            Some(from) => {
+                self.open_switch((from, kind), false);
+                Command::batch([command, self.survey(), self.take_focus()])
+            }
+            None => command,
+        }
+    }
+
+    /// Asks both engines of the open switch page what the switch involves.
+    fn survey(&self) -> Command<Msg> {
+        match (&self.switch, self.page()) {
+            (Some(page), Page::Switch) => ui::switch::survey(page).map(Msg::Switch),
+            _ => Command::none(),
+        }
+    }
+
+    /// Does what the switch page asked for.
+    fn switched(&mut self, request: ui::switch::Request) -> Command<Msg> {
+        match request {
+            // The offer at start was taken: the engine that answers is the one from now on.
+            ui::switch::Request::Use(kind) => {
+                if let Some(page) = self.switch.as_mut() {
+                    page.taken();
+                }
+                self.config.set_engine_kind(kind.name());
+                Command::batch([self.save(), self.look()])
+            }
+            ui::switch::Request::Leave => {
+                self.switch = None;
+                if !self.router.back() {
+                    self.router.replace(Page::Home);
+                }
+                self.take_focus()
+            }
+        }
     }
 
     /// Does what the settings screen asked for, past every question it needed.
@@ -868,6 +1045,10 @@ impl QCode {
                 self.save()
             }
             Request::Engine(kind) => {
+                // Remembered until the new engine answers: the page that follows the change is
+                // about an engine that works, and one that does not is the repair strip's.
+                let before = self.config.engine_kind().and_then(EngineKind::from_name);
+                self.switching_from = before.filter(|before| *before != kind);
                 self.config.set_engine_kind(kind.name());
                 Command::batch([self.save(), self.look()])
             }
@@ -882,6 +1063,13 @@ impl QCode {
                 self.config.set_sound(sound);
                 if let Some(screen) = self.workspace.as_mut() {
                     screen.set_sound(sound);
+                }
+                self.save()
+            }
+            Request::AskFirst(ask) => {
+                self.config.set_ask_first(ask);
+                if let Some(screen) = self.workspace.as_mut() {
+                    screen.set_ask_first(ask);
                 }
                 self.save()
             }
@@ -903,6 +1091,7 @@ impl QCode {
                 };
                 Command::batch([applied, self.save()])
             }
+            Request::UpdateNotice(on) => self.store_update_notice(on),
             Request::InstallService => self.change_service(true),
             Request::RemoveService => self.change_service(false),
         }
@@ -1077,34 +1266,40 @@ fn trouble(problem: &ui::setup::gates::EngineProblem) -> Trouble {
         EngineProblem::NotInstalled => Trouble::NotInstalled,
         EngineProblem::DaemonStopped { .. } => Trouble::DaemonStopped,
         EngineProblem::MachineStopped { .. } => Trouble::MachineStopped,
-        EngineProblem::Refused { output, .. } => Trouble::Refused(output.clone()),
+        // Both are refusals the settings screen reads again and says plainly.
+        EngineProblem::Refused { output, .. }
+        | EngineProblem::NoPermission { output, .. }
+        | EngineProblem::NoIdRanges { output, .. } => Trouble::Refused(output.clone()),
         EngineProblem::NotRunnable { message, .. } => Trouble::NotRunnable(message.clone()),
     }
+}
+
+/// What the list of keys is reached by at the foot of the rail: the icon set's question mark.
+const KEYS_ICON: &str = "help";
+
+/// The ways out of the workspace screen, at the foot of its rail: an empty row, the list of keys,
+/// the settings, another empty row and the way back on the last row.
+///
+/// They stand under the rail rather than in a header and a footer of their own because the
+/// middle of that screen is a terminal, and a terminal is worth more rows than three controls
+/// that are each one cell wide. The way back is nearest the bottom edge, which is where the
+/// hand that reaches for it already is. The empty rows are the owner's: one keeps the foot apart
+/// from the last workspace, one keeps the way back apart from the settings, so a hand going for
+/// one does not land on the other.
+fn under_rail(ui: &mut View<'_, Msg>) {
+    ui.column(|ui| {
+        ui.spacer().height(Length::Cells(1));
+        ui.add(IconButton::new(KEYS_ICON).tooltip(t!("app.keys")).on_press(Msg::Help(true))).id("keys");
+        ui.add(IconButton::new("settings").tooltip(t!("home.settings")).on_press(Msg::Open(Entry::Settings)))
+            .id("rail-settings");
+        ui.spacer().height(Length::Cells(1));
+        ui.add(IconButton::new("arrow-left").tooltip(t!("app.back")).on_press(Msg::Back)).id("back");
+    });
 }
 
 /// The one key hint every screen carries, at the bottom right: the key that opens the list of
 /// every key, which is also a button for the pointer. The hint bars the screens once had are that
 /// list now, so the screens keep their room and nothing they listed is lost.
-/// What the list of keys is reached by at the foot of the rail: a question mark, which QCode
-/// adds to the icon set itself because the framework's has no glyph for this yet.
-const KEYS_ICON: &str = "help";
-
-/// The ways out of the workspace screen, at the foot of its rail: the list of keys, the settings
-/// and the way back, in that order down to the last row.
-///
-/// They stand under the rail rather than in a header and a footer of their own because the
-/// middle of that screen is a terminal, and a terminal is worth more rows than three controls
-/// that are each one cell wide. The way back is nearest the bottom edge, which is where the
-/// hand that reaches for it already is.
-fn under_rail(ui: &mut View<'_, Msg>) {
-    ui.column(|ui| {
-        ui.add(IconButton::new(KEYS_ICON).tooltip(t!("app.keys")).on_press(Msg::Help(true))).id("keys");
-        ui.add(IconButton::new("settings").tooltip(t!("home.settings")).on_press(Msg::Open(Entry::Settings)))
-            .id("rail-settings");
-        ui.add(IconButton::new("arrow-left").tooltip(t!("app.back")).on_press(Msg::Back)).id("back");
-    });
-}
-
 fn keys_hint(ui: &mut View<'_, Msg>) {
     let key = ui.env().keymap().chords_for(Scope::Global, "help").first().map(KeyChord::label);
     ui.row(|ui| {
@@ -1128,6 +1323,7 @@ fn screen_hints(page: Page, icons: &qframe::icons::Icons) -> Vec<(String, String
         Page::Providers => ui::providers::hints(icons),
         Page::Workspace => ui::workspace::hints(icons),
         Page::Settings => ui::settings::hints(icons),
+        Page::Switch => ui::switch::hints(icons),
     }
 }
 
@@ -1139,7 +1335,9 @@ impl App for QCode {
     fn init(&mut self) -> Command<Msg> {
         match self.setup.as_mut() {
             Some(setup) => ui::setup::opened(setup).map(Msg::Setup),
-            None => self.take_focus(),
+            // Not while the wizard is open: a first start has enough to say, and the next start
+            // asks.
+            None => Command::batch([self.take_focus(), self.survey(), self.ask_for_update()]),
         }
     }
 
@@ -1236,6 +1434,15 @@ impl App for QCode {
                     None => command,
                 }
             }
+            Msg::Switch(message) => {
+                let Some(page) = self.switch.as_mut() else { return Command::none() };
+                let (command, request) = ui::switch::update(page, message);
+                let command = command.map(Msg::Switch);
+                match request {
+                    Some(request) => Command::batch([command, self.switched(request)]),
+                    None => command,
+                }
+            }
             Msg::Back => self.leave(),
             Msg::Quit => self.quit(),
             Msg::Help(open) => {
@@ -1248,6 +1455,7 @@ impl App for QCode {
             Msg::SignedOut(Ok(())) => Command::toast(Toast::success(t!("settings.signed-out"))),
             Msg::SignedOut(Err(reason)) => Command::toast(Toast::danger(t!("settings.sign-out-failed")).body(reason)),
             Msg::Refreshed(profile, outcome) => Command::toast(refreshed(&profile, outcome)),
+            Msg::NewVersion(update) => Command::toast(update.toast()),
         }
     }
 
@@ -1360,6 +1568,11 @@ impl QCode {
             }
             Page::Settings => {
                 ui.map(Msg::Settings, |ui| ui::settings::view(&self.settings, ui)).fill();
+            }
+            Page::Switch => {
+                if let Some(page) = &self.switch {
+                    ui.map(Msg::Switch, |ui| ui::switch::view(page, ui)).fill();
+                }
             }
             // Drawn whole by `draw` once its screen exists; before that there is nothing to show.
             Page::Workspace => {}
@@ -1583,6 +1796,58 @@ mod tests {
         assert!(screen.contains("Next"), "the way on is still on the screen:\n{screen}");
     }
 
+    /// Two stand-in engines that answer everything and hold nothing, found by the switch page in
+    /// place of the machine's own: the page is about the application moving between them, and
+    /// the machine running the test may have neither.
+    fn stand_in_engines(name: &str) -> crate::ui::switch::Finder {
+        let folder = scratch(&format!("switch-{name}"));
+        std::fs::create_dir_all(&folder).expect("a folder");
+        for engine in ["podman", "docker"] {
+            let path = folder.join(engine);
+            std::fs::write(&path, "#!/bin/sh\nexit 0\n").expect("a stand-in engine");
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("runnable");
+        }
+        crate::ui::switch::Finder::new(move |kind| Some(crate::engine::Engine::new(kind, folder.join(kind.name()))))
+    }
+
+    #[test]
+    fn choosing_the_other_engine_in_the_settings_opens_what_the_move_takes_once_it_answers() {
+        let store = scratch("switch-settings-store");
+        let app = app(config(&store, &[]), &settled(), None).with_finder(stand_in_engines("settings"));
+        let mut harness = harness(app, 110, 44);
+        harness.click_text("Settings").render();
+        assert_eq!(harness.app().page(), Page::Settings, "{}", harness.screen());
+        // The engine's own choice, the way the person makes it: the list, then the other engine.
+        harness.click_text("Podman").render();
+        harness.click_text("Docker").render();
+        assert_eq!(harness.app().config.engine_kind(), Some("docker"), "{}", harness.screen());
+        // What looking for Docker answers on a machine that has it; the machine running this test
+        // may not, so the answer is handed over rather than asked of it.
+        let docker = crate::engine::Engine::new(crate::engine::EngineKind::Docker, "/stand-in/docker");
+        harness.send(Msg::Looked(crate::engine::EngineKind::Docker, Ok(Box::new(docker)))).render();
+        assert_eq!(harness.app().page(), Page::Switch, "{}", harness.screen());
+        assert!(harness.screen().contains("Moving from Podman to Docker"), "{}", harness.screen());
+        harness.click_text("Done").render();
+        assert_eq!(harness.app().page(), Page::Settings, "Done goes back where the change was made");
+    }
+
+    #[test]
+    fn a_saved_engine_that_does_not_answer_beside_one_that_does_opens_on_the_same_offer() {
+        let store = scratch("switch-start-store");
+        let app = app(config(&store, &[]), &without_engine(), None)
+            .with_finder(stand_in_engines("start"))
+            .with_switch_offer(Some((crate::engine::EngineKind::Podman, crate::engine::EngineKind::Docker)));
+        let mut harness = harness(app, 110, 44);
+        let screen = harness.screen();
+        assert_eq!(harness.app().page(), Page::Switch, "{screen}");
+        assert!(screen.contains("Podman does not answer, and Docker does."), "{screen}");
+        assert_eq!(harness.app().config.engine_kind(), Some("podman"), "nothing is changed by itself");
+        harness.click_text("Use Docker").render();
+        assert_eq!(harness.app().config.engine_kind(), Some("docker"));
+        assert!(!harness.screen().contains("Use Docker"), "the offer was taken:\n{}", harness.screen());
+        assert!(harness.screen().contains("Moving from Podman to Docker"), "the rest of the page stays");
+    }
+
     /// The mark the chosen row of a list of choices carries, read off `screen` as the one
     /// character that stands before `name` and before nothing else in `names`.
     ///
@@ -1660,9 +1925,14 @@ mod tests {
         rail_foot(harness, 0);
     }
 
-    /// The list of keys, two rows above it.
-    fn rail_keys(harness: &mut qframe::runtime::Harness<super::QCode>) {
+    /// The settings, above the empty row over the way back.
+    fn rail_settings(harness: &mut qframe::runtime::Harness<super::QCode>) {
         rail_foot(harness, 2);
+    }
+
+    /// The list of keys, right above the settings.
+    fn rail_keys(harness: &mut qframe::runtime::Harness<super::QCode>) {
+        rail_foot(harness, 3);
     }
 
     /// Opens the workspace `Firefly` of a fresh store at `root`.
@@ -1678,28 +1948,215 @@ mod tests {
     }
 
     #[test]
-    fn the_foot_of_the_rail_carries_the_keys_the_settings_and_the_way_back_one_row_each() {
+    fn the_switch_that_asks_before_messages_between_tabs_reaches_the_open_workspace_and_the_file() {
+        let root = scratch("ask-first");
+        let mut harness = open_workspace(&root);
+        let asks = |harness: &qframe::runtime::Harness<super::QCode>| {
+            let screen = harness.app().workspace.as_ref().expect("the workspace screen is open");
+            (screen.ask_first(), harness.app().config.ask_first())
+        };
+        assert_eq!(asks(&harness), (false, false), "QCode starts without asking");
+
+        rail_settings(&mut harness);
+        assert_eq!(harness.app().page(), Page::Settings, "{}", harness.screen());
+        harness.resize(SIZE.0, 70).render();
+        // A switch is drawn in colour alone; it stands at the column's right edge, which the
+        // language drop-down's arrow marks.
+        let (_, row) = harness.find("Ask before the first message").expect("the row is on screen");
+        let (edge, _) = harness.find("▾").expect("the language drop-down");
+        harness.click(edge - 1, row).advance(MOMENT);
+        assert_eq!(asks(&harness), (true, true), "{}", harness.screen());
+
+        harness.click(edge - 1, row).advance(MOMENT);
+        assert_eq!(asks(&harness), (false, false));
+        let file = harness.app().config.to_toml();
+        assert!(!file.contains("[bridge]"), "not asking is not written down:\n{file}");
+        let _ = std::fs::remove_dir_all(&root);
+
+        // A settings file that turned it on opens its workspaces asking.
+        let root = scratch("ask-first-stored");
+        let _ = std::fs::remove_dir_all(&root);
+        crate::store::Store::new(&root)
+            .create_workspace("Firefly", qframe::date::Date::today_utc())
+            .expect("the store takes a workspace");
+        let mut stored = config(&root, &[]);
+        stored.set_ask_first(true);
+        let mut opened = super::testing::harness(app(stored, &settled(), None), SIZE.0, SIZE.1);
+        opened.click_text("Workspaces").advance(MOMENT);
+        opened.click_text("Firefly").advance(MOMENT);
+        assert_eq!(asks(&opened), (true, true), "{}", opened.screen());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The family's folders of a test named `what`, empty, so the update notice starts on as it
+    /// does on a machine that never chose.
+    fn family(what: &str) -> super::UpdateFolders {
+        let root = scratch(&format!("family-{what}"));
+        let _ = std::fs::remove_dir_all(&root);
+        super::UpdateFolders { config: root.join("config"), state: root.join("state") }
+    }
+
+    /// QCode on its home screen over the family's `folders`, as a person starts it.
+    fn started(folders: &super::UpdateFolders) -> qframe::runtime::Harness<super::QCode> {
+        let store = scratch("updates-store");
+        super::testing::harness(
+            app(config(&store, &[]), &settled(), None).with_update_notice(Some(folders.clone())),
+            SIZE.0,
+            SIZE.1,
+        )
+    }
+
+    /// Moves the switch of the family's update notice in the settings, where it is drawn: a switch
+    /// is colour alone and stands at the column's right edge, which the language drop-down's arrow
+    /// marks.
+    fn click_update_notice(harness: &mut qframe::runtime::Harness<super::QCode>) {
+        harness.click_text("Settings").advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Settings, "{}", harness.screen());
+        harness.resize(SIZE.0, 70).render();
+        let (_, row) = harness.find("Say when an update is out").expect("the switch is on screen");
+        let (edge, _) = harness.find("▾").expect("the language drop-down");
+        harness.click(edge - 1, row).advance(MOMENT);
+    }
+
+    #[test]
+    fn a_newer_version_is_said_in_the_familys_notice_and_the_same_one_is_not() {
+        let folders = family("newer");
+        let mut harness = started(&folders);
+        let asked = harness.update_checks().to_vec();
+        assert_eq!(asked.len(), 1, "QCode asks once at start");
+        assert_eq!((asked[0].package(), asked[0].current()), ("quvyta-code", env!("CARGO_PKG_VERSION")));
+        assert!(!harness.screen().contains("is out"), "nothing is said before the answer");
+
+        harness.set_latest_version(Some("9.9.9")).advance(MOMENT);
+        let screen = harness.screen();
+        assert!(screen.contains("quvyta-code 9.9.9 is out"), "the notice names the new version:\n{screen}");
+        assert!(screen.contains(env!("CARGO_PKG_VERSION")), "and the one running:\n{screen}");
+
+        for latest in [env!("CARGO_PKG_VERSION"), "0.0.1"] {
+            let mut same = started(&family("same"));
+            same.set_latest_version(Some(latest)).advance(MOMENT);
+            assert!(!same.screen().contains("is out"), "{latest} is not newer:\n{}", same.screen());
+        }
+        let _ = std::fs::remove_dir_all(folders.config.parent().expect("the family's root"));
+    }
+
+    #[test]
+    fn the_setup_wizard_is_not_interrupted_by_the_question() {
+        let folders = family("wizard");
+        let store = scratch("updates-wizard-store");
+        let fresh = app(config(&store, &[]), &settled(), Some(SetupStep::Language)).with_update_notice(Some(folders));
+        let harness = super::testing::harness(fresh, SIZE.0, SIZE.1);
+        assert_eq!(harness.app().page(), Page::Setup);
+        assert!(harness.update_checks().is_empty(), "nothing is asked while the wizard is open");
+    }
+
+    #[test]
+    fn the_switch_in_the_settings_turns_the_question_off_for_the_family_and_back_on() {
+        use qframe::storage::Family;
+
+        let folders = family("switch");
+        let mut harness = started(&folders);
+        assert_eq!(harness.update_checks().len(), 1, "on until someone turns it off");
+        click_update_notice(&mut harness);
+        assert!(!Family::QUVYTA.update_notice_in(&folders.config), "the family's file says off:\n{}", harness.screen());
+        let shared = std::fs::read_to_string(folders.config.join("quvyta.conf")).expect("the family's file");
+        assert!(shared.contains("update-notice = false"), "{shared}");
+
+        let mut off = started(&folders);
+        assert!(off.update_checks().is_empty(), "a QCode started with it off asks nothing at all");
+        off.set_latest_version(Some("9.9.9")).advance(MOMENT);
+        assert!(!off.screen().contains("is out"), "{}", off.screen());
+
+        click_update_notice(&mut off);
+        assert!(Family::QUVYTA.update_notice_in(&folders.config), "turned back on:\n{}", off.screen());
+        let on = started(&folders);
+        assert_eq!(on.update_checks().len(), 1, "and the next start asks again");
+        let _ = std::fs::remove_dir_all(folders.config.parent().expect("the family's root"));
+    }
+
+    #[test]
+    fn the_foot_of_the_rail_is_a_gap_the_keys_the_settings_a_gap_and_the_way_back() {
         let root = scratch("rail-foot");
         let mut harness = open_workspace(&root);
         let screen = harness.screen();
         let rows: Vec<&str> = screen.lines().collect();
         let icons = harness.env().icons();
         let (settings, arrow) = (icons.glyph("settings").into_owned(), icons.glyph("arrow-left").into_owned());
-        // Three rows, not three each: a workspace tab is three rows tall and these are not tabs.
-        assert_eq!(rows[rows.len() - 3].trim(), "?", "the keys:\n{screen}");
-        assert_eq!(rows[rows.len() - 2].trim(), settings, "the settings above the way back:\n{screen}");
-        assert_eq!(rows[rows.len() - 1].trim(), arrow, "and the way back on the very last row:\n{screen}");
+        // The rail is four cells wide; the rest of each row is the tab and the panel.
+        let rail = |row: &str| row.chars().take(4).collect::<String>();
+        let foot: Vec<String> = rows[rows.len() - 5..].iter().map(|row| rail(row).trim().to_owned()).collect();
+        assert_eq!(foot, ["", "?", settings.as_str(), "", arrow.as_str()], "the foot of the rail:\n{screen}");
 
         // Each one does what it stands for, pressed where it stands.
         rail_keys(&mut harness);
         assert!(harness.screen().contains("close tab"), "the keys opened:\n{}", harness.screen());
         harness.press("esc").advance(MOMENT);
-        rail_foot(&mut harness, 1);
+        rail_settings(&mut harness);
         assert_eq!(harness.app().page(), Page::Settings, "the settings opened:\n{}", harness.screen());
         harness.click_text("Back").advance(MOMENT);
         rail_back(&mut harness);
         assert_eq!(harness.app().page(), Page::Workspaces, "the way back led back:\n{}", harness.screen());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Opens `count` workspaces of a fresh store at `root`, one after the other, so the rail holds
+    /// all of them; the first by name is opened last and is the one on screen.
+    fn open_workspaces(
+        root: &std::path::Path,
+        count: usize,
+        size: (u16, u16),
+    ) -> qframe::runtime::Harness<super::QCode> {
+        let _ = std::fs::remove_dir_all(root);
+        let store = crate::store::Store::new(root);
+        let names: Vec<String> = (0..count).map(|index| format!("Place{index:02}")).collect();
+        for name in &names {
+            store.create_workspace(name, qframe::date::Date::today_utc()).expect("the store takes a workspace");
+        }
+        let mut harness = harness(app(config(root, &[]), &settled(), None), size.0, size.1);
+        harness.click_text("Workspaces").advance(MOMENT);
+        for (index, name) in names.iter().rev().enumerate() {
+            harness.click_text(name).advance(MOMENT);
+            assert_eq!(harness.app().page(), Page::Workspace, "{name} opened:\n{}", harness.screen());
+            if index + 1 < names.len() {
+                // The way back, on the last row, leads to the list of workspaces.
+                harness.click(1, i32::from(size.1) - 1).advance(MOMENT);
+            }
+        }
+        harness
+    }
+
+    #[test]
+    fn the_workspaces_take_every_row_above_the_foot_and_the_gaps_are_nobodys() {
+        // Heights of every remainder a workspace's four rows can leave, so at one of them a
+        // rail that had the gap's row would draw one more workspace there, and a wide one.
+        let sizes = (20..28).map(|height| (80, height)).chain([(160, 50)]);
+        for size in sizes {
+            let root = scratch(&format!("rail-fill-{}x{}", size.0, size.1));
+            // More workspaces than the rail has rows for, so every row the rail owns holds one.
+            let count = usize::from(size.1 / 3) + 2;
+            let mut harness = open_workspaces(&root, count, size);
+            assert_eq!(harness.app().page(), Page::Workspace, "{}", harness.screen());
+            let height = i32::from(size.1);
+            let screen = harness.screen();
+            let rows: Vec<&str> = screen.lines().collect();
+            let rail = |row: &str| row.chars().take(4).collect::<String>();
+            // The gap over the foot is empty, and the rail reaches down to it: what is left between
+            // its last workspace and the gap is less than one more workspace would need, which is
+            // a workspace's three rows and the row between two of them.
+            let gap = rows.len() - 5;
+            assert_eq!(rail(rows[gap]).trim(), "", "the gap over the foot at {size:?}:\n{screen}");
+            let last =
+                (0..gap).rev().find(|&row| !rail(rows[row]).trim().is_empty()).expect("the rail draws workspaces");
+            assert!(gap - last - 1 < 4, "the rail leaves {} rows unused at {size:?}:\n{screen}", gap - last - 1);
+
+            // Pressing either empty row does nothing: it opens no other workspace and no control,
+            // so the screen stays exactly as it was.
+            for up in [4, 1] {
+                harness.click(1, height - 1 - up).advance(MOMENT);
+                assert_eq!(harness.screen(), screen, "row {up} up changed something at {size:?}");
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     #[test]
@@ -1732,7 +2189,7 @@ mod tests {
             match page {
                 Page::Workspace => {
                     let rows: Vec<&str> = screen.lines().collect();
-                    let keys = rows[rows.len() - 3].trim();
+                    let keys = rows[rows.len() - 4].trim();
                     assert_eq!(keys, "?", "the way to the keys is in the rail:\n{screen}");
                     assert!(!screen.contains("Keys"), "and nowhere else:\n{screen}");
                 }
@@ -1815,7 +2272,7 @@ mod tests {
         let (back_x, back_y) = harness.find(&arrow).expect("the way back");
         let (keys_x, keys_y) = harness.find("?").expect("the way to the keys");
         assert_eq!(back_y, i32::from(SIZE.1) - 1, "the way back is on the last row:\n{screen}");
-        assert_eq!(keys_y, i32::from(SIZE.1) - 3, "and the keys two rows above it:\n{screen}");
+        assert_eq!(keys_y, i32::from(SIZE.1) - 4, "and the keys three rows above it:\n{screen}");
         assert!(back_x < panel_x && keys_x < panel_x, "both in the rail, not over the panel:\n{screen}");
         // The rail is where they are, so the tabs have the first row and the terminal the last.
         assert!(screen.lines().next().is_some_and(|row| row.contains('+')), "the tabs are first:\n{screen}");
@@ -1988,6 +2445,7 @@ mod tests {
             assets: crate::profile::MountAccess::ReadOnly,
             network: crate::profile::NetworkMode::Full,
             without: Vec::new(),
+            os: crate::base::Os::Debian,
         };
         store.write_profile(&profile).expect("the store takes a profile");
         harness.click_text("Back").advance(MOMENT);
@@ -2030,6 +2488,7 @@ mod tests {
         harness.click_text("opencode").advance(MOMENT);
         harness.click_text("Next").advance(MOMENT);
         harness.click_text("Next").advance(MOMENT);
+        harness.click_text("Next").advance(MOMENT);
         harness.click_text("free, no account").advance(MOMENT);
         harness.click_text("Next").advance(MOMENT);
         harness.click_text("Next").advance(MOMENT);
@@ -2059,7 +2518,9 @@ mod tests {
         let mut harness = harness(app, SIZE.0, SIZE.1);
         harness.click_text("Profiles").advance(MOMENT);
         harness.click_text("New profile").advance(MOMENT);
-        // Claude Code is the harness offered first; the template and then the account follow.
+        // Claude Code is the harness offered first; the system, the template and then the account
+        // follow.
+        harness.click_text("Next").advance(MOMENT);
         harness.click_text("Next").advance(MOMENT);
         harness.click_text("Next").advance(MOMENT);
         harness.click_text("a provider of your own").advance(MOMENT);
@@ -2105,6 +2566,7 @@ mod tests {
         harness.click_text("New profile").advance(MOMENT);
         harness.type_text("scout");
         harness.click_text("opencode").advance(MOMENT);
+        harness.click_text("Next").advance(MOMENT);
         harness.click_text("Next").advance(MOMENT);
         harness.click_text("Next").advance(MOMENT);
         harness.click_text("free, no account").advance(MOMENT);

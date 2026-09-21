@@ -2,9 +2,12 @@
 //! out everything which would reach into a container while there is no engine.
 
 use qframe::prelude::*;
-use qframe::widgets::{Placement, Tooltip};
+use qframe::widgets::{CopyValue, Placement, Tooltip};
 
+use crate::engine::known::{self, Known};
 use crate::engine::{EngineKind, Unavailable};
+use crate::store::Platform;
+use crate::ui::setup::install::IdRanges;
 
 /// The engine's name, as people write it rather than as its binary is called.
 #[must_use]
@@ -13,6 +16,75 @@ pub fn name(kind: EngineKind) -> String {
         EngineKind::Podman => t!("settings.podman"),
         EngineKind::Docker => t!("settings.docker"),
     }
+}
+
+/// What to tell the person about an engine refusal QCode recognises: the plain sentence, and the
+/// one line that puts it right where there is one line that does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Help {
+    /// What happened and what to do, in the person's language.
+    pub sentence: String,
+    /// The command to run, when this system has one QCode can promise.
+    pub line: Option<String>,
+}
+
+/// The help for `output`, the words `kind` refused with, when they are a refusal QCode
+/// recognises; `None` leaves the engine's own words to speak for themselves.
+#[must_use]
+pub fn help(kind: EngineKind, output: &str) -> Option<Help> {
+    known::recognise(output).map(|known| help_for(kind, known, Platform::host()))
+}
+
+/// The help for a refusal already recognised, on `platform`.
+#[must_use]
+pub fn help_for(kind: EngineKind, known: Known, platform: Platform) -> Help {
+    let engine = name(kind);
+    let sentence = match known {
+        Known::ImageMissing => t!("known.image-missing", engine = engine),
+        Known::NotRunning => t!("known.not-running", engine = engine),
+        Known::NoPermission => t!("known.no-permission", engine = engine),
+        Known::NoIdRanges => t!("known.no-id-ranges", engine = engine),
+    };
+    let line = match (known, kind, platform) {
+        (Known::NotRunning, EngineKind::Docker, Platform::Linux) => {
+            Some("sudo systemctl enable --now docker".to_owned())
+        }
+        (Known::NotRunning, EngineKind::Docker, Platform::MacOs) => Some("open -a Docker".to_owned()),
+        // Podman on Linux needs no service of its own; one it cannot reach is the socket a
+        // remote connection points at, which the person's own systemd starts.
+        (Known::NotRunning, EngineKind::Podman, Platform::Linux) => {
+            Some("systemctl --user enable --now podman.socket".to_owned())
+        }
+        (Known::NotRunning, EngineKind::Podman, _) => Some("podman machine start".to_owned()),
+        (Known::NoPermission, _, Platform::Linux) => Some("sudo usermod -aG docker $USER".to_owned()),
+        (Known::NoIdRanges, _, Platform::Linux) => Some(id_ranges_line()),
+        _ => None,
+    };
+    Help { sentence, line }
+}
+
+impl Help {
+    /// Draws the sentence and, under it, the line to run beside a few words saying so. The
+    /// line is a value the person copies: QCode runs nothing of the kind by itself here.
+    pub fn show<M: Clone + 'static>(&self, ui: &mut View<'_, M>) {
+        ui.add(Text::new(self.sentence.clone()).role("secondary")).fill_width();
+        if let Some(line) = &self.line {
+            ui.row(|ui| {
+                ui.add(Text::new(t!("known.run")).role("faint"));
+                ui.add(CopyValue::new(line.clone())).id("known-line").fill_width();
+            })
+            .gap(2)
+            .fill_width();
+        }
+    }
+}
+
+/// The line that gives this account its id ranges. The two files are read once, the first time
+/// the line is needed, which is only ever while podman is refusing for want of them: the range
+/// they lead to stays right until the line is run, and after that it is no longer shown.
+fn id_ranges_line() -> String {
+    static LINE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LINE.get_or_init(|| IdRanges::here().line()).clone()
 }
 
 /// Why the engine cannot be used, in a shape a screen can keep.
