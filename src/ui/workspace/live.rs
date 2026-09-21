@@ -65,6 +65,8 @@ impl Scratch {
             network: Network::Full,
             window: None,
             bridge: None,
+            guidance: None,
+            graphify: false,
         }
     }
 }
@@ -190,6 +192,149 @@ fn a_stopped_container_of_an_older_plan_is_made_again_with_the_bridge_and_keeps_
         capture(&engine.remove_container(REMADE)).expect("the container is removed");
         capture(&engine.remove_volume(&home.volume())).expect("the home is removed");
     }
+}
+
+/// Brings up a real QCode high container of `harness` in a scratch workspace through the path a
+/// tab takes, on every engine, and hands `check` a shell into it; then brings it up a second time
+/// and checks that nothing in the workspace changed. Everything made is removed again.
+fn verify_guided(harness: crate::profile::HarnessKind, check: impl Fn(&dyn Fn(&str) -> String, &Path)) {
+    use crate::profile::guidance::{self, BEGIN};
+    use crate::profile::{AccountKind, MountAccess, NetworkMode, Profile, SafeName, Template};
+    use crate::store::{WorkspaceId, WorkspacePaths};
+
+    for engine in engines() {
+        let kind = engine.kind();
+        let scratch = Scratch::new();
+        let profile = Profile {
+            name: SafeName::parse(&format!("guidetest-{}", harness.record().id)).expect("a safe name"),
+            harness,
+            template: Template::High,
+            account: AccountKind::Subscription,
+            provider: None,
+            assets: MountAccess::ReadOnly,
+            network: NetworkMode::None,
+            without: Vec::new(),
+        };
+        let workspace = WorkspaceId::parse("uiguidelive").expect("a workspace id");
+        let paths = WorkspacePaths {
+            root: scratch.0.clone(),
+            file: scratch.0.join("workspace.qcode"),
+            code: scratch.0.join("Work"),
+            assets: scratch.0.join("Assets"),
+            harness: scratch.0.join("Containers").join("Harness"),
+        };
+        let plan = ContainerPlan::profile(&workspace, &paths, &profile);
+        assert_eq!(plan.guidance, Some(harness), "a QCode high profile's plan brings its files up to date");
+        let home = plan.home.clone().expect("a profile has a home");
+        // Everything this run makes goes again, also when a check below fails.
+        let _made = Made {
+            engine: engine.clone(),
+            profile: profile.clone(),
+            container: plan.name.clone(),
+            volume: home.volume(),
+        };
+        let _ = capture(&engine.remove_container(&plan.name));
+        let _ = capture(&engine.remove_volume(&home.volume()));
+
+        let built = std::time::Instant::now();
+        crate::profile::harness_live::build(&engine, &profile);
+        eprintln!("{kind:?} {}: QCode high image built in {} s", harness.record().id, built.elapsed().as_secs());
+
+        // The person's own file is there first; nothing of it may be lost.
+        let file = paths.code.join(guidance::file(harness));
+        std::fs::create_dir_all(file.parent().expect("a folder")).expect("the folder");
+        std::fs::write(&file, "# uiguidelive\n\nThe person's own line.\n").expect("the person's file");
+
+        let user = HostUser::current().expect("the current user");
+        let started = std::time::Instant::now();
+        let answer = super::start(None, &engine, &plan, user, None, "tok-guidelive", |result| {
+            result.unwrap_or_else(|failure| panic!("{kind:?}: the container did not come up: {failure:?}"));
+            super::Msg::Deliver
+        });
+        eprintln!(
+            "{kind:?} {}: first bring-up, with graphify and QCode's section, {} ms",
+            harness.record().id,
+            started.elapsed().as_millis()
+        );
+        assert!(matches!(answer, super::Msg::Deliver), "{kind:?}: nothing went wrong on the way: {answer:?}");
+
+        let run = |script: &str| {
+            capture(&engine.exec_without_terminal(&Exec { container: &plan.name, command: &["sh", "-c", script] }))
+                .unwrap_or_else(|error| panic!("{kind:?}: `{script}` failed: {error:?}"))
+        };
+        let text = std::fs::read_to_string(&file).expect("the file is there");
+        assert!(text.starts_with("# uiguidelive\n\nThe person's own line.\n"), "{kind:?}: {text}");
+        assert!(text.contains("## graphify"), "{kind:?}: graphify wrote its section: {text}");
+        assert!(text.contains(&guidance::block()), "{kind:?}: {text}");
+        assert_eq!(text.matches(BEGIN).count(), 1, "{kind:?}");
+        // The agent in the container reads the same file.
+        assert_eq!(run(&format!("cat /work/{}", guidance::file(harness))), text, "{kind:?}");
+        // graphify's skill came with the image into this workspace's home.
+        run(&format!("test -f \"$HOME/{}\"", guidance::skill(harness)));
+        check(&run, &paths.code);
+
+        // Twice is harmless: the container is running, graphify writes nothing new and QCode's
+        // section is already as it would be written.
+        let before = run("cd /work && find . -type f -exec sha256sum {} + | sort");
+        let started = std::time::Instant::now();
+        let again = super::start(None, &engine, &plan, user, None, "tok-guidelive", |result| {
+            result.expect("up again");
+            super::Msg::Deliver
+        });
+        eprintln!("{kind:?} {}: second bring-up {} ms", harness.record().id, started.elapsed().as_millis());
+        assert!(matches!(again, super::Msg::Deliver), "{kind:?}: {again:?}");
+        assert_eq!(run("cd /work && find . -type f -exec sha256sum {} + | sort"), before, "{kind:?}: nothing changed");
+    }
+}
+
+/// What a guided live run made: its container, its home volume and its images, taken away when
+/// the run ends, however it ends.
+struct Made {
+    engine: Engine,
+    profile: crate::profile::Profile,
+    container: String,
+    volume: String,
+}
+
+impl Drop for Made {
+    fn drop(&mut self) {
+        let _ = capture(&self.engine.remove_container(&self.container));
+        let _ = capture(&self.engine.remove_volume(&self.volume));
+        crate::profile::harness_live::clear(&self.engine, &self.profile, &self.container);
+    }
+}
+
+#[test]
+#[ignore = "needs a container engine and the network; run with QCODE_CONTAINER_TESTS=1"]
+fn a_qcode_high_claude_code_container_comes_up_with_graphifys_part_and_qcodes_in_claude_md() {
+    verify_guided(crate::profile::HarnessKind::ClaudeCode, |run, code| {
+        // The hooks are in the project settings Claude Code reads from the folder it runs in,
+        // and graphify's command answers inside the container, where the hook runs it.
+        let settings = std::fs::read_to_string(code.join(".claude/settings.json")).expect("the project settings");
+        assert!(settings.contains("\"PreToolUse\""), "{settings}");
+        assert!(settings.contains("/usr/local/bin/graphify hook-guard search"), "{settings}");
+        assert!(settings.contains("/usr/local/bin/graphify hook-guard read"), "{settings}");
+        run("cd /work && echo '{}' | /usr/local/bin/graphify hook-guard search");
+        // Claude Code's own package names the project settings file graphify wrote into.
+        let found =
+            run("grep -rlaF -- '.claude/settings.json' /usr/local/npm/lib/node_modules/@anthropic-ai | head -1");
+        assert!(!found.trim().is_empty(), "Claude Code reads .claude/settings.json");
+    });
+}
+
+#[test]
+#[ignore = "needs a container engine and the network; run with QCODE_CONTAINER_TESTS=1"]
+fn a_qcode_high_opencode_container_comes_up_with_graphifys_part_and_qcodes_in_agents_md() {
+    verify_guided(crate::profile::HarnessKind::OpenCode, |run, code| {
+        let settings = std::fs::read_to_string(code.join(".opencode/opencode.json")).expect("the project settings");
+        assert!(settings.contains(".opencode/plugins/graphify.js"), "{settings}");
+        assert!(code.join(".opencode/plugins/graphify.js").is_file(), "graphify's plugin");
+        // opencode itself, in the workspace, loads the plugin graphify registered, beside the
+        // one QCode high put in the image.
+        let config = run("cd /work && opencode debug config 2>&1");
+        assert!(config.contains("graphify.js"), "{config}");
+        assert!(config.contains("oh-my-openagent"), "{config}");
+    });
 }
 
 /// The name of the machine QCode is running on, read without asking a shell for it.

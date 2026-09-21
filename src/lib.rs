@@ -15,6 +15,7 @@ pub mod bridge;
 pub mod desktop;
 pub mod engine;
 pub mod profile;
+pub mod provider;
 pub mod service;
 pub mod store;
 pub mod ui;
@@ -40,6 +41,7 @@ use store::{
 };
 use ui::home::{Entry, Home};
 use ui::profiles::Profiles;
+use ui::providers::Providers as ProvidersScreen;
 use ui::settings::engine::{EngineState, Health, Trouble};
 use ui::settings::{Request, ServiceRow, Settings as SettingsScreen};
 use ui::setup::Setup;
@@ -163,6 +165,8 @@ pub enum Page {
     Workspaces,
     /// The profiles of the store.
     Profiles,
+    /// The model services of the person's own.
+    Providers,
     /// One workspace: its tabs, its terminals and its panel.
     Workspace,
     /// What the person can change about QCode.
@@ -178,6 +182,7 @@ impl Page {
             Self::Home => "home",
             Self::Workspaces => "workspaces",
             Self::Profiles => "profiles",
+            Self::Providers => "providers",
             Self::Workspace => "workspace",
             Self::Settings => "settings",
         }
@@ -221,6 +226,8 @@ pub enum Msg {
     Workspaces(ui::workspaces::Msg),
     /// Something happened on the profiles screen.
     Profiles(ui::profiles::Msg),
+    /// Something happened on the providers screen.
+    Providers(Box<ui::providers::Msg>),
     /// Something happened on the workspace screen.
     Workspace(ui::workspace::Msg),
     /// Something happened on the settings screen.
@@ -259,6 +266,7 @@ pub struct QCode {
     home: Home,
     workspaces: Option<Workspaces>,
     profiles: Option<Profiles>,
+    providers: Option<ProvidersScreen>,
     workspace: Option<WorkspaceScreen>,
     settings: SettingsScreen,
     help: bool,
@@ -362,6 +370,7 @@ impl QCode {
             home: Home::new(Vec::new()),
             workspaces: None,
             profiles: None,
+            providers: None,
             workspace: None,
             settings,
             help: false,
@@ -406,6 +415,18 @@ impl QCode {
     /// its harness would wait for the disk and the socket forever.
     fn following_files(mut self) -> Self {
         self.live_files = true;
+        self
+    }
+
+    /// The same application whose providers screen reads the file at `path` and asks its
+    /// questions through `web`.
+    ///
+    /// Both are parameters for the same reason [`Installer`] is one: a test drives the whole
+    /// screen — adding a provider, trying the connection, measuring a window — with a file of
+    /// its own and a web that answers from a string, and nothing it does can reach the network.
+    #[must_use]
+    pub fn with_providers(mut self, path: Option<PathBuf>, web: provider::Web) -> Self {
+        self.providers = Some(ProvidersScreen::new(path, web));
         self
     }
 
@@ -496,6 +517,7 @@ impl QCode {
             Page::Home => Some(ui::home::entry()),
             Page::Workspaces => None,
             Page::Profiles => self.profiles.as_ref().and_then(ui::profiles::entry),
+            Page::Providers => self.providers.as_ref().and_then(ui::providers::entry),
             Page::Workspace => self.workspace.as_ref().map(ui::workspace::entry),
             Page::Settings => Some(ui::settings::entry(&self.settings)),
         };
@@ -509,6 +531,7 @@ impl QCode {
             Entry::Workspaces => self.show_workspaces(false),
             Entry::NewWorkspace => self.show_workspaces(true),
             Entry::Profiles => self.show_profiles(),
+            Entry::Providers => self.show_providers(),
             Entry::Settings => self.show_settings(),
             Entry::Continue => self.resume(),
         }
@@ -555,11 +578,29 @@ impl QCode {
     fn show_profiles(&mut self) -> Command<Msg> {
         let Some(store) = self.store() else { return self.repair(SetupStep::Location) };
         if self.profiles.is_none() {
-            self.profiles = Some(Profiles::new(Some(store.root().to_path_buf()), self.found.clone()));
+            // The wizard offers what the Providers page writes, so both read the same file.
+            let providers = match &self.providers {
+                Some(screen) => screen.path().map(std::path::Path::to_path_buf),
+                None => crate::provider::Providers::file(),
+            };
+            self.profiles = Some(
+                Profiles::new(Some(store.root().to_path_buf()), self.found.clone()).with_providers_file(providers),
+            );
         }
         let Some(screen) = self.profiles.as_mut() else { return Command::none() };
         self.router.push(Page::Profiles);
         ui::profiles::update(screen, ui::profiles::Msg::Reload).map(Msg::Profiles)
+    }
+
+    /// Opens the providers screen, which reads the providers file and nothing else: not one
+    /// request leaves the machine because a page was opened.
+    fn show_providers(&mut self) -> Command<Msg> {
+        if self.providers.is_none() {
+            self.providers = Some(ProvidersScreen::new(crate::provider::Providers::file(), provider::Web::network()));
+        }
+        let Some(screen) = self.providers.as_mut() else { return Command::none() };
+        self.router.push(Page::Providers);
+        ui::providers::update(screen, ui::providers::Msg::Reload).map(|message| Msg::Providers(Box::new(message)))
     }
 
     /// Opens the settings screen.
@@ -884,7 +925,15 @@ impl QCode {
             return Command::none();
         }
         self.router.back();
-        Command::batch([self.take_focus(), self.reread_profiles()])
+        Command::batch([self.take_focus(), self.reread_profiles(), self.reread_providers()])
+    }
+
+    /// Reads the providers again for the profiles screen when it is returned to: its wizard sends
+    /// the person to the Providers page to add one, and the one added there is what they came
+    /// back to choose.
+    fn reread_providers(&mut self) -> Command<Msg> {
+        let (Page::Profiles, Some(screen)) = (self.page(), self.profiles.as_mut()) else { return Command::none() };
+        ui::profiles::update(screen, ui::profiles::Msg::ReloadProviders).map(Msg::Profiles)
     }
 
     /// Reads the store's profiles again for the workspace screen when it is returned to, so a
@@ -1076,6 +1125,7 @@ fn screen_hints(page: Page, icons: &qframe::icons::Icons) -> Vec<(String, String
         Page::Home => ui::home::hints(icons),
         Page::Workspaces => ui::workspaces::hints(icons),
         Page::Profiles => ui::profiles::hints(icons),
+        Page::Providers => ui::providers::hints(icons),
         Page::Workspace => ui::workspace::hints(icons),
         Page::Settings => ui::settings::hints(icons),
     }
@@ -1118,12 +1168,23 @@ impl App for QCode {
                     None => command,
                 }
             }
+            Msg::Providers(message) => {
+                let Some(screen) = self.providers.as_mut() else { return Command::none() };
+                ui::providers::update(screen, *message).map(|message| Msg::Providers(Box::new(message)))
+            }
             Msg::Profiles(message) => {
                 let Some(screen) = self.profiles.as_mut() else { return Command::none() };
                 // The listing is what puts the list on screen, and the wizard is the person's
                 // own doing, so the keyboard is only moved when there is no wizard over it.
                 let landed = matches!(message, ui::profiles::Msg::Loaded(_));
+                // The wizard's own account page cannot open a screen of its own; the row that
+                // says a provider is needed asks the application for it, the way the workspace
+                // screen already asks for the profiles screen below.
+                let wants_providers = matches!(message, ui::profiles::Msg::ManageProviders);
                 let command = ui::profiles::update(screen, message).map(Msg::Profiles);
+                if wants_providers {
+                    return Command::batch([command, self.show_providers()]);
+                }
                 // A workspace waiting behind this screen was waiting for exactly one thing, and it
                 // now has it: the wizard closing is the way back. Reached from anywhere else the
                 // screen stays open, because there the list of profiles is the thing wanted.
@@ -1149,7 +1210,19 @@ impl App for QCode {
                     None => Command::none(),
                 };
                 let shown = match asked {
-                    Some(Page::Profiles) => self.show_profiles(),
+                    // The row the person pressed says "New profile", so the wizard is what opens,
+                    // not the list with a second button to press for the same wish.
+                    Some(Page::Profiles) => {
+                        let shown = self.show_profiles();
+                        let arrived = self.page() == Page::Profiles;
+                        let wizard = match self.profiles.as_mut().filter(|_| arrived) {
+                            Some(screen) => {
+                                ui::profiles::update(screen, ui::profiles::Msg::NewWhenRead).map(Msg::Profiles)
+                            }
+                            None => Command::none(),
+                        };
+                        Command::batch([shown, wizard])
+                    }
                     Some(Page::Workspaces) => self.show_workspaces(false),
                     _ => Command::none(),
                 };
@@ -1280,6 +1353,11 @@ impl QCode {
                     ui.map(Msg::Profiles, |ui| ui::profiles::view(screen, ui)).fill();
                 }
             }
+            Page::Providers => {
+                if let Some(screen) = &self.providers {
+                    ui.map(|message| Msg::Providers(Box::new(message)), |ui| ui::providers::view(screen, ui)).fill();
+                }
+            }
             Page::Settings => {
                 ui.map(Msg::Settings, |ui| ui::settings::view(&self.settings, ui)).fill();
             }
@@ -1337,8 +1415,27 @@ pub(crate) mod testing {
     }
 
     /// An application over `config`, opening on the wizard's `entry` step or on the home screen.
+    ///
+    /// Its providers screen reads a file of this test's own and asks through a web that reaches
+    /// nothing, so no test can read the person's data folder or leave the machine.
     pub fn app(config: Config, gates: &Gates, entry: Option<SetupStep>) -> QCode {
-        QCode::new(config, dirs(), host(), gates, None, None, entry)
+        QCode::new(config, dirs(), host(), gates, None, None, entry).with_providers(Some(providers_file()), no_web())
+    }
+
+    /// A providers file of this process's own, never the person's.
+    pub fn providers_file() -> PathBuf {
+        scratch("providers").join("providers.toml")
+    }
+
+    /// A web that reaches nothing at all: a test that sends a request by accident is told so
+    /// rather than quietly going out over the network.
+    pub fn no_web() -> crate::provider::Web {
+        crate::provider::Web::new(|ask| {
+            Err(crate::provider::AskError::Unreachable {
+                url: ask.url.clone(),
+                reason: "no test reaches the network".to_owned(),
+            })
+        })
     }
 
     /// An application on its home screen holding an engine whose binary is not there: every
@@ -1347,6 +1444,7 @@ pub(crate) mod testing {
     pub fn app_with_absent_engine(config: Config) -> QCode {
         let engine = Engine::new(EngineKind::Podman, "/qcode/no/such/engine");
         QCode::new(config, dirs(), host(), &settled(), Some(engine), None, None)
+            .with_providers(Some(providers_file()), no_web())
     }
 
     /// Runs the test `name` of this crate again in a process of its own, with none of the
@@ -1808,6 +1906,7 @@ mod tests {
         for (row, page, word) in [
             ("Workspaces", Page::Workspaces, "New workspace"),
             ("Profiles", Page::Profiles, "Profiles"),
+            ("Providers", Page::Providers, "plain text"),
             ("Settings", Page::Settings, "Language"),
         ] {
             harness.click_text(row).advance(MOMENT);
@@ -1885,8 +1984,10 @@ mod tests {
             harness: crate::profile::HarnessKind::ClaudeCode,
             template: crate::profile::Template::Recommended,
             account: crate::profile::AccountKind::Subscription,
+            provider: None,
             assets: crate::profile::MountAccess::ReadOnly,
             network: crate::profile::NetworkMode::Full,
+            without: Vec::new(),
         };
         store.write_profile(&profile).expect("the store takes a profile");
         harness.click_text("Back").advance(MOMENT);
@@ -1912,11 +2013,18 @@ mod tests {
         let mut harness = harness(app(config(&root, &[]), &settled(), None), SIZE.0, SIZE.1);
         harness.click_text("Workspaces").advance(MOMENT);
         harness.click_text("Firefly").advance(MOMENT);
-        // The row a workspace offers when it has no profile to open a tab with.
-        harness.send(Msg::Workspace(crate::ui::workspace::Msg::ManageProfiles)).advance(MOMENT);
-        assert_eq!(harness.app().page(), Page::Profiles, "{}", harness.screen());
-
+        // The row a workspace's new tab offers when it has no profile to open a tab with. One
+        // press for one wish: it lands in the wizard, not on a list with another such button.
+        harness.click_text("New tab").advance(MOMENT);
         harness.click_text("New profile").advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Profiles, "{}", harness.screen());
+        assert!(
+            harness.app().profiles.as_ref().and_then(|screen| screen.draft()).is_some(),
+            "the wizard is open:\n{}",
+            harness.screen()
+        );
+        assert!(!harness.screen().contains("No profiles yet"), "{}", harness.screen());
+
         harness.type_text("scout");
         // A harness with no sign-in, so the image page is the wizard's last one.
         harness.click_text("opencode").advance(MOMENT);
@@ -1937,6 +2045,51 @@ mod tests {
             harness.screen()
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_provider_added_on_the_way_out_of_the_wizard_is_offered_when_the_person_comes_back() {
+        let root = scratch("wizard-provider");
+        let _ = std::fs::remove_dir_all(&root);
+        let _store = crate::store::Store::new(&root);
+        let providers = scratch("wizard-provider-file").join("providers.toml");
+        let _ = std::fs::remove_dir_all(providers.parent().expect("its folder"));
+        let app =
+            app(config(&root, &[]), &settled(), None).with_providers(Some(providers.clone()), crate::testing::no_web());
+        let mut harness = harness(app, SIZE.0, SIZE.1);
+        harness.click_text("Profiles").advance(MOMENT);
+        harness.click_text("New profile").advance(MOMENT);
+        // Claude Code is the harness offered first; the template and then the account follow.
+        harness.click_text("Next").advance(MOMENT);
+        harness.click_text("Next").advance(MOMENT);
+        harness.click_text("a provider of your own").advance(MOMENT);
+        assert!(harness.screen().contains("You have not added a provider yet"), "{}", harness.screen());
+
+        // Exactly what the page says to do: go to Providers, add one, come back.
+        harness.click_text("Go to Providers").advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Providers, "{}", harness.screen());
+        harness.click_text("Add a provider").advance(MOMENT);
+        harness.click_text("ollama").advance(MOMENT);
+        harness.press("tab");
+        harness.type_text("ev");
+        harness.press("tab");
+        for _ in 0..80 {
+            harness.press("backspace");
+        }
+        harness.type_text("http://192.168.122.1:11434");
+        harness.click_text("Add").advance(MOMENT);
+        assert!(std::fs::read_to_string(&providers).is_ok_and(|text| text.contains("\"ev\"")), "it was added");
+        harness.click_text("Back").advance(MOMENT);
+
+        assert_eq!(harness.app().page(), Page::Profiles, "{}", harness.screen());
+        let screen = harness.screen();
+        assert!(!screen.contains("You have not added a provider yet"), "the wizard no longer says so:\n{screen}");
+        assert!(screen.contains("ev"), "the provider just added is offered:\n{screen}");
+        harness.click_text("ev").advance(MOMENT);
+        let draft = harness.app().profiles.as_ref().and_then(|screen| screen.draft()).expect("the wizard is open");
+        assert_eq!(draft.provider_tag.as_deref(), Some("ev"), "and it can be chosen");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(providers.parent().expect("its folder"));
     }
 
     #[test]
@@ -2019,7 +2172,7 @@ mod tests {
         // The click left the selection on Settings, so one press up is the row above it, and
         // that press is the first key after coming back.
         harness.press("up").press("enter").advance(MOMENT);
-        assert_eq!(harness.app().page(), Page::Profiles, "{}", harness.screen());
+        assert_eq!(harness.app().page(), Page::Providers, "{}", harness.screen());
     }
 
     #[test]

@@ -783,16 +783,22 @@ fn install_choice(setup: &Setup, command: &str, ui: &mut View<'_, Msg>) {
     })
     .gap(2)
     .fill_width();
+    // Right under the button that asked for it, as that button's answer. The row a gap would
+    // take is one the promise at the foot of the step needs in an 80 by 24 terminal.
     if matches!(setup.install, Install::Shown) {
-        ui.spacer().height(Length::Cells(1));
         line(ui, &t!("setup.install-with"), command);
     }
 }
 
-/// A command the person runs themselves, with its one-line explanation above it.
+/// A command the person runs themselves, with its few words of explanation in front of it on
+/// the same row, where they read as one sentence and cost no row of their own.
 fn line(ui: &mut View<'_, Msg>, label: &str, command: &str) {
-    ui.add(Text::new(label.to_owned()).role("faint"));
-    ui.add(CopyValue::new(command.to_owned())).id("setup-command").fill_width();
+    ui.row(|ui| {
+        ui.add(Text::new(label.to_owned()).role("faint"));
+        ui.add(CopyValue::new(command.to_owned())).id("setup-command").fill_width();
+    })
+    .gap(2)
+    .fill_width();
 }
 
 /// The third step: where the store goes.
@@ -1133,6 +1139,36 @@ mod tests {
         assert!(screen.contains("Install it with"), "{screen}");
         assert!(screen.contains("paru -S podman"), "the command belongs to this machine:\n{screen}");
         assert!(!screen.contains("running here"), "showing a command runs nothing:\n{screen}");
+    }
+
+    #[test]
+    fn at_80_by_24_the_shown_command_and_the_whole_promise_under_it_fit_in_every_language() {
+        // The end of the promise is what a page too short for it cut off, mid-sentence, with
+        // nothing to say more was below. Every language is walked, so the one that wraps the
+        // most is among them.
+        for code in crate::store::Config::LANGUAGES {
+            let gates = gates(EngineCheck::Broken(EngineProblem::NotInstalled), LocationCheck::Unknown);
+            let config = format!("language = \"{code}\"\n");
+            // The seam every installation goes through, holding nothing that could install: it
+            // counts what it is asked to start, and showing a command must ask it for nothing.
+            let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = std::sync::Arc::clone(&started);
+            let installer = Installer::new(move |_| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(std::io::Error::other("nothing is installed in a test"))
+            });
+            let mut harness = on(&config, &gates, Some(temporary("home")), (80, 24), host(), installer);
+            harness.set_locale(code).render();
+            let shown = harness.env().i18n().translate("setup.install-myself", &[]);
+            harness.click_text(&shown).render();
+            let screen = harness.screen();
+            assert!(screen.contains("paru -S podman"), "{code}: the command is shown:\n{screen}");
+            let promise = harness.env().i18n().translate("setup.never-installs", &[]);
+            // Read the way a person reads it: across the lines it wraps onto, whole.
+            let bare = |text: &str| text.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+            assert!(bare(&screen).contains(&bare(&promise)), "{code}: the promise is whole on screen:\n{screen}");
+            assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 0, "{code}: nothing was started");
+        }
     }
 
     #[test]

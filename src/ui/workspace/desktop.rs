@@ -80,6 +80,11 @@ pub(super) fn open(screen: &WorkspaceScreen, key: TabKey, run: u64) -> Command<M
         return Command::perform(move || Msg::WindowOpened(key, run, Ok(Opening::Waiting)));
     }
     let (user, registry) = (screen.user, screen.registry.clone());
+    let token = screen
+        .workspaces
+        .iter()
+        .find_map(|workspace| workspace.tabs.iter().find(|tab| tab.key() == key))
+        .map_or_else(String::new, |tab| tab.token().to_owned());
     let display = match &screen.display {
         Ok(display) => display.clone(),
         Err(reason) => {
@@ -88,11 +93,23 @@ pub(super) fn open(screen: &WorkspaceScreen, key: TabKey, run: u64) -> Command<M
         }
     };
     Command::perform(move || {
+        // Made ready before the window is opened, because the application reads its settings and
+        // its instructions as it starts and its container cannot be written to once it is running.
+        let prepared = plan::prepare_window(&engine, &plan, user, &token);
+        let unregistered =
+            plan.bridge.as_ref().and_then(|bridge| prepared.bridge.err().map(|trouble| (bridge.harness, trouble)));
+        let unguided = plan.guidance.and_then(|harness| prepared.guidance.err().map(|trouble| (harness, trouble)));
         let opened = plan::open_window(&engine, &plan, user, &display).map(|_| Opening::Up);
         // Noted like every container QCode starts, so a QCode that is closed while a window is
         // open stops it rather than leaving it on the screen with nothing behind it.
         let up = opened.is_ok();
-        let message = Msg::WindowOpened(key, run, opened);
+        let mut message = Msg::WindowOpened(key, run, opened);
+        if let Some((harness, trouble)) = unregistered {
+            message = Msg::Unbridged(harness, trouble, Box::new(message));
+        }
+        if let Some((harness, trouble)) = unguided {
+            message = Msg::Unguided(harness, trouble, Box::new(message));
+        }
         if up { super::noted(registry.as_deref(), engine.kind(), &plan.name, message) } else { message }
     })
 }

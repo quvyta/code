@@ -48,6 +48,11 @@ pub enum AccountKind {
     /// make, store or carry: the harness writes it into the workspace's home volume itself and
     /// finds it there again. QCode's sign-in container and credential volume have no part in it.
     InApp,
+    /// A provider the person added on the Providers page, named in the profile by its tag and a
+    /// model of its own. Nothing for QCode's sign-in container to make either: the key already
+    /// lives in `providers.toml`, and a tab of this profile is pointed at the workspace's relay
+    /// instead of the provider's own address, so the key never enters the container.
+    Provider,
 }
 
 /// A configuration file a template writes into the image, by its path under the home directory.
@@ -154,6 +159,10 @@ pub enum McpShape {
     Gemini,
     /// TOML, one `[mcp_servers.<name>]` table per server with `command` and `args`.
     Codex,
+    /// JSON, servers under `mcpServers` with `command`, `args` and `env`. Its schema names every
+    /// field a server may have and takes no other, so neither Claude Code's `type` nor Gemini
+    /// CLI's `trust` belongs in this file.
+    Antigravity,
 }
 
 /// Everything QCode needs to know about one harness to build its image, start it and carry its
@@ -190,14 +199,45 @@ pub struct Harness {
     pub identity: &'static [&'static str],
     /// The configuration the `recommended` template writes, when the harness reads one.
     pub settings: Option<ConfigFile>,
+    /// What the harness keeps of the questions it asks on its very first start, already
+    /// answered, so that a tab opens on its prompt instead of on a question whose highlighted
+    /// answer leaves. Written by both QCode templates; `None` for a harness that asks nothing.
+    pub first_start: Option<ConfigFile>,
     /// How the harness is told to open a conversation it had before, by that conversation's id;
     /// `None` for one that keeps no conversations QCode can list.
     pub resume: Option<Resume>,
     /// Where the harness draws.
     pub surface: Surface,
-    /// Where the harness reads the MCP servers it starts; `None` for one that opens a window,
-    /// which has no agent of QCode's bridge in it.
+    /// Where the harness reads the MCP servers it starts; `None` for one that reads none.
     pub mcp: Option<McpSettings>,
+}
+
+/// Where npm keeps what it downloads while an install step of an image runs, and where nothing is
+/// left once that step is over.
+pub const BUILD_NPM_CACHE: &str = "/tmp/qcode-npm-cache";
+
+impl Harness {
+    /// The install as the `RUN` steps of an image, one per command in [`Harness::install`].
+    ///
+    /// Each step gives npm a cache of its own and removes it before the step ends, so the layer
+    /// the step leaves never holds npm's downloads: left in the base image's shared cache
+    /// (`NPM_CONFIG_CACHE=/var/cache/npm`) they were measured at 323 MB of opencode's image, all
+    /// of it tarballs of what the same layer already holds unpacked.
+    ///
+    /// A private directory rather than emptying the shared one afterwards: the shared cache is
+    /// made by the base image, open to every user, for whatever npm fetches while a container
+    /// runs, and a step that removed and remade it would have to know and repeat how the base
+    /// image made it. The variable is exported rather than written before the command, so it
+    /// holds for the whole step and not only for its first command.
+    #[must_use]
+    pub fn image_steps(&self) -> Vec<String> {
+        self.install
+            .iter()
+            .map(|step| {
+                format!("RUN export NPM_CONFIG_CACHE={BUILD_NPM_CACHE} \\\n && {step} \\\n && rm -rf {BUILD_NPM_CACHE}")
+            })
+            .collect()
+    }
 }
 
 /// How a harness opens an earlier conversation from its command line.
@@ -299,7 +339,7 @@ impl HarnessKind {
 
 impl AccountKind {
     /// Every account type. The wizard offers each harness's own list, in that harness's order.
-    pub const ALL: [Self; 4] = [Self::Free, Self::Subscription, Self::ApiKey, Self::InApp];
+    pub const ALL: [Self; 5] = [Self::Free, Self::Subscription, Self::ApiKey, Self::InApp, Self::Provider];
 
     /// How the account type is written in definition files.
     #[must_use]
@@ -309,6 +349,7 @@ impl AccountKind {
             Self::Subscription => "subscription",
             Self::ApiKey => "api-key",
             Self::InApp => "in-app",
+            Self::Provider => "provider",
         }
     }
 
@@ -325,6 +366,10 @@ impl AccountKind {
     /// where it lands in the workspace's home volume. There is nothing for the sign-in container to
     /// capture and nothing to carry from workspace to workspace, so the profile is ready the moment
     /// its image is, exactly like one that signs in to nothing.
+    ///
+    /// A provider is the same: its key already lives in `providers.toml`, added on the Providers
+    /// page long before this profile existed, so there is nothing for a sign-in container to
+    /// capture either.
     #[must_use]
     pub fn needs_login(self) -> bool {
         matches!(self, Self::Subscription | Self::ApiKey)
@@ -354,10 +399,26 @@ impl AccountKind {
 /// `mcpServers`) and checked against 2.1.278: with the entry [`crate::bridge::config`] writes,
 /// `claude mcp list` checks the server's health and prints `qcode: node … - ✔ Connected`, and
 /// the harness keeps the entry when it rewrites the file at its next start.
+///
+/// First start, checked against 2.1.278 on a terminal in a container at `/work`: a fresh home
+/// asks for a text style, shows its security notes, then asks whether the folder is trusted and
+/// whether the permission mode it was started in is accepted — the last two with "No, exit"
+/// highlighted, so a person pressing Return leaves. Answered by hand, it writes
+/// `hasCompletedOnboarding` and `projects["/work"].hasTrustDialogAccepted` into `~/.claude.json`
+/// and `theme` and `skipDangerousModePermissionPrompt` into `~/.claude/settings.json`. With the
+/// files below and no key pressed it draws its prompt at once; without
+/// `skipDangerousModePermissionPrompt` the permission warning comes back, without
+/// `hasTrustDialogAccepted` the folder question, and without `hasCompletedOnboarding` the text
+/// style. `theme` is not needed: the style question belongs to the onboarding that key closes.
 static CLAUDE_CODE: Harness = Harness {
     id: "claude-code",
     display_name: "Claude Code",
-    accounts: &[AccountKind::Subscription, AccountKind::ApiKey],
+    // A provider is offered here and nowhere else: `ANTHROPIC_BASE_URL` with
+    // `ANTHROPIC_AUTH_TOKEN`, read once at start, is the one redirection this record can verify
+    // works. opencode and Codex have their own provider configuration files rather than an
+    // environment variable, and Gemini CLI's was never tried; offering it to them would be a
+    // claim nobody checked.
+    accounts: &[AccountKind::Subscription, AccountKind::ApiKey, AccountKind::Provider],
     withdrawn: &[],
     install: &["npm install -g @anthropic-ai/claude-code"],
     command: "claude",
@@ -366,12 +427,18 @@ static CLAUDE_CODE: Harness = Harness {
     identity: &[".claude/.credentials.json"],
     settings: Some(ConfigFile {
         path: ".claude/settings.json",
-        contents: "{\n  \"permissions\": {\n    \"defaultMode\": \"bypassPermissions\"\n  }\n}\n",
+        contents: "{\n  \"permissions\": {\n    \"defaultMode\": \"bypassPermissions\"\n  },\n  \"skipDangerousModePermissionPrompt\": true\n}\n",
     }),
+    first_start: Some(ConfigFile { path: ".claude.json", contents: CLAUDE_FIRST_START }),
     resume: Some(Resume::Option("--resume")),
     surface: Surface::Terminal,
     mcp: Some(McpSettings { path: ".claude.json", shape: McpShape::Claude }),
 };
+
+/// Claude Code's answers to its first-start questions, for the workspace mounted at
+/// [`CODE_DIR`](crate::base::paths::CODE_DIR). The same file is where the bridge registers its
+/// server, and it merges into what it finds, so these keys stay.
+const CLAUDE_FIRST_START: &str = "{\n  \"hasCompletedOnboarding\": true,\n  \"projects\": {\n    \"/work\": {\n      \"hasTrustDialogAccepted\": true\n    }\n  }\n}\n";
 
 /// opencode. Install and start command from the opencode documentation (`opencode.ai/docs`), the
 /// argument from `opencode.ai/docs/cli` and `opencode.ai/docs/permissions`, the configuration
@@ -413,6 +480,7 @@ static OPENCODE: Harness = Harness {
         path: ".config/opencode/opencode.json",
         contents: "{\n  \"$schema\": \"https://opencode.ai/config.json\",\n  \"permission\": {\n    \"*\": \"allow\"\n  }\n}\n",
     }),
+    first_start: None,
     resume: Some(Resume::Option("--session")),
     surface: Surface::Terminal,
     mcp: Some(McpSettings { path: ".config/opencode/opencode.json", shape: McpShape::OpenCode }),
@@ -491,6 +559,7 @@ static GEMINI_CLI: Harness = Harness {
         path: ".gemini/settings.json",
         contents: "{\n  \"security\": {\n    \"folderTrust\": {\n      \"enabled\": false\n    }\n  }\n}\n",
     }),
+    first_start: None,
     resume: Some(Resume::Option("--resume")),
     surface: Surface::Terminal,
     mcp: Some(McpSettings { path: ".gemini/settings.json", shape: McpShape::Gemini }),
@@ -546,6 +615,7 @@ static CODEX: Harness = Harness {
         path: ".codex/config.toml",
         contents: "approval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\n",
     }),
+    first_start: None,
     resume: Some(Resume::Subcommand("resume")),
     surface: Surface::Terminal,
     mcp: Some(McpSettings { path: ".codex/config.toml", shape: McpShape::Codex }),
@@ -594,6 +664,13 @@ static CODEX: Harness = Harness {
 /// template's file, which means the workspace's home volume gets it when the volume is first filled
 /// and never again, so an edit the person makes afterwards stays. The store trust question is
 /// deliberately left alone: refusing it on someone's behalf is not QCode's to do.
+///
+/// The servers: the application reads user-level MCP servers from `~/.gemini/config/mcp_config.json`,
+/// which is where its own code joins that path, and its schema takes no field it does not name.
+/// This was measured in a throwaway container: a server written there was started, it was handed
+/// the variable the entry's `env` named, and the application opened the newer era of the protocol
+/// and asked for the tools. So the window's agent reaches the other tabs of the workspace and can
+/// give them work; nothing can be given back to it, because it draws no prompt to type into.
 static ANTIGRAVITY_IDE: Harness = Harness {
     id: "antigravity-ide",
     display_name: "Antigravity IDE",
@@ -608,9 +685,10 @@ static ANTIGRAVITY_IDE: Harness = Harness {
         path: ".config/Antigravity IDE/User/settings.json",
         contents: "{\n  \"telemetry.telemetryLevel\": \"off\",\n  \"update.mode\": \"none\"\n}\n",
     }),
+    first_start: None,
     resume: None,
     surface: Surface::Desktop(&ANTIGRAVITY),
-    mcp: None,
+    mcp: Some(McpSettings { path: ".gemini/config/mcp_config.json", shape: McpShape::Antigravity }),
 };
 
 /// The window Antigravity IDE opens, as the trial measured it.
@@ -692,7 +770,8 @@ mod tests {
     #[test]
     fn configuration_a_template_writes_also_stays_inside_the_home_directory() {
         for harness in HarnessKind::ALL {
-            if let Some(file) = harness.record().settings {
+            let record = harness.record();
+            for file in record.settings.into_iter().chain(record.first_start) {
                 assert!(!file.path.starts_with('/') && !file.path.starts_with('~'), "{harness:?}");
                 assert!(!file.contents.is_empty(), "{harness:?}");
             }
@@ -703,17 +782,15 @@ mod tests {
     fn every_harness_reads_its_servers_from_its_home_and_never_from_its_login() {
         for harness in HarnessKind::ALL {
             let record = harness.record();
-            // A harness that opens a window has no such file: nothing of QCode's runs inside it.
-            let Some(mcp) = record.mcp else {
-                assert!(matches!(record.surface, Surface::Desktop(_)), "{harness:?} reads servers from nowhere");
-                continue;
-            };
-            let path = mcp.path;
+            let path = record.mcp.expect("every harness starts servers of its own").path;
             assert!(!path.starts_with('/') && !path.starts_with('~'), "{harness:?}: {path}");
             assert!(!record.identity.contains(&path), "{harness:?}: registering a server would touch the login");
         }
         assert_eq!(HarnessKind::ClaudeCode.record().mcp.expect("it has one").path, ".claude.json");
         assert_eq!(HarnessKind::Codex.record().mcp.expect("it has one").shape, McpShape::Codex);
+        let window = HarnessKind::AntigravityIde.record().mcp.expect("a window reads servers too");
+        assert_eq!(window.path, ".gemini/config/mcp_config.json");
+        assert_eq!(window.shape, McpShape::Antigravity);
     }
 
     #[test]
@@ -732,7 +809,7 @@ mod tests {
         // silently undo the template.
         for harness in HarnessKind::ALL {
             let record = harness.record();
-            if let Some(file) = record.settings {
+            for file in record.settings.into_iter().chain(record.first_start) {
                 assert!(!record.identity.contains(&file.path), "{harness:?}: {}", file.path);
             }
         }
@@ -762,6 +839,15 @@ mod tests {
         assert_eq!(AccountKind::parse("free"), Some(AccountKind::Free));
         assert!(HarnessKind::ClaudeCode.supports(AccountKind::Subscription));
         assert!(HarnessKind::ClaudeCode.supports(AccountKind::ApiKey));
+    }
+
+    #[test]
+    fn only_claude_code_is_offered_a_provider_of_ones_own() {
+        assert!(HarnessKind::ClaudeCode.supports(AccountKind::Provider));
+        for harness in [HarnessKind::OpenCode, HarnessKind::GeminiCli, HarnessKind::Codex] {
+            assert!(!harness.supports(AccountKind::Provider), "{harness:?}");
+        }
+        assert!(!AccountKind::Provider.needs_login(), "the key already lives in providers.toml");
     }
 
     #[test]

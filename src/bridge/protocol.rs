@@ -11,7 +11,7 @@
 //! An answer carries the words the agent is shown, whether it was done, and for a list the tabs:
 //!
 //! ```text
-//! {"ok":true,"text":"…","tabs":[{"tab":"3","title":"codex-main","harness":"Codex","profile":"codex-main","network":true}]}
+//! {"ok":true,"text":"…","tabs":[{"tab":"3","title":"codex-main","harness":"Codex","profile":"codex-main","network":true,"waiting":0,"trouble":null}]}
 //! {"ok":false,"text":"…"}
 //! ```
 //!
@@ -92,6 +92,12 @@ pub struct Listed {
     pub profile: String,
     /// Whether the tab's container reaches the network.
     pub network: bool,
+    /// How many messages are still waiting to be typed into the tab's harness. A sending agent
+    /// reads it to see that what it sent has not arrived yet.
+    pub waiting: usize,
+    /// Why the waiting messages have not been typed in, when something is stopping them, in the
+    /// words the agent is shown. `None` while nothing is.
+    pub trouble: Option<String>,
 }
 
 /// QCode's answer to a question.
@@ -141,6 +147,8 @@ impl Answer {
                         "harness": tab.harness,
                         "profile": tab.profile,
                         "network": tab.network,
+                        "waiting": tab.waiting,
+                        "trouble": tab.trouble,
                     })
                 })
                 .collect();
@@ -216,6 +224,8 @@ mod tests {
             harness: "Codex".to_owned(),
             profile: "codex-main".to_owned(),
             network: false,
+            waiting: 2,
+            trouble: Some("the harness in that tab is not running".to_owned()),
         };
         let line = Answer::listed("one tab".to_owned(), vec![tab]).line();
         let back: Value = serde_json::from_str(line.trim_end()).expect("the answer is JSON");
@@ -223,5 +233,24 @@ mod tests {
         assert_eq!(back["tabs"][0]["tab"], "3");
         assert_eq!(back["tabs"][0]["harness"], "Codex");
         assert_eq!(back["tabs"][0]["network"], Value::Bool(false));
+        assert_eq!(back["tabs"][0]["waiting"], 2);
+        assert_eq!(back["tabs"][0]["trouble"], "the harness in that tab is not running");
+    }
+
+    #[test]
+    fn a_tab_with_nothing_waiting_says_so_rather_than_leaving_it_out() {
+        let tab = Listed {
+            tab: "3".to_owned(),
+            title: "codex-main".to_owned(),
+            harness: "Codex".to_owned(),
+            profile: "codex-main".to_owned(),
+            network: true,
+            waiting: 0,
+            trouble: None,
+        };
+        let line = Answer::listed("one tab".to_owned(), vec![tab]).line();
+        let back: Value = serde_json::from_str(line.trim_end()).expect("the answer is JSON");
+        assert_eq!(back["tabs"][0]["waiting"], 0);
+        assert_eq!(back["tabs"][0]["trouble"], Value::Null);
     }
 }

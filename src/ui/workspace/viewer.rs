@@ -145,11 +145,14 @@ pub(super) fn show_page(screen: &mut WorkspaceScreen, key: TabKey, page: Option<
     let Some(engine) = engine else { return Command::none() };
     tab.turn(Pages { page: page.clamp(1, pages.count), drawn: true, ..pages });
     tab.restarting();
+    let token = tab.token().to_owned();
     let run = tab.run();
     let kind = tab.kind().clone();
     let Some(plan) = workspace.plan(&kind) else { return Command::none() };
     let file = kind.file().map(|file| workspace.files.path(file));
-    super::bring_up(engine, plan, user, key, run, file, registry)
+    // A PDF tab never runs a harness, so it never carries a provider to check.
+    let launch = super::Launch::new(key, run, token, None, None);
+    super::bring_up(engine, plan, launch, user, file, registry)
 }
 
 /// Whether the tab `tab` shows a page drawn, rather than text.

@@ -5,6 +5,36 @@ Every release of quvyta-code, newest first. The format follows
 [Semantic Versioning](https://semver.org/); while the version starts with 0, a minor release may
 change files qcode writes, and the notes say so when it does.
 
+## 0.1.12 - 2026-09-21
+
+### Added
+
+- **Tabs can give each other work.** An agent in one tab can see the other tabs of its workspace and hand one of them a task; the message lands in that agent's own prompt, the way you would have typed it, and it says which tab it came from. The first time one tab writes to another, qcode asks you, and your answer holds for those two tabs until qcode closes. It works for opencode and Claude Code, and was watched working in containers with no network at all. A desktop window (Antigravity) can send work to the tabs but cannot receive any, because it has no prompt to write into.
+- **Two ready-made ways to set up a harness: QCode basic and QCode high.** QCode basic (the recommended one) writes the harness's settings into the image the way qcode runs it, so a new Claude Code tab opens straight at its prompt instead of stopping at questions about trusting the folder. QCode high adds the tools qcode's author works with: graphify, a map of your code the agent asks before it reads files, five Claude Code plugins (superpowers, context7, code-review, security-guidance, block-no-verify) and, for opencode, oh-my-openagent. Each of them is on by default and each can be switched off in the profile wizard; what is off is neither installed nor set up. The wizard says what is downloaded and that building the image needs the network, even when the profile's containers have none.
+- With QCode high, graphify starts building its map of your workspace in the background the first time a tab opens, so the map the agent is told about is really there.
+- **Providers of your own.** A new page beside Profiles: you write down the model services you already have — an ollama server on your own network, or OpenRouter — give each one a tag of your choosing, paste its key where one is needed, try the connection and read back the models it offers. The key is kept in a file of its own (`providers.toml` in qcode's data folder, readable only by you) and never in the settings file; the page says so in a line you cannot miss, because a backup of your home folder carries that file in plain text.
+- qcode measures what a server really gives, rather than repeating what a model claims. A model's own record may say 262 144 tokens while the server quietly accepts three thousand and drops the front of everything larger, which makes an agent look forgetful for no reason anyone can see. The page shows both numbers.
+- **A profile can sign in with one of your providers.** Beside a subscription, an API key and a free tier, a Claude Code profile can run on a provider you added and a model of it. The tab then talks to that provider through a relay: the request leaves your machine from qcode, not from the container, so the provider's key never enters the container at all — a container with no network can still use a model service on your network. The harness is also told the window that was measured, so it stops assuming room the server does not give.
+- The choice is offered for Claude Code only. It is the one harness whose redirection is verified to work; offering it for the others would be a claim nobody checked.
+- In the profile wizard, a model whose window was never measured gets a line saying that Claude Code will assume 200 000 tokens until you measure it on the Providers page.
+
+### Changed
+
+- Harness images are smaller: npm no longer leaves its download cache inside them. An opencode image loses more than 300 MB.
+- The tagline under the logo says what qcode is for: coding agents, always inside a container.
+- The folder your code lives in is called **Work** on the profile screens too, the same name it has on disk and (as `/work`) inside the container.
+
+### Fixed
+
+- The key file is kept the way it was promised: readable only by you, in a folder only you can open. A folder that already existed is narrowed when the file is saved, a warning no longer appears before there is any key to protect, a warning that was put right disappears, and the warning speaks your language.
+- The Providers page keeps its buttons on screen when a server offers many models; the list of models scrolls inside the room that is left.
+- The server address offered in the new-provider dialog is replaced when you type your own, and an address qcode could not send a request to is refused beside the field instead of failing later.
+- Adding a provider from inside the profile wizard ("Go to Providers") and coming back now offers that provider, as the wizard says it will.
+- Choosing **New profile** from a workspace's new tab opens the profile wizard at once, and a finished profile is the one selected in the list.
+- The workspace panel shows a container as soon as a tab brings it up, and its "no container yet" sentence is no longer cut off at the panel's edge.
+- The **Add a provider** button showed a broken icon name instead of its icon.
+- The first-run engine step fits a terminal of 80 by 24 in every language, with no sentence cut off.
+
 ## 0.1.11 - 2026-09-21
 
 ### Added

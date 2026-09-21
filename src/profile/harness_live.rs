@@ -57,8 +57,10 @@ fn profile(harness: HarnessKind) -> Profile {
         harness,
         template: Template::Recommended,
         account: AccountKind::Subscription,
+        provider: None,
         assets: MountAccess::ReadOnly,
         network: NetworkMode::Full,
+        without: Vec::new(),
     }
 }
 
@@ -381,5 +383,111 @@ fn codex_installs_answers_and_keeps_its_login_where_the_record_says() {
         let broken = lab.run("codex login status 2>&1").unwrap_or_else(|said| said);
         assert!(broken.contains("Error loading configuration"), "{kind:?}: the settings file is not read: {broken}");
         lab.ok(&format!("mv \"$HOME/{path}.aside\" \"$HOME/{path}\"", path = settings.path));
+    });
+}
+
+/// A profile of `harness` under QCode high, whose checks run without the network like every
+/// profile here: what the build installed has to work from the image alone.
+fn high(harness: HarnessKind) -> Profile {
+    Profile {
+        name: SafeName::parse(&format!("harnesstest-high-{}", harness.record().id)).expect("the name is safe"),
+        template: Template::High,
+        ..profile(harness)
+    }
+}
+
+/// The size of `image` as the engine reports it, in whole megabytes, for the record of what QCode
+/// high costs.
+fn image_mb(engine: &Engine, image: &str) -> u64 {
+    let program = match engine.kind() {
+        EngineKind::Podman => "podman",
+        EngineKind::Docker => "docker",
+    };
+    let out = std::process::Command::new(program)
+        .args(["image", "inspect", "--format", "{{.Size}}", image])
+        .output()
+        .expect("the engine answers");
+    String::from_utf8_lossy(&out.stdout).trim().parse::<u64>().unwrap_or(0) / 1_000_000
+}
+
+/// Builds the QCode high image of `harness` on every engine, checks what every harness gets, then
+/// `more` for what only that harness gets, and says how long the build took and what it weighs.
+fn verify_high(harness: HarnessKind, more: impl Fn(&Lab)) {
+    let profile = high(harness);
+    for engine in engines() {
+        let started = std::time::Instant::now();
+        let lab = open(engine, &profile);
+        let kind = lab.engine.kind();
+        eprintln!(
+            "{kind:?} {}: QCode high image built in {} s, {} MB",
+            harness.record().id,
+            started.elapsed().as_secs(),
+            image_mb(&lab.engine, &profile.image())
+        );
+
+        // graphify answers, from outside the home, for a user the image never saw, offline.
+        let version = lab.ok("graphify --version");
+        assert!(version.starts_with("graphify "), "{kind:?}: {version}");
+        assert_eq!(lab.ok("command -v graphify").trim(), "/usr/local/bin/graphify", "{kind:?}");
+        let home = lab.ok("ls -A \"$HOME\"; du -sm \"$HOME\" | cut -f1");
+        assert!(!home.contains("pipx") && !home.contains(".local/share/pipx"), "{kind:?}: {home}");
+        eprintln!(
+            "{kind:?} {}: home directory of the image: {} MB",
+            harness.record().id,
+            home.lines().last().unwrap_or("")
+        );
+        let sizes = lab.ok("du -sm /opt/pipx /var/cache/npm /usr/local/npm/lib/node_modules/* 2>/dev/null || true");
+        eprintln!("{kind:?} {}: sizes in MB:\n{sizes}", harness.record().id);
+        // It maps code without asking anyone: the part of it that needs no model.
+        lab.ok("mkdir -p /tmp/g && cd /tmp/g && printf 'def a():\\n    return b()\\n\\ndef b():\\n    return 1\\n' > m.py && graphify update . > /dev/null 2>&1 && test -s graphify-out/graph.json");
+
+        more(&lab);
+        clear(&lab.engine, &profile, &lab.container);
+    }
+}
+
+#[test]
+#[ignore = "needs a container engine and the network; run with QCODE_CONTAINER_TESTS=1"]
+fn qcode_high_gives_claude_code_graphify_and_the_five_plugins() {
+    verify_high(HarnessKind::ClaudeCode, |lab| {
+        let kind = lab.engine.kind();
+        let listed = lab.ok("claude plugin list 2>&1");
+        for plugin in super::CLAUDE_PLUGINS {
+            let at = listed.find(plugin).unwrap_or_else(|| panic!("{kind:?}: {plugin} is not installed:\n{listed}"));
+            let status = listed[at..].lines().find(|line| line.contains("Status:")).unwrap_or_default();
+            assert!(status.contains("enabled"), "{kind:?}: {plugin}: {status}");
+        }
+        // The plugins were added to the settings the template wrote, not written over them, and
+        // the first-start answers are still where Claude Code reads them.
+        let settings = lab.ok("cat \"$HOME/.claude/settings.json\"");
+        assert!(settings.contains("\"skipDangerousModePermissionPrompt\": true"), "{kind:?}: {settings}");
+        assert!(settings.contains("bypassPermissions") && settings.contains("enabledPlugins"), "{kind:?}: {settings}");
+        let state = lab.ok("cat \"$HOME/.claude.json\"");
+        assert!(state.contains("\"hasTrustDialogAccepted\": true"), "{kind:?}: {state}");
+        assert!(state.contains("\"hasCompletedOnboarding\": true"), "{kind:?}: {state}");
+        assert!(!lab.ok("ls /usr/local/npm/lib/node_modules").contains("oh-my-openagent"), "{kind:?}");
+        eprintln!("{kind:?}: plugins in the home: {} MB", lab.ok("du -sm \"$HOME/.claude/plugins\" | cut -f1").trim());
+    });
+}
+
+#[test]
+#[ignore = "needs a container engine and the network; run with QCODE_CONTAINER_TESTS=1"]
+fn qcode_high_gives_opencode_graphify_and_loads_oh_my_openagent_from_the_image() {
+    verify_high(HarnessKind::OpenCode, |lab| {
+        let kind = lab.engine.kind();
+        // Loaded, not only installed: its agents are opencode's own agents now, with no network
+        // and nothing downloaded into the home at start.
+        let agents = lab.ok("cd /work && opencode agent list 2>&1");
+        // These come from the plugin alone; opencode without it lists build, plan, explore,
+        // general and its own helpers.
+        for agent in ["Sisyphus - ultraworker", "Prometheus - Plan Builder", "Metis - Plan Consultant"] {
+            assert!(agents.contains(agent), "{kind:?}: opencode does not load oh-my-openagent:\n{agents}");
+        }
+        let config = lab.ok("cd /work && opencode debug config 2>&1");
+        assert!(config.contains("file:///usr/local/npm/lib/node_modules/oh-my-openagent"), "{kind:?}: {config}");
+        let fetched = lab.ok("ls \"$HOME/.cache/opencode/packages\" 2>/dev/null || true");
+        assert!(!fetched.contains("oh-my-openagent"), "{kind:?}: a second copy was fetched: {fetched}");
+        assert_eq!(lab.ok("printf '%s' \"$OMO_SEND_ANONYMOUS_TELEMETRY\""), "0", "{kind:?}");
+        assert!(!lab.ok("claude --version 2>&1 || true").contains("Claude Code"), "{kind:?}: no plugins here");
     });
 }

@@ -63,8 +63,10 @@ fn profile() -> Profile {
         harness: HarnessKind::AntigravityIde,
         template: Template::Recommended,
         account: AccountKind::InApp,
+        provider: None,
         assets: MountAccess::ReadOnly,
         network: NetworkMode::Full,
+        without: Vec::new(),
     }
 }
 

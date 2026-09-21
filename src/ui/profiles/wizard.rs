@@ -10,8 +10,12 @@ use std::sync::Arc;
 use qframe::runtime::TaskId;
 use qframe::widgets::{LogBuffer, TerminalSession};
 
-use crate::profile::{AccountKind, HarnessKind, MountAccess, NetworkMode, Profile, SafeName, Template};
+use crate::profile::{
+    AccountKind, Extra, HarnessKind, MountAccess, NetworkMode, Profile, ProviderChoice, SafeName, Template,
+};
+use crate::provider::{Model, ProviderEntry};
 
+use super::recipe;
 use super::work::{LoginContainer, Problem};
 
 /// How many lines of a build are kept. A build talks for minutes; this is more than any of them
@@ -137,10 +141,21 @@ pub struct Draft {
     pub template: Template,
     /// The chosen account type.
     pub account: AccountKind,
+    /// The providers the person has added, as the Providers page last had them, for the account
+    /// page to offer when the chosen harness can be pointed at one of its own.
+    pub providers: Vec<ProviderEntry>,
+    /// The tag of the chosen provider, while `account` is [`AccountKind::Provider`].
+    pub provider_tag: Option<String>,
+    /// The model asked for, while `account` is [`AccountKind::Provider`].
+    pub provider_model: Option<String>,
     /// How `Assets/` is mounted.
     pub assets: MountAccess,
     /// What the container may reach.
     pub network: NetworkMode,
+    /// The parts of QCode high's additions switched off. Kept while another template or harness
+    /// is looked at, so going back finds them as they were left; only the ones the chosen
+    /// template and harness add reach the profile.
+    pub without: Vec<Extra>,
     /// How far the build has got.
     pub build: Build,
     /// Every line the build has printed.
@@ -162,12 +177,15 @@ pub enum Blocked {
     NameTaken,
     /// The image has not been built.
     NoImage,
+    /// The account is a provider of one's own, and no provider and model have both been chosen.
+    NoProvider,
 }
 
 impl Draft {
-    /// A new draft for a store whose profiles are called `taken`.
+    /// A new draft for a store whose profiles are called `taken`, offering `providers` on the
+    /// account page for a harness that can be pointed at one.
     #[must_use]
-    pub fn new(taken: impl IntoIterator<Item = String>) -> Self {
+    pub fn new(taken: impl IntoIterator<Item = String>, providers: Vec<ProviderEntry>) -> Self {
         let harness = HarnessKind::ALL[0];
         let mut draft = Self {
             stage: Stage::Harness,
@@ -176,10 +194,14 @@ impl Draft {
             harness,
             template: Template::Recommended,
             account: first_account(harness),
+            providers,
+            provider_tag: None,
+            provider_model: None,
             // The assets folder is where the person keeps what the harness is meant to use and
             // add to, so a new profile may write there unless the person narrows it.
             assets: MountAccess::ReadWrite,
             network: NetworkMode::Full,
+            without: Vec::new(),
             build: Build::Waiting,
             log: LogBuffer::new(LOG_LINES),
             login: Login::Waiting,
@@ -201,14 +223,25 @@ impl Draft {
             harness: profile.harness,
             template: profile.template,
             account: profile.account,
+            providers: Vec::new(),
+            provider_tag: profile.provider.as_ref().map(|provider| provider.tag.clone()),
+            provider_model: profile.provider.as_ref().map(|provider| provider.model.clone()),
             assets: profile.assets,
             network: profile.network,
+            without: profile.without.clone(),
             build: Build::Done,
             log: LogBuffer::new(LOG_LINES),
             login: Login::Waiting,
             taken: Vec::new(),
             only_login: true,
         }
+    }
+
+    /// Whether the build failed because a step of QCode high could not download what it
+    /// installs, which the step says in words of its own (`recipe::HIGH_FAILED`) in the log.
+    #[must_use]
+    pub fn high_download_failed(&self) -> bool {
+        matches!(self.build, Build::Failed(_)) && self.log.iter().any(|line| line.text().contains(recipe::HIGH_FAILED))
     }
 
     /// Whether this draft is only a login for a profile that already exists.
@@ -236,6 +269,61 @@ impl Draft {
         }
     }
 
+    /// The provider the tag `tag` names among the ones the person has added, if there is one.
+    #[must_use]
+    fn provider_entry(&self, tag: &str) -> Option<&ProviderEntry> {
+        self.providers.iter().find(|provider| provider.tag.as_str() == tag)
+    }
+
+    /// The models of the chosen provider, or none while no provider is chosen or it offers none
+    /// yet: a provider the person has not asked to list is added with an empty list, and its own
+    /// page is where that is fixed.
+    #[must_use]
+    pub fn provider_models(&self) -> &[Model] {
+        self.provider_tag.as_deref().and_then(|tag| self.provider_entry(tag)).map_or(&[], |entry| &entry.models)
+    }
+
+    /// Chooses the provider tagged `tag`, and with it the first model it is known to offer, so
+    /// that picking a provider that already has one model chosen it for the person rather than
+    /// leaving a second, empty choice behind it.
+    pub fn choose_provider(&mut self, tag: &str) {
+        self.provider_tag = Some(tag.to_owned());
+        self.provider_model =
+            self.provider_entry(tag).and_then(|entry| entry.models.first()).map(|model| model.id.clone());
+    }
+
+    /// Offers `providers` from now on, as the file has them after the person was away on the
+    /// Providers page. A provider account keeps the provider and model it had where they are
+    /// still there, and otherwise takes the first of what is offered now, the way picking the
+    /// account does: the page told the person to add one and come back, so the one they added is
+    /// the one they meant.
+    pub fn offer_providers(&mut self, providers: Vec<ProviderEntry>) {
+        self.providers = providers;
+        if self.account != AccountKind::Provider {
+            return;
+        }
+        let kept = self.provider_tag.clone().filter(|tag| self.provider_entry(tag).is_some());
+        match kept.or_else(|| self.providers.first().map(|entry| entry.tag.to_string())) {
+            Some(tag) => {
+                let model = self.provider_model.clone();
+                self.choose_provider(&tag);
+                let offered = self.provider_models();
+                if let Some(model) = model.filter(|id| offered.iter().any(|offered| offered.id == *id)) {
+                    self.provider_model = Some(model);
+                }
+            }
+            None => {
+                self.provider_tag = None;
+                self.provider_model = None;
+            }
+        }
+    }
+
+    /// Chooses the model `id` of the provider already chosen.
+    pub fn choose_provider_model(&mut self, id: &str) {
+        self.provider_model = Some(id.to_owned());
+    }
+
     /// The pages this draft goes through. A profile that signs in to nothing has no sign-in
     /// page: a step that could only say "nothing to do" would still have to be walked through.
     #[must_use]
@@ -243,17 +331,53 @@ impl Draft {
         if self.account.needs_login() { &Stage::ALL } else { &Stage::WITHOUT_LOGIN }
     }
 
-    /// The profile the draft describes, if the name is usable.
+    /// The profile the draft describes, if the name is usable and, for a provider account, both
+    /// a provider and a model have been chosen.
     #[must_use]
     pub fn profile(&self) -> Option<Profile> {
+        let provider = match self.account {
+            AccountKind::Provider => {
+                Some(ProviderChoice { tag: self.provider_tag.clone()?, model: self.provider_model.clone()? })
+            }
+            _ => None,
+        };
         Some(Profile {
             name: SafeName::from_display(&self.name)?,
             harness: self.harness,
             template: self.template,
             account: self.account,
+            provider,
             assets: self.assets,
             network: self.network,
+            without: self.without.iter().copied().filter(|extra| self.offers(*extra)).collect(),
         })
+    }
+
+    /// Whether the chosen template adds `extra` for the chosen harness, so that it is offered.
+    #[must_use]
+    pub fn offers(&self, extra: Extra) -> bool {
+        self.template.extras(self.harness).contains(&extra)
+    }
+
+    /// Whether `extra` is offered and switched on.
+    #[must_use]
+    pub fn has(&self, extra: Extra) -> bool {
+        self.offers(extra) && !self.without.contains(&extra)
+    }
+
+    /// Whether anything at all is added to the image beside what QCode basic writes: false for
+    /// QCode basic and base, and for QCode high with every part switched off.
+    #[must_use]
+    pub fn adds_anything(&self) -> bool {
+        self.template.extras(self.harness).into_iter().any(|extra| self.has(extra))
+    }
+
+    /// Switches `extra` on or off.
+    pub fn switch(&mut self, extra: Extra, on: bool) {
+        self.without.retain(|left| *left != extra);
+        if !on {
+            self.without.push(extra);
+        }
     }
 
     /// The name as it will be written, which is not always the name as it was typed.
@@ -271,9 +395,18 @@ impl Draft {
                 Some(name) if self.taken.iter().any(|taken| taken == name.as_str()) => Some(Blocked::NameTaken),
                 Some(_) => None,
             },
+            Stage::Account if self.account == AccountKind::Provider && self.profile_provider().is_none() => {
+                Some(Blocked::NoProvider)
+            }
             Stage::Image if self.build != Build::Done => Some(Blocked::NoImage),
             _ => None,
         }
+    }
+
+    /// The provider and model the account page has chosen so far, when both are there.
+    #[must_use]
+    fn profile_provider(&self) -> Option<ProviderChoice> {
+        Some(ProviderChoice { tag: self.provider_tag.clone()?, model: self.provider_model.clone()? })
     }
 
     /// Whether the wizard should show its buttons as working and ignore them.
@@ -331,7 +464,7 @@ mod tests {
 
     #[test]
     fn a_new_draft_is_named_after_its_harness_until_it_is_renamed() {
-        let mut draft = Draft::new([]);
+        let mut draft = Draft::new([], Vec::new());
         assert_eq!(draft.name, "claude-code");
         draft.choose_harness(HarnessKind::Codex);
         assert_eq!(draft.name, "codex");
@@ -343,7 +476,7 @@ mod tests {
 
     #[test]
     fn a_name_that_is_already_taken_blocks_the_first_page() {
-        let mut draft = Draft::new(["claude-code".to_owned()]);
+        let mut draft = Draft::new(["claude-code".to_owned()], Vec::new());
         assert_eq!(draft.blocked(), Some(Blocked::NameTaken));
         draft.name = "  ".to_owned();
         assert_eq!(draft.blocked(), Some(Blocked::NameEmpty));
@@ -354,7 +487,7 @@ mod tests {
 
     #[test]
     fn the_image_page_cannot_be_left_before_there_is_an_image() {
-        let mut draft = Draft::new([]);
+        let mut draft = Draft::new([], Vec::new());
         draft.stage = Stage::Image;
         assert_eq!(draft.blocked(), Some(Blocked::NoImage));
         assert_eq!(draft.advance(), Some(Blocked::NoImage));
@@ -370,7 +503,7 @@ mod tests {
 
     #[test]
     fn nothing_moves_while_the_build_is_running() {
-        let mut draft = Draft::new([]);
+        let mut draft = Draft::new([], Vec::new());
         draft.stage = Stage::Image;
         draft.build = Build::Running(qframe::runtime::Task::<()>::new("build", |_| Ok(())).id());
         assert!(draft.is_busy());
@@ -382,7 +515,7 @@ mod tests {
 
     #[test]
     fn a_finished_page_can_be_gone_back_to_and_one_ahead_cannot() {
-        let mut draft = Draft::new([]);
+        let mut draft = Draft::new([], Vec::new());
         draft.stage = Stage::Permissions;
         draft.go_to(Stage::Image.index());
         assert_eq!(draft.stage, Stage::Permissions, "a page that has not been reached is not chosen");
@@ -392,7 +525,7 @@ mod tests {
 
     #[test]
     fn choosing_a_harness_keeps_the_account_type_one_that_harness_can_use() {
-        let mut draft = Draft::new([]);
+        let mut draft = Draft::new([], Vec::new());
         draft.account = AccountKind::ApiKey;
         draft.choose_harness(HarnessKind::GeminiCli);
         assert!(draft.harness.supports(draft.account));
@@ -400,7 +533,7 @@ mod tests {
 
     #[test]
     fn opencode_starts_free_and_the_others_never_offer_it() {
-        let mut draft = Draft::new([]);
+        let mut draft = Draft::new([], Vec::new());
         assert_eq!(draft.account, AccountKind::Subscription, "Claude Code starts with a subscription");
         draft.choose_harness(HarnessKind::OpenCode);
         assert_eq!(draft.account, AccountKind::Free, "opencode is chosen with its free use");
@@ -416,7 +549,7 @@ mod tests {
 
     #[test]
     fn a_free_profile_has_no_sign_in_page_and_ends_with_its_image() {
-        let mut draft = Draft::new([]);
+        let mut draft = Draft::new([], Vec::new());
         draft.choose_harness(HarnessKind::OpenCode);
         assert_eq!(draft.stages(), Stage::WITHOUT_LOGIN);
         draft.stage = Stage::Image;
@@ -433,7 +566,7 @@ mod tests {
 
     #[test]
     fn a_new_profile_may_write_to_its_assets_unless_narrowed() {
-        assert_eq!(Draft::new([]).assets, MountAccess::ReadWrite);
+        assert_eq!(Draft::new([], Vec::new()).assets, MountAccess::ReadWrite);
     }
 
     #[test]
@@ -447,7 +580,7 @@ mod tests {
 
     #[test]
     fn a_login_only_draft_starts_on_the_login_page_of_a_profile_that_already_has_an_image() {
-        let mut source = Draft::new([]);
+        let mut source = Draft::new([], Vec::new());
         source.name = "claude-sub".to_owned();
         let profile = source.profile().expect("the name folds");
         let draft = Draft::for_login(&profile);
@@ -460,7 +593,7 @@ mod tests {
 
     #[test]
     fn a_draft_becomes_the_profile_it_describes() {
-        let mut draft = Draft::new([]);
+        let mut draft = Draft::new([], Vec::new());
         draft.name = "Claude Abonelik".to_owned();
         draft.template = Template::Recommended;
         draft.assets = MountAccess::ReadWrite;
@@ -470,6 +603,64 @@ mod tests {
         assert_eq!(profile.image(), "qcode/profile/claude-abonelik");
         assert_eq!(profile.assets, MountAccess::ReadWrite);
         assert_eq!(profile.network, NetworkMode::None);
+    }
+
+    /// A provider entry for the tests below, with `models` already known the way the Providers
+    /// page leaves them once someone has listed them.
+    fn entry(tag: &str, models: &[&str]) -> ProviderEntry {
+        let mut entry = ProviderEntry::new(
+            crate::provider::Tag::parse(tag).expect("a tag"),
+            crate::provider::ProviderKind::Ollama,
+            "http://127.0.0.1:11434",
+        );
+        entry.models = models.iter().map(|id| crate::provider::Model::new(*id)).collect();
+        entry
+    }
+
+    #[test]
+    fn choosing_a_provider_account_page_cannot_be_left_until_a_provider_and_model_are_chosen() {
+        let mut draft = Draft::new([], vec![entry("ev1", &["qwen3.8"])]);
+        draft.choose_harness(HarnessKind::ClaudeCode);
+        draft.account = AccountKind::Provider;
+        draft.stage = Stage::Account;
+        assert_eq!(draft.blocked(), Some(Blocked::NoProvider));
+        draft.choose_provider("ev1");
+        assert_eq!(draft.provider_tag.as_deref(), Some("ev1"));
+        assert_eq!(draft.provider_model.as_deref(), Some("qwen3.8"), "the first model is chosen along with it");
+        assert_eq!(draft.blocked(), None);
+    }
+
+    #[test]
+    fn a_provider_with_no_models_listed_yet_still_blocks_the_page() {
+        let mut draft = Draft::new([], vec![entry("ev1", &[])]);
+        draft.account = AccountKind::Provider;
+        draft.stage = Stage::Account;
+        draft.choose_provider("ev1");
+        assert_eq!(draft.provider_model, None, "nothing to choose from yet");
+        assert_eq!(draft.blocked(), Some(Blocked::NoProvider));
+        assert!(draft.provider_models().is_empty());
+    }
+
+    #[test]
+    fn a_second_model_can_be_chosen_of_the_same_provider() {
+        let mut draft = Draft::new([], vec![entry("ev1", &["qwen3.8", "qwen3.8-32k"])]);
+        draft.choose_provider("ev1");
+        draft.choose_provider_model("qwen3.8-32k");
+        assert_eq!(draft.provider_model.as_deref(), Some("qwen3.8-32k"));
+        assert_eq!(draft.provider_models().len(), 2);
+    }
+
+    #[test]
+    fn a_provider_profile_carries_its_tag_and_model_and_an_incomplete_one_makes_no_profile() {
+        let mut draft = Draft::new([], vec![entry("ev1", &["qwen3.8"])]);
+        draft.name = "ev-tab".to_owned();
+        draft.account = AccountKind::Provider;
+        assert_eq!(draft.profile(), None, "nothing chosen yet");
+        draft.choose_provider("ev1");
+        let profile = draft.profile().expect("a provider and a model are both chosen");
+        let provider = profile.provider.expect("a provider profile carries one");
+        assert_eq!(provider.tag, "ev1");
+        assert_eq!(provider.model, "qwen3.8");
     }
 
     #[test]

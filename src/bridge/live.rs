@@ -10,9 +10,12 @@
 //! QCODE_CONTAINER_TESTS=1 cargo test bridge::live -- --ignored --test-threads=1
 //! ```
 //!
-//! Nobody signs in, so no model is ever asked anything. What the harness is asked is what it
-//! answers without one: its list of servers, which for three of the four starts each server and
-//! says whether it answered.
+//! Nobody signs in, so no model is asked anything but in one test. What the harness is asked is
+//! what it answers without one: its list of servers, which for three of the four starts each
+//! server and says whether it answered. The exception is the delivery into Claude Code, which
+//! draws no prompt without a model to speak to; it is given one through the provider relay and
+//! also needs `QCODE_PROVIDER_URL` and `QCODE_PROVIDER_MODEL`, as [`crate::provider::relay_live`]
+//! does.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -80,8 +83,10 @@ fn profile(harness: HarnessKind) -> Profile {
         harness,
         template: Template::Recommended,
         account: AccountKind::ApiKey,
+        provider: None,
         assets: MountAccess::ReadOnly,
         network: NetworkMode::None,
+        without: Vec::new(),
     }
 }
 
@@ -142,6 +147,8 @@ fn answer_as_qcode(listener: &Listener, seen: mpsc::Sender<Question>) -> std::th
                         harness: "Codex".to_owned(),
                         profile: "codex-main".to_owned(),
                         network: false,
+                        waiting: 1,
+                        trouble: Some("the coding tool in that tab is not running".to_owned()),
                     }],
                 ),
                 Request::Send { tab, text } => Answer::done(format!("queued for {tab}: {text}")),
@@ -194,6 +201,10 @@ fn check_answers(kind: EngineKind, answers: &std::collections::HashMap<u64, Valu
     assert_eq!(answers[&8]["error"]["code"], -32602, "{kind:?}: an unknown tool is a protocol error");
 }
 
+/// The token the tab whose settings are written would have. Nothing but a running QCode hands
+/// one out, so a file holding it can only have been written here.
+const TOKEN: &str = "5b3e0c7a91d4f26803ae5d17c94b6f20";
+
 /// The whole check for one harness, on every engine.
 fn verify(harness: HarnessKind) {
     let profile = profile(harness);
@@ -218,10 +229,12 @@ fn verify(harness: HarnessKind) {
         let mcp = harness.record().mcp.expect("a harness with an agent reads servers from a file");
         let settings = mcp.path;
         let before = run(&engine, &plan.name, &format!("cat \"$HOME/{settings}\" 2>/dev/null || true")).expect("read");
-        config::register(&engine, &plan.name, harness).unwrap_or_else(|trouble| panic!("{kind:?}: {trouble:?}"));
+        config::register(&engine, &plan.name, harness, TOKEN).unwrap_or_else(|trouble| panic!("{kind:?}: {trouble:?}"));
         let after = run(&engine, &plan.name, &format!("cat \"$HOME/{settings}\"")).expect("the settings are there");
         assert!(after.contains("qcode-bridge.mjs"), "{kind:?} {harness:?}: {after}");
-        if let Some(template) = harness.record().settings.filter(|template| template.path == settings) {
+        // Claude Code's servers go into the file QCode's templates answer its first start in, so
+        // the file is there before the bridge is, and every answer in it has to stay.
+        if let Some(template) = Template::Recommended.files(harness).into_iter().find(|file| file.path == settings) {
             assert_eq!(before, template.contents, "{kind:?} {harness:?}: the template's file was there first");
             match mcp.shape {
                 crate::profile::McpShape::Codex => assert!(after.starts_with(&before), "{after}"),
@@ -234,7 +247,7 @@ fn verify(harness: HarnessKind) {
                 }
             }
         }
-        config::register(&engine, &plan.name, harness).expect("registering again is fine");
+        config::register(&engine, &plan.name, harness, TOKEN).expect("registering again is fine");
         let again = run(&engine, &plan.name, &format!("cat \"$HOME/{settings}\"")).expect("read again");
         assert_eq!(again, after, "{kind:?} {harness:?}: registered once, written once");
 
@@ -288,4 +301,332 @@ fn gemini_cli_starts_the_bridge_and_reaches_qcode() {
 #[ignore = "needs a container engine and the network; run with QCODE_CONTAINER_TESTS=1"]
 fn codex_starts_the_bridge_and_reaches_qcode() {
     verify(HarnessKind::Codex);
+}
+
+/// A screen that draws nothing but one tab's terminal, so that what a real harness has drawn can
+/// be read back. The framework's session hands out no screen of its own: what the person sees is
+/// what this widget draws, so this is where a delivery has to be looked for.
+struct Watched(qframe::widgets::TerminalSession);
+
+impl qframe::prelude::App for Watched {
+    type Msg = ();
+
+    fn update(&mut self, (): ()) -> qframe::prelude::Command<()> {
+        qframe::prelude::Command::none()
+    }
+
+    fn view(&self, ui: &mut qframe::prelude::View<'_, ()>) {
+        ui.add(qframe::widgets::Terminal::new(&self.0).read_only()).fill_width().fill_height();
+    }
+}
+
+/// Draws the tab again and again until `wanted` is on it, giving a real harness a generous while
+/// to get there: it starts a runtime, reads its settings and draws its first screen.
+fn until_shown(screen: &mut qframe::runtime::Harness<Watched>, wanted: &str) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+    loop {
+        screen.render();
+        let drawn = screen.screen();
+        if drawn.contains(wanted) || std::time::Instant::now() > deadline {
+            return drawn;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+/// Waits for the harness's own prompt, answering with Return whatever it asks on its very first
+/// start — Claude Code picks a text style before it shows a prompt, and a person answers that
+/// question the same way. The questions Return answers wrongly are the ones whose first choice is
+/// "No, exit" — Claude Code's folder trust, and its warning about the permission mode QCode starts
+/// it in: a person moves down to the "Yes" before pressing it, and so does this. The answer is
+/// typed into the harness, not sent past it: what is being checked is the screen a person would
+/// be looking at.
+fn until_prompt(
+    screen: &mut qframe::runtime::Harness<Watched>,
+    session: &qframe::widgets::TerminalSession,
+    harness: HarnessKind,
+) -> String {
+    let wanted = prompt_of(harness);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+    let mut answered = 0;
+    let mut before = String::new();
+    loop {
+        screen.render();
+        let drawn = screen.screen();
+        if drawn.contains(wanted) || std::time::Instant::now() > deadline {
+            return drawn;
+        }
+        // Still on the same screen and no prompt: it is waiting for an answer, not working.
+        if drawn == before && answered < 6 {
+            answered += 1;
+            if drawn.contains("❯ No, exit") {
+                let _ = session.write(b"\x1b[B");
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            let _ = session.write(b"\r");
+        }
+        before = drawn;
+        std::thread::sleep(std::time::Duration::from_secs(3));
+    }
+}
+
+/// Words the harness itself draws once its own prompt is up and it is reading what is typed,
+/// taken from the screen each one really drew in a container.
+fn prompt_of(harness: HarnessKind) -> &'static str {
+    match harness {
+        // Claude Code draws its prompt only once it has a model to speak to: without the network
+        // and without a provider it quits before drawing anything. Through the provider relay it
+        // asks nobody to sign in; after the folder trust and permission mode questions it draws
+        // an empty prompt with this line of the permission mode under it.
+        HarnessKind::ClaudeCode => "shift+tab to cycle",
+        HarnessKind::OpenCode => "Ask anything",
+        HarnessKind::GeminiCli => "Type your message",
+        HarnessKind::Codex => "To get started",
+        HarnessKind::AntigravityIde => unreachable!("a window harness has no prompt in a tab"),
+    }
+}
+
+/// A message really delivered into a real harness running in a container with no network of its
+/// own: the same paste and Return the screen sends, and the harness's own prompt shows them.
+fn verify_delivery(harness: HarnessKind) {
+    use qframe::runtime::Harness as Screen;
+    use qframe::widgets::TerminalSession;
+
+    let profile = profile(harness);
+    let sent = "Through QCode, from the Claude Code · claude-sub tab:";
+    let task = "please write the test for the parser and run it";
+    for engine in engines() {
+        let kind = engine.kind();
+        let scratch = Scratch::new(&format!("{}-delivery", harness.record().id));
+        let paths = scratch.paths();
+        let workspace = WorkspaceId::parse(WORKSPACE).expect("a workspace id");
+        let plan = ContainerPlan::profile(&workspace, &paths, &profile);
+        let home = Home::new(profile.name.clone(), workspace.clone());
+        let _ = capture(&engine.remove_container(&plan.name));
+        let _ = capture(&engine.remove_volume(&home.volume()));
+        build(&engine, &profile);
+        let user = HostUser::current().expect("the current user");
+        ensure_running(&engine, &plan, user).unwrap_or_else(|failure| panic!("{kind:?}: {failure:?}"));
+
+        // Exactly the line a harness tab spawns, token and all.
+        let line = harness.command_line(None);
+        let parts: Vec<&str> = line.iter().map(String::as_str).collect();
+        let command = plan.enter_with(&engine, &parts, &[(super::TOKEN_VARIABLE, "tok-delivery")]);
+        let session = TerminalSession::spawn(command.program.as_os_str(), &command.args, &scratch.0)
+            .expect("a pseudo-terminal for the tab");
+        let mut screen = Screen::new(Watched(session.clone()), 120, 36);
+        let drawn = until_prompt(&mut screen, &session, harness);
+        assert!(drawn.contains(prompt_of(harness)), "{kind:?} {harness:?}: no prompt came up:\n{drawn}");
+
+        // What delivery does, byte for byte: the sender's name in front, then Return.
+        session.paste(&format!("{sent}\n\n{task}")).unwrap_or_else(|error| panic!("{kind:?}: the paste: {error}"));
+        session.write(b"\r").unwrap_or_else(|error| panic!("{kind:?}: the Return: {error}"));
+        let drawn = until_shown(&mut screen, task);
+        assert!(drawn.contains(task), "{kind:?} {harness:?}: the message never reached the prompt:\n{drawn}");
+        assert!(drawn.contains("QCode"), "{kind:?} {harness:?}: the sender is not named:\n{drawn}");
+
+        session.kill();
+        capture(&engine.remove_container(&plan.name)).expect("the container is removed");
+        capture(&engine.remove_volume(&home.volume())).expect("the home is removed");
+        clear(&engine, &profile, &plan.name);
+    }
+}
+
+#[test]
+#[ignore = "needs a container engine and the network; run with QCODE_CONTAINER_TESTS=1"]
+fn a_message_delivered_into_opencode_reaches_its_own_prompt() {
+    verify_delivery(HarnessKind::OpenCode);
+}
+
+/// The tag the provider of the delivery check is written down under.
+const PROVIDER_TAG: &str = "teslim";
+
+/// A Claude Code profile signed in with a provider of this machine, in a container with no
+/// network — the same profile [`crate::provider::relay_live`] proves the road with.
+fn provider_profile(model: &str) -> Profile {
+    provider_profile_under(model, Template::Recommended)
+}
+
+/// [`provider_profile`] under `template`, named after it so two templates never share an image.
+fn provider_profile_under(model: &str, template: Template) -> Profile {
+    Profile {
+        name: SafeName::parse(&format!("bridgetest-claude-code-provider-{}", template.id())).expect("the name is safe"),
+        harness: HarnessKind::ClaudeCode,
+        template,
+        account: AccountKind::Provider,
+        provider: Some(crate::profile::ProviderChoice { tag: PROVIDER_TAG.to_owned(), model: model.to_owned() }),
+        assets: MountAccess::ReadOnly,
+        network: NetworkMode::None,
+        without: Vec::new(),
+    }
+}
+
+/// A message delivered into a real Claude Code, the one harness that draws no prompt until it has
+/// somebody to speak to. The provider relay gives it one: the container still has no network, the
+/// key never enters it, and what it answers with comes from a model on this machine's own
+/// network. Everything the tab is started with is the product's: the container of
+/// [`ContainerPlan::profile`], the program of [`crate::provider::relay::wrapping`], the
+/// environment of [`crate::profile::ProviderChoice::environment`].
+#[test]
+#[ignore = "needs a container engine, the network once for the image, and a model service; run with QCODE_CONTAINER_TESTS=1, QCODE_PROVIDER_URL and QCODE_PROVIDER_MODEL"]
+fn a_message_delivered_into_claude_code_reaches_its_own_prompt() {
+    use crate::provider::relay::{self, Listener as Relay, Upstream};
+    use crate::provider::{ProviderEntry, ProviderKind, Tag};
+    use qframe::runtime::Harness as Screen;
+    use qframe::widgets::TerminalSession;
+
+    let base = std::env::var("QCODE_PROVIDER_URL").unwrap_or_else(|_| "http://192.168.122.1:11434".to_owned());
+    let model = std::env::var("QCODE_PROVIDER_MODEL").unwrap_or_else(|_| "qwen3.5-256k".to_owned());
+    let profile = provider_profile(&model);
+    let choice = profile.provider.clone().expect("the profile names a provider");
+    let entry = ProviderEntry::new(Tag::parse(PROVIDER_TAG).expect("a tag"), ProviderKind::Ollama, &base);
+    let harness = HarnessKind::ClaudeCode;
+    let sent = "Through QCode, from the Codex · codex-main tab:";
+    let task = "please write the test for the parser and run it";
+
+    for engine in engines() {
+        let kind = engine.kind();
+        let scratch = Scratch::new("claude-code-provider-delivery");
+        let paths = scratch.paths();
+        let workspace = WorkspaceId::parse(WORKSPACE).expect("a workspace id");
+        let plan = ContainerPlan::profile(&workspace, &paths, &profile);
+        let home = Home::new(profile.name.clone(), workspace.clone());
+        let _ = capture(&engine.remove_container(&plan.name));
+        let _ = capture(&engine.remove_volume(&home.volume()));
+        build(&engine, &profile);
+
+        // QCode's own side of the road, listening before the tab starts, so the harness finds it
+        // the moment it looks.
+        let token = super::token();
+        let mine = token.clone();
+        let carried = entry.clone();
+        let relay = Relay::open(
+            &paths.mcp(),
+            move |asked| (asked == mine).then(|| carried.clone()),
+            Upstream::network(),
+            |_| (),
+        )
+        .expect("the workspace's relay socket opens");
+        assert!(relay.socket().exists(), "{kind:?}: the socket is there for the container to reach");
+
+        let user = HostUser::current().expect("the current user");
+        ensure_running(&engine, &plan, user).unwrap_or_else(|failure| panic!("{kind:?}: {failure:?}"));
+
+        // Exactly the line a provider tab spawns: the relay in front of the harness, and the
+        // variables that point the harness at it. Nothing was measured for the window here, and
+        // a number invented for it would be the very thing the measurement exists to avoid.
+        let line = harness.command_line(None);
+        let parts = relay::wrapping(&line);
+        let words: Vec<&str> = parts.iter().map(String::as_str).collect();
+        let mut carried = vec![(super::TOKEN_VARIABLE.to_owned(), token.clone())];
+        carried.extend(choice.environment(&token, None));
+        let envs: Vec<(&str, &str)> = carried.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
+        let command = plan.enter_with(&engine, &words, &envs);
+        let session = TerminalSession::spawn(command.program.as_os_str(), &command.args, &scratch.0)
+            .expect("a pseudo-terminal for the tab");
+        let mut screen = Screen::new(Watched(session.clone()), 120, 36);
+        let drawn = until_prompt(&mut screen, &session, harness);
+        assert!(drawn.contains(prompt_of(harness)), "{kind:?} {harness:?}: no prompt came up:\n{drawn}");
+
+        // What delivery does, byte for byte: the sender's name in front, then Return.
+        session.paste(&format!("{sent}\n\n{task}")).unwrap_or_else(|error| panic!("{kind:?}: the paste: {error}"));
+        session.write(b"\r").unwrap_or_else(|error| panic!("{kind:?}: the Return: {error}"));
+        let drawn = until_shown(&mut screen, task);
+        assert!(drawn.contains(task), "{kind:?} {harness:?}: the message never reached the prompt:\n{drawn}");
+        assert!(drawn.contains("QCode"), "{kind:?} {harness:?}: the sender is not named:\n{drawn}");
+
+        session.kill();
+        drop(relay);
+        capture(&engine.remove_container(&plan.name)).expect("the container is removed");
+        capture(&engine.remove_volume(&home.volume())).expect("the home is removed");
+        clear(&engine, &profile, &plan.name);
+    }
+}
+
+/// A real Claude Code tab, started exactly as the product starts one, opens on its own prompt with
+/// not one key pressed: the image of a QCode template has answered the questions of its first
+/// start already. Every one of them would otherwise stand in the way with "No, exit" highlighted
+/// under the cursor, where a person pressing Return leaves. It is watched for the prompt only; a
+/// question on the screen means the prompt never comes and the test shows what was drawn instead.
+fn claude_code_opens_on_its_prompt(template: Template) {
+    use crate::provider::relay::{self, Listener as Relay, Upstream};
+    use crate::provider::{ProviderEntry, ProviderKind, Tag};
+    use qframe::runtime::Harness as Screen;
+    use qframe::widgets::TerminalSession;
+
+    let base = std::env::var("QCODE_PROVIDER_URL").unwrap_or_else(|_| "http://192.168.122.1:11434".to_owned());
+    let model = std::env::var("QCODE_PROVIDER_MODEL").unwrap_or_else(|_| "qwen3.5-256k".to_owned());
+    let profile = provider_profile_under(&model, template);
+    let choice = profile.provider.clone().expect("the profile names a provider");
+    let entry = ProviderEntry::new(Tag::parse(PROVIDER_TAG).expect("a tag"), ProviderKind::Ollama, &base);
+    let harness = HarnessKind::ClaudeCode;
+
+    for engine in engines() {
+        let kind = engine.kind();
+        let scratch = Scratch::new(&format!("claude-code-first-start-{}", template.id()));
+        let paths = scratch.paths();
+        let workspace = WorkspaceId::parse(WORKSPACE).expect("a workspace id");
+        let plan = ContainerPlan::profile(&workspace, &paths, &profile);
+        let home = Home::new(profile.name.clone(), workspace.clone());
+        let _ = capture(&engine.remove_container(&plan.name));
+        let _ = capture(&engine.remove_volume(&home.volume()));
+        build(&engine, &profile);
+
+        let token = super::token();
+        let mine = token.clone();
+        let carried = entry.clone();
+        let relay = Relay::open(
+            &paths.mcp(),
+            move |asked| (asked == mine).then(|| carried.clone()),
+            Upstream::network(),
+            |_| (),
+        )
+        .expect("the workspace's relay socket opens");
+        let user = HostUser::current().expect("the current user");
+        ensure_running(&engine, &plan, user).unwrap_or_else(|failure| panic!("{kind:?}: {failure:?}"));
+        // The bridge registers its server into the very file the answers are in, before the tab
+        // starts, the way a workspace does.
+        config::register(&engine, &plan.name, harness, &token)
+            .unwrap_or_else(|trouble| panic!("{kind:?}: {trouble:?}"));
+
+        let line = harness.command_line(None);
+        let parts = relay::wrapping(&line);
+        let words: Vec<&str> = parts.iter().map(String::as_str).collect();
+        let mut carried = vec![(super::TOKEN_VARIABLE.to_owned(), token.clone())];
+        carried.extend(choice.environment(&token, None));
+        let envs: Vec<(&str, &str)> = carried.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
+        let command = plan.enter_with(&engine, &words, &envs);
+        let session = TerminalSession::spawn(command.program.as_os_str(), &command.args, &scratch.0)
+            .expect("a pseudo-terminal for the tab");
+        let mut screen = Screen::new(Watched(session.clone()), 120, 36);
+        let started = std::time::Instant::now();
+        let drawn = until_shown(&mut screen, prompt_of(harness));
+        assert!(
+            drawn.contains(prompt_of(harness)),
+            "{kind:?} {template:?}: no prompt without a key being pressed:\n{drawn}"
+        );
+        assert!(!drawn.contains("No, exit"), "{kind:?} {template:?}:\n{drawn}");
+        eprintln!(
+            "{kind:?} {template:?}: Claude Code drew its prompt {} s after it started",
+            started.elapsed().as_secs()
+        );
+
+        session.kill();
+        drop(relay);
+        capture(&engine.remove_container(&plan.name)).expect("the container is removed");
+        capture(&engine.remove_volume(&home.volume())).expect("the home is removed");
+        clear(&engine, &profile, &plan.name);
+    }
+}
+
+#[test]
+#[ignore = "needs a container engine, the network once for the image, and a model service; run with QCODE_CONTAINER_TESTS=1, QCODE_PROVIDER_URL and QCODE_PROVIDER_MODEL"]
+fn claude_code_opens_on_its_prompt_under_qcode_basic_without_a_key_pressed() {
+    claude_code_opens_on_its_prompt(Template::Recommended);
+}
+
+#[test]
+#[ignore = "needs a container engine, the network once for the image, and a model service; run with QCODE_CONTAINER_TESTS=1, QCODE_PROVIDER_URL and QCODE_PROVIDER_MODEL"]
+fn claude_code_opens_on_its_prompt_under_qcode_high_without_a_key_pressed() {
+    claude_code_opens_on_its_prompt(Template::High);
 }

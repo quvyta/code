@@ -11,6 +11,7 @@ use std::ffi::OsStr;
 
 use qframe::runtime::OpenOutcome;
 
+use crate::base::paths::MCP_DIR;
 use crate::desktop::{Display, NoDisplay, RUNTIME_DIR};
 use crate::ui::workspace::{Opening, entry};
 
@@ -54,6 +55,65 @@ impl Session {
     }
 }
 
+/// A stand-in engine: a script that writes down every call it is given, answers the reading of a
+/// settings file with "there is none", keeps what is written into one, and refuses to run the
+/// window itself so that nothing of this test waits on a container that will never be there.
+struct Recording {
+    scratch: Scratch,
+    binary: PathBuf,
+    calls: PathBuf,
+    written: PathBuf,
+}
+
+impl Recording {
+    fn new(name: &str) -> Self {
+        let scratch = Scratch::new(name);
+        let (binary, calls, written) = (scratch.0.join("engine"), scratch.0.join("calls"), scratch.0.join("written"));
+        let script = format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {calls}\n\
+             [ \"$1\" = run ] && exit 1\n\
+             for word in \"$@\"; do\n\
+             case \"$word\" in\n\
+             *'exit 3'*) exit 3 ;;\n\
+             *'qcode-new'*) cat > {written}; exit 0 ;;\n\
+             esac\n\
+             done\n\
+             exit 0\n",
+            calls = calls.display(),
+            written = written.display(),
+        );
+        fs::write(&binary, script).expect("the stand-in engine is written");
+        fs::set_permissions(&binary, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("it can be run");
+        Self { scratch, binary, calls, written }
+    }
+
+    /// A screen on this engine with the one desktop profile, and a display to open a window on.
+    fn screen(&self) -> WorkspaceScreen {
+        let runtime = self.scratch.0.join("runtime");
+        fs::create_dir_all(&runtime).expect("a runtime folder");
+        let socket = runtime.join("wayland-1");
+        fs::write(&socket, "").expect("a stand-in compositor socket");
+        let display = Display { socket, name: "wayland-1".to_owned(), device: None };
+        let workspaces = vec![workspace(
+            "firefly",
+            "Firefly",
+            self.scratch.paths(),
+            vec![profile(WINDOW, HarnessKind::AntigravityIde)],
+        )];
+        WorkspaceScreen::new(
+            Some(Engine::new(EngineKind::Podman, &self.binary)),
+            HostUser::Ids { uid: 1000, gid: 1000 },
+            workspaces,
+        )
+        .showing_on(Ok(display))
+    }
+
+    fn calls(&self) -> Vec<String> {
+        fs::read_to_string(&self.calls).unwrap_or_default().lines().map(str::to_owned).collect()
+    }
+}
+
 /// The choice a blank tab's page offers for the window.
 fn window() -> Choice {
     Choice::Window(WINDOW.to_owned())
@@ -92,10 +152,20 @@ fn the_window_runs_in_a_container_of_its_own_beside_the_profiles_harness_contain
     assert_eq!(window.image, harness.image);
     assert_eq!(window.home, harness.home);
     assert!(window.window.is_some() && harness.window.is_none());
-    // The harness container answers to an agent and is given the bridge between tabs; the window
-    // runs the application itself, which is nobody's agent, so it never sees that socket.
-    assert!(harness.bridge.is_some(), "a harness tab can be talked to");
-    assert!(window.bridge.is_none(), "a window has no agent to talk to");
+    // Both are given the bridge between tabs, because the agent inside the window asks over the
+    // same socket as any other; the same folder, so they reach the same QCode.
+    assert_eq!(window.bridge, harness.bridge, "the window's agent reaches the other tabs too");
+    assert!(window.bridge.is_some(), "a window's agent has nothing to ask over");
+}
+
+#[test]
+fn the_window_sees_the_folder_the_bridges_socket_lives_in_read_only() {
+    let session = Session::new("window-bridge");
+    let words = opening_words(&session.screen());
+    let folder = session.scratch.paths().mcp();
+    // Read-only, as for a harness tab: a container may speak over the socket, never replace the
+    // server every tab of the workspace starts.
+    assert!(words.contains(&format!("{}:{}:ro,z", folder.display(), MCP_DIR)), "{words:?}");
 }
 
 #[test]
@@ -401,4 +471,36 @@ fn screen_user() -> HostUser {
 
 fn no_display() -> Display {
     Display { socket: PathBuf::from("/run/user/1000/wayland-1"), name: "wayland-1".to_owned(), device: None }
+}
+
+#[test]
+fn choosing_the_window_writes_this_tabs_token_into_the_settings_before_the_window_is_started() {
+    let engine = Recording::new("window-register");
+    let mut harness = harness(engine.screen(), SIZE.0, SIZE.1);
+    // Chosen on the blank tab's page, the way the person chooses it, with the background work
+    // running as it does in the application.
+    open_in(&mut harness, window());
+    harness.render();
+
+    let token = harness.app().0.workspace().expect("a workspace").tabs()[0].token().to_owned();
+    let written = fs::read_to_string(&engine.written).expect("the settings were written");
+    let settings: serde_json::Value = serde_json::from_str(&written).expect("they are JSON");
+    assert_eq!(settings["mcpServers"]["qcode"]["env"]["QCODE_BRIDGE"], token, "{written}");
+    assert_eq!(settings["mcpServers"]["qcode"]["command"], "node", "{written}");
+
+    // Written from a container of its own on the window's home volume, and finished with before
+    // the window is run: the application reads its settings as it starts.
+    let calls = engine.calls();
+    let scribe = calls
+        .iter()
+        .find(|call| call.starts_with("create --name qcode-firefly-anti.mcp"))
+        .unwrap_or_else(|| panic!("a container of its own: {calls:?}"));
+    assert!(scribe.contains("qcode-home-firefly-anti:/home/qcode"), "on the window's own home: {scribe}");
+    assert!(scribe.contains("--network=none"), "it needs no network: {scribe}");
+    let removed = calls
+        .iter()
+        .rposition(|call| call.starts_with("rm --force") && call.contains("qcode-firefly-anti.mcp"))
+        .expect("the scribe is taken away again");
+    let run = calls.iter().position(|call| call.starts_with("run ")).expect("the window is run");
+    assert!(removed < run, "the settings are finished with before the window starts: {calls:?}");
 }

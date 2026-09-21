@@ -359,9 +359,7 @@ fn a_harness_installs_on_top_of_the_image_and_answers() {
         build(&engine, TEST_BASE, &containerfile(), &scratch);
 
         let mut lines = vec![format!("FROM {TEST_BASE}")];
-        for step in record.install {
-            lines.push(format!("RUN {step}"));
-        }
+        lines.extend(record.image_steps());
         // The same shape `ui::profiles::recipe` writes: the file is staged and moved into the
         // home directory by the image's own shell, so the recipe never names that directory.
         lines.push(format!(

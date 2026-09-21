@@ -23,6 +23,7 @@ mod files;
 mod history;
 mod panel;
 mod plan;
+mod relay;
 mod sound;
 mod tab;
 mod viewer;
@@ -35,7 +36,7 @@ mod tests;
 
 pub use backups::{BackupOf, BackupTrouble, Farewell, Leaving, Part, leaving};
 pub use blank::Choice;
-pub use bridge::{Letter, Letters};
+pub use bridge::{Letter, Letters, Undelivered};
 pub use desktop::Opening;
 pub use file_ops::{Change, FileError, NameProblem};
 pub use files::{DocumentTrouble, FileEntry, FileMsg, FileTree, NameFor, Naming};
@@ -71,8 +72,9 @@ use crate::bridge::config::{self as bridge_config, Unregistered};
 use crate::bridge::rules::Rules;
 use crate::bridge::socket::Call;
 use crate::engine::{Container, Engine, EngineCommand, EngineKind, Exec, HostUser};
+use crate::profile::guidance::Unguided;
 use crate::profile::history::Conversation;
-use crate::profile::{HarnessKind, Profile};
+use crate::profile::{HarnessKind, Profile, ProviderChoice};
 use crate::store::{
     Registry, Session, SessionTab, SessionTabKind, SessionWorkspace, WorkspaceFile, WorkspaceId, WorkspacePaths,
     add_profile,
@@ -134,8 +136,9 @@ pub enum Msg {
     HistorySlow(HistoryKey, u64),
     /// The indicator of a reading has been on screen long enough to be read.
     HistorySettled(HistoryKey),
-    /// The profiles screen was asked for, to make the first profile. The screen itself cannot go
-    /// there; the application that holds both answers this message.
+    /// A new profile was asked for, from the blank tab's "New profile" row: the application opens
+    /// the profiles screen with its wizard already open. The screen itself cannot go there; the
+    /// application that holds both answers this message.
     ManageProfiles,
     /// The profiles of the store were read again, after the person may have changed them.
     Profiles(Vec<Profile>),
@@ -316,9 +319,14 @@ pub enum Msg {
     },
     /// Something was done with the messages waiting in a tab.
     Letters(TabKey, Letters),
+    /// Time to look again at the tabs that still hold messages for their agents.
+    Deliver,
     /// The bridge could not be registered in the settings of a harness whose container came up;
     /// the message that came with the start follows.
     Unbridged(HarnessKind, Unregistered, Box<Msg>),
+    /// The instruction files of a QCode high profile whose container came up could not be brought
+    /// up to date in the workspace; the message that came with the start follows.
+    Unguided(HarnessKind, Unguided, Box<Msg>),
     /// Bringing a backup back finished.
     Restored {
         /// The workspace's id.
@@ -374,6 +382,9 @@ pub struct OpenWorkspace {
     assets: bool,
     /// Whether the workspace listens for its tabs' agents.
     link: bridge::Link,
+    /// Whether the workspace's provider relay is listening, for a tab of a profile that runs on
+    /// a provider of the person's own.
+    relay: relay::Link,
 }
 
 impl OpenWorkspace {
@@ -407,6 +418,7 @@ impl OpenWorkspace {
             skip: file.backup_skip.clone(),
             assets: file.backup_assets,
             link: bridge::Link::default(),
+            relay: relay::Link::default(),
         };
         workspace.set_profiles(profiles);
         workspace
@@ -525,7 +537,11 @@ impl OpenWorkspace {
             TabKind::Shell => Some(plan::SHELL.iter().map(|part| (*part).to_owned()).collect()),
             TabKind::Profile(name) => {
                 let profile = self.profiles.iter().find(|profile| profile.name.as_str() == name)?;
-                Some(profile.harness.command_line(tab.conversation()))
+                let command = profile.harness.command_line(tab.conversation());
+                // A profile that runs on a provider of the person's own is pointed at the relay's
+                // address, so the relay has to be listening inside the container before the
+                // harness says anything: it is what starts the harness.
+                Some(if profile.provider.is_some() { crate::provider::relay::wrapping(&command) } else { command })
             }
             TabKind::Image(file) => Some(apps::picture(&inside_container(file))),
             TabKind::Editor(file) => Some(editor.command(&inside_container(file))),
@@ -619,6 +635,11 @@ pub struct WorkspaceScreen {
     /// Where the containers this screen starts are noted, so they can be stopped once no QCode
     /// is open; `None` notes nothing.
     registry: Option<PathBuf>,
+    /// Where `providers.toml` is read from before a tab of a provider profile is started, so its
+    /// tag can be checked against the providers that exist right now rather than a stale copy
+    /// the profile once carried; `None` means this machine has no data folder to hold one, so no
+    /// provider profile can ever start.
+    providers_path: Option<PathBuf>,
     /// Whether a problem with that list was said already: it is said once, not at every tab.
     registry_told: bool,
     /// How often the open workspaces are backed up.
@@ -637,6 +658,9 @@ pub struct WorkspaceScreen {
     rules: Rules,
     /// The questions to the person about one tab sending to another that are not answered yet.
     asking: Vec<bridge::Asking>,
+    /// Whether a look at the tabs that hold messages is already timed, so that one is timed at a
+    /// time and none at all while no tab holds a message.
+    delivering: bool,
 }
 
 impl WorkspaceScreen {
@@ -665,6 +689,7 @@ impl WorkspaceScreen {
             live: false,
             last_watch: 0,
             registry: None,
+            providers_path: crate::provider::Providers::file(),
             registry_told: false,
             backup_every: BackupEvery::default(),
             last_timer: 0,
@@ -674,6 +699,7 @@ impl WorkspaceScreen {
             last_link: 0,
             rules: Rules::default(),
             asking: Vec::new(),
+            delivering: false,
         }
     }
 
@@ -706,6 +732,15 @@ impl WorkspaceScreen {
     #[must_use]
     pub fn with_registry(mut self, path: Option<PathBuf>) -> Self {
         self.registry = path;
+        self
+    }
+
+    /// The same screen, reading `providers.toml` at `path` rather than this machine's own data
+    /// folder before a provider tab starts, so a test can say what it holds without ever
+    /// touching a real one.
+    #[must_use]
+    pub fn with_providers_path(mut self, path: Option<PathBuf>) -> Self {
+        self.providers_path = path;
         self
     }
 
@@ -899,10 +934,17 @@ impl WorkspaceScreen {
         let program = workspace.program(tab, self.editor)?;
         let parts: Vec<&str> = program.iter().map(String::as_str).collect();
         // A harness tab carries the token its agent's bridge server hands back, which is how
-        // QCode knows which tab a message comes from.
+        // QCode knows which tab a message comes from; a tab of a provider profile carries the
+        // same token again, because the relay reuses the bridge's rather than minting a second
+        // one, and the provider's own address and model besides.
         match tab.kind() {
             TabKind::Profile(_) => {
-                Some(plan.enter_with(engine, &parts, &[(crate::bridge::TOKEN_VARIABLE, tab.token())]))
+                let mut env = vec![(crate::bridge::TOKEN_VARIABLE.to_owned(), tab.token().to_owned())];
+                if let Some(provider) = provider_choice(workspace, tab.kind()) {
+                    env.extend(provider.environment(tab.token(), self.measured_window(&provider)));
+                }
+                let env: Vec<(&str, &str)> = env.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
+                Some(plan.enter_with(engine, &parts, &env))
             }
             _ => Some(plan.enter(engine, &parts)),
         }
@@ -978,6 +1020,7 @@ impl WorkspaceScreen {
 /// waiting to be shown, and reads the conversations a blank tab's page offers when the open tab
 /// is one.
 pub fn opened(screen: &mut WorkspaceScreen) -> Command<Msg> {
+    relay::follow(screen);
     let command = Command::batch([load_root(screen), list_containers(screen), wake(screen), show_page(screen, true)]);
     Command::batch([command, follow_disk(screen), backups::keep(screen), bridge::follow(screen)])
 }
@@ -1001,6 +1044,9 @@ pub fn add(screen: &mut WorkspaceScreen, workspace: OpenWorkspace) -> Command<Ms
 /// starts here: switching to it, closing the tab before it and opening its workspace all show it.
 /// The same goes for a blank tab's page that comes into view, which reads its conversations.
 pub fn update(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
+    // Profiles read again may carry a provider a workspace's did not before, so this runs before
+    // anything else has the chance to start a tab that needs the relay already open.
+    relay::follow(screen);
     // Profiles read again may be new ones, whose conversations the page shown has not read.
     let profiles = matches!(message, Msg::Profiles(_));
     let command = apply(screen, message);
@@ -1045,6 +1091,8 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
                 tab.close_session();
             }
             let keys: Vec<TabKey> = workspace.tabs.iter().map(Tab::key).collect();
+            let tokens: Vec<String> = workspace.tabs.iter().map(|tab| tab.token().to_owned()).collect();
+            relay::closed(workspace, &tokens);
             bridge::closed(screen, &keys);
             TabEdit::Close(index).apply(&mut screen.workspaces, &mut screen.active);
             Command::batch([backed, silenced, load_root(screen), list_containers(screen)])
@@ -1073,9 +1121,14 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
             };
             let Some(workspace) = screen.workspaces.get_mut(screen.active) else { return Command::none() };
             let mut gone = Vec::new();
+            let mut token = None;
             if let Some(tab) = workspace.tabs.get_mut(index) {
                 tab.close_session();
                 gone.push(tab.key());
+                token = Some(tab.token().to_owned());
+            }
+            if let Some(token) = token {
+                relay::closed(workspace, &[token]);
             }
             TabEdit::Close(index).apply(&mut workspace.tabs, &mut workspace.active_tab);
             bridge::closed(screen, &gone);
@@ -1164,6 +1217,9 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
                 && !running
             {
                 tab.settled(TabState::Stopped);
+                // The container went away under the tab, so the panel's list no longer holds.
+                let id = workspace.id.as_str().to_owned();
+                return containers_of(screen, &id);
             }
             Command::none()
         }
@@ -1344,17 +1400,16 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
             Command::none()
         }
         Msg::Restored { workspace, name, of, file, done } => {
-            backups::restored(screen, &workspace, &name, &of, file.as_deref(), &done)
+            let told = backups::restored(screen, &workspace, &name, &of, file.as_deref(), &done);
+            // Bringing conversations back may have stopped their container first.
+            Command::batch([told, containers_of(screen, &workspace)])
         }
         Msg::BackupEvery(every) => {
             backups::set_every(screen, every);
             Command::none()
         }
         Msg::Bridge(id, run, call) => bridge::called(screen, &id, run, call),
-        Msg::Allow { from, to, allow } => {
-            bridge::allowed(screen, from, to, allow);
-            Command::none()
-        }
+        Msg::Allow { from, to, allow } => bridge::allowed(screen, from, to, allow),
         Msg::StillAsking { from, to } => {
             bridge::still_asking(screen, from, to);
             Command::none()
@@ -1363,8 +1418,15 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
             bridge::letters(screen, key, action);
             Command::none()
         }
+        Msg::Deliver => {
+            screen.delivering = false;
+            bridge::deliver(screen, std::time::Instant::now())
+        }
         Msg::Unbridged(harness, trouble, message) => {
             Command::batch([bridge::unregistered(harness, &trouble), update(screen, *message)])
+        }
+        Msg::Unguided(harness, trouble, message) => {
+            Command::batch([unguided(harness, &trouble), update(screen, *message)])
         }
         Msg::ContainerActed(result) => {
             let refresh = list_containers(screen);
@@ -1398,6 +1460,7 @@ fn choose(screen: &mut WorkspaceScreen, key: TabKey, choice: Choice) -> Command<
     let Some(engine) = screen.engine.clone() else { return Command::none() };
     let user = screen.user;
     let registry = screen.registry.clone();
+    let providers_path = screen.providers_path.clone();
     let Some(workspace) = screen.owner_mut(key) else { return Command::none() };
     let (kind, conversation) = match choice {
         Choice::Shell => (TabKind::Shell, None),
@@ -1415,21 +1478,51 @@ fn choose(screen: &mut WorkspaceScreen, key: TabKey, choice: Choice) -> Command<
         _ => Command::none(),
     };
     let window = plan.window.is_some();
+    let provider = provider_choice(workspace, &kind);
     let Some((_, tab)) = workspace.find(key) else { return Command::none() };
     tab.choose(kind, conversation);
     let run = tab.run();
+    let token = tab.token().to_owned();
+    if let Some(provider) = &provider {
+        relay::entered(&*workspace, &token, &provider.tag);
+    }
     // A window is not entered with a terminal, so it takes the window's own path and the keyboard
     // goes to the tab's one action rather than to a terminal that is not there.
     if window {
         return Command::batch([desktop::open(screen, key, run), Command::focus(desktop::WINDOW_ID), record]);
     }
+    let launch = Launch::new(key, run, token, provider, providers_path);
     Command::batch([
         Command::perform(move || {
-            start(registry.as_deref(), &engine, &plan, user, |result| Msg::Ready(key, run, result))
+            let Launch { key, run, gate, token } = launch;
+            start(registry.as_deref(), &engine, &plan, user, gate.as_ref(), &token, |result| {
+                Msg::Ready(key, run, result)
+            })
         }),
         Command::focus(TERMINAL_ID),
         record,
     ])
+}
+
+impl WorkspaceScreen {
+    /// What this machine measured the provider's server really gives for the model `provider`
+    /// names, when it has been measured; `None` when it has not, or the provider is gone.
+    ///
+    /// Read from `providers.toml` as a tab starts rather than carried on the profile: a window
+    /// measured again on the Providers page must reach the next tab, not the tab after QCode is
+    /// started again.
+    fn measured_window(&self, provider: &ProviderChoice) -> Option<u64> {
+        let path = self.providers_path.as_ref()?;
+        let providers = crate::provider::Providers::open(path).value;
+        Some(providers.get(&provider.tag)?.model(&provider.model)?.measured?.tokens())
+    }
+}
+
+/// The provider and model a profile of `kind` runs on, when `kind` is a harness tab of a profile
+/// that names one of its own.
+fn provider_choice(workspace: &OpenWorkspace, kind: &TabKind) -> Option<ProviderChoice> {
+    let name = kind.profile()?;
+    workspace.profiles.iter().find(|profile| profile.name.as_str() == name)?.provider.clone()
 }
 
 /// Writes into the workspace's `workspace.qcode` that it carries the profile `name`, on a background
@@ -1494,9 +1587,11 @@ fn wake(screen: &mut WorkspaceScreen) -> Command<Msg> {
     let Some(engine) = screen.engine.clone() else { return Command::none() };
     let user = screen.user;
     let registry = screen.registry.clone();
+    let providers_path = screen.providers_path.clone();
     let Some(workspace) = screen.workspaces.get_mut(screen.active) else { return Command::none() };
     let Some(tab) = workspace.tabs.get(workspace.active_tab) else { return Command::none() };
     let Some(plan) = workspace.plan(tab.kind()) else { return Command::none() };
+    let provider = provider_choice(workspace, tab.kind());
     let file = tab.kind().file().map(|file| workspace.files.path(file));
     let harness = match tab.kind() {
         TabKind::Profile(name) if tab.conversation().is_none() => {
@@ -1507,18 +1602,26 @@ fn wake(screen: &mut WorkspaceScreen) -> Command<Msg> {
     let Some(tab) = workspace.tabs.get_mut(workspace.active_tab) else { return Command::none() };
     tab.wake();
     let (key, run) = (tab.key(), tab.run());
+    let token = tab.token().to_owned();
+    if let Some(provider) = &provider {
+        relay::entered(&*workspace, &token, &provider.tag);
+    }
     match harness {
-        None => bring_up(engine, plan, user, key, run, file, registry),
-        Some(harness) => Command::perform(move || {
-            start(registry.as_deref(), &engine, &plan, user, |result| {
-                // Not being able to read only means the tab cannot be matched to its
-                // conversation; it then starts a new one, the way it started last time. The
-                // container is up by now, so reading it starts nothing.
-                let found =
-                    result.is_ok().then(|| history::read(&engine, &plan.name, harness, &mut || {}).ok()).flatten();
-                Msg::Woken(key, run, result, found)
+        None => bring_up(engine, plan, Launch::new(key, run, token, provider, providers_path), user, file, registry),
+        Some(harness) => {
+            let launch = Launch::new(key, run, token, provider, providers_path);
+            Command::perform(move || {
+                let Launch { key, run, gate, token } = launch;
+                start(registry.as_deref(), &engine, &plan, user, gate.as_ref(), &token, |result| {
+                    // Not being able to read only means the tab cannot be matched to its
+                    // conversation; it then starts a new one, the way it started last time. The
+                    // container is up by now, so reading it starts nothing.
+                    let found =
+                        result.is_ok().then(|| history::read(&engine, &plan.name, harness, &mut || {}).ok()).flatten();
+                    Msg::Woken(key, run, result, found)
+                })
             })
-        }),
+        }
     }
 }
 
@@ -1594,6 +1697,7 @@ fn restart_tab(screen: &mut WorkspaceScreen, key: TabKey) -> Command<Msg> {
     let engine = screen.engine.clone();
     let user = screen.user;
     let registry = screen.registry.clone();
+    let providers_path = screen.providers_path.clone();
     let Some(workspace) = screen.owner_mut(key) else { return Command::none() };
     let Some((_, tab)) = workspace.find(key) else { return Command::none() };
     let kind = tab.kind().clone();
@@ -1622,15 +1726,76 @@ fn restart_tab(screen: &mut WorkspaceScreen, key: TabKey) -> Command<Msg> {
     let reads = viewer::text_command(&kind).is_some() && !viewer::draws(tab);
     tab.restarting();
     let run = tab.run();
+    let token = tab.token().to_owned();
     if reads {
         return viewer::take_text(screen, key, run);
     }
     let Some(plan) = workspace.plan(&kind) else { return Command::none() };
+    let provider = provider_choice(workspace, &kind);
+    if let Some(provider) = &provider {
+        let token = workspace.tabs.iter().find(|tab| tab.key() == key).map(|tab| tab.token().to_owned());
+        if let Some(token) = token {
+            relay::entered(&*workspace, &token, &provider.tag);
+        }
+    }
     let file = kind.file().map(|file| workspace.files.path(file));
-    bring_up(engine, plan, user, key, run, file, registry)
+    bring_up(engine, plan, Launch::new(key, run, token, provider, providers_path), user, file, registry)
 }
 
-/// Brings the container of `plan` up for the tab `key` in its run `run`, on a background thread.
+/// What has to be true of a provider profile's provider before its tab is trusted to speak for
+/// it, and the words to say when it is not: the provider it names, where its providers are read
+/// from, and, made here rather than on the background thread [`start`] runs on, what to say if
+/// it is gone. Translating needs the thread the person's own language is loaded on; `start` only
+/// reads the file and decides whether the words are needed. `None` for a tab of no provider.
+struct ProviderGate {
+    /// The provider and model the tab's profile runs on.
+    provider: ProviderChoice,
+    /// Where `providers.toml` is read from to check that provider still exists.
+    path: Option<PathBuf>,
+    /// What to say if it is gone, made in the person's language before this ever reaches a
+    /// background thread.
+    missing: String,
+}
+
+impl ProviderGate {
+    /// The gate a tab of `provider` is checked against, when it has one.
+    fn of(provider: Option<ProviderChoice>, path: Option<PathBuf>) -> Option<Self> {
+        let provider = provider?;
+        let missing = t!("workspace.provider-missing", tag = provider.tag.as_str());
+        Some(Self { provider, path, missing })
+    }
+}
+
+/// What ties a container's launch to one tab: its key, the run it is starting as, and, for a
+/// provider profile, what its tab is checked against before it starts. Bundled so the functions
+/// that carry it stay under the argument count a reader can hold in their head at once.
+struct Launch {
+    /// The tab this launch is for.
+    key: TabKey,
+    /// The run it is starting as; an answer that names another run has moved on.
+    run: u64,
+    /// What this tab's provider is checked against, when it has one.
+    gate: Option<ProviderGate>,
+    /// The token by which the bridge knows this tab's agent.
+    token: String,
+}
+
+impl Launch {
+    /// A launch for the tab `key` in its run `run`, known to the bridge as `token`, naming the
+    /// provider `provider` runs on when it has one and where `providers.toml` is read from to
+    /// check it still exists.
+    fn new(
+        key: TabKey,
+        run: u64,
+        token: String,
+        provider: Option<ProviderChoice>,
+        providers_path: Option<PathBuf>,
+    ) -> Self {
+        Self { key, run, gate: ProviderGate::of(provider, providers_path), token }
+    }
+}
+
+/// Brings the container of `plan` up for `launch`'s tab, on a background thread.
 ///
 /// A tab that opens one of the workspace's files first looks for the file at `file` on this
 /// machine: an editor started on a file that is gone would open an empty one of that name and
@@ -1638,17 +1803,17 @@ fn restart_tab(screen: &mut WorkspaceScreen, key: TabKey) -> Command<Msg> {
 fn bring_up(
     engine: Engine,
     plan: ContainerPlan,
+    launch: Launch,
     user: HostUser,
-    key: TabKey,
-    run: u64,
     file: Option<PathBuf>,
     registry: Option<PathBuf>,
 ) -> Command<Msg> {
     Command::perform(move || {
+        let Launch { key, run, gate, token } = launch;
         if file.is_some_and(|file| !file.exists()) {
             return Msg::Missing(key, run);
         }
-        start(registry.as_deref(), &engine, &plan, user, |result| Msg::Ready(key, run, result))
+        start(registry.as_deref(), &engine, &plan, user, gate.as_ref(), &token, |result| Msg::Ready(key, run, result))
     })
 }
 
@@ -1664,14 +1829,46 @@ fn start(
     engine: &Engine,
     plan: &ContainerPlan,
     user: HostUser,
+    gate: Option<&ProviderGate>,
+    token: &str,
     answer: impl FnOnce(Result<(), LaunchFailure>) -> Msg,
 ) -> Msg {
+    // A profile whose provider tag was removed from the Providers page since it was chosen here
+    // cannot be pointed anywhere: the relay would refuse every request with an unknown tab, which
+    // reads to the person as the harness itself being broken. Checked before anything is started,
+    // against the file as it is right now rather than a stale copy this profile once carried; the
+    // words for it were made before this thread was, because a background thread has no language
+    // of its own to translate them into.
+    if let Some(gate) = gate {
+        let providers = match &gate.path {
+            Some(path) => crate::provider::Providers::open(path).value,
+            None => crate::provider::Providers::in_memory(),
+        };
+        if providers.get(&gate.provider.tag).is_none() {
+            let message = gate.missing.clone();
+            return answer(Err(LaunchFailure { command: String::new(), output: message }));
+        }
+    }
     let result = plan::ensure_running(engine, plan, user);
     let up = result.is_ok();
     // Registered before the harness starts, so it finds the bridge's server at its first start.
     let unregistered = match &plan.bridge {
-        Some(bridge) if up => {
-            bridge_config::register(engine, &plan.name, bridge.harness).err().map(|trouble| (bridge.harness, trouble))
+        Some(bridge) if up => bridge_config::register(engine, &plan.name, bridge.harness, token)
+            .err()
+            .map(|trouble| (bridge.harness, trouble)),
+        _ => None,
+    };
+    // After the bridge and before the harness starts, so the agent reads the files as they are
+    // meant to be from its first turn.
+    let unguided = match plan.guidance {
+        Some(harness) if up => {
+            let trouble = plan::guide(engine, &plan.name, &plan.code, harness, plan.graphify).err();
+            // After graphify's installer, which is what points the agent at the map; started and
+            // not waited for, so the harness starts at once.
+            if plan.graphify {
+                plan::build_map(engine, &plan.name, &plan.code);
+            }
+            trouble.map(|trouble| (harness, trouble))
         }
         _ => None,
     };
@@ -1679,7 +1876,25 @@ fn start(
     if let Some((harness, trouble)) = unregistered {
         message = Msg::Unbridged(harness, trouble, Box::new(message));
     }
+    if let Some((harness, trouble)) = unguided {
+        message = Msg::Unguided(harness, trouble, Box::new(message));
+    }
     if up { noted(registry, engine.kind(), &plan.name, message) } else { message }
+}
+
+/// The words for a QCode high profile whose instruction files in the workspace could not be
+/// brought up to date. Its tab starts all the same: the agent works, it only has not been told
+/// everything it would have been.
+pub(super) fn unguided(harness: HarnessKind, trouble: &Unguided) -> Command<Msg> {
+    let body = match trouble {
+        Unguided::Graphify(words) => t!("workspace.unguided.graphify", words = words.as_str()),
+        Unguided::Unwritten(file, words) => {
+            t!("workspace.unguided.unwritten", file = file.as_str(), words = words.as_str())
+        }
+        Unguided::Broken(file) => t!("workspace.unguided.broken", file = file.as_str()),
+    };
+    let title = t!("workspace.unguided.title", harness = harness.record().display_name);
+    Command::toast(Toast::warning(title).body(body))
 }
 
 /// Notes in the list at `registry` that QCode started the container `name` in `engine`, and
@@ -1788,26 +2003,32 @@ fn ready(screen: &mut WorkspaceScreen, key: TabKey, run: u64, result: &Result<()
     let Some(command) = screen.launch_command(key) else { return Command::none() };
     let Some(workspace) = screen.owner_mut(key) else { return Command::none() };
     let folder = workspace.paths.root.clone();
+    // Bringing a tab up makes, remakes or starts a container, and even one that failed halfway may
+    // have left one behind; the panel's list is what the engine said before, so it is asked again.
+    let id = workspace.id.as_str().to_owned();
     let Some((_, tab)) = workspace.find(key) else { return Command::none() };
     if tab.run() != run || !tab.state().is_starting() {
         return Command::none();
     }
     if let Err(failure) = result {
         tab.settled(TabState::Failed(failure.clone()));
-        return Command::none();
+        return containers_of(screen, &id);
     }
     let args: Vec<OsString> = command.args.clone();
-    match TerminalSession::spawn(command.program.as_os_str(), &args, &folder) {
+    let attached = match TerminalSession::spawn(command.program.as_os_str(), &args, &folder) {
         Ok(session) => {
             let watch = session.watch();
             tab.attached(session);
-            Command::perform(move || Msg::Output(key, run, watch.next()))
+            let next = Command::perform(move || Msg::Output(key, run, watch.next()));
+            // A harness that has just come back takes whatever waited for it while it was gone.
+            Command::batch([next, bridge::deliver(screen, std::time::Instant::now())])
         }
         Err(error) => {
             tab.settled(TabState::Failed(LaunchFailure::spawn(&command, &error)));
             Command::none()
         }
-    }
+    };
+    Command::batch([attached, containers_of(screen, &id)])
 }
 
 /// Keeps a tab's session watched, and asks after its container when the session ends.
@@ -1821,13 +2042,14 @@ fn output(screen: &mut WorkspaceScreen, key: TabKey, run: u64, event: TerminalEv
         return Command::none();
     }
     match event {
-        TerminalEvent::Output => match tab.session() {
-            Some(session) => {
-                let watch = session.watch();
-                Command::perform(move || Msg::Output(key, run, watch.next()))
-            }
-            None => Command::none(),
-        },
+        TerminalEvent::Output => {
+            let Some(session) = tab.session() else { return Command::none() };
+            let watch = session.watch();
+            let next = Command::perform(move || Msg::Output(key, run, watch.next()));
+            // The tab has just spoken, so the wait for its quiet starts again from here, and a
+            // message held for it is looked at once that wait is over.
+            Command::batch([next, bridge::deliver(screen, std::time::Instant::now())])
+        }
         TerminalEvent::Exited(code) => {
             tab.settled(TabState::Ended { code });
             // A session can end because the person left the shell, or because the container
@@ -1866,8 +2088,16 @@ fn read_folder(workspace: &OpenWorkspace, key: &str) -> Command<Msg> {
 
 /// Asks the engine which containers the open workspace has.
 fn list_containers(screen: &mut WorkspaceScreen) -> Command<Msg> {
+    let Some(id) = screen.workspaces.get(screen.active).map(|workspace| workspace.id.as_str().to_owned()) else {
+        return Command::none();
+    };
+    containers_of(screen, &id)
+}
+
+/// Asks the engine which containers the workspace `id` has, open or waiting behind another.
+fn containers_of(screen: &mut WorkspaceScreen, id: &str) -> Command<Msg> {
     let Some(engine) = screen.engine.clone() else { return Command::none() };
-    let Some(workspace) = screen.workspaces.get_mut(screen.active) else { return Command::none() };
+    let Some(workspace) = screen.workspace_mut(id) else { return Command::none() };
     workspace.busy = true;
     let id = workspace.id.as_str().to_owned();
     Command::perform(move || {

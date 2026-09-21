@@ -541,8 +541,10 @@ mod tests {
         drop(workspace);
 
         // A program another test thread is starting holds a copy of the lock the round above
-        // took between `fork` and `exec`, so it is free once that copy closes too.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // took between `fork` and `exec`, so it is free once that copy closes too. The wait is
+        // long because a loaded machine takes its time over that, and a short one would report a
+        // working lock as broken: this failed once at five seconds with the whole suite running.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let _profile = loop {
             if let Some(held) = super::hold(&paths, &home()).expect("made") {
                 break held;

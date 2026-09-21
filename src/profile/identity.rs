@@ -84,6 +84,13 @@ impl Home {
         names::profile_container(self.workspace.as_str(), self.profile.as_str())
     }
 
+    /// The short-lived container that writes the bridge's server into this home's settings, for a
+    /// profile whose own container cannot be written to from the inside.
+    #[must_use]
+    pub fn settings_container(&self) -> String {
+        names::settings_container(self.workspace.as_str(), self.profile.as_str())
+    }
+
     /// The short-lived container that carries the login from one volume to the other.
     fn courier(&self) -> String {
         format!("qcode-refresh-{}-{}", self.workspace, self.profile)

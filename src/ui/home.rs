@@ -21,6 +21,8 @@ pub enum Entry {
     Workspaces,
     /// The harness profiles workspaces are opened with.
     Profiles,
+    /// The model services a harness can be pointed at, and the keys they are reached with.
+    Providers,
     /// Language, theme and the container engine.
     Settings,
     /// Leaves the application.
@@ -35,6 +37,7 @@ impl Entry {
             Self::NewWorkspace => t!("home.new-workspace"),
             Self::Workspaces => t!("home.workspaces"),
             Self::Profiles => t!("home.profiles"),
+            Self::Providers => t!("provider.menu"),
             Self::Settings => t!("home.settings"),
             Self::Quit => t!("home.quit"),
         }
@@ -48,6 +51,7 @@ impl Entry {
         match self {
             Self::Continue | Self::NewWorkspace | Self::Workspaces => "workspace",
             Self::Profiles => "profile",
+            Self::Providers => "category-network",
             Self::Settings => "settings",
             Self::Quit => "power",
         }
@@ -88,9 +92,9 @@ impl Home {
     /// The rows, in order. The first one either continues where the person left off or starts
     /// their first workspace.
     #[must_use]
-    pub fn entries(&self) -> [Entry; 5] {
+    pub fn entries(&self) -> [Entry; 6] {
         let first = if self.open.is_empty() { Entry::NewWorkspace } else { Entry::Continue };
-        [first, Entry::Workspaces, Entry::Profiles, Entry::Settings, Entry::Quit]
+        [first, Entry::Workspaces, Entry::Profiles, Entry::Providers, Entry::Settings, Entry::Quit]
     }
 
     /// What the "Continue" row says beside its label: the first workspace, and how many more
@@ -181,12 +185,33 @@ mod tests {
         let harness = home(None, SIZE.0, SIZE.1);
         let screen = harness.screen();
         assert!(screen.contains("███▀     ███  ██████"), "the wordmark is drawn:\n{screen}");
-        for label in ["New workspace", "Workspaces", "Profiles", "Settings", "Quit"] {
+        for label in ["New workspace", "Workspaces", "Profiles", "Providers", "Settings", "Quit"] {
             assert!(screen.contains(label), "`{label}` is missing:\n{screen}");
         }
-        let (_, logo_row) = harness.find("Coding harnesses").expect("the tagline is on screen");
+        let (_, logo_row) = harness.find("Coding agents").expect("the tagline is on screen");
         let (_, menu_row) = harness.find("Workspaces").expect("the menu is on screen");
         assert!(logo_row < menu_row, "the tagline sits above the menu:\n{screen}");
+    }
+
+    #[test]
+    fn the_tagline_calls_what_runs_in_the_container_a_coding_agent_in_every_language() {
+        let mut harness = home(None, SIZE.0, SIZE.1);
+        let screen = harness.screen();
+        assert!(screen.contains("Coding agents, always inside a container"), "{screen}");
+        for (code, words) in [
+            ("tr", "Kodlama ajanları"),
+            ("de", "Coding-Agenten"),
+            ("es", "Agentes de programación"),
+            ("fr", "agents de programmation"),
+            ("pt-BR", "Agentes de programação"),
+            ("ru", "Агенты"),
+            ("zh-Hans", "智能体"),
+            ("ja", "エージェント"),
+        ] {
+            harness.set_locale(code).render();
+            let screen = harness.screen();
+            assert!(screen.contains(words), "{code} says `{words}` under the logo:\n{screen}");
+        }
     }
 
     #[test]
@@ -253,14 +278,14 @@ mod tests {
 
     #[test]
     fn a_short_screen_drops_the_logo_before_it_drops_a_menu_row() {
-        // Fifteen rows hold the drawing, the tagline and the whole menu; ten hold the name in
-        // place of the drawing; nine hold the menu alone.
-        let drawn = home(None, SIZE.0, 15).screen();
+        // Sixteen rows hold the drawing, the tagline and the whole menu; eleven hold the name in
+        // place of the drawing; ten hold the menu alone.
+        let drawn = home(None, SIZE.0, 16).screen();
         assert!(drawn.contains("█████████▄"), "{drawn}");
-        let named = home(None, SIZE.0, 10).screen();
+        let named = home(None, SIZE.0, 11).screen();
         assert!(!named.contains('█'), "the drawing gives way first:\n{named}");
         assert!(named.contains("QCode"), "{named}");
-        let bare = home(None, SIZE.0, 9).screen();
+        let bare = home(None, SIZE.0, 10).screen();
         assert!(!bare.contains("QCode"), "the logo goes rather than the menu:\n{bare}");
         for screen in [&drawn, &named, &bare] {
             assert!(screen.contains("New workspace") && screen.contains("Quit"), "the menu is whole:\n{screen}");
@@ -277,7 +302,7 @@ mod tests {
         // In ASCII mode the logo is painted in colour rather than written in characters, so the
         // text of the screen alone cannot tell whether it is there. Only the logo sits above the
         // tagline, so a coloured cell there is the logo.
-        let (_, tagline) = harness.find("Coding harnesses").expect("the tagline is on screen");
+        let (_, tagline) = harness.find("Coding agents").expect("the tagline is on screen");
         let rows = 0..u16::try_from(tagline).expect("the tagline row fits the screen");
         let background = harness.bg(0, 0);
         let painted = rows.flat_map(|y| (0..SIZE.0).map(move |x| (x, y))).any(|(x, y)| harness.bg(x, y) != background);
@@ -310,24 +335,32 @@ mod tests {
                     "▌  \u{f009} Continue             firefly",
                     "\u{f009} Workspaces",
                     "\u{f007} Profiles",
+                    "\u{f0ac} Providers",
                     "\u{f013} Settings",
                     "\u{f011} Quit",
                 ],
             ),
             (
                 GlyphMode::Unicode,
-                ["▌  ◰ Continue             firefly", "◰ Workspaces", "◉ Profiles", "▤ Settings", "○ Quit"],
+                [
+                    "▌  ◰ Continue             firefly",
+                    "◰ Workspaces",
+                    "◉ Profiles",
+                    "◎ Providers",
+                    "▤ Settings",
+                    "○ Quit",
+                ],
             ),
             (
                 GlyphMode::Ascii,
-                ["# Continue             firefly", "# Workspaces", "@ Profiles", "* Settings", "x Quit"],
+                ["# Continue             firefly", "# Workspaces", "@ Profiles", "~ Providers", "* Settings", "x Quit"],
             ),
         ] {
             harness.set_glyph_mode(mode).render();
             let screen = harness.screen();
             let (_, first) = harness.find("Continue").expect("the menu is on screen");
             let first = usize::try_from(first).expect("a row on the screen");
-            let rows: Vec<&str> = screen.lines().skip(first).take(5).map(str::trim).collect();
+            let rows: Vec<&str> = screen.lines().skip(first).take(6).map(str::trim).collect();
             assert_eq!(rows, expected, "{mode:?}:\n{screen}");
         }
     }

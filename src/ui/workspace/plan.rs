@@ -13,14 +13,16 @@
 use std::path::{Path, PathBuf};
 
 use crate::base;
+use crate::bridge::config::{self, Unregistered};
 use crate::desktop::{self, Display};
 use crate::engine::{
     Access, Container, ContainerCreate, ContainerState, Engine, EngineCommand, Exec, HostUser, Mount, MountSource,
     Network, RunOnce, RunWindow, Socket, Tmpfs, names,
     run::{self, EngineError},
 };
+use crate::profile::guidance::{self, Unguided};
 use crate::profile::identity::{self, Home};
-use crate::profile::{Desktop, HarnessKind, MountAccess, NetworkMode, Profile};
+use crate::profile::{Desktop, Extra, HarnessKind, MountAccess, NetworkMode, Profile, Template};
 use crate::store::{WorkspaceId, WorkspacePaths};
 
 /// The places every container agrees on, taken from the one contract the base image is built to.
@@ -68,6 +70,14 @@ pub struct ContainerPlan {
     /// `Containers/Browser/` on the host, mounted writable at [`desktop::signin::OPEN_DIR`].
     /// `None` for every container that opens no window.
     pub browser: Option<PathBuf>,
+    /// The harness whose instruction files in the workspace are brought up to date when the
+    /// container comes up — graphify's section and hooks, and QCode's own section — for a profile
+    /// on QCode high; `None` for every other container, which leaves the workspace's files alone.
+    pub guidance: Option<HarnessKind>,
+    /// Whether graphify is in the profile's image, so that its installer runs in the workspace and
+    /// its map is built there when the container comes up. False for every container but that of
+    /// a QCode high profile that kept graphify.
+    pub graphify: bool,
 }
 
 /// The bridge a profile container carries.
@@ -95,6 +105,8 @@ impl ContainerPlan {
             window: None,
             bridge: None,
             browser: None,
+            guidance: None,
+            graphify: false,
         }
     }
 
@@ -113,6 +125,8 @@ impl ContainerPlan {
             window: None,
             bridge: Some(Bridge { folder: paths.mcp(), harness: profile.harness }),
             browser: None,
+            guidance: (profile.template == Template::High).then_some(profile.harness),
+            graphify: profile.has(Extra::Graphify),
         }
     }
 
@@ -125,6 +139,10 @@ impl ContainerPlan {
     /// has to ask a compositor what is on screen. The two can stand side by side on the same home
     /// volume, so a profile's window and its command-line tabs share their settings and history.
     ///
+    /// The bridge comes along, because the agent inside the window is an agent like any other:
+    /// it starts the same server and asks over the same socket. Only the way back is missing,
+    /// there being no prompt on a window to type an answer into.
+    ///
     /// `None` for a profile whose harness draws in a terminal.
     #[must_use]
     pub fn window(workspace: &WorkspaceId, paths: &WorkspacePaths, profile: &Profile) -> Option<Self> {
@@ -133,10 +151,6 @@ impl ContainerPlan {
             name: names::desktop_container(workspace.as_str(), profile.name.as_str()),
             window: Some(desktop),
             browser: Some(paths.browser()),
-            // No bridge: what runs in this container is the application itself, not an agent of
-            // QCode's, so there is nothing to answer the socket and no reason to let the
-            // application see it.
-            bridge: None,
             ..Self::profile(workspace, paths, profile)
         })
     }
@@ -473,10 +487,11 @@ pub fn open_window(
         }
         None => {}
     }
-    // The folder the window writes addresses into has to be there before the container starts:
-    // an engine refuses to mount a path that does not exist.
-    if let Some(browser) = &plan.browser {
-        std::fs::create_dir_all(browser).map_err(|error| LaunchFailure::from_host(&error))?;
+    // The folders the window mounts have to be there before the container starts: an engine
+    // refuses to mount a path that does not exist. One is where the window writes the addresses
+    // it wants opened, the other is where the bridge's socket and server live.
+    for folder in [plan.browser.as_ref(), plan.bridge.as_ref().map(|bridge| &bridge.folder)].into_iter().flatten() {
+        std::fs::create_dir_all(folder).map_err(|error| LaunchFailure::from_host(&error))?;
     }
     let seccomp = if engine.needs_sandbox_profile() {
         Some(desktop::seccomp::file().map_err(|error| LaunchFailure::from_host(&error))?)
@@ -487,7 +502,166 @@ pub fn open_window(
         return Ok(Window::Opened);
     };
     run::capture(&command).map_err(|error| LaunchFailure::from(&error))?;
+    // In the window's own container rather than the one that prepared it: that one is taken away
+    // at once, and the map with it, while this one lives as long as the window.
+    if plan.graphify {
+        build_map(engine, &plan.name, &plan.code);
+    }
     Ok(Window::Opened)
+}
+
+/// What was made ready for a window before it opened: the bridge's server registered in its
+/// settings, and its instruction files in the workspace; each of them either done or why not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prepared {
+    /// The bridge's registration.
+    pub bridge: Result<(), Unregistered>,
+    /// The instruction files, for a profile on QCode high.
+    pub guidance: Result<(), Unguided>,
+}
+
+/// Makes `plan`'s window ready before it opens, from a container made for that and nothing else:
+/// registers the bridge's server in the settings on its home volume, for the tab whose token is
+/// `token`, and, for a profile on QCode high, brings its instruction files in the workspace up to
+/// date the way [`guide`] does for a terminal's container.
+///
+/// A window's own container cannot be written to from the inside: it is created and started in one
+/// go with the application as its only program, so by the time it is there the settings have been
+/// read. This runs before the window opens instead, on the same volume and workspace and from the
+/// same image, so what it writes is what the application finds. The container goes away again
+/// whatever happened, and one left behind by an interrupted run is removed first, so it cannot
+/// block the next.
+///
+/// Runs engine commands and waits for them, so it belongs on a background thread.
+#[must_use]
+pub fn prepare_window(engine: &Engine, plan: &ContainerPlan, user: HostUser, token: &str) -> Prepared {
+    let mut prepared = Prepared { bridge: Ok(()), guidance: Ok(()) };
+    let Some(home) = &plan.home else { return prepared };
+    if plan.bridge.is_none() && plan.guidance.is_none() {
+        return prepared;
+    }
+    let name = home.settings_container();
+    let volume = home.volume();
+    let mut mounts =
+        vec![Mount { source: MountSource::Volume(&volume), target: Path::new(HOME_DIR), access: Access::ReadWrite }];
+    if plan.guidance.is_some() {
+        mounts.push(Mount {
+            source: MountSource::Path(&plan.code),
+            target: Path::new(CODE_DIR),
+            access: Access::ReadWrite,
+        });
+    }
+    let create = engine.create_container(&ContainerCreate {
+        name: &name,
+        hostname: names::HOSTNAME,
+        labels: &[],
+        image: &plan.image,
+        mounts: &mounts,
+        network: Network::None,
+        user,
+        workdir: None,
+        command: KEEP_ALIVE,
+    });
+    let remove = engine.remove_container(&name);
+    let _ = run::capture(&remove);
+    let up = run::capture(&create).and_then(|_| run::capture(&engine.start_container(&name)));
+    match up {
+        Ok(_) => {
+            if let Some(bridge) = &plan.bridge {
+                prepared.bridge = config::register(engine, &name, bridge.harness, token);
+            }
+            if let Some(harness) = plan.guidance {
+                prepared.guidance = guide(engine, &name, &plan.code, harness, plan.graphify);
+            }
+        }
+        Err(error) => {
+            let words = config::words(&error);
+            if plan.bridge.is_some() {
+                prepared.bridge = Err(Unregistered::Engine(words.clone()));
+            }
+            if plan.guidance.is_some() {
+                prepared.guidance = Err(Unguided::Graphify(words));
+            }
+        }
+    }
+    let _ = run::capture(&remove);
+    prepared
+}
+
+/// Brings the instruction files of `harness` in the workspace up to date, from the running
+/// container `container` whose workspace folder is `code` on this machine; graphify's part only
+/// when `graphify` says it is in the image, since a profile that went without it has no graphify
+/// to run.
+///
+/// graphify goes first and writes its own part itself — its section, its hooks, and for some
+/// harnesses a skill in the home — by its own installer inside the container, in [`CODE_DIR`],
+/// the folder the agent works in: measured, it needs no network and a second run writes nothing
+/// new. QCode's section is written next, on this machine, into the same folder, and only when it
+/// is not already there as it would be written. The two happen under [`guidance::lock`], so two
+/// tabs coming up at once in one workspace cannot write one file over the other's.
+///
+/// Runs engine commands and writes the disk, so it belongs on a background thread.
+///
+/// # Errors
+///
+/// [`Unguided`] when graphify's installer or the engine refuses, or QCode's section cannot be
+/// written. QCode's section is still written when graphify's failed, so the agent learns of the
+/// other tabs either way.
+pub fn guide(
+    engine: &Engine,
+    container: &str,
+    code: &Path,
+    harness: HarnessKind,
+    graphify: bool,
+) -> Result<(), Unguided> {
+    let _writing = guidance::lock();
+    let install =
+        ["sh", "-c", "cd \"$1\" && exec graphify \"$2\" install", "sh", CODE_DIR, guidance::platform(harness)];
+    let graphify = if graphify {
+        run::capture(&engine.exec_without_terminal(&Exec { container, command: &install }))
+            .map(|_| ())
+            .map_err(|error| Unguided::Graphify(config::words(&error)))
+    } else {
+        Ok(())
+    };
+    let ours = guidance::write(code, harness).map(|_| ());
+    graphify.and(ours)
+}
+
+/// graphify's map of the workspace's code, relative to the workspace folder: what graphify's
+/// section and hooks send the agent to.
+pub const MAP: &str = "graphify-out/graph.json";
+
+/// Starts graphify building its map of the workspace's code in the running container `container`,
+/// whose workspace folder is `code` on this machine, when there is no map there yet; does nothing
+/// when there is one.
+///
+/// graphify's installer writes a section and hooks that tell the agent to ask the map before it
+/// reads files, but it builds no map, so without this the agent is pointed at a file that is not
+/// there. `graphify update .` builds it from the code alone: measured, it needs no network and no
+/// model. It is left running on its own inside the container and not waited for, because a large
+/// workspace takes minutes and the harness must not wait for it; its output goes nowhere, since
+/// nobody is there to read it. Once the map is there, graphify's own hooks keep it current, so a
+/// map that exists is never rebuilt here.
+///
+/// A map that fails to be built is not said on screen: graphify's section tells the agent how to
+/// build it, and the agent works without one.
+///
+/// Runs an engine command, so it belongs on a background thread.
+pub fn build_map(engine: &Engine, container: &str, code: &Path) {
+    if code.join(MAP).exists() {
+        return;
+    }
+    // `flock -n` so that two tabs of one profile coming up at once, which share its container,
+    // start one build between them and not two writing the same files.
+    let build = [
+        "sh",
+        "-c",
+        "cd \"$1\" && nohup flock -n /tmp/qcode-map graphify update . </dev/null >/dev/null 2>&1 &",
+        "sh",
+        CODE_DIR,
+    ];
+    let _ = run::capture(&engine.exec_without_terminal(&Exec { container, command: &build }));
 }
 
 /// Waits for the window's container to end and answers its exit code, or `None` when the engine

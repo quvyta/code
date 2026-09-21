@@ -203,8 +203,10 @@ fn profile(name: &str, harness: HarnessKind, account: AccountKind) -> Profile {
         harness,
         template: Template::Recommended,
         account,
+        provider: None,
         assets: MountAccess::ReadWrite,
         network: NetworkMode::None,
+        without: Vec::new(),
     }
 }
 

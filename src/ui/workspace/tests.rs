@@ -29,6 +29,7 @@ mod backups;
 mod bridge;
 mod desktop;
 mod files;
+mod guidance;
 mod history;
 mod registry;
 mod sound;
@@ -130,8 +131,10 @@ fn profile(name: &str, harness: HarnessKind) -> Profile {
         harness,
         template: Template::Recommended,
         account: AccountKind::Subscription,
+        provider: None,
         assets: MountAccess::ReadOnly,
         network: NetworkMode::Full,
+        without: Vec::new(),
     }
 }
 
@@ -298,6 +301,169 @@ fn a_tab_opens_inside_a_container_and_never_on_this_machine() {
         ["exec", "--interactive", "--tty", "qcode-firefly-claude-sub", "claude", "--dangerously-skip-permissions"],
         "the harness is an argument of the engine, so it runs in the container"
     );
+}
+
+/// A profile of [`AccountKind::Provider`], running on `tag`/`model`.
+fn provider_profile(name: &str, tag: &str, model: &str) -> Profile {
+    Profile {
+        account: AccountKind::Provider,
+        provider: Some(crate::profile::ProviderChoice { tag: tag.to_owned(), model: model.to_owned() }),
+        ..profile(name, HarnessKind::ClaudeCode)
+    }
+}
+
+/// A `providers.toml` at a scratch path of its own, carrying one provider tagged `tag` (an ollama
+/// entry, which needs no key) when `present`, or nothing at all otherwise — the way the Providers
+/// page would leave it after the person removed it.
+fn providers_file(name: &str, tag: &str, present: bool) -> PathBuf {
+    // A folder of its own: saving narrows the folder the file is in, and that must never be
+    // the machine's shared temporary folder.
+    let path = std::env::temp_dir().join(format!("qcode-workspace-providers-{name}")).join("providers.toml");
+    let mut providers = crate::provider::Providers::in_memory();
+    if present {
+        let entry = crate::provider::ProviderEntry::new(
+            crate::provider::Tag::parse(tag).expect("a tag"),
+            crate::provider::ProviderKind::Ollama,
+            "http://127.0.0.1:11434",
+        );
+        providers.add(entry).expect("the tag is free");
+    }
+    providers.at(&path).save().expect("the scratch file is written");
+    path
+}
+
+/// A `providers.toml` carrying one ollama provider tagged `tag` whose model `model` was measured
+/// to give `window` tokens, which is what a tab of it must be told.
+fn measured_providers_file(name: &str, tag: &str, model: &str, window: u64) -> PathBuf {
+    // A folder of its own: saving narrows the folder the file is in, and that must never be
+    // the machine's shared temporary folder.
+    let path = std::env::temp_dir().join(format!("qcode-workspace-providers-{name}")).join("providers.toml");
+    let mut providers = crate::provider::Providers::in_memory();
+    let mut entry = crate::provider::ProviderEntry::new(
+        crate::provider::Tag::parse(tag).expect("a tag"),
+        crate::provider::ProviderKind::Ollama,
+        "http://127.0.0.1:11434",
+    );
+    let mut known = crate::provider::Model::new(model);
+    known.claimed = Some(262_144);
+    known.measured = Some(crate::provider::Measured::About(window));
+    entry.models = vec![known];
+    providers.add(entry).expect("the tag is free");
+    providers.at(&path).save().expect("the scratch file is written");
+    path
+}
+
+/// The `--env NAME=VALUE` pairs a command carries, by name.
+fn envs(command: &EngineCommand) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let mut args = command.args.iter().map(|arg| arg.to_string_lossy().into_owned()).peekable();
+    while let Some(word) = args.next() {
+        if word == "--env"
+            && let Some(pair) = args.next()
+            && let Some((name, value)) = pair.split_once('=')
+        {
+            map.insert(name.to_owned(), value.to_owned());
+        }
+    }
+    map
+}
+
+#[test]
+fn a_provider_tabs_environment_points_at_the_relay_and_never_carries_a_key() {
+    let scratch = Scratch::new("provider-env");
+    let profiles = vec![provider_profile("ev-tab", "ev1", "qwen3.8")];
+    let mut screen = WorkspaceScreen::new(
+        Some(engine()),
+        HostUser::Ids { uid: 1000, gid: 1000 },
+        vec![workspace("firefly", "Firefly", scratch.paths(), profiles)],
+    );
+    apply(&mut screen, Msg::OpenWorkspace(0));
+    open(&mut screen, Choice::NewChat("ev-tab".to_owned()));
+
+    let command = screen.launch_command(key(&screen, 0)).expect("a chosen tab has a command");
+    let env = envs(&command);
+    assert_eq!(env.get("ANTHROPIC_BASE_URL").map(String::as_str), Some("http://127.0.0.1:41417"));
+    assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("qwen3.8"));
+    assert!(env.contains_key("ANTHROPIC_AUTH_TOKEN"), "{env:?}");
+    // The one thing that must never appear: a provider's real key. None was ever given to this
+    // profile — providers.toml is never read to build this command — so the container's own
+    // words are the proof: the key stays on this machine, never inside what a tab is started with.
+    let spelled = format!("{command:?}");
+    assert!(!spelled.to_lowercase().contains("apikey") && !spelled.contains("sk-"), "{spelled}");
+}
+
+#[test]
+fn a_provider_tab_runs_the_relay_which_starts_the_harness_and_an_ordinary_tab_does_not() {
+    let scratch = Scratch::new("provider-program");
+    let profiles = vec![provider_profile("ev-tab", "ev1", "qwen3.8"), profile("plain", HarnessKind::ClaudeCode)];
+    let mut screen = WorkspaceScreen::new(
+        Some(engine()),
+        HostUser::Ids { uid: 1000, gid: 1000 },
+        vec![workspace("firefly", "Firefly", scratch.paths(), profiles)],
+    );
+    apply(&mut screen, Msg::OpenWorkspace(0));
+    open(&mut screen, Choice::NewChat("ev-tab".to_owned()));
+
+    let editor = screen.editor();
+    let workspace = screen.workspace().expect("a workspace");
+    let chosen = &workspace.tabs()[0];
+    let program = workspace.program(chosen, editor).expect("a harness tab runs something");
+    // The relay must already answer at the address the tab's environment names when the harness
+    // makes its first request, and the only thing that can promise that is the relay starting the
+    // harness itself.
+    assert_eq!(program[0], "node", "{program:?}");
+    assert!(program[1].ends_with("qcode-relay.mjs"), "{program:?}");
+    assert_eq!(&program[2..], ["claude", "--dangerously-skip-permissions"], "{program:?}");
+
+    // A profile that signs in the ordinary way runs its harness and nothing else: no relay is
+    // started for a tab that has no provider to reach.
+    open(&mut screen, Choice::NewChat("plain".to_owned()));
+    let editor = screen.editor();
+    let workspace = screen.workspace().expect("a workspace");
+    let plain = &workspace.tabs()[1];
+    let program = workspace.program(plain, editor).expect("a harness tab runs something");
+    assert_eq!(program[0], "claude", "{program:?}");
+}
+
+#[test]
+fn a_tab_is_told_the_window_this_server_was_measured_to_give_rather_than_leaving_it_assumed() {
+    let scratch = Scratch::new("provider-window");
+    let path = measured_providers_file("window", "ev1", "qwen3.8", 31_512);
+    let profiles = vec![provider_profile("ev-tab", "ev1", "qwen3.8")];
+    let mut screen = WorkspaceScreen::new(
+        Some(engine()),
+        HostUser::Ids { uid: 1000, gid: 1000 },
+        vec![workspace("firefly", "Firefly", scratch.paths(), profiles)],
+    )
+    .with_providers_path(Some(path.clone()));
+    apply(&mut screen, Msg::OpenWorkspace(0));
+    open(&mut screen, Choice::NewChat("ev-tab".to_owned()));
+
+    // Not a default: a harness told nothing assumes its own models' room, which here would be
+    // six times what this server really gives.
+    let env = envs(&screen.launch_command(key(&screen, 0)).expect("a chosen tab has a command"));
+    assert_eq!(env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS").map(String::as_str), Some("31512"), "{env:?}");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_profile_whose_provider_tag_was_deleted_says_so_instead_of_starting() {
+    let scratch = Scratch::new("provider-missing");
+    let path = providers_file("missing", "ev1", false);
+    let profiles = vec![provider_profile("ev-tab", "ev1", "qwen3.8")];
+    let screen = WorkspaceScreen::new(
+        Some(engine()),
+        HostUser::Ids { uid: 1000, gid: 1000 },
+        vec![workspace("firefly", "Firefly", scratch.paths(), profiles)],
+    )
+    .with_providers_path(Some(path));
+    let mut harness = harness(screen, SIZE.0, SIZE.1);
+    open_in(&mut harness, Choice::NewChat("ev-tab".to_owned()));
+
+    let state = harness.app().0.workspace().expect("a workspace").tabs()[0].state().clone();
+    let TabState::Failed(failure) = state else { panic!("a deleted tag cannot start a tab: {state:?}") };
+    assert!(failure.output.contains("ev1"), "the tag it could not find is named: {failure:?}");
+    assert_eq!(failure.command, "", "nothing was even tried against the engine");
 }
 
 #[test]
@@ -985,6 +1151,71 @@ fn the_container_widget_lists_this_workspaces_containers_and_acts_on_one() {
     let text = harness.screen();
     assert!(text.contains("Stop"), "{text}");
     assert!(text.contains("Restart"), "a stopped container can still be restarted:\n{text}");
+}
+
+#[test]
+fn a_workspace_without_a_container_says_so_in_a_whole_sentence() {
+    // The panel is a third of a 120-column screen at most, and the sentence is longer than that.
+    let scratch = Scratch::new("no-container");
+    let mut harness = harness(one_workspace(&scratch), 120, 36);
+    harness.send(Msg::ContainersRead("firefly".to_owned(), Ok(Vec::new())));
+    harness.render();
+    let screen = harness.screen();
+    let panel = panel_lines(&harness);
+    let read = panel.join(" ").split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(read.contains("This workspace has no container yet"), "the sentence is read to its end:\n{screen}");
+    assert!(!panel.iter().any(|line| line.contains('…')), "and nothing in the panel is cut:\n{screen}");
+}
+
+/// The panel's column of each line of the harness's screen, trimmed.
+fn panel_lines(harness: &Harness<Screen>) -> Vec<String> {
+    let width = usize::from(harness.app().0.panel().width());
+    harness
+        .screen()
+        .lines()
+        .map(|line| {
+            let cells: Vec<char> = line.chars().collect();
+            cells[cells.len().saturating_sub(width)..].iter().collect::<String>().trim().to_owned()
+        })
+        .collect()
+}
+
+#[test]
+fn a_container_a_tab_brings_up_appears_in_the_panel_without_a_refresh() {
+    // An engine that knows no container until one is started, and lists the started ones after.
+    // Once started it says the container is running, so the tab's session ending at once is not
+    // taken for the container going away: the list can only be read again because it came up.
+    let scratch = Scratch::new("brought-up");
+    let (binary, listed) = (scratch.0.join("engine"), scratch.0.join("listed"));
+    let script = format!(
+        "#!/bin/sh\n\
+         [ \"$1\" = start ] && printf '%s\\trunning\\n' \"$2\" >> {listed}\n\
+         [ \"$1\" = ps ] && {{ cat {listed} 2>/dev/null; exit 0; }}\n\
+         [ \"$2\" = inspect ] && [ -e {listed} ] && {{ echo running; exit 0; }}\n\
+         for word in \"$@\"; do case \"$word\" in *'qcode-new'*) cat > /dev/null ;; esac; done\n\
+         exit 0\n",
+        listed = listed.display(),
+    );
+    fs::write(&binary, script).expect("the stand-in engine is written");
+    fs::set_permissions(&binary, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("it can be run");
+    let workspaces =
+        vec![workspace("firefly", "Firefly", scratch.paths(), vec![profile("claude-sub", HarnessKind::ClaudeCode)])];
+    let screen = WorkspaceScreen::new(
+        Some(Engine::new(EngineKind::Podman, &binary)),
+        HostUser::Ids { uid: 1000, gid: 1000 },
+        workspaces,
+    );
+    let mut harness = harness(screen, 120, 36);
+    harness.set_reduced_motion(true).render();
+    let before = panel_lines(&harness).join(" ");
+    assert!(before.contains("no container"), "nothing is up yet:\n{}", harness.screen());
+
+    harness.click_text("New tab").render();
+    harness.click_text("New chat").advance(Duration::from_millis(400)).render();
+    assert!(listed.exists(), "the tab started its container:\n{}", harness.screen());
+    let after = panel_lines(&harness).join(" ");
+    assert!(after.contains("claude-sub") && after.contains("running"), "the panel lists it:\n{}", harness.screen());
+    assert!(!after.contains("no container"), "and no longer says there is none:\n{}", harness.screen());
 }
 
 #[test]

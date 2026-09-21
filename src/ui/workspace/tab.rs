@@ -8,7 +8,7 @@ use qframe::widgets::TerminalSession;
 use crate::base::apps::Quiet;
 use crate::bridge;
 
-use super::bridge::Letter;
+use super::bridge::{Letter, Undelivered};
 use super::plan::LaunchFailure;
 
 /// A tab's identity, which stays the same while tabs are closed and dragged around it.
@@ -183,6 +183,9 @@ pub struct Tab {
     letters: Vec<Letter>,
     /// Whether the waiting letters are shown.
     letters_shown: bool,
+    /// Why the oldest waiting message could not be typed into the harness, when an attempt was
+    /// made and failed. Cleared as soon as one is typed in.
+    undelivered: Option<Undelivered>,
 }
 
 impl Tab {
@@ -208,6 +211,7 @@ impl Tab {
             token: bridge::token(),
             letters: Vec::new(),
             letters_shown: false,
+            undelivered: None,
         }
     }
 
@@ -376,6 +380,29 @@ impl Tab {
         self.letters.push(letter);
     }
 
+    /// Why the waiting messages have not been typed into the harness, when something stops them.
+    #[must_use]
+    pub fn undelivered(&self) -> Option<Undelivered> {
+        self.undelivered
+    }
+
+    /// Records that the oldest waiting message could not be typed in, and why. The message stays
+    /// where it is: dropping it would let the sender believe its work was handed over.
+    pub fn not_delivered(&mut self, why: Undelivered) {
+        self.undelivered = Some(why);
+    }
+
+    /// Takes the oldest waiting message away, once it has been typed into the harness.
+    pub fn delivered(&mut self) {
+        if !self.letters.is_empty() {
+            self.letters.remove(0);
+        }
+        self.undelivered = None;
+        if self.letters.is_empty() {
+            self.letters_shown = false;
+        }
+    }
+
     /// Shows the waiting messages, or hides them.
     pub fn show_letters(&mut self, shown: bool) {
         self.letters_shown = shown;
@@ -385,6 +412,7 @@ impl Tab {
     pub fn discard_letters(&mut self) {
         self.letters.clear();
         self.letters_shown = false;
+        self.undelivered = None;
     }
 
     /// Turns a blank tab into a tab of `kind` showing `conversation`, opened now and waiting for

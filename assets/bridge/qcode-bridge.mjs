@@ -28,7 +28,10 @@ const HOST_WAIT_MS = 120000;
 const INSTRUCTIONS =
   "Other tabs of this QCode project run agents too. list_tabs names them; send_message " +
   "hands one of them a message. The person using QCode approves the first message between two " +
-  "tabs, and QCode may refuse a message; the answer always says what happened and why.";
+  "tabs, and QCode may refuse a message; the answer always says what happened and why. A " +
+  "message is written into the other tab's prompt once that tab is quiet, so it may still be " +
+  "waiting after send_message answers: list_tabs says how many messages each tab still holds " +
+  "and what is stopping them.";
 
 const TOOLS = [
   {
@@ -36,7 +39,10 @@ const TOOLS = [
     title: "List the project's other agent tabs",
     description:
       "Lists the other tabs open in this QCode project that run an agent: the id to send " +
-      "to, the tab's title, its harness, its profile and whether it reaches the network.",
+      "to, the tab's title, its coding tool, its profile, whether it reaches the network, how " +
+      "many messages are still waiting to be written into it (`waiting`) and what is stopping " +
+      "them (`trouble`, null when nothing is). Call it again to see whether a message you sent " +
+      "has arrived.",
     inputSchema: { type: "object", additionalProperties: false },
   },
   {
@@ -44,8 +50,11 @@ const TOOLS = [
     title: "Send a message to another agent tab",
     description:
       "Sends a message to the agent of another tab of this QCode project, by the id " +
-      "list_tabs gave. The receiving agent sees who sent it. The answer says whether the message " +
-      "was accepted, is waiting for the person's approval, or was refused, and why.",
+      "list_tabs gave. The message is written into that tab's prompt, naming this tab as its " +
+      "sender, once the tab is quiet: nobody typing in it and its tool done writing. The answer " +
+      "says whether the message went in, is still waiting to go in, is waiting for the person's " +
+      "approval, or was refused, and why. Do not take a message that is still waiting for " +
+      "delivered work; list_tabs says whether it has arrived.",
     inputSchema: {
       type: "object",
       properties: {

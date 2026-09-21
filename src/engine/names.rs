@@ -67,6 +67,16 @@ pub fn desktop_container(workspace: &str, profile: &str) -> String {
     format!("qcode-{workspace}-{profile}.desk")
 }
 
+/// The short-lived container that writes the bridge's server into the settings on a workspace
+/// profile's home volume, for a profile whose own container cannot be written to from the inside.
+///
+/// The dot is what no workspace id and no profile name can hold, so this can never be the
+/// container of a profile or of its window.
+#[must_use]
+pub fn settings_container(workspace: &str, profile: &str) -> String {
+    format!("qcode-{workspace}-{profile}.mcp")
+}
+
 /// The volume holding a profile's login, shared by every workspace that uses the profile.
 #[must_use]
 pub fn credential_volume(profile: &str) -> String {
@@ -84,7 +94,7 @@ pub fn home_volume(workspace: &str, profile: &str) -> String {
 mod tests {
     use super::{
         BASE_IMAGE, HOSTNAME, base_container, credential_volume, desktop_container, home_volume, profile_container,
-        profile_image, sound_container,
+        profile_image, settings_container, sound_container,
     };
     use crate::profile::SafeName;
 
@@ -142,10 +152,13 @@ mod tests {
             assert!(is_object_name(&base_container(name)), "{text:?}");
             assert!(is_object_name(&sound_container(name, 7)), "{text:?}");
             assert!(is_object_name(&desktop_container(name, name)), "{text:?}");
+            assert!(is_object_name(&settings_container(name, name)), "{text:?}");
             // No profile, whatever its name, has the container a sound plays in or a window opens
             // in: both are told apart by a dot, which a safe name never holds.
             assert!(!profile_container(name, name).contains('.'), "{text:?}");
             assert_ne!(desktop_container(name, name), profile_container(name, name), "{text:?}");
+            assert_ne!(settings_container(name, name), desktop_container(name, name), "{text:?}");
+            assert_ne!(settings_container(name, name), profile_container(name, name), "{text:?}");
         }
     }
 

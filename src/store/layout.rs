@@ -534,8 +534,10 @@ mod tests {
             harness: HarnessKind::ClaudeCode,
             template: Template::Recommended,
             account: AccountKind::Subscription,
+            provider: None,
             assets: MountAccess::ReadOnly,
             network: NetworkMode::Full,
+            without: Vec::new(),
         }
     }
 

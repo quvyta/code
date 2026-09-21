@@ -6,6 +6,7 @@
 //! the definition and the facts every harness brings with it; building images and running
 //! containers is the engine's work.
 
+pub mod guidance;
 pub mod history;
 pub mod identity;
 
@@ -22,7 +23,9 @@ mod live;
 mod name;
 mod template;
 
-pub use definition::{Loaded, MountAccess, NetworkMode, Profile};
+pub use definition::{ASSUMED_CONTEXT_TOKENS, Loaded, MountAccess, NetworkMode, Profile, ProviderChoice};
 pub use harness::{AccountKind, ConfigFile, Desktop, Harness, HarnessKind, McpSettings, McpShape, Resume, Surface};
 pub use name::SafeName;
-pub use template::Template;
+pub use template::{
+    Addition, CLAUDE_MARKETPLACES, CLAUDE_PLUGINS, Extra, GRAPHIFY_HOME, GRAPHIFY_PACKAGE, OH_MY_OPENAGENT, Template,
+};

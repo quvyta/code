@@ -342,12 +342,33 @@ mod tests {
         let _ = served.join();
     }
 
+    /// Waits until nothing answers on `socket` any more, which is what a socket left behind by a
+    /// QCode that ended is.
+    ///
+    /// Dropping the listener is not yet that, in a test binary. Other tests start processes on
+    /// other threads, and a process being started is a copy of this one until it runs its
+    /// program: for that moment it holds every descriptor this one has, the listener just dropped
+    /// included, and the socket still takes connections. `Listener::open` then finds it answered
+    /// and rightly leaves it alone. Measured: 13 of 2000 opens right after a drop found it
+    /// answered while another thread started `true` over and over, none of 2000 when nothing was
+    /// started, and none of 2000 with this wait in between. A QCode
+    /// that ended has no such copy left, so the product has nothing to wait for; the test waits
+    /// for the state it means to set up, for as long as a loaded machine could take.
+    fn refused(socket: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while UnixStream::connect(socket).is_ok() {
+            assert!(std::time::Instant::now() < deadline, "something still answers on {}", socket.display());
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn a_socket_left_behind_is_replaced() {
         let scratch = Scratch::new("stale");
         std::fs::create_dir_all(&scratch.0).expect("a folder");
         let stale = std::os::unix::net::UnixListener::bind(scratch.0.join(SOCKET_NAME)).expect("a socket");
         drop(stale);
+        refused(&scratch.0.join(SOCKET_NAME));
         let listener = Listener::open(&scratch.0).expect("the stale socket is replaced");
         let served = answering(listener.inbox(), echo);
         assert!(ask(listener.socket(), "{\"token\":\"t\",\"op\":\"list\"}\n").contains("none"));

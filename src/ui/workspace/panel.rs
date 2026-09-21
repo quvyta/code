@@ -577,18 +577,21 @@ fn containers_widget(screen: &WorkspaceScreen, workspace: &OpenWorkspace, ui: &m
     // The panel is narrow and every container of a workspace starts with the same `qcode-<id>-`,
     // so the part that differs is what is shown; the whole name is in the engine's own listing.
     let prefix = format!("qcode-{}-", workspace.id());
-    let rows = workspace.containers().iter().map(|container| {
-        let short = container.name.strip_prefix(&prefix).unwrap_or(&container.name);
-        ListItem::new(short.to_owned()).icon("dot", Some(tone(&container.state))).detail(state_text(&container.state))
-    });
-    ui.add(
-        List::new(rows)
-            .selected(Some(workspace.container_row))
-            .empty_text(t!("workspace.containers.empty"))
-            .on_select(Msg::SelectContainer),
-    )
-    .fill()
-    .id("workspace-containers");
+    if workspace.containers().is_empty() {
+        // A list's empty text is one line cut at the panel's edge, and the panel is narrow enough
+        // that the sentence loses its end; as text of its own it wraps and is read whole.
+        ui.add(Text::new(t!("workspace.containers.empty")).role("secondary")).fill_width().id("workspace-containers");
+    } else {
+        let rows = workspace.containers().iter().map(|container| {
+            let short = container.name.strip_prefix(&prefix).unwrap_or(&container.name);
+            ListItem::new(short.to_owned())
+                .icon("dot", Some(tone(&container.state)))
+                .detail(state_text(&container.state))
+        });
+        ui.add(List::new(rows).selected(Some(workspace.container_row)).on_select(Msg::SelectContainer))
+            .fill()
+            .id("workspace-containers");
+    }
 
     let selected = workspace.containers().get(workspace.container_row);
     let name = selected.map(|container| container.name.clone());

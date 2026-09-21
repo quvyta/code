@@ -4,17 +4,26 @@
 //! No socket is opened here: a harness would wait on it forever. The calls a socket would carry
 //! are handed to the screen by the test application below, the way the screen's own listener
 //! hands them over, and their answers are read from the other end of each call.
+//!
+//! Delivery is driven against a real program on a real pseudo-terminal, started by the test
+//! application the way a container's harness is: what reaches its prompt is read back from the
+//! file it writes everything into. The moment a delivery is tried at is given rather than waited
+//! for, so a test says exactly which of the two silences it is about.
 
+use std::ffi::OsStr;
+use std::path::Path;
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
+
+use qframe::widgets::TerminalSession;
 
 use super::*;
 
 use crate::bridge::protocol::{Answer, Malformed, Question, Request};
 use crate::bridge::rules::{MOST_HOPS, MOST_PER_WINDOW};
 use crate::bridge::socket::Call;
-use crate::ui::workspace::Letter;
-use crate::ui::workspace::bridge::ASK_WAIT;
+use crate::ui::workspace::bridge::{ASK_WAIT, QUIET, RETRY_EVERY};
+use crate::ui::workspace::{Letter, Undelivered};
 
 /// The workspace screen, with one more way in: a call as the workspace's socket would bring it.
 struct Bridged(WorkspaceScreen);
@@ -23,6 +32,11 @@ struct Bridged(WorkspaceScreen);
 enum Test {
     Screen(Msg),
     Call(Call),
+    /// Gives the tab at this place a running program to be typed into, as a container that came
+    /// up gives a tab its session.
+    Attach(usize, TerminalSession),
+    /// Looks at the tabs holding messages as of this moment.
+    Deliver(Instant),
 }
 
 impl App for Bridged {
@@ -34,6 +48,14 @@ impl App for Bridged {
             Test::Call(call) => {
                 super::super::bridge::answer(&mut self.0, "firefly", call, Instant::now()).map(Test::Screen)
             }
+            Test::Attach(index, session) => {
+                let active = self.0.active;
+                if let Some(workspace) = self.0.workspaces.get_mut(active) {
+                    workspace.tabs[index].attached(session);
+                }
+                Command::none()
+            }
+            Test::Deliver(now) => super::super::bridge::deliver(&mut self.0, now).map(Test::Screen),
         }
     }
 
@@ -93,6 +115,23 @@ fn to_codex(harness: &mut Harness<Bridged>, text: &str) -> Receiver<Answer> {
 fn to_claude(harness: &mut Harness<Bridged>, text: &str) -> Receiver<Answer> {
     let claude = tab(harness, 0).key().0.to_string();
     ask(harness, 2, Request::Send { tab: claude, text: text.to_owned() })
+}
+
+/// A workspace with a Claude Code tab and, beside it, the window of a desktop profile.
+fn an_agent_and_a_window(scratch: &Scratch) -> Harness<Bridged> {
+    let profiles = vec![profile("claude-sub", HarnessKind::ClaudeCode), profile("anti", HarnessKind::AntigravityIde)];
+    let mut screen = WorkspaceScreen::new(
+        Some(engine()),
+        HostUser::Ids { uid: 1000, gid: 1000 },
+        vec![workspace("firefly", "Firefly", scratch.paths(), profiles)],
+    );
+    open(&mut screen, Choice::NewChat("claude-sub".to_owned()));
+    open(&mut screen, Choice::Window("anti".to_owned()));
+    let mut harness = Harness::with_env(Bridged(screen), env(), SIZE.0, SIZE.1);
+    harness.set_locale("en").set_glyph_mode(GlyphMode::Unicode);
+    harness.send(Test::Screen(Msg::TogglePanel(false))).send(Test::Screen(Msg::OpenTab(0)));
+    harness.advance(Duration::from_secs(1)).render();
+    harness
 }
 
 fn answered(answers: &Receiver<Answer>) -> Answer {
@@ -169,7 +208,10 @@ fn the_first_message_between_two_tabs_asks_the_person_and_is_taken_when_allowed(
 
     harness.click_text("Allow").render();
     let answer = answered(&answers);
-    assert!(answer.ok && answer.text.starts_with("Taken. The message waits in Codex · codex-main"), "{answer:?}");
+    // No container came up in this test, so there is nothing to write into and the sender is
+    // told so rather than being left to believe the other agent has the work.
+    assert!(answer.ok && answer.text.starts_with("Taken, but not handed over yet"), "{answer:?}");
+    assert!(answer.text.contains("is not running") && answer.text.contains("list_tabs"), "{answer:?}");
     let letter =
         Letter { from: "Claude Code · claude-sub".to_owned(), text: "Please write the test for parse().".to_owned() };
     assert_eq!(tab(&harness, 2).letters(), [letter]);
@@ -361,13 +403,15 @@ fn the_line_of_waiting_messages_reads_in_turkish_too() {
         harness.screen()
     );
     harness.click_text("İzin ver").render();
-    assert!(answered(&answers).text.starts_with("Alındı."));
+    assert!(answered(&answers).text.starts_with("Alındı, ama henüz iletilmedi"));
     harness.send(Test::Screen(Msg::OpenTab(2))).render();
     assert!(
         said(&harness).contains("Claude Code · claude-sub sekmesinden bir mesaj burada bekliyor"),
         "{}",
         harness.screen()
     );
+    harness.resize(180, 24).render();
+    assert!(said(&harness).contains("iletilemedi, bu sekmedeki kodlama aracı çalışmıyor"), "{}", harness.screen());
 }
 
 #[cfg(unix)]
@@ -405,4 +449,307 @@ fn a_bridged_screen_listens_in_the_workspaces_folder_and_answers_a_real_connecti
     drop(super::super::bridge::follow(&mut screen));
     apply(&mut screen, Msg::CloseWorkspace(0));
     assert!(!scratch.0.join("Containers").join("MCP").join("bridge.sock").exists());
+}
+
+/// A real program in the tab at `index`, standing in for the harness a container would run: it
+/// never echoes what is typed, so the two silences can be told apart, and it writes everything
+/// that reaches it into `file`. `preface` runs first, which is how a program asks for bracketed
+/// paste or takes its time before speaking.
+fn harness_in(
+    harness: &mut Harness<Bridged>,
+    scratch: &Scratch,
+    index: usize,
+    file: &Path,
+    preface: &str,
+) -> TerminalSession {
+    let script = format!("stty -echo; {preface} cat > {}", file.display());
+    let session = TerminalSession::spawn(OsStr::new("/bin/sh"), &["-c", script.as_str()], &scratch.0)
+        .expect("a pseudo-terminal for the tab");
+    harness.send(Test::Attach(index, session.clone()));
+    session
+}
+
+/// Tries a delivery as of `now`, the moment the screen's own timer would reach.
+fn deliver_at(harness: &mut Harness<Bridged>, now: Instant) {
+    harness.send(Test::Deliver(now)).render();
+}
+
+/// Reads `file` until it holds `wanted`, and gives up only after a wait long enough for a loaded
+/// machine: a short bound would buy no correctness and fail on a busy one.
+fn written(file: &Path, wanted: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let read = std::fs::read_to_string(file).unwrap_or_default();
+        if read.contains(wanted) || Instant::now() > deadline {
+            return read;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// What reached the program once it has had time to write it down, for a test that expects
+/// nothing to have reached it.
+fn settled(file: &Path) -> Vec<u8> {
+    std::thread::sleep(Duration::from_millis(300));
+    std::fs::read(file).unwrap_or_default()
+}
+
+/// Lets the Claude Code tab send to the Codex tab without asking the person each time.
+fn allow_pair(harness: &mut Harness<Bridged>) {
+    let (claude, codex) = (tab(harness, 0).key(), tab(harness, 2).key());
+    harness.send(Test::Screen(Msg::Allow { from: claude, to: codex, allow: true }));
+}
+
+#[test]
+fn a_message_goes_in_when_the_tab_falls_quiet_and_never_while_its_tool_is_still_writing() {
+    let scratch = Scratch::new("bridge-quiet-output");
+    let mut harness = two_agents(&scratch, ONLINE, ONLINE);
+    allow_pair(&mut harness);
+    let file = scratch.0.join("codex-read.txt");
+    // The stand-in speaks once, a while after it starts, the way an agent answers.
+    let session = harness_in(&mut harness, &scratch, 2, &file, "sleep 1; printf 'thinking\\n';");
+
+    let answer = answered(&to_codex(&mut harness, "Please write the test for parse()."));
+    assert!(answer.ok && answer.text.starts_with("Taken. The message will be written"), "{answer:?}");
+    assert_eq!(tab(&harness, 2).letters().len(), 1, "it is still waiting");
+
+    // Wait for the program's own line, and try the moment its silence is only half grown.
+    while session.watch().next() != TerminalEvent::Output {}
+    let spoke = session.last_output();
+    deliver_at(&mut harness, spoke + QUIET / 2);
+    assert_eq!(tab(&harness, 2).letters().len(), 1, "a tool still writing is not written into");
+    assert!(settled(&file).is_empty(), "nothing reached the tool: {:?}", settled(&file));
+
+    deliver_at(&mut harness, spoke + QUIET);
+    let read = written(&file, "parse()");
+    assert!(read.contains("Through QCode, from the Claude Code · claude-sub tab:"), "{read:?}");
+    assert!(read.contains("Please write the test for parse()."), "{read:?}");
+    assert!(read.ends_with('\n'), "Return was written after it: {read:?}");
+    assert!(tab(&harness, 2).letters().is_empty(), "it is gone from the queue");
+    assert!(tab(&harness, 2).undelivered().is_none());
+    assert!(!said(&harness).contains("waits here"), "{}", harness.screen());
+}
+
+#[test]
+fn a_message_waits_while_the_person_is_typing_in_the_tab() {
+    let scratch = Scratch::new("bridge-quiet-input");
+    let mut harness = two_agents(&scratch, ONLINE, ONLINE);
+    allow_pair(&mut harness);
+    let file = scratch.0.join("codex-read.txt");
+    let session = harness_in(&mut harness, &scratch, 2, &file, "");
+    assert!(answered(&to_codex(&mut harness, "Run the tests.")).ok);
+
+    // The tool has been silent from the start; let that silence grow past the wait, so that only
+    // the person's typing can still hold the message back.
+    std::thread::sleep(QUIET);
+    session.write(b"half a line").expect("the person types");
+    let typed = session.last_input();
+
+    deliver_at(&mut harness, typed + QUIET / 2);
+    assert_eq!(tab(&harness, 2).letters().len(), 1, "a half-written line is not cut in half");
+
+    deliver_at(&mut harness, typed + QUIET);
+    let read = written(&file, "Run the tests.");
+    assert!(read.contains("half a line"), "the person's own line is still theirs: {read:?}");
+    assert!(read.contains("Through QCode, from the Claude Code · claude-sub tab:"), "{read:?}");
+    assert!(tab(&harness, 2).letters().is_empty());
+}
+
+#[test]
+fn a_message_stays_in_the_tab_when_its_tool_has_ended_and_goes_in_once_it_is_started_again() {
+    let scratch = Scratch::new("bridge-ended");
+    let mut harness = two_agents(&scratch, ONLINE, ONLINE);
+    allow_pair(&mut harness);
+    let file = scratch.0.join("codex-read.txt");
+    let session = harness_in(&mut harness, &scratch, 2, &file, "");
+    assert!(answered(&to_codex(&mut harness, "Look at issue 12.")).ok);
+
+    session.kill();
+    while !matches!(session.watch().next(), TerminalEvent::Exited(_)) {}
+    deliver_at(&mut harness, session.last_output() + QUIET * 4);
+    assert_eq!(tab(&harness, 2).letters().len(), 1, "a message is never dropped on the way");
+    assert_eq!(tab(&harness, 2).undelivered(), Some(Undelivered::NotRunning));
+
+    // Wide enough for the whole sentence: the line gives way from its end on a narrow tab.
+    harness.send(Test::Screen(Msg::OpenTab(2))).resize(180, 24).render();
+    let screen = said(&harness);
+    assert!(screen.contains("it could not be handed over, the coding tool in this tab is not running"), "{screen}");
+    assert!(screen.contains("Read") && screen.contains("Discard"), "{screen}");
+
+    // The sender that asks again is told, both in words and in the fields it reads.
+    let answer = answered(&ask(&mut harness, 0, Request::List));
+    let listed = answer.tabs.expect("a list");
+    assert_eq!(listed[0].waiting, 1);
+    assert_eq!(
+        listed[0].trouble.as_deref(),
+        Some(
+            "the coding tool in that tab is not running, so nothing can be written into it; the person can start it again from the tab"
+        )
+    );
+    assert!(answer.text.contains("one message is still waiting to be written into it"), "{}", answer.text);
+
+    // Its own restart brings a tool back, and what waited goes in by itself.
+    let again = scratch.0.join("codex-read-again.txt");
+    let session = harness_in(&mut harness, &scratch, 2, &again, "");
+    deliver_at(&mut harness, session.last_output() + QUIET);
+    assert!(written(&again, "issue 12").contains("Look at issue 12."), "{:?}", std::fs::read_to_string(&again));
+    assert!(tab(&harness, 2).letters().is_empty());
+    assert!(tab(&harness, 2).undelivered().is_none());
+}
+
+#[test]
+fn paste_markers_inside_a_message_cannot_escape_into_the_receiving_terminal() {
+    let scratch = Scratch::new("bridge-markers");
+    let mut harness = two_agents(&scratch, ONLINE, ONLINE);
+    allow_pair(&mut harness);
+    let file = scratch.0.join("codex-read.txt");
+    // A tool that asks for bracketed paste, as every harness's line editor does.
+    let session = harness_in(&mut harness, &scratch, 2, &file, "printf '\\033[?2004h';");
+    while session.watch().next() != TerminalEvent::Output {}
+
+    let sneaky = "first\u{1b}[201~rm -rf /\u{1b}[200~second";
+    assert!(answered(&to_codex(&mut harness, sneaky)).ok);
+    deliver_at(&mut harness, session.last_output() + QUIET);
+    let read = written(&file, "second");
+    assert!(read.contains("first") && read.contains("rm -rf /") && read.contains("second"), "{read:?}");
+    assert_eq!(read.matches("\u{1b}[200~").count(), 1, "one paste, opened once: {read:?}");
+    assert_eq!(read.matches("\u{1b}[201~").count(), 1, "and closed once: {read:?}");
+    assert!(read.starts_with("\u{1b}[200~"), "the whole message is inside the paste: {read:?}");
+    let inside = read.trim_start_matches("\u{1b}[200~");
+    assert!(inside.find("\u{1b}[201~") > inside.find("second"), "nothing ends the paste early: {read:?}");
+}
+
+#[test]
+fn the_sender_is_told_whether_its_message_went_in_or_is_still_waiting() {
+    let scratch = Scratch::new("bridge-told");
+    let mut harness = two_agents(&scratch, ONLINE, ONLINE);
+    allow_pair(&mut harness);
+    let file = scratch.0.join("codex-read.txt");
+    harness_in(&mut harness, &scratch, 2, &file, "");
+    // The tab has been quiet since it started, so the first message goes in as it is taken.
+    std::thread::sleep(QUIET + Duration::from_millis(300));
+
+    let answer = answered(&to_codex(&mut harness, "Start with the parser."));
+    assert!(answer.ok && answer.text.starts_with("Delivered."), "{answer:?}");
+    assert!(answer.text.contains("Codex · codex-main"), "{}", answer.text);
+    assert!(written(&file, "Start with the parser.").contains("Start with the parser."));
+    assert!(tab(&harness, 2).letters().is_empty());
+
+    // The Return that sent the first one is the newest typing in that tab, so the next waits.
+    let answer = answered(&to_codex(&mut harness, "Then the writer."));
+    assert!(answer.ok && answer.text.starts_with("Taken. The message will be written"), "{answer:?}");
+    let listed = answered(&ask(&mut harness, 0, Request::List)).tabs.expect("a list");
+    assert_eq!((listed[0].waiting, listed[0].trouble.clone()), (1, None));
+}
+
+#[test]
+fn a_tab_that_was_busy_is_looked_at_again_on_its_own_and_nothing_is_timed_while_nothing_waits() {
+    let scratch = Scratch::new("bridge-timer");
+    let mut harness = two_agents(&scratch, ONLINE, ONLINE);
+    allow_pair(&mut harness);
+    assert!(!harness.app().0.delivering, "no tab holds a message");
+    let file = scratch.0.join("codex-read.txt");
+    harness_in(&mut harness, &scratch, 2, &file, "");
+
+    assert!(answered(&to_codex(&mut harness, "Read the note first.")).ok);
+    assert!(harness.app().0.delivering, "a message waits, so another look is timed");
+    assert_eq!(tab(&harness, 2).letters().len(), 1);
+
+    std::thread::sleep(QUIET + Duration::from_millis(300));
+    harness.advance(RETRY_EVERY).render();
+    assert!(written(&file, "Read the note first.").contains("Read the note first."));
+    assert!(tab(&harness, 2).letters().is_empty(), "the screen delivered it without being asked");
+}
+
+#[test]
+fn the_message_written_into_a_tab_names_its_sender_in_turkish_too() {
+    let scratch = Scratch::new("bridge-teslim-tr");
+    let mut harness = two_agents(&scratch, ONLINE, ONLINE);
+    harness.set_locale("tr");
+    allow_pair(&mut harness);
+    let file = scratch.0.join("codex-read.txt");
+    let session = harness_in(&mut harness, &scratch, 2, &file, "");
+    let answer = answered(&to_codex(&mut harness, "parse() için testi yaz."));
+    assert!(answer.text.starts_with("Alındı. Mesaj"), "{answer:?}");
+    deliver_at(&mut harness, session.last_output() + QUIET);
+    let read = written(&file, "parse()");
+    assert!(read.contains("QCode aracılığıyla Claude Code · claude-sub sekmesinden:"), "{read:?}");
+    assert!(read.contains("parse() için testi yaz."), "{read:?}");
+}
+
+#[test]
+fn a_window_tab_is_never_a_tab_a_message_can_be_sent_to() {
+    // Antigravity IDE opens a window instead of drawing in a tab's terminal. There is no prompt
+    // to write a message into and no way to push one to it, so it is not offered as somewhere to
+    // send to: an agent that was given the choice would believe it had handed work over.
+    let scratch = Scratch::new("bridge-window");
+    let profiles =
+        vec![profile("claude-sub", HarnessKind::ClaudeCode), profile("antigravity", HarnessKind::AntigravityIde)];
+    let mut screen = WorkspaceScreen::new(
+        Some(engine()),
+        HostUser::Ids { uid: 1000, gid: 1000 },
+        vec![workspace("firefly", "Firefly", scratch.paths(), profiles)],
+    );
+    open(&mut screen, Choice::NewChat("claude-sub".to_owned()));
+    open(&mut screen, Choice::Window("antigravity".to_owned()));
+    let mut harness = Harness::with_env(Bridged(screen), env(), SIZE.0, SIZE.1);
+    harness.set_locale("en").set_glyph_mode(GlyphMode::Unicode);
+    harness.advance(Duration::from_secs(1)).render();
+    assert!(matches!(tab(&harness, 1).kind(), TabKind::Desktop(_)), "{:?}", tab(&harness, 1).kind());
+
+    let answer = answered(&ask(&mut harness, 0, Request::List));
+    assert!(answer.ok, "{answer:?}");
+    assert!(answer.tabs.expect("a list").is_empty(), "the window is not somewhere to send to");
+    assert!(answer.text.contains("No other tab"), "{}", answer.text);
+
+    let window = tab(&harness, 1).key().0.to_string();
+    let answer = answered(&ask(&mut harness, 0, Request::Send { tab: window, text: "take this".to_owned() }));
+    assert!(!answer.ok && answer.text.contains("Nothing was sent"), "{answer:?}");
+    assert!(tab(&harness, 1).letters().is_empty(), "nothing waits in a window");
+}
+
+#[test]
+fn the_agent_in_a_window_lists_the_terminal_tabs_and_gives_one_of_them_work() {
+    let scratch = Scratch::new("bridge-window-sends");
+    let mut harness = an_agent_and_a_window(&scratch);
+    assert!(matches!(tab(&harness, 1).kind(), TabKind::Desktop(_)), "the second tab is the window");
+
+    let answer = answered(&ask(&mut harness, 1, Request::List));
+    assert!(answer.ok, "the window's agent speaks for its own tab: {answer:?}");
+    let tabs = answer.tabs.expect("a list");
+    assert_eq!(tabs.len(), 1, "only the Claude Code tab: {tabs:?}");
+    assert_eq!(tabs[0].tab, tab(&harness, 0).key().0.to_string());
+
+    let claude = tab(&harness, 0).key().0.to_string();
+    let answers = ask(&mut harness, 1, Request::Send { tab: claude, text: "Rename parse() to read().".to_owned() });
+    let screen = said(&harness);
+    assert!(
+        screen.contains("Let Antigravity IDE · anti window send messages to Claude Code · claude-sub?"),
+        "{screen}"
+    );
+    harness.click_text("Allow").render();
+    assert!(answered(&answers).ok);
+    let letter =
+        Letter { from: "Antigravity IDE · anti window".to_owned(), text: "Rename parse() to read().".to_owned() };
+    assert_eq!(tab(&harness, 0).letters(), [letter], "the work is waiting in the terminal tab");
+}
+
+#[test]
+fn a_window_is_never_somewhere_a_message_can_be_left() {
+    let scratch = Scratch::new("bridge-window-target");
+    let mut harness = an_agent_and_a_window(&scratch);
+    let answer = answered(&ask(&mut harness, 0, Request::List));
+    assert!(answer.ok && answer.tabs.expect("a list").is_empty(), "a window is not a tab to send to");
+    assert!(answer.text.contains("No other tab of this workspace runs an agent"), "{}", answer.text);
+
+    // Not by its number and not by its title either: a window draws no prompt, so a message left
+    // there would be one the sending agent believes it handed over and nobody ever reads.
+    for named in [tab(&harness, 1).key().0.to_string(), "anti window".to_owned()] {
+        let answers = ask(&mut harness, 0, Request::Send { tab: named.clone(), text: "Open the diff.".to_owned() });
+        let answer = answered(&answers);
+        assert!(!answer.ok, "{named}: {answer:?}");
+        assert!(answer.text.contains("There is no other agent tab"), "{named}: {}", answer.text);
+        assert!(!said(&harness).contains("send messages to"), "the person is not even asked: {}", harness.screen());
+        assert!(tab(&harness, 1).letters().is_empty(), "{named}");
+    }
 }

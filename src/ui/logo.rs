@@ -27,10 +27,10 @@ const ROWS: u16 = 6;
 /// the same in every language and so is not part of the language files.
 const PLAIN: &str = "QCode";
 
-/// Rows the logo keeps free beneath itself: the tagline and the five menu rows. The menu is the
+/// Rows the logo keeps free beneath itself: the tagline and the six menu rows. The menu is the
 /// screen and the logo is its decoration, so on a short terminal the logo shrinks to the name and
 /// then goes altogether rather than pushing a row of the menu off the bottom.
-const ROWS_BELOW: u16 = 6;
+const ROWS_BELOW: u16 = 7;
 
 /// Theme colour the wordmark is painted in. A logo is one accent, not a palette.
 const COLOR: &str = "accent";

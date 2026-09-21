@@ -11,7 +11,10 @@ use std::path::PathBuf;
 use crate::base::paths::{OPEN_HOME, USER};
 use crate::desktop::signin;
 use crate::engine::names::BASE_IMAGE;
-use crate::profile::{Desktop, Profile};
+use crate::profile::guidance;
+use crate::profile::{
+    Addition, CLAUDE_MARKETPLACES, Desktop, GRAPHIFY_HOME, GRAPHIFY_PACKAGE, HarnessKind, OH_MY_OPENAGENT, Profile,
+};
 
 /// Where the build context puts the files a template writes, so the `COPY` never has to know
 /// the home directory of the image.
@@ -42,9 +45,16 @@ pub struct Recipe {
 /// A harness that opens a window is installed by [`desktop_steps`] instead of from a registry: it
 /// needs system packages and an archive unpacked into `/opt`, neither of which the base image's
 /// own user may do, so those steps run as root and the image ends as its user again.
+///
+/// What QCode high adds is installed by [`addition_step`], in an order that matters: graphify's
+/// system packages as root and nothing else as root; the configuration files before the Claude
+/// Code plugins, because installing a plugin adds it to the settings file and copying the file
+/// afterwards would forget every one of them.
 #[must_use]
 pub fn image(profile: &Profile) -> Recipe {
     let harness = profile.harness.record();
+    // Less whatever the person switched off: a part they went without is not downloaded at all.
+    let additions = profile.additions();
     let mut lines = vec![format!("FROM {BASE_IMAGE}")];
     let desktop = profile.harness.desktop();
     if let Some(desktop) = desktop {
@@ -53,20 +63,43 @@ pub fn image(profile: &Profile) -> Recipe {
         lines.push("USER root".to_owned());
         lines.extend(desktop_steps(desktop));
     }
-    for step in harness.install {
-        lines.push(format!("RUN {step}"));
-    }
+    lines.extend(harness.image_steps());
     for (key, value) in harness.environment {
         lines.push(format!("ENV {key}=\"{value}\""));
     }
+    if additions.contains(&Addition::Graphify) {
+        // A window's image is root at this point already, and goes back at the end.
+        if desktop.is_none() {
+            lines.push("USER root".to_owned());
+        }
+        lines.push(addition_step(Addition::Graphify, profile));
+        if desktop.is_none() {
+            lines.push(format!("USER {USER}"));
+        }
+        lines.push(graphify_skill(profile.harness));
+    }
+    if additions.contains(&Addition::OhMyOpenAgent) {
+        lines.push(addition_step(Addition::OhMyOpenAgent, profile));
+        // Its own words after installing: "Anonymous telemetry is enabled by default. Disable it
+        // with OMO_SEND_ANONYMOUS_TELEMETRY=0 or OMO_DISABLE_POSTHOG=1." QCode's templates turn
+        // a maker's telemetry off wherever there is a switch for it.
+        lines.push("ENV OMO_SEND_ANONYMOUS_TELEMETRY=\"0\"".to_owned());
+        lines.push("ENV OMO_DISABLE_POSTHOG=\"1\"".to_owned());
+    }
     let mut files = Vec::new();
-    if let Some(file) = profile.template.settings(profile.harness) {
-        files.push((PathBuf::from("template").join(file.path), file.contents.to_owned()));
+    let written = profile.files();
+    if !written.is_empty() {
         lines.push(format!("COPY template {STAGING}"));
+    }
+    for file in written {
+        files.push((PathBuf::from("template").join(file.path), file.contents.to_owned()));
         lines.push(format!(
             "RUN mkdir -p \"$HOME/$(dirname '{path}')\" && cp '{STAGING}/{path}' \"$HOME/{path}\"",
             path = file.path
         ));
+    }
+    if additions.contains(&Addition::ClaudePlugins) {
+        lines.push(addition_step(Addition::ClaudePlugins, profile));
     }
     lines.push(format!("RUN {OPEN_HOME}"));
     // The name is on the image so that a stray image can be traced back to its profile.
@@ -76,6 +109,84 @@ pub fn image(profile: &Profile) -> Recipe {
     }
     lines.push(String::new());
     Recipe { containerfile: lines.join("\n"), files }
+}
+
+/// The step that puts graphify's skill for `harness` into the image's home: what the agent turns
+/// to when the person asks it to build the map (`/graphify .`).
+///
+/// It is written here rather than when a workspace's container comes up, because it lands in the
+/// home directory and never depends on the workspace: measured, `graphify install --platform
+/// <harness>` writes only under `$HOME` (for Claude Code also a line in `~/.claude/CLAUDE.md` that
+/// names the skill), needs no network and writes the same bytes a second time. The one exception
+/// is opencode's, which also leaves a plugin in the folder it runs in; it runs in a folder of its
+/// own that is removed again, because opencode's plugin belongs to the workspace and is written
+/// there when the container comes up. The step ends by asking for the skill, so a graphify that
+/// moved it fails the build instead of leaving an image without it.
+fn graphify_skill(harness: HarnessKind) -> String {
+    format!(
+        "RUN scratch=\"$(mktemp -d)\" \\\n && cd \"$scratch\" \\\n && graphify install --platform {platform} \\\n \
+         && cd / && rm -rf \"$scratch\" \\\n && test -f \"$HOME/{skill}\"",
+        platform = guidance::platform(harness),
+        skill = guidance::skill(harness),
+    )
+}
+
+/// The words a build step of QCode high starts its complaint with when it fails, so the screen
+/// can tell that failure from any other and say what it means.
+pub const HIGH_FAILED: &str = "QCode high:";
+
+/// The step that installs `addition` for `profile`, checked before it counts: each one ends by
+/// asking what it installed, so a step that seemed to work and left something out still fails the
+/// build. Of the Claude Code plugins, only the ones `profile` has switched on are installed, and
+/// only the marketplaces they come from are added.
+///
+/// Everything here is downloaded — from Debian and PyPI, npm, GitHub — and a build without the
+/// network would otherwise stop on some package manager's own words, or, where a tool shrugs an
+/// error off, not stop at all. So a failing step says, after whatever the tool said, what it was
+/// installing and that the build needs the network; the image is then not made, and never made
+/// with a part missing.
+fn addition_step(addition: Addition, profile: &Profile) -> String {
+    let (what, commands) = match addition {
+        Addition::Graphify => (
+            "graphify",
+            vec![
+                "apt-get update".to_owned(),
+                "apt-get install --yes --no-install-recommends python3 pipx".to_owned(),
+                "rm -rf /var/lib/apt/lists/*".to_owned(),
+                format!(
+                    "PIPX_GLOBAL_HOME={GRAPHIFY_HOME} PIPX_GLOBAL_BIN_DIR=/usr/local/bin pipx install --global {GRAPHIFY_PACKAGE}"
+                ),
+                "graphify --version".to_owned(),
+            ],
+        ),
+        Addition::ClaudePlugins => {
+            let plugins = profile.claude_plugins();
+            let mut commands: Vec<String> = CLAUDE_MARKETPLACES
+                .iter()
+                .filter(|(_, name)| plugins.iter().any(|plugin| plugin.ends_with(&format!("@{name}"))))
+                .map(|(repository, _)| format!("claude plugin marketplace add {repository}"))
+                .collect();
+            commands.extend(plugins.iter().map(|plugin| format!("claude plugin install {plugin}")));
+            commands.push("claude plugin list > /tmp/qcode-plugins".to_owned());
+            commands.extend(plugins.iter().map(|plugin| format!("grep -qF '{plugin}' /tmp/qcode-plugins")));
+            commands.push("rm /tmp/qcode-plugins".to_owned());
+            ("the Claude Code plugins", commands)
+        }
+        Addition::OhMyOpenAgent => (
+            "oh-my-openagent",
+            vec![
+                // A cache of its own, removed in the same step: the image's shared npm cache would
+                // otherwise keep another 214 MB of this one package's downloads in a layer.
+                format!("npm install -g --cache /tmp/qcode-npm-cache {OH_MY_OPENAGENT}"),
+                "rm -rf /tmp/qcode-npm-cache".to_owned(),
+                format!("test -f /usr/local/npm/lib/node_modules/{OH_MY_OPENAGENT}/package.json"),
+            ],
+        ),
+    };
+    format!(
+        "RUN {{ {steps}; }} \\\n || {{ echo '{HIGH_FAILED} could not install {what}. What QCode high adds is downloaded while the image is built, so the build needs the network.' >&2; exit 1; }}",
+        steps = commands.join(" \\\n && "),
+    )
 }
 
 /// The steps that put a desktop application into the image: the packages it needs, then the
@@ -149,7 +260,9 @@ pub fn capture_script(profile: &Profile) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profile::{AccountKind, HarnessKind, MountAccess, NetworkMode, SafeName, Template};
+    use crate::profile::{
+        AccountKind, CLAUDE_PLUGINS, Extra, HarnessKind, MountAccess, NetworkMode, SafeName, Template,
+    };
 
     fn profile(harness: HarnessKind, template: Template) -> Profile {
         Profile {
@@ -157,8 +270,10 @@ mod tests {
             harness,
             template,
             account: AccountKind::Subscription,
+            provider: None,
             assets: MountAccess::ReadOnly,
             network: NetworkMode::Full,
+            without: Vec::new(),
         }
     }
 
@@ -167,7 +282,32 @@ mod tests {
         let recipe = image(&profile(HarnessKind::ClaudeCode, Template::Base));
         let first = recipe.containerfile.lines().next().expect("the file has a line");
         assert_eq!(first, format!("FROM {BASE_IMAGE}"));
-        assert!(recipe.containerfile.contains("RUN npm install -g @anthropic-ai/claude-code"), "{recipe:?}");
+        assert!(recipe.containerfile.contains("npm install -g @anthropic-ai/claude-code"), "{recipe:?}");
+    }
+
+    #[test]
+    fn every_harness_install_leaves_no_npm_cache_in_its_layer() {
+        // npm keeps every tarball it downloads in its cache; in the base image's shared cache
+        // that was 323 MB of opencode's image. Removing it in a later step would not help — the
+        // layer that wrote it keeps it — so the cache is a private one, named before the install
+        // and removed after it, all in the one `RUN` step.
+        for harness in HarnessKind::TERMINAL {
+            for template in Template::ALL {
+                let file = image(&profile(harness, template)).containerfile;
+                for install in harness.record().install {
+                    let step = steps(&file)
+                        .into_iter()
+                        .find(|step| step.contains(install))
+                        .unwrap_or_else(|| panic!("{harness:?} {template:?}: `{install}` is not in {file}"));
+                    let cache = step.find("export NPM_CONFIG_CACHE=/tmp/qcode-npm-cache ");
+                    let installed = step.find(install).expect("found above");
+                    let removed = step.rfind("&& rm -rf /tmp/qcode-npm-cache");
+                    assert!(cache.is_some_and(|cache| cache < installed), "{harness:?}: no cache of its own: {step}");
+                    assert!(removed.is_some_and(|removed| removed > installed), "{harness:?}: cache kept: {step}");
+                    assert!(!step.contains("/var/cache/npm"), "{harness:?}: {step}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -262,12 +402,221 @@ mod tests {
     #[test]
     fn a_command_line_harness_never_becomes_root_in_its_image() {
         for harness in HarnessKind::TERMINAL {
-            for template in Template::ALL {
+            for template in [Template::Base, Template::Recommended] {
                 let file = image(&profile(harness, template)).containerfile;
                 assert!(!file.contains("USER root"), "{harness:?} {template:?}: {file}");
                 assert!(!file.contains("apt-get"), "{harness:?} {template:?}: {file}");
             }
         }
+    }
+
+    #[test]
+    fn a_command_line_harness_image_never_ends_as_root() {
+        // QCode high needs root for graphify's system packages, and for nothing after them: the
+        // plugins and the configuration belong to the image's user, and a container must never
+        // default to root.
+        for harness in HarnessKind::ALL {
+            for template in Template::ALL {
+                let file = image(&profile(harness, template)).containerfile;
+                let last_user = file.lines().rfind(|line| line.starts_with("USER "));
+                if file.contains("USER root") {
+                    assert_eq!(last_user, Some(format!("USER {USER}").as_str()), "{harness:?} {template:?}: {file}");
+                }
+                if harness.desktop().is_none() && template == Template::High {
+                    let root = file.find("USER root").expect("graphify's packages need root");
+                    let back = file[root..].find(&format!("USER {USER}")).expect("and it goes back") + root;
+                    let root_part = &file[root..back];
+                    assert!(root_part.contains("pipx install"), "{harness:?}: {root_part}");
+                    assert_eq!(root_part.matches("\nRUN ").count(), 1, "one step as root and no more: {root_part}");
+                }
+            }
+        }
+    }
+
+    /// The `RUN` steps of `file`, each with its continuation lines and nothing after them.
+    fn steps(file: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut lines = file.lines();
+        while let Some(line) = lines.next() {
+            let Some(first) = line.strip_prefix("RUN ") else { continue };
+            let mut step = vec![first];
+            let mut last = first;
+            while last.trim_end().ends_with('\\') {
+                let Some(next) = lines.next() else { break };
+                step.push(next);
+                last = next;
+            }
+            found.push(step.join("\n"));
+        }
+        found
+    }
+
+    #[test]
+    fn qcode_high_installs_graphify_for_every_harness_outside_the_home() {
+        for harness in HarnessKind::ALL {
+            let file = image(&profile(harness, Template::High)).containerfile;
+            let step = steps(&file).into_iter().find(|step| step.contains("pipx")).expect("graphify is installed");
+            assert!(step.contains("apt-get install --yes --no-install-recommends python3 pipx"), "{step}");
+            assert!(step.contains("pipx install --global graphifyy"), "{step}");
+            assert!(step.contains("PIPX_GLOBAL_HOME=/opt/pipx"), "not under the home: {step}");
+            assert!(step.contains("PIPX_GLOBAL_BIN_DIR=/usr/local/bin"), "on the path: {step}");
+            assert!(step.contains("graphify --version"), "the step checks what it installed: {step}");
+            assert!(!step.contains("$HOME"), "{step}");
+            for other in [Template::Base, Template::Recommended] {
+                let file = image(&profile(harness, other)).containerfile;
+                assert!(!file.contains("graphify"), "{harness:?} {other:?}: {file}");
+            }
+        }
+    }
+
+    #[test]
+    fn qcode_high_puts_graphifys_skill_for_its_own_harness_into_the_home() {
+        for harness in HarnessKind::ALL {
+            let file = image(&profile(harness, Template::High)).containerfile;
+            let all = steps(&file);
+            let graphify = all.iter().position(|step| step.contains("pipx install")).expect("graphify is installed");
+            let skill = all
+                .iter()
+                .position(|step| step.contains("graphify install --platform"))
+                .unwrap_or_else(|| panic!("{harness:?}: no skill: {file}"));
+            assert!(graphify < skill, "the skill comes after graphify: {file}");
+            let step = &all[skill];
+            let word = guidance::platform(harness);
+            assert!(step.contains(&format!("graphify install --platform {word} ")), "{step}");
+            assert!(step.contains(&format!("test -f \"$HOME/{}\"", guidance::skill(harness))), "{step}");
+            assert!(step.contains("rm -rf \"$scratch\""), "the folder it ran in is removed: {step}");
+            if harness.desktop().is_none() {
+                let back = file.find(&format!("USER {USER}")).expect("back to the user");
+                let at = file.find("graphify install --platform").expect("the skill");
+                assert!(back < at, "written as the image's user, not root: {file}");
+            }
+            for other in [Template::Base, Template::Recommended] {
+                let file = image(&profile(harness, other)).containerfile;
+                assert!(!file.contains("--platform"), "{harness:?} {other:?}: {file}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_plugins_go_into_claude_codes_image_and_no_other() {
+        for harness in HarnessKind::ALL {
+            let file = image(&profile(harness, Template::High)).containerfile;
+            assert_eq!(file.contains("claude plugin"), harness == HarnessKind::ClaudeCode, "{harness:?}: {file}");
+            assert_eq!(file.contains("oh-my-openagent"), harness == HarnessKind::OpenCode, "{harness:?}: {file}");
+        }
+        let file = image(&profile(HarnessKind::ClaudeCode, Template::High)).containerfile;
+        for (repository, _) in CLAUDE_MARKETPLACES {
+            assert!(file.contains(&format!("claude plugin marketplace add {repository}")), "{file}");
+        }
+        for plugin in CLAUDE_PLUGINS {
+            assert!(file.contains(&format!("claude plugin install {plugin}")), "{plugin}: {file}");
+            assert!(file.contains(&format!("grep -qF '{plugin}'")), "{plugin} is checked after: {file}");
+        }
+        // Installing a plugin writes it into the settings file; the file copied in after would
+        // undo every one of them.
+        let settings = file.find("\"$HOME/.claude/settings.json\"").expect("the settings are written");
+        let plugins = file.find("claude plugin install").expect("the plugins are installed");
+        assert!(settings < plugins, "{file}");
+    }
+
+    #[test]
+    fn a_part_switched_off_is_not_installed_and_the_rest_still_are() {
+        let without = |without: Vec<Extra>| Profile { without, ..profile(HarnessKind::ClaudeCode, Template::High) };
+        let file = image(&without(vec![Extra::Plugin("context7@claude-plugins-official")])).containerfile;
+        assert!(!file.contains("context7"), "{file}");
+        for plugin in CLAUDE_PLUGINS.iter().filter(|plugin| !plugin.starts_with("context7@")) {
+            assert!(file.contains(&format!("claude plugin install {plugin}")), "{plugin}: {file}");
+        }
+        assert!(file.contains("pipx install --global graphifyy"), "{file}");
+
+        // The only plugin of a marketplace switched off, and that marketplace is not added either.
+        let file = image(&without(vec![Extra::Plugin("block-no-verify@claude-code-workflows")])).containerfile;
+        assert!(!file.contains("wshobson/agents"), "{file}");
+        assert!(file.contains("anthropics/claude-plugins-official"), "{file}");
+
+        let file = image(&without(vec![Extra::Graphify])).containerfile;
+        assert!(!file.contains("graphify") && !file.contains("pipx"), "{file}");
+        assert!(file.contains("claude plugin install superpowers@claude-plugins-official"), "{file}");
+
+        // Everything off is QCode basic's image.
+        let file = image(&without(Template::High.extras(HarnessKind::ClaudeCode))).containerfile;
+        assert_eq!(file, image(&profile(HarnessKind::ClaudeCode, Template::Recommended)).containerfile);
+    }
+
+    #[test]
+    fn opencode_without_oh_my_openagent_is_not_told_of_it() {
+        let recipe =
+            image(&Profile { without: vec![Extra::OhMyOpenAgent], ..profile(HarnessKind::OpenCode, Template::High) });
+        assert!(!recipe.containerfile.contains("oh-my-openagent"), "{recipe:?}");
+        assert!(!recipe.files.iter().any(|(_, contents)| contents.contains("oh-my-openagent")), "{recipe:?}");
+        assert!(recipe.containerfile.contains("graphify"), "{recipe:?}");
+    }
+
+    #[test]
+    fn opencode_gets_oh_my_openagent_and_is_told_where_it_is() {
+        let recipe = image(&profile(HarnessKind::OpenCode, Template::High));
+        let file = &recipe.containerfile;
+        assert!(file.contains("npm install -g --cache /tmp/qcode-npm-cache oh-my-openagent"), "{file}");
+        assert!(file.contains("ENV OMO_SEND_ANONYMOUS_TELEMETRY=\"0\""), "{file}");
+        let (_, settings) = recipe
+            .files
+            .iter()
+            .find(|(path, _)| path == &PathBuf::from("template/.config/opencode/opencode.json"))
+            .expect("opencode's settings are written");
+        assert!(settings.contains("file:///usr/local/npm/lib/node_modules/oh-my-openagent"), "{settings}");
+        let basic = image(&profile(HarnessKind::OpenCode, Template::Recommended));
+        assert!(!basic.files.iter().any(|(_, contents)| contents.contains("oh-my-openagent")), "{basic:?}");
+    }
+
+    #[test]
+    fn claude_codes_first_start_is_answered_under_both_qcode_templates() {
+        for template in [Template::Recommended, Template::High] {
+            let recipe = image(&profile(HarnessKind::ClaudeCode, template));
+            let paths: Vec<&PathBuf> = recipe.files.iter().map(|(path, _)| path).collect();
+            assert!(paths.contains(&&PathBuf::from("template/.claude.json")), "{template:?}: {paths:?}");
+            assert!(recipe.containerfile.contains("\"$HOME/.claude.json\""), "{template:?}: {recipe:?}");
+            assert_eq!(recipe.containerfile.matches("COPY template").count(), 1, "one staging copy: {recipe:?}");
+        }
+    }
+
+    #[test]
+    fn every_step_of_qcode_high_says_the_build_needs_the_network_when_it_fails() {
+        for harness in HarnessKind::ALL {
+            let file = image(&profile(harness, Template::High)).containerfile;
+            let high: Vec<String> = steps(&file)
+                .into_iter()
+                .filter(|step| ["pipx", "claude plugin", "oh-my-openagent"].iter().any(|word| step.contains(word)))
+                .collect();
+            assert_eq!(high.len(), Template::High.additions(harness).len(), "{harness:?}: {file}");
+            for step in high {
+                assert!(step.starts_with("{ "), "the whole step is one group: {step}");
+                assert!(step.contains(&format!("|| {{ echo '{HIGH_FAILED} ")), "{step}");
+                assert!(step.contains("the build needs the network"), "{step}");
+                assert!(step.trim_end().ends_with("exit 1; }"), "the build stops: {step}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_failing_step_of_qcode_high_stops_and_says_why_in_a_real_shell() {
+        // The same step, with its first command made to fail the way it fails without the network,
+        // run by a shell: it must fail, and say what the screen looks for.
+        let file = image(&profile(HarnessKind::OpenCode, Template::High)).containerfile;
+        let step = steps(&file)
+            .into_iter()
+            .find(|step| step.contains("npm install -g --cache /tmp/qcode-npm-cache oh-my-openagent"))
+            .expect("step");
+        let script = step.replace("npm install -g --cache /tmp/qcode-npm-cache oh-my-openagent", "false");
+        let ran = std::process::Command::new("sh").arg("-c").arg(&script).output().expect("a shell runs the step");
+        assert!(!ran.status.success(), "{script}");
+        let said = String::from_utf8_lossy(&ran.stderr);
+        assert!(said.contains(HIGH_FAILED) && said.contains("needs the network"), "{said}");
+        // And a step whose commands all succeed says nothing and succeeds.
+        let fine = step
+            .replace("npm install -g --cache /tmp/qcode-npm-cache oh-my-openagent", "true")
+            .replace("test -f", "test -n");
+        let ran = std::process::Command::new("sh").arg("-c").arg(&fine).output().expect("a shell runs the step");
+        assert!(ran.status.success(), "{fine}: {}", String::from_utf8_lossy(&ran.stderr));
     }
 
     #[test]
