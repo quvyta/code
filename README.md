@@ -110,6 +110,12 @@ It does not protect:
   providers can work with no network at all, and even then what the harness puts in its requests,
   which can be anything in the workspace, goes to that provider: qcode carries those requests
   there, and to nowhere else.
+- **your machine's loopback during a sign-in.** While a desktop harness signs in, qcode listens
+  on one port of `127.0.0.1` (and `[::1]`), the one the sign-in comes back to, and carries every
+  connection to that port to the application inside the container. Any program on your machine
+  can connect to it in that time, as it could to the application's own port if it ran outside a
+  container. qcode stops listening as soon as the sign-in has arrived, when the window closes, or
+  after ten minutes.
 - **the logins.** A profile's login lives in the engine's volumes. Anyone who can use your
   container engine can read them.
 - **against the engine or the kernel.** A container shares your machine's kernel; a flaw there
@@ -160,7 +166,8 @@ All other traffic comes from programs you can see qcode start: your container en
 builds an image (the base image, the harness packages and, for QCode high, what that template
 adds) or clones a workspace from a git address; the command that installs a container engine,
 when you let qcode run it in the setup; and your own browser, when a sign-in page is handed to
-it. Inside the containers, the harnesses keep their own behaviour, including any telemetry of
+it. That hand-over is the one time qcode listens for a connection itself: on your machine's own
+loopback, on the port the sign-in comes back to, until it has (see Desktop harnesses). Inside the containers, the harnesses keep their own behaviour, including any telemetry of
 their own; their documentation says what that is. Two are switched off by qcode's templates:
 QCode basic turns off Antigravity's telemetry, and QCode high turns off that of oh-my-openagent,
 which it adds.
@@ -336,13 +343,18 @@ from:
   nothing extra for that. Docker's default seccomp profile refuses the calls the sandbox is built
   from, so qcode hands docker a profile of its own: docker's default plus `clone`, `setns` and
   `unshare`. It is in `assets/seccomp/desktop.json` with a comment saying what it costs.
-- **Signing in happens inside the container.** The application cannot be used without a Google
-  account. When it asks to sign in, the page opens in a small window inside the container, so
-  Google's answer comes back to the application there and the sign-in completes; you sign in once
-  per profile and it is remembered in that workspace. Your own browser is only the fallback when
-  that window cannot start, and a sign-in from there cannot reach the application. A profile made
-  with qcode 0.1.13 or earlier has no such window in its image: **Rebuild image** on the Profiles
-  screen gives it one.
+- **Signing in happens in your own browser.** The application cannot be used without a Google
+  account. When it asks to sign in, qcode opens the page in your own browser, where you may be
+  signed in to Google already. Google then sends the browser back to `http://localhost:<port>/…`,
+  where the application waits inside its container; qcode listens on that port on your machine's
+  `127.0.0.1` (and `[::1]`) and carries what arrives to the application, through the engine, so
+  the container needs no network for it. The tab says which port and for how long. You sign in
+  once per profile and it is remembered in that workspace. If another program already uses the
+  port, the page is not opened and the tab says so: the sign-in has to come back to exactly that
+  port. The page can also be shown in a small sign-in window inside the container (**Use the
+  sign-in window here** on the tab), but Google refuses its own sign-in there with "This browser
+  or app may not be secure", so it is only the fallback. A profile made with qcode 0.1.13 or
+  earlier has no such window in its image: **Rebuild image** on the Profiles screen gives it one.
 - **A profile with the network off makes no sense here.** The application does all its work on its
   maker's servers; the tab says so if you try.
 

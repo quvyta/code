@@ -1,5 +1,5 @@
-//! Signing in from a window: where the page the application wants opened is shown, and how the
-//! sign-in finds its way back.
+//! Signing in from a window: how the page the application wants opened reaches QCode, and the
+//! window of last resort it can be shown in inside the container.
 //!
 //! An application in a container asks the desktop to open a web address the way every Linux
 //! program does, by running `xdg-open`. Inside a container that is nobody: there is no browser,
@@ -11,29 +11,22 @@
 //! container shares with QCode, and nothing else: the folder is the workspace's own, and the only
 //! thing that travels through it is a line of text.
 //!
-//! QCode then shows the page **inside the same container**, in a small browser window of its own.
-//! That is the whole point of the place: Google's sign-in ends by sending the browser to a
-//! `localhost` address the application listens on, and `localhost` is the container's. A browser
-//! on the person's own machine lands on its own `localhost`, where nobody listens, and the
-//! sign-in never completes. A browser in the container lands where the application is, and the
-//! sign-in completes by itself, with no port carried across.
+//! QCode opens the page in the person's own browser, and carries the sign-in's way back to the
+//! application's `localhost` inside the container: that is [`super::callback`].
 //!
-//! The browser costs the image next to nothing: it is the application's own Electron — a whole
+//! It showed the page inside the container first, in a small browser window of its own, so that
+//! the `localhost` the sign-in returns to was the application's without anything carried. Google
+//! refuses that window: "Couldn't sign you in — This browser or app may not be secure." It stays
+//! in the image as the window of last resort, which the person can ask for from the tab, for a
+//! sign-in that is not Google's or for the day Google lets it through.
+//!
+//! That window costs the image next to nothing: it is the application's own Electron — a whole
 //! Chromium — started with a twenty-line program of QCode's instead of the application's. Electron
 //! finds the program to run beside the executable it was started as, and resolves a symbolic link
 //! to the real file first, which opened the editor itself when that was tried; a hard link is a
 //! file of its own name and keeps [`BROWSER_DIR`] as the place Electron looks. The links are made
 //! in the same build step that unpacks the archive, which is what keeps them free: made in a step
 //! of their own, the layer copies the 200 MB executable.
-//!
-//! The price is that this browser's cookie jar starts empty: the first time, the person signs in
-//! to Google there with their password and second step, once per profile in a workspace. The jar
-//! is kept in the profile's home volume, so it is once.
-//!
-//! When that window cannot be started — an image built before it existed has none — the page is
-//! opened in the person's own browser instead, through the framework rather than spawned from our
-//! own code: `Command::open` is the single door to the desktop, and a test run records the opening
-//! instead of carrying it out. A sign-in from there cannot come back, and the tab says so.
 //!
 //! The address is written to a temporary name and moved into place, so QCode never reads half a
 //! line; and every address QCode takes is removed as it is read, so a folder left behind cannot
@@ -70,6 +63,19 @@ pub const SCRIPT: &str = "#!/bin/sh\n\
 #[must_use]
 pub fn script() -> String {
     SCRIPT.replace("$0_DIR", OPEN_DIR)
+}
+
+/// The build step that puts [`OPEN_PROGRAM`] into an image, with the folder it writes into made
+/// in the image so that a container given nothing there still has it. It runs as root.
+///
+/// The script is written with `printf '%b'` from a single line: a `RUN` step is one line, so the
+/// script's own line breaks travel as `\n` and are turned back into breaks by printf.
+#[must_use]
+pub fn opener_step() -> String {
+    format!(
+        "RUN {write} \\\n && chmod 0755 '{OPEN_PROGRAM}' \\\n && mkdir -p '{OPEN_DIR}'",
+        write = written(&script(), OPEN_PROGRAM),
+    )
 }
 
 /// Where the sign-in window's browser lives in the image: hard links to the application's own

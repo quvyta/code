@@ -5,6 +5,16 @@ Every release of quvyta-code, newest first. The format follows
 [Semantic Versioning](https://semver.org/); while the version starts with 0, a minor release may
 change files qcode writes, and the notes say so when it does.
 
+## 0.1.16 - 2026-09-23
+
+### Changed
+
+- **Antigravity IDE signs in from your own browser.** Google refused the small sign-in window inside the container ("Couldn't sign you in — This browser or app may not be secure"). Now the sign-in page opens in your own browser, and when Google sends the browser back to `localhost`, qcode listens on that port on `127.0.0.1` (and `[::1]`) and carries the answer to the application in its container, without giving the container any network. The tab says which port it listens on, that the sign-in arrived, or that nothing came back within ten minutes. If another program already uses the port, the page is not opened and the tab says what to do. The window inside the container is still there as **Use the sign-in window here**.
+
+### Verified
+
+- **Kimi Code answers live.** Claude Code and opencode each answered through the ready-made Kimi Code provider (`kimi-for-coding`) in a container with no network, and the key was found nowhere inside it. 0.1.15 could only show the road, because the subscription's usage limit was reached that day.
+
 ## 0.1.15 - 2026-09-23
 
 ### Added

@@ -13,9 +13,12 @@
 //! compositor restart changes the socket and cuts an open window off; reopening the tab is the
 //! way back, and the tab says so.
 
+pub mod callback;
 pub mod seccomp;
 pub mod signin;
 
+#[cfg(test)]
+mod callback_live;
 #[cfg(test)]
 mod live;
 

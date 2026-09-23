@@ -246,17 +246,8 @@ fn addition_step(addition: Addition, profile: &Profile) -> String {
 fn desktop_steps(desktop: &Desktop) -> Vec<String> {
     let packages = desktop.packages.join(" ");
     let dir = desktop.install_dir;
-    // The program the application runs to open a web address, and the folder it writes into. The
-    // folder is made in the image so that a container given nothing there still has it.
-    //
-    // The script is written with `printf '%b'` from a single line: a `RUN` step is one line, so
-    // the script's own line breaks travel as `\n` and are turned back into breaks by printf.
-    let opener = format!(
-        "RUN {write} \\\n && chmod 0755 '{program}' \\\n && mkdir -p '{folder}'",
-        write = signin::written(&signin::script(), signin::OPEN_PROGRAM),
-        program = signin::OPEN_PROGRAM,
-        folder = signin::OPEN_DIR,
-    );
+    // The program the application runs to open a web address, and the folder it writes into.
+    let opener = signin::opener_step();
     // The sign-in window's browser is linked in the step that unpacks the application, and only
     // there: in a step of its own, the layer would copy the 200 MB executable it links to.
     let browser: String =

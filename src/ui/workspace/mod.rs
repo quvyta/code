@@ -47,7 +47,7 @@ pub use plan::{
     ASSETS_DIR, Bridge, CODE_DIR, ContainerPlan, HOME_DIR, KEEP_ALIVE, LaunchFailure, MCP_DIR, PLAN_LABEL, SHELL,
     ensure_running, open_page,
 };
-pub use tab::{Pages, Shown, Tab, TabKey, TabKind, TabState};
+pub use tab::{Back, Pages, Shown, Tab, TabKey, TabKind, TabState};
 pub use viewer::{MOST_TEXT, Taken};
 
 use std::collections::{HashMap, HashSet};
@@ -233,9 +233,10 @@ pub enum Msg {
     SignInWanted(TabKey, u64, Vec<String>),
     /// The opening of that address answered, saying where it was shown.
     SignInOpened(TabKey, u64, String, Shown),
-    /// The sign-in window inside the window's container could not show that address, so it is
-    /// opened in the person's own browser instead.
-    SignInElsewhere(TabKey, u64, String),
+    /// The listening for the way back of a sign-in, the one of that id, ended.
+    SignInBack(TabKey, u64, u64, crate::desktop::callback::Ending),
+    /// The person asked for the page of the sign-in in the window inside the container instead.
+    SignInHere(TabKey),
     /// The open window of a tab was asked to show itself.
     RaiseWindow(TabKey),
     /// That asking finished; a refusal is worth saying, because nothing else would show it.
@@ -1374,7 +1375,8 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
         Msg::WindowEnded(key, run, code) => desktop::ended(screen, key, run, code),
         Msg::SignInWanted(key, run, addresses) => desktop::sign_in_wanted(screen, key, run, &addresses),
         Msg::SignInOpened(key, run, address, opened) => desktop::sign_in_opened(screen, key, run, &address, opened),
-        Msg::SignInElsewhere(key, run, address) => desktop::sign_in_elsewhere(key, run, address),
+        Msg::SignInBack(key, run, id, ending) => desktop::sign_in_back(screen, key, run, id, ending),
+        Msg::SignInHere(key) => desktop::sign_in_here(screen, key),
         Msg::RaiseWindow(key) => desktop::raise(screen, key),
         // Nothing is said when it worked: the window came forward, or the compositor marked it,
         // and either way the person is looking at their screen rather than at this tab.

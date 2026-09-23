@@ -17,15 +17,17 @@
 
 use qframe::prelude::*;
 
-use qframe::runtime::{Open, OpenOutcome};
+use std::sync::atomic::Ordering;
+
+use qframe::runtime::{Open, OpenOutcome, Task};
 use qframe::storage::FolderWatch;
 use qframe::widgets::EmptyState;
 
-use crate::desktop::{self, Display, NoDisplay, signin};
+use crate::desktop::{self, Display, NoDisplay, callback, signin};
 use crate::engine::Network;
 
 use super::plan::{self, ContainerPlan, LaunchFailure};
-use super::{Msg, OpenWorkspace, Shown, Tab, TabKey, TabKind, TabState, WorkspaceScreen};
+use super::{Back, Msg, OpenWorkspace, Shown, Tab, TabKey, TabKind, TabState, WorkspaceScreen};
 
 /// The name the tab's one action is focused by, whichever action the tab's state offers.
 pub(super) const WINDOW_ID: &str = "workspace-window";
@@ -157,12 +159,16 @@ pub(super) fn watch_browser(screen: &WorkspaceScreen, key: TabKey, run: u64) -> 
     })
 }
 
-/// Takes the addresses the window asked to have opened: the newest one is shown in the sign-in
-/// window inside the window's own container, and the watch is set again for the next one.
+/// Takes the addresses the window asked to have opened: the newest one is opened in the person's
+/// own browser, and the watch is set again for the next one.
 ///
-/// Inside, because that is where a sign-in comes back to: the application waits for it on the
-/// container's `localhost`. When that window cannot be started, the page goes to the person's own
-/// browser instead ([`sign_in_elsewhere`]), and the tab says what that cannot do.
+/// When the address is a sign-in that comes back to the application's `localhost`, the way back
+/// is listened for on this machine first, so the browser never arrives before QCode does, and
+/// what arrives is carried to the application inside its container ([`callback`]). When the port
+/// is taken, the page is not opened at all: its sign-in would be handed to whichever program holds
+/// the port, and another port cannot be chosen. The window inside the container is not tried
+/// first any more, because Google refuses to sign in there; the person can still ask for it
+/// ([`sign_in_here`]).
 pub(super) fn sign_in_wanted(
     screen: &mut WorkspaceScreen,
     key: TabKey,
@@ -179,32 +185,106 @@ pub(super) fn sign_in_wanted(
         return Command::none();
     }
     let Some(address) = addresses.last().cloned() else { return Command::none() };
-    // The address is put on the tab at once: whatever the window does, the person can read it.
+    // The address is put on the tab at once: whatever the browser does, the person can read it.
     tab.asked_to_open(address.clone());
     if !signin::is_web(&address) {
         // Not an address QCode shows anywhere. The tab says so rather than opening it quietly.
         tab.opened_here(&address, Shown::Nowhere);
         return watch_browser(screen, key, run);
     }
-    let (Some(plan), Some(engine)) = (plan, engine) else { return watch_browser(screen, key, run) };
-    let showing = Command::perform(move || match plan::open_page(&engine, &plan, &address) {
-        Ok(true) => Msg::SignInOpened(key, run, address, Shown::InWindow),
-        Ok(false) | Err(_) => Msg::SignInElsewhere(key, run, address),
-    });
-    Command::batch([showing, watch_browser(screen, key, run)])
+    let back = callback::return_to(&address);
+    let listening = match (&back, plan, engine) {
+        // A page with no way back to this machine, or a second press of sign in whose way back is
+        // listened for already: only the page is opened.
+        (None, _, _) => Command::none(),
+        (Some(back), _, _) if tab.listens_on(back.port) => Command::none(),
+        (Some(back), Some(plan), Some(engine)) => {
+            tab.stop_listening();
+            match callback::Listener::bind(back) {
+                Ok(listener) => {
+                    let carrier = callback::carrier(&engine, &plan.name, back);
+                    let (stop, stopped) = callback::Stop::new();
+                    let id = stop.id();
+                    tab.back_to(back.port, Back::Listening(stop));
+                    Command::task(Task::new(t!("workspace.window.signin-task"), move |cx| {
+                        let ending =
+                            listener.serve(&carrier, |pause| cx.sleep(pause) && !stopped.load(Ordering::SeqCst));
+                        Ok(Msg::SignInBack(key, run, id, ending))
+                    }))
+                }
+                Err(refusal) => {
+                    let why = match refusal {
+                        callback::NotListening::Taken => Back::Taken,
+                        callback::NotListening::Refused(words) => Back::Refused(words),
+                    };
+                    tab.back_to(back.port, why);
+                    tab.opened_here(&address, Shown::Held);
+                    return watch_browser(screen, key, run);
+                }
+            }
+        }
+        // No engine to carry it with: the page still opens, and the tab says nothing it cannot keep.
+        (Some(_), _, _) => Command::none(),
+    };
+    Command::batch([listening, in_browser(key, run, address), watch_browser(screen, key, run)])
 }
 
-/// Opens in the person's own browser an address the sign-in window could not show.
+/// Opens an address in the person's own browser.
 ///
 /// The one door to the desktop: an opening the framework carries out beside QCode and a test run
 /// records instead. The screen is never given away, so nothing blinks while a browser that has
 /// yet to start comes up.
-pub(super) fn sign_in_elsewhere(key: TabKey, run: u64, address: String) -> Command<Msg> {
+fn in_browser(key: TabKey, run: u64, address: String) -> Command<Msg> {
     let answer = address.clone();
     Command::open_with(Open::new(address).answer(move |outcome| {
         let shown = if outcome == OpenOutcome::Opened { Shown::InBrowser } else { Shown::Nowhere };
         Msg::SignInOpened(key, run, answer, shown)
     }))
+}
+
+/// Takes the end of the listening `id` for the way back of the tab `key`'s sign-in.
+pub(super) fn sign_in_back(
+    screen: &mut WorkspaceScreen,
+    key: TabKey,
+    run: u64,
+    id: u64,
+    ending: callback::Ending,
+) -> Command<Msg> {
+    if let Some((_, tab)) = screen.owner_mut(key).and_then(|workspace| workspace.find(key))
+        && tab.run() == run
+    {
+        tab.came_back(id, ending);
+    }
+    Command::none()
+}
+
+/// Shows the page of the tab `key`'s sign-in in the window inside the container, which the
+/// person asked for instead of their browser.
+///
+/// That window's `localhost` is the application's, so nothing needs carrying and the listening is
+/// given up. Google turns that window away for its own accounts, which the tab says; it is kept
+/// for the sign-ins that do not.
+pub(super) fn sign_in_here(screen: &mut WorkspaceScreen, key: TabKey) -> Command<Msg> {
+    let plan = plan_of(screen, key).map(|(plan, _)| plan);
+    let engine = screen.engine.clone();
+    let Some((_, tab)) = screen.owner_mut(key).and_then(|workspace| workspace.find(key)) else {
+        return Command::none();
+    };
+    let Some(address) = tab.sign_in().map(|(address, _)| address.to_owned()) else { return Command::none() };
+    if tab.state() != &TabState::Running {
+        return Command::none();
+    }
+    tab.stop_listening();
+    let run = tab.run();
+    let (Some(plan), Some(engine)) = (plan, engine) else { return Command::none() };
+    Command::perform(move || {
+        let shown = match plan::open_page(&engine, &plan, &address) {
+            Ok(true) => Shown::InWindow,
+            Ok(false) => Shown::NoWindow,
+            Err(_) => Shown::Nowhere,
+        };
+        Msg::SignInOpened(key, run, address, shown)
+    })
 }
 
 /// Takes the answer of that opening: where the address was shown.
@@ -347,15 +427,31 @@ pub(super) fn view(screen: &WorkspaceScreen, tab: &Tab, profile: &str, ui: &mut 
             if let Some((address, opened)) = tab.sign_in() {
                 // While the opening is still on its way there is nothing true to say about the
                 // browser, so only the address is shown; the sentence joins it a moment later.
-                if let Some(shown) = opened {
-                    let said = match shown {
-                        Shown::InWindow => "workspace.window.signin-opened",
-                        Shown::InBrowser => "workspace.window.signin-in-browser",
-                        Shown::Nowhere => "workspace.window.signin-open-yourself",
-                    };
-                    ui.add(Text::new(t!(said)).role("secondary")).fill_width();
+                let carried = tab.back().is_some();
+                let said = match opened {
+                    Some(Shown::InBrowser) if carried => Some(t!("workspace.window.signin-in-browser")),
+                    Some(Shown::InBrowser) => Some(t!("workspace.window.signin-browser-only")),
+                    Some(Shown::InWindow) => Some(t!("workspace.window.signin-opened")),
+                    Some(Shown::NoWindow) => Some(t!("workspace.window.signin-no-window")),
+                    Some(Shown::Nowhere) => Some(t!("workspace.window.signin-open-yourself")),
+                    Some(Shown::Held) | None => None,
+                };
+                if let Some(said) = said {
+                    ui.add(Text::new(said).role("secondary")).fill_width();
                 }
                 ui.add(Text::new(address.to_owned())).selectable(true).fill_width();
+                if let Some((port, back)) = tab.back() {
+                    let (role, words) = back_words(port, back);
+                    ui.add(Text::new(words).role(role)).selectable(true).fill_width();
+                }
+                // The window inside the container, for a sign-in the browser cannot finish:
+                // offered under the default rather than instead of it, while there is a window.
+                if tab.state() == &TabState::Running && opened.is_some() && opened != Some(Shown::InWindow) {
+                    ui.row(|ui| {
+                        ui.add(Button::new(t!("workspace.window.signin-here")).on_press(Msg::SignInHere(key)))
+                            .id("workspace-window-signin-here");
+                    });
+                }
             }
             ui.row(|ui| match tab.state() {
                 TabState::Running => {
@@ -382,6 +478,25 @@ pub(super) fn view(screen: &WorkspaceScreen, tab: &Tab, profile: &str, ui: &mut 
     .padding(Padding::symmetric(1, 2))
     .fill()
     .id("workspace-desktop");
+}
+
+/// What the tab says about the way back of a sign-in to `port`, and the role it is said in.
+fn back_words(port: u16, back: &Back) -> (&'static str, String) {
+    let port = port.to_string();
+    let minutes = (callback::WAIT.as_secs() / 60).to_string();
+    match back {
+        Back::Listening(_) => {
+            ("secondary", t!("workspace.window.signin-listening", port = port.as_str(), minutes = minutes.as_str()))
+        }
+        Back::Returned => ("success", t!("workspace.window.signin-returned", port = port.as_str())),
+        Back::TimedOut => {
+            ("warning", t!("workspace.window.signin-timed-out", port = port.as_str(), minutes = minutes.as_str()))
+        }
+        Back::Taken => ("warning", t!("workspace.window.signin-port-taken", port = port.as_str())),
+        Back::Refused(words) => {
+            ("warning", t!("workspace.window.signin-no-listen", port = port.as_str(), reason = words.as_str()))
+        }
+    }
 }
 
 /// The widest the tab's words grow, so a line of explanation stays readable on a wide terminal.

@@ -8,6 +8,7 @@ use qframe::widgets::{LogBuffer, LogLevel, LogLine, TerminalSession};
 
 use crate::base::apps::Quiet;
 use crate::bridge;
+use crate::desktop::callback::{Ending, Stop};
 
 use super::bridge::{Letter, Undelivered};
 use super::plan::LaunchFailure;
@@ -109,14 +110,34 @@ impl Default for Pages {
 /// Where the page a window asked to have opened was shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shown {
-    /// In the sign-in window inside the window's own container, where a sign-in comes back to the
-    /// application by itself.
-    InWindow,
-    /// In the person's own browser, because the sign-in window could not be started; a sign-in
-    /// from there cannot come back.
+    /// In the person's own browser. Whether its sign-in is carried back is the tab's [`Back`].
     InBrowser,
+    /// In the sign-in window inside the window's own container, which the person chose instead;
+    /// a sign-in comes back from there by itself, where Google lets it.
+    InWindow,
+    /// Not shown, because the sign-in could not come back from it: its port is taken. The tab's
+    /// [`Back`] says why.
+    Held,
+    /// The person asked for the sign-in window, and the profile's image has none.
+    NoWindow,
     /// Nowhere: the person is given the address to read.
     Nowhere,
+}
+
+/// Where the way back of a window's sign-in stands: QCode listening on this machine for the
+/// browser to be sent back, and carrying what arrives to the application.
+#[derive(Debug)]
+pub enum Back {
+    /// Listening; dropping the stop gives the port up.
+    Listening(Stop),
+    /// The application answered the request for the way back.
+    Returned,
+    /// Nothing came back within the wait.
+    TimedOut,
+    /// Another program of this machine holds the port.
+    Taken,
+    /// The system refused to listen on the port, in its own words.
+    Refused(String),
 }
 
 /// Where a tab stands.
@@ -200,6 +221,8 @@ pub struct Tab {
     /// The web address the window asked to have opened, and where it was shown — `None` while
     /// the opening is still on its way. A window tab only.
     sign_in: Option<(String, Option<Shown>)>,
+    /// The port that sign-in comes back to, and where its way back stands. A window tab only.
+    back: Option<(u16, Back)>,
     /// Counts the sessions this tab has started, so the watch of a session that was replaced by
     /// a restart is recognised and ignored.
     run: u64,
@@ -236,6 +259,7 @@ impl Tab {
             pages: Pages::default(),
             quiet: None,
             sign_in: None,
+            back: None,
             socket: None,
             held: false,
             run: 0,
@@ -384,6 +408,46 @@ impl Tab {
         }
     }
 
+    /// The port the window's sign-in comes back to, and where its way back stands.
+    #[must_use]
+    pub fn back(&self) -> Option<(u16, &Back)> {
+        self.back.as_ref().map(|(port, back)| (*port, back))
+    }
+
+    /// Whether the tab listens for a sign-in coming back to `port` right now.
+    #[must_use]
+    pub fn listens_on(&self, port: u16) -> bool {
+        matches!(self.back, Some((listening, Back::Listening(_))) if listening == port)
+    }
+
+    /// Records where the way back to `port` stands; a listening that was going on is stopped by
+    /// being replaced.
+    pub fn back_to(&mut self, port: u16, back: Back) {
+        self.back = Some((port, back));
+    }
+
+    /// Takes the end of the listening `id`, if it is still the tab's.
+    pub fn came_back(&mut self, id: u64, ending: Ending) {
+        let Some((port, Back::Listening(stop))) = &self.back else { return };
+        if stop.id() != id {
+            return;
+        }
+        let port = *port;
+        match ending {
+            Ending::Returned => self.back = Some((port, Back::Returned)),
+            Ending::TimedOut => self.back = Some((port, Back::TimedOut)),
+            // Only the tab stops a listening, and it has moved on already.
+            Ending::Stopped => {}
+        }
+    }
+
+    /// Stops listening for the way back, when the tab was.
+    pub fn stop_listening(&mut self) {
+        if matches!(self.back, Some((_, Back::Listening(_)))) {
+            self.back = None;
+        }
+    }
+
     /// Which session of this tab is the current one.
     #[must_use]
     pub fn run(&self) -> u64 {
@@ -481,6 +545,7 @@ impl Tab {
     /// ends the program still attached to it.
     pub fn restarting(&mut self) {
         self.close_session();
+        self.stop_listening();
         self.state = TabState::Starting;
         self.run += 1;
     }
@@ -525,6 +590,10 @@ impl Tab {
     /// Moves the tab to `state`, keeping the session so its last screen stays readable: a tab
     /// that says the container stopped still shows what the harness printed before it did.
     pub fn settled(&mut self, state: TabState) {
+        // A window that is not open has nobody to carry a sign-in to.
+        if state != TabState::Running {
+            self.stop_listening();
+        }
         self.state = state;
     }
 
