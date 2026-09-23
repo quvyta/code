@@ -175,23 +175,8 @@ fn context_dir() -> PathBuf {
 }
 
 /// The command that asks the image which description it was built from.
-///
-/// It is spelled out here rather than in the engine layer because it is the only question in
-/// QCode that reads a label; when a second one appears, both belong there.
 fn revision_query(engine: &Engine, os: Os) -> EngineCommand {
-    EngineCommand {
-        program: engine.bin().to_path_buf(),
-        args: [
-            "image",
-            "inspect",
-            "--format",
-            &format!("{{{{index .Config.Labels \"{REVISION_LABEL}\"}}}}"),
-            os.image(),
-        ]
-        .into_iter()
-        .map(std::ffi::OsString::from)
-        .collect(),
-    }
+    engine.image_label(os.image(), REVISION_LABEL)
 }
 
 #[cfg(test)]

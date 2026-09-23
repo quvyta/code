@@ -12,10 +12,15 @@ keys = "Keys"
 session-gone = { one = "A workspace of the last session is gone", other = "{n} workspaces of the last session are gone" }
 session-broken = "Only part of the last session could be read"
 session-unsaved = "The open workspaces could not be remembered"
+quit-title = "Quit while an agent is at work?"
+quit-working = { one = "An agent tab is still running. Quitting stops its container, so whatever it is doing now is cut off. Its conversation is kept and goes on when you open the workspace again.", other = "{n} agent tabs are still running. Quitting stops their containers, so whatever they are doing now is cut off. Their conversations are kept and go on when you open the workspace again." }
+quit-anyway = "Quit anyway"
+quit-stay = "Stay"
 
 [home]
 continue = "Continue"
-continue-detail = { one = "{first}", other = "{first} +{more}" }
+continue-one = "{first}"
+continue-more = "{first} +{more}"
 new-workspace = "New workspace"
 workspaces = "Workspaces"
 profiles = "Profiles"
@@ -422,7 +427,7 @@ window.no-wayland = "This session has no Wayland compositor, and QCode does not 
 window.no-socket = "The compositor's socket is not at {socket} any more. A compositor that restarted leaves an open window behind; opening it again is the way back."
 window.open = "Open the window"
 window.signin-opened = "The window asked to sign in, so a small sign-in window opened beside it. Sign in there; the application hears back by itself."
-window.signin-in-browser = "The window asked to sign in, but its own sign-in window could not start, so the page opened in your browser. A sign-in from there cannot reach the application. The image of a profile made with an earlier QCode has no sign-in window; making the profile again gives it one."
+window.signin-in-browser = "The window asked to sign in, but its own sign-in window could not start, so the page opened in your browser. A sign-in from there cannot reach the application. The image of a profile made with an earlier QCode has no sign-in window; Rebuild image on the Profiles page gives it one."
 window.signin-open-yourself = "The window asked to open this page, and it could not be shown here:"
 window.raise = "Bring to front"
 window.close = "Close the window"
@@ -723,6 +728,19 @@ gives-unknown = "not measured yet"
 cramped = "This window is under {tokens} tokens, which is too small for a coding agent: it sends its own instructions and your open files first, and this server throws the front of that away without a word or an error."
 cramped-remedy = "You can give the model a window of its own and use that name instead. Write a file holding the two lines FROM {model} and PARAMETER num_ctx 32768, then run: ollama create {model}-32k -f that-file. Setting OLLAMA_CONTEXT_LENGTH works too, but only once the running service has really been restarted with it."
 
+# ready-made providers
+region-europe = "Europe"
+region-singapore = "Singapore"
+region-china = "China"
+region-overseas = "Outside China"
+speaks-anthropic = "Anthropic shape: {address}"
+speaks-openai = "OpenAI shape: {address}"
+key-header = "The key goes in its {header} header, from this machine only."
+ready-made-models = "Models: {models}"
+key-needed-for = "{kind} is reached with a key."
+claims-published = "its maker publishes {claimed}"
+published-at = "{model}: the service does not say its window, so the figure shown is the one its maker publishes at {source}."
+
 [known]
 image-missing = "{engine} does not have the image this needs. It was most likely built with the other engine, or removed; building it again puts it back."
 not-running = "{engine} is installed but not running. Start it, then try again."
@@ -789,3 +807,22 @@ remove-text = { one = "The container goes; its home and login volumes stay in {e
 remove-do = "Remove"
 removing = "Removing…"
 removed = "QCode's containers are gone from {engine}. Its homes and logins are still there."
+
+[profiles.rebuild]
+button = "Rebuild image"
+title = "Rebuild the image of {name}?"
+message = "The image is built again from the start, from what QCode puts in this profile's image today, and the harness is downloaded again; it takes a few minutes. The homes of the workspaces, the login and the conversations are kept. Tabs of this profile that are open keep running on the old image until they are opened again. If the build fails or is stopped, the old image stays."
+confirm = "Build it again"
+heading = "Rebuilding the image of {name}"
+running = "Building. Everything the engine says is below; stopping it keeps the image that was there."
+stopping = "Stopping. The image that was there is kept."
+done = "The image of {name} is built again. Tabs of this profile use it from the next time they are opened."
+stopped = "The rebuild was stopped. The image that was there before is kept."
+failed = "The rebuild failed. What the engine said is below; the image that was there before is kept."
+earlier = "This image was built by an earlier QCode. Rebuilding it gives it what QCode puts in this profile's image today."
+
+[profiles.gemini]
+closed-title = "Google closed the sign-in of {name}"
+closed = "Google closed Gemini CLI's sign-in with a Google account for personal accounts: Gemini now answers it with \"This client is no longer supported for Gemini Code Assist for individuals\". It still works for Gemini Code Assist Standard and Enterprise. With a personal account, the ways on are a profile of Antigravity IDE, which runs in QCode, or a new Gemini CLI profile with an API key from Google AI Studio."
+login-why = "{harness} signs in with an API key from Google AI Studio (aistudio.google.com/app/apikey). QCode opens a container from this profile's image and runs the harness in a terminal below, where it asks for the key and nothing else. Nothing of your machine is in that container."
+login-what = "Choose Use Gemini API Key, paste the key and press Enter. When the harness shows its prompt, press the button under it, or simply leave the harness."

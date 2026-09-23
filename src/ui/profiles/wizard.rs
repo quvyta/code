@@ -173,6 +173,8 @@ pub struct Draft {
     taken: Vec<String>,
     /// Whether this draft exists only to sign an existing profile in.
     only_login: bool,
+    /// Whether this draft exists only to build an existing profile's image again.
+    only_rebuild: bool,
 }
 
 /// Why a step cannot be left yet.
@@ -217,6 +219,7 @@ impl Draft {
             login: Login::Waiting,
             taken: taken.into_iter().collect(),
             only_login: false,
+            only_rebuild: false,
         };
         draft.name = draft.suggested_name();
         draft
@@ -245,6 +248,20 @@ impl Draft {
             login: Login::Waiting,
             taken: Vec::new(),
             only_login: true,
+            only_rebuild: false,
+        }
+    }
+
+    /// A draft that only builds `profile`'s image again: the image page is the whole of it, and
+    /// the build has not started. Nothing of the profile changes but its image.
+    #[must_use]
+    pub fn for_rebuild(profile: &Profile) -> Self {
+        Self {
+            stage: Stage::Image,
+            build: Build::Waiting,
+            only_login: false,
+            only_rebuild: true,
+            ..Self::for_login(profile)
         }
     }
 
@@ -259,6 +276,12 @@ impl Draft {
     #[must_use]
     pub fn is_only_login(&self) -> bool {
         self.only_login
+    }
+
+    /// Whether this draft only builds the image of a profile that already exists again.
+    #[must_use]
+    pub fn is_only_rebuild(&self) -> bool {
+        self.only_rebuild
     }
 
     /// The name a profile of this harness gets while nobody has typed one.
@@ -282,7 +305,7 @@ impl Draft {
 
     /// The provider the tag `tag` names among the ones the person has added, if there is one.
     #[must_use]
-    fn provider_entry(&self, tag: &str) -> Option<&ProviderEntry> {
+    pub(super) fn provider_entry(&self, tag: &str) -> Option<&ProviderEntry> {
         self.providers.iter().find(|provider| provider.tag.as_str() == tag)
     }
 

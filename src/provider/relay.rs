@@ -19,7 +19,7 @@
 //!
 //! One connection to the socket carries one request and its answer. The container writes one
 //! line of JSON — the token, the method, the path, the headers it read from the harness minus
-//! `authorization` and `x-api-key` — then the request body as raw bytes, ending the write side of
+//! `authorization`, `x-api-key` and `api-key` — then the request body as raw bytes, ending the write side of
 //! the connection when the body is done (a harness's request is small, so this is read whole
 //! before it goes on). QCode reads that line, decides whether to carry the request at all, and
 //! if so writes back its own line of JSON — the status and the headers the provider answered
@@ -41,9 +41,12 @@
 //!
 //! Which of the two message paths a request takes is the harness's to say, not the provider
 //! entry's. Nothing translates between the shapes, so the only shape that can work is the one
-//! the harness speaks — Claude Code the Anthropic one, opencode the OpenAI one — and both kinds
-//! of provider QCode knows serve both. Holding a tab to its provider's recorded shape would only
-//! refuse the one request its harness can make.
+//! the harness speaks — Claude Code the Anthropic one, opencode the OpenAI one — and every kind
+//! of provider QCode knows serves both. Holding a tab to its provider's recorded shape would only
+//! refuse the one request its harness can make. The shape does decide where the request goes,
+//! since one service answers the two shapes under different roots ([`crate::provider::
+//! ProviderKind::api_root`]), and the key goes in the header the entry's kind reads
+//! ([`crate::provider::ProviderKind::key_header`]).
 
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -105,7 +108,11 @@ const MOST_CONNECTIONS: usize = 16;
 /// The headers a request or an answer never carries across the relay because the framing on
 /// either side already speaks for them, or because letting them through would carry someone
 /// else's idea of authentication into a request QCode is about to add its own key to.
-const STRIPPED: [&str; 6] = ["authorization", "x-api-key", "host", "content-length", "transfer-encoding", "connection"];
+///
+/// `api-key` is among them because it is the header Xiaomi reads a key from: a harness that was
+/// given one of its own must not have it reach a provider beside the key QCode adds.
+const STRIPPED: [&str; 7] =
+    ["authorization", "x-api-key", "api-key", "host", "content-length", "transfer-encoding", "connection"];
 
 /// One request read off the socket, before it is decided whether to carry it anywhere.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -378,8 +385,8 @@ mod unix {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use super::super::ProviderEntry;
-    use super::super::ask::{Method, Secret};
+    use super::super::ask::{Method, secret_of};
+    use super::super::{ProviderEntry, Wire};
     use super::{
         Event, Listener, MOST_CONNECTIONS, MOST_HEAD, PATIENCE, SOCKET_NAME, STRIPPED, Upstream, UpstreamAsk, allowed,
         head_line, parse_incoming, refusal_body, write_script,
@@ -509,15 +516,11 @@ mod unix {
 
         let headers: Vec<(String, String)> =
             incoming.headers.into_iter().filter(|(name, _)| !STRIPPED.contains(&name.as_str())).collect();
-        let secret = entry.key.clone().map(|key| Secret {
-            header: "Authorization".to_owned(),
-            prefix: "Bearer ".to_owned(),
-            key,
-        });
+        let secret = secret_of(&entry);
         // Under the provider's API rather than its bare address: a harness asks for
-        // `/v1/messages` the way it would ask Anthropic, and OpenRouter answers that path only
-        // under `/api`.
-        let url = entry.api_address(&incoming.path);
+        // `/v1/messages` the way it would ask Anthropic, OpenRouter answers that path only under
+        // `/api`, and Xiaomi only under `/anthropic` while it answers the other shape at its root.
+        let url = entry.api_address(Wire::of_path(&incoming.path), &incoming.path);
         let ask = UpstreamAsk { method, url, headers, secret, body: Box::new(reading) };
 
         match upstream.call(ask) {
@@ -838,6 +841,7 @@ mod tests {
         assert!(SCRIPT.contains(crate::bridge::TOKEN_VARIABLE), "the script reads the same token the bridge does");
         assert!(SCRIPT.to_lowercase().contains("authorization"), "the script strips the harness's own header");
         assert!(SCRIPT.to_lowercase().contains("x-api-key"), "the script strips the harness's other header");
+        assert!(SCRIPT.contains("\"api-key\""), "and the one Xiaomi reads a key from");
     }
 
     #[test]
@@ -915,5 +919,77 @@ mod tests {
         let seen = seen_rx.recv().expect("the request reached the stand-in");
         assert_eq!(seen.url, "https://openrouter.ai/api/v1/chat/completions");
         assert_eq!(seen.secret.expect("the key is added").key.expose(), MADE_UP_KEY);
+    }
+
+    /// A ready-made entry of `kind` at its first address, with the made-up key.
+    fn ready_made(kind: ProviderKind) -> ProviderEntry {
+        let mut entry = ProviderEntry::new(tag("hazir"), kind, kind.suggested_base());
+        entry.key = Some(Key::new(MADE_UP_KEY).expect("a key"));
+        entry
+    }
+
+    /// Every header a harness could have been given a key of its own in, which must all stop at
+    /// the relay whichever of them the provider reads.
+    const HARNESS_OWN: [(&str, &str); 4] = [
+        ("content-type", "application/json"),
+        ("authorization", "Bearer harness-own-key"),
+        ("x-api-key", "harness-own-key"),
+        ("api-key", "harness-own-key"),
+    ];
+
+    #[test]
+    fn xiaomi_gets_its_key_in_api_key_at_the_root_each_shape_answers_under() {
+        let scratch = Scratch::new("mimo");
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let entry = ready_made(ProviderKind::MimoTokenPlan);
+        let listener = Listener::open(&scratch.0, resolve_one("tok", entry), canned(200, "{}", seen_tx), |_| {})
+            .expect("the socket opens");
+        for (method, path, url) in [
+            ("POST", "/v1/messages?beta=true", "https://token-plan-ams.xiaomimimo.com/anthropic/v1/messages?beta=true"),
+            ("POST", "/v1/chat/completions", "https://token-plan-ams.xiaomimimo.com/v1/chat/completions"),
+            ("GET", "/v1/models", "https://token-plan-ams.xiaomimimo.com/v1/models"),
+        ] {
+            let (head, _) = ask_with_headers(listener.socket(), "tok", method, path, &HARNESS_OWN, b"{}");
+            assert_eq!(head["status"], 200, "{path}");
+            let seen = seen_rx.recv().expect("the request reached the stand-in");
+            assert_eq!(seen.url, url, "{path}");
+            let secret = seen.secret.expect("the key is added");
+            assert_eq!((secret.header.as_str(), secret.prefix.as_str()), ("api-key", ""), "{path}");
+            assert_eq!(secret.key.expose(), MADE_UP_KEY);
+            for own in ["authorization", "x-api-key", "api-key"] {
+                assert!(
+                    seen.headers.iter().all(|(name, _)| name != own),
+                    "{path}: the harness's own {own} never reaches the provider: {:?}",
+                    seen.headers.iter().map(|(name, _)| name).collect::<Vec<_>>()
+                );
+            }
+            assert!(seen.headers.iter().any(|(name, _)| name == "content-type"), "{path}: the rest is carried");
+        }
+    }
+
+    #[test]
+    fn kimi_gets_its_key_in_x_api_key_under_coding_in_both_shapes() {
+        let scratch = Scratch::new("kimi");
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let entry = ready_made(ProviderKind::KimiCode);
+        let listener = Listener::open(&scratch.0, resolve_one("tok", entry), canned(200, "{}", seen_tx), |_| {})
+            .expect("the socket opens");
+        for (path, url) in [
+            ("/v1/messages", "https://api.kimi.com/coding/v1/messages"),
+            ("/v1/chat/completions", "https://api.kimi.com/coding/v1/chat/completions"),
+        ] {
+            let (head, body) = ask_with_headers(listener.socket(), "tok", "POST", path, &HARNESS_OWN, b"{}");
+            assert_eq!(head["status"], 200);
+            assert!(!format!("{head}").contains(MADE_UP_KEY) && !String::from_utf8_lossy(&body).contains(MADE_UP_KEY));
+            let seen = seen_rx.recv().expect("the request reached the stand-in");
+            assert_eq!(seen.url, url);
+            let secret = seen.secret.expect("the key is added");
+            assert_eq!((secret.header.as_str(), secret.prefix.as_str()), ("x-api-key", ""));
+            assert!(
+                seen.headers.iter().all(|(name, value)| !value.contains("harness-own-key") && name != "x-api-key"),
+                "only QCode's key goes out: {:?}",
+                seen.headers
+            );
+        }
     }
 }

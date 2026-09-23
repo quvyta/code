@@ -1,7 +1,7 @@
 //! Providers: the model services a person adds themselves, and what QCode asks each of them.
 //!
 //! A provider is the person's own tag, a kind, an address, the shape it speaks, the models it
-//! was last seen to offer and the key it is reached with. Both kinds QCode knows speak the
+//! was last seen to offer and the key it is reached with. Every kind QCode knows speaks the
 //! Anthropic message shape and the OpenAI one directly, so a harness is pointed at the address in
 //! the shape it speaks itself — Claude Code the one, opencode the other — and nothing translates
 //! in between.
@@ -39,6 +39,6 @@ mod tests;
 pub use ask::{Answer, Ask, AskError, Method, Reached, Secret, Web};
 pub use file::{AddError, PermissionProblem, Providers, permission_problems};
 pub use key::Key;
-pub use record::{CRAMPED, Measured, Model, ProviderEntry, ProviderKind, Wire};
+pub use record::{CRAMPED, Measured, Model, ProviderEntry, ProviderKind, Published, Region, Wire, trim_base};
 pub use relay::{Event as RelayEvent, Listener as RelayListener, Upstream};
 pub use tag::{Tag, TagError};

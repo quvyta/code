@@ -1,5 +1,5 @@
-//! What QCode knows about a profile on this machine: whether its image is built and whether a
-//! login is kept for it.
+//! What QCode knows about a profile on this machine: whether its image is built, whether it was
+//! built from the recipe this QCode would use, and whether a login is kept for it.
 //!
 //! Both answers come from the engine and neither is ever guessed. Until the engine has been
 //! asked, the answer is [`Readiness::Unknown`] and the screen says so rather than showing a
@@ -26,6 +26,18 @@ impl Readiness {
     }
 }
 
+/// Which recipe a profile's image was built from, as the label the build left on it says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Revision {
+    /// There is no image to ask, or it has not been asked yet.
+    Unknown,
+    /// The image was built from the recipe this QCode writes for the profile today.
+    Current,
+    /// The image was built from another recipe: an earlier QCode's, or one from before images
+    /// carried the label at all.
+    Earlier,
+}
+
 /// What the engine answered about one profile, carried by name so an answer that arrives late
 /// still finds the profile it belongs to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +46,8 @@ pub struct Status {
     pub name: SafeName,
     /// Whether the profile's image is built.
     pub image: Readiness,
+    /// Which recipe the image was built from.
+    pub revision: Revision,
     /// Whether a login is kept in the profile's credentials volume.
     pub identity: Readiness,
 }
@@ -45,6 +59,8 @@ pub struct Row {
     pub profile: Profile,
     /// Whether the profile's image is built.
     pub image: Readiness,
+    /// Which recipe the image was built from.
+    pub revision: Revision,
     /// Whether a login is kept for the profile.
     pub identity: Readiness,
 }
@@ -53,7 +69,7 @@ impl Row {
     /// A row nothing has been asked about yet.
     #[must_use]
     pub fn new(profile: Profile) -> Self {
-        Self { profile, image: Readiness::Unknown, identity: Readiness::Unknown }
+        Self { profile, image: Readiness::Unknown, revision: Revision::Unknown, identity: Readiness::Unknown }
     }
 
     /// Whether a workspace could open this profile right now: the image is there and so is a
@@ -73,6 +89,7 @@ impl Row {
     pub fn apply(&mut self, status: &Status) {
         if status.name == self.profile.name {
             self.image = status.image;
+            self.revision = status.revision;
             self.identity = status.identity;
         }
     }
@@ -111,12 +128,14 @@ mod tests {
         row.apply(&Status {
             name: SafeName::parse("claude-sub").expect("safe"),
             image: Readiness::Present,
+            revision: Revision::Current,
             identity: Readiness::Missing,
         });
         assert!(!row.is_runnable());
         row.apply(&Status {
             name: SafeName::parse("claude-sub").expect("safe"),
             image: Readiness::Present,
+            revision: Revision::Current,
             identity: Readiness::Present,
         });
         assert!(row.is_runnable());
@@ -132,6 +151,7 @@ mod tests {
         row.apply(&Status {
             name: SafeName::parse("oc").expect("safe"),
             image: Readiness::Present,
+            revision: Revision::Current,
             identity: Readiness::Missing,
         });
         assert!(row.is_runnable(), "no login is kept, and none is needed");
@@ -143,6 +163,7 @@ mod tests {
         row.apply(&Status {
             name: SafeName::parse("codex-key").expect("safe"),
             image: Readiness::Present,
+            revision: Revision::Current,
             identity: Readiness::Present,
         });
         assert_eq!(row.image, Readiness::Unknown);

@@ -10,7 +10,9 @@
 //!
 //! **What models there are**, and **what window each of them claims** — both from the
 //! provider's own API, never guessed and never scraped: ollama answers `/api/tags` and
-//! `/api/show`, OpenRouter answers `/api/v1/models`.
+//! `/api/show`, OpenRouter answers `/api/v1/models`. A ready-made provider answers its own
+//! `/v1/models`; where that names a model without its window, the window its maker publishes is
+//! kept, and the page says where it was read.
 //!
 //! **What window the server really gives**, which is the one that matters and the one nobody
 //! tells you. A model's record can say 262 144 while the endpoint a harness actually uses pins
@@ -24,6 +26,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::record::Published;
 use super::{Key, Measured, Model, ProviderEntry, ProviderKind, Wire};
 
 /// How long a single request may take before it is given up on. Generous rather than tight: a
@@ -277,7 +280,11 @@ fn shorten(said: &str) -> String {
 pub fn listing(entry: &ProviderEntry) -> Ask {
     match entry.kind {
         ProviderKind::Ollama => plain(Method::Get, entry.address("/api/tags")),
-        ProviderKind::OpenRouter => plain(Method::Get, entry.api_address("/v1/models")),
+        ProviderKind::OpenRouter => plain(Method::Get, entry.api_address(Wire::OpenAi, "/v1/models")),
+        // Both ready-made services list only for a key, and both at the OpenAI root.
+        ProviderKind::MimoTokenPlan | ProviderKind::KimiCode => {
+            with_key(Method::Get, entry.api_address(Wire::OpenAi, "/v1/models"), entry)
+        }
     }
 }
 
@@ -298,7 +305,10 @@ pub fn trial(entry: &ProviderEntry) -> Ask {
         // The key's own endpoint, so that the trial really tries the key rather than an address
         // that answers whether or not the key is any good — and so that trying a connection
         // never spends anything.
-        ProviderKind::OpenRouter => with_key(Method::Get, entry.api_address("/v1/key"), entry),
+        ProviderKind::OpenRouter => with_key(Method::Get, entry.api_address(Wire::OpenAi, "/v1/key"), entry),
+        // Neither service has an endpoint of the key's own; the model listing answers only for a
+        // good key and spends nothing, which is all a trial may do.
+        ProviderKind::MimoTokenPlan | ProviderKind::KimiCode => listing(entry),
     }
 }
 
@@ -307,11 +317,17 @@ fn plain(method: Method, url: String) -> Ask {
     Ask { method, url, headers: Vec::new(), body: None, secret: None }
 }
 
-/// The same request with `entry`'s key on it, when it has one.
+/// The same request with `entry`'s key on it, when it has one, in the header its kind reads.
 fn with_key(method: Method, url: String, entry: &ProviderEntry) -> Ask {
-    let secret =
-        entry.key.clone().map(|key| Secret { header: "Authorization".to_owned(), prefix: "Bearer ".to_owned(), key });
-    Ask { method, url, headers: Vec::new(), body: None, secret }
+    Ask { method, url, headers: Vec::new(), body: None, secret: secret_of(entry) }
+}
+
+/// `entry`'s key as the header its kind reads it from, when it has one. The relay adds the very
+/// same header, so what the page tried is what a tab sends.
+#[must_use]
+pub fn secret_of(entry: &ProviderEntry) -> Option<Secret> {
+    let (header, prefix) = entry.kind.key_header();
+    entry.key.clone().map(|key| Secret { header: header.to_owned(), prefix: prefix.to_owned(), key })
 }
 
 /// What a provider offers, with the window each model claims.
@@ -326,7 +342,15 @@ fn with_key(method: Method, url: String, entry: &ProviderEntry) -> Ask {
 /// When the provider could not be reached or its listing could not be read.
 pub fn list_models(web: &Web, entry: &ProviderEntry) -> Result<Vec<Model>, AskError> {
     let ask = listing(entry);
-    let answered = web.json(&ask)?;
+    let answered = match web.json(&ask) {
+        Ok(answered) => answered,
+        // A ready-made service that does not list its models is still known to have the ones its
+        // maker publishes; a refused key is a different answer and is said as one.
+        Err(AskError::Refused { status: 404, .. }) if !entry.kind.published().is_empty() => {
+            return Ok(entry.kind.published().iter().map(published_model).collect());
+        }
+        Err(trouble) => return Err(trouble),
+    };
     match entry.kind {
         ProviderKind::Ollama => {
             let names = answered
@@ -343,21 +367,32 @@ pub fn list_models(web: &Web, entry: &ProviderEntry) -> Result<Vec<Model>, AskEr
                 })
                 .collect())
         }
-        ProviderKind::OpenRouter => {
+        ProviderKind::OpenRouter | ProviderKind::MimoTokenPlan | ProviderKind::KimiCode => {
             let models = answered
                 .get("data")
                 .and_then(|data| data.as_array())
                 .ok_or_else(|| AskError::Unreadable { url: ask.url.clone(), wanted: "data".to_owned() })?;
+            let published = entry.kind.published();
             Ok(models
                 .iter()
                 .filter_map(|model| {
                     let id = model.get("id")?.as_str()?.to_owned();
-                    let claimed = model.get("context_length").and_then(serde_json::Value::as_u64);
+                    // What the service answers comes first; Kimi gives it, Xiaomi does not, and
+                    // then the maker's published figure is all there is.
+                    let claimed = model
+                        .get("context_length")
+                        .and_then(serde_json::Value::as_u64)
+                        .or_else(|| published.iter().find(|known| known.id == id).map(|known| known.window));
                     Some(Model { id, claimed, measured: None })
                 })
                 .collect())
         }
     }
+}
+
+/// A model as its maker publishes it.
+fn published_model(published: &Published) -> Model {
+    Model { id: published.id.to_owned(), claimed: Some(published.window), measured: None }
 }
 
 /// The window `model`'s own record claims on an ollama server, or `None` when the server would
@@ -396,7 +431,7 @@ pub fn try_connection(web: &Web, entry: &ProviderEntry) -> Result<Reached, AskEr
                 .ok_or_else(|| AskError::Unreadable { url: ask.url.clone(), wanted: "version".to_owned() })?;
             Ok(Reached::Version(version.to_owned()))
         }
-        ProviderKind::OpenRouter => match answered.get("data") {
+        ProviderKind::OpenRouter | ProviderKind::MimoTokenPlan | ProviderKind::KimiCode => match answered.get("data") {
             Some(_) => Ok(Reached::KeyAccepted),
             None => Err(AskError::Unreadable { url: ask.url.clone(), wanted: "data".to_owned() }),
         },

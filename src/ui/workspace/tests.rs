@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use qframe::date::Date;
 use qframe::env::{AssetDirs, Env};
+use qframe::event::{MouseButton, MouseKind};
 use qframe::icons::GlyphMode;
 use qframe::prelude::*;
 use qframe::runtime::Harness;
@@ -27,12 +28,14 @@ use super::plan::{CODE_DIR, SHELL};
 
 mod backups;
 mod bridge;
+mod closed_sign_in;
 mod desktop;
 mod engine_help;
 mod files;
 mod guidance;
 mod history;
 mod missing_image;
+mod rebuilt_image;
 mod registry;
 mod sound;
 mod viewers;
@@ -266,9 +269,13 @@ fn every_language_fits_the_workspace_screen_without_losing_a_label() {
             assert!(ours.iter().any(|text| line.contains(text.as_str())), "{code} cuts a line:\n{screen}");
         }
 
-        // Dragged wide, the panel has room for the three container buttons side by side, and
-        // they still stand there whole.
-        harness.send(Msg::ResizePanel(super::PANEL_MAX));
+        // Dragged wide by its edge, as far as it goes, the panel has room for the three container
+        // buttons side by side, and they still stand there whole.
+        let edge = i32::from(SIZE.0 - super::PANEL_WIDTH);
+        let row = i32::from(SIZE.1 / 2);
+        harness.mouse(MouseKind::Down(MouseButton::Left), edge, row);
+        harness.mouse(MouseKind::Drag(MouseButton::Left), 2, row);
+        harness.mouse(MouseKind::Up(MouseButton::Left), 2, row);
         harness.render();
         let wide = harness.screen();
         let row: Vec<String> =
@@ -447,6 +454,57 @@ fn a_tab_is_told_the_window_this_server_was_measured_to_give_rather_than_leaving
     let env = envs(&screen.launch_command(key(&screen, 0)).expect("a chosen tab has a command"));
     assert_eq!(env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS").map(String::as_str), Some("31512"), "{env:?}");
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_tab_on_a_ready_made_service_is_told_the_window_the_service_gives_without_measuring_it() {
+    let scratch = Scratch::new("provider-ready-made");
+    // What the Providers page writes when the person picks Xiaomi's Token Plan and pastes a key:
+    // the maker's models with the window it publishes, nothing measured.
+    let path = std::env::temp_dir().join("qcode-workspace-providers-ready-made").join("providers.toml");
+    let mut providers = crate::provider::Providers::in_memory();
+    let kind = crate::provider::ProviderKind::MimoTokenPlan;
+    let entry = crate::provider::ProviderEntry::new(
+        crate::provider::Tag::parse("mimo").expect("a tag"),
+        kind,
+        kind.suggested_base(),
+    );
+    providers.add(entry).expect("the tag is free");
+    // Beside it an ollama server whose model claims a window nobody measured: its claim is not
+    // what it gives, so it is still not handed over.
+    let mut ollama = crate::provider::ProviderEntry::new(
+        crate::provider::Tag::parse("ev1").expect("a tag"),
+        crate::provider::ProviderKind::Ollama,
+        "http://127.0.0.1:11434",
+    );
+    let mut claimed = crate::provider::Model::new("qwen3.8");
+    claimed.claimed = Some(262_144);
+    ollama.models = vec![claimed];
+    providers.add(ollama).expect("the tag is free");
+    providers.at(&path).save().expect("the scratch file is written");
+
+    let profiles =
+        vec![provider_profile("mimo-tab", "mimo", "mimo-v2.6-flash"), provider_profile("ev-tab", "ev1", "qwen3.8")];
+    let mut screen = WorkspaceScreen::new(
+        Some(engine()),
+        HostUser::Ids { uid: 1000, gid: 1000 },
+        vec![workspace("firefly", "Firefly", scratch.paths(), profiles)],
+    )
+    .with_providers_path(Some(path.clone()));
+    apply(&mut screen, Msg::OpenWorkspace(0));
+    open(&mut screen, Choice::NewChat("mimo-tab".to_owned()));
+    open(&mut screen, Choice::NewChat("ev-tab".to_owned()));
+
+    let env = envs(&screen.launch_command(key(&screen, 0)).expect("a chosen tab has a command"));
+    assert_eq!(env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS").map(String::as_str), Some("1048576"), "{env:?}");
+    assert_eq!(
+        env.get("ANTHROPIC_BASE_URL").map(String::as_str),
+        Some("http://127.0.0.1:41417"),
+        "the relay, not Xiaomi"
+    );
+    let env = envs(&screen.launch_command(key(&screen, 1)).expect("a chosen tab has a command"));
+    assert_eq!(env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS"), None, "a claim of a server of one's own: {env:?}");
+    let _ = std::fs::remove_dir_all(path.parent().expect("its folder"));
 }
 
 #[test]
@@ -1772,4 +1830,20 @@ fn ctrl_alt_space_takes_the_keyboard_between_the_harness_and_the_tabs() {
     harness.type_text("abcd");
     wait_for(&mut harness, "61 62 63 64");
     session.kill();
+}
+
+#[test]
+fn a_running_harness_counts_as_an_agent_at_work_and_a_running_shell_does_not() {
+    let scratch = Scratch::new("at-work");
+    let mut screen = one_workspace(&scratch);
+    let alive = || {
+        TerminalSession::spawn("/bin/sh".as_ref(), &["-c", "sleep 30"], Path::new("/"))
+            .expect("a terminal for the shell")
+    };
+    open(&mut screen, Choice::Shell);
+    screen.attach(key(&screen, 0), alive());
+    assert_eq!(super::agents_at_work(&screen), 0, "a shell is nobody's work");
+    open(&mut screen, claude());
+    screen.attach(key(&screen, 1), alive());
+    assert_eq!(super::agents_at_work(&screen), 1, "the harness is at work");
 }

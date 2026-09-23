@@ -7,6 +7,7 @@ use qframe::storage::Settings;
 use crate::base::Os;
 use crate::engine::names;
 use crate::profile::{AccountKind, Addition, ConfigFile, Extra, HarnessKind, SafeName, Template};
+use crate::provider::Wire;
 
 /// Whether a directory is mounted into the container writable or read-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,11 +87,25 @@ impl ProviderChoice {
         }
     }
 
+    /// The address a harness inside the container is given for this provider in shape `wire`:
+    /// always the workspace's relay, written the way a client of that shape expects its base —
+    /// the bare address for the Anthropic shape, which clients follow with `/v1/messages`, and
+    /// `/v1` for the OpenAI one, which clients follow with `/chat/completions`. Where the
+    /// provider really answers that shape, and which header its key goes in, is the relay's to
+    /// know; a harness is only ever told this address.
+    #[must_use]
+    pub fn endpoint(wire: Wire) -> String {
+        match wire {
+            Wire::Anthropic => relay_address(),
+            Wire::OpenAi => format!("{}/v1", relay_address()),
+        }
+    }
+
     /// Claude Code speaks the Anthropic message shape and is pointed at another endpoint by
     /// three variables it reads once, as it starts.
     fn claude_code(&self, token: &str, window: Option<u64>) -> Vec<(String, String)> {
         let mut environment = vec![
-            (ANTHROPIC_BASE_URL.to_owned(), relay_address()),
+            (ANTHROPIC_BASE_URL.to_owned(), Self::endpoint(Wire::Anthropic)),
             (ANTHROPIC_AUTH_TOKEN.to_owned(), token.to_owned()),
             (ANTHROPIC_MODEL.to_owned(), self.model.clone()),
         ];
@@ -132,7 +147,7 @@ impl ProviderChoice {
                 self.tag.as_str(): {
                     "npm": "@ai-sdk/openai-compatible",
                     "name": self.tag,
-                    "options": { "baseURL": format!("{}/v1", relay_address()), "apiKey": token },
+                    "options": { "baseURL": Self::endpoint(Wire::OpenAi), "apiKey": token },
                     "models": { self.model.as_str(): model },
                 },
             },

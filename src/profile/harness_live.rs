@@ -351,6 +351,32 @@ fn gemini_cli_installs_answers_and_keeps_its_login_where_the_record_says() {
     });
 }
 
+/// A Gemini CLI profile that signs in with a key, under the `base` template that writes nothing
+/// into the home: the image carries the system settings, readable by the person the container runs
+/// as, and the harness reads them. Headless, with no key stored, it names the enforced type before
+/// anything else, which it can only know from that file; the dialog itself, which offers the key
+/// alone, was watched in a terminal by hand and is described on the record.
+#[test]
+#[ignore = "needs a container engine and the network; run with QCODE_CONTAINER_TESTS=1"]
+fn gemini_cli_with_a_key_reads_the_system_settings_that_keep_it_to_the_key() {
+    let profile = Profile {
+        account: AccountKind::ApiKey,
+        template: Template::Base,
+        name: SafeName::parse("harnesstest-gemini-key").expect("the name is safe"),
+        ..profile(HarnessKind::GeminiCli)
+    };
+    let file = HarnessKind::GeminiCli.record().key_only.expect("Gemini CLI is kept to a key");
+    for engine in engines() {
+        let lab = open(engine, &profile);
+        let kind = lab.engine.kind();
+        assert_eq!(lab.ok(&format!("cat {}", file.path)), file.contents, "{kind:?}: the person reads the file");
+        assert_eq!(lab.ok(&format!("stat -c '%U %a' {}", file.path)).trim(), "root 644", "{kind:?}");
+        let said = lab.ok("gemini -p hi 2>&1 || true");
+        assert!(said.contains("'gemini-api-key' is enforced"), "{kind:?}: {said}");
+        clear(&lab.engine, &profile, &lab.container);
+    }
+}
+
 #[test]
 #[ignore = "needs a container engine and the network; run with QCODE_CONTAINER_TESTS=1"]
 fn codex_installs_answers_and_keeps_its_login_where_the_record_says() {

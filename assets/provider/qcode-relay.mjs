@@ -2,8 +2,8 @@
 // speak to a provider it has been pointed at, without ever holding the provider's key.
 //
 // A harness is given this server's address (127.0.0.1 and the port below) the way it would be
-// given the provider's own. Every request is carried, unchanged but for its own `authorization`
-// and `x-api-key` headers, to QCode on the host over the socket beside this file. QCode decides
+// given the provider's own. Every request is carried, unchanged but for its own `authorization`,
+// `x-api-key` and `api-key` headers, to QCode on the host over the socket beside this file. QCode decides
 // whether the request may go anywhere at all, adds the real key to the copy it sends the
 // provider, and streams the answer back here. The key never reaches this process, this container,
 // or anything either of them could write down.
@@ -28,7 +28,7 @@ const PORT = 41417;
 const TOKEN_VARIABLE = "QCODE_BRIDGE";
 // Headers a harness's own request carries that must never reach QCode as if they were meant for
 // it: the key that matters here is QCode's own, added once the request reaches the host.
-const STRIPPED = new Set(["authorization", "x-api-key"]);
+const STRIPPED = new Set(["authorization", "x-api-key", "api-key"]);
 
 // The tab this server speaks for, found the same way the bridge finds it: its own environment
 // first, then its parents' in turn, because a harness that passes on only part of its environment

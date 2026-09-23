@@ -13,10 +13,15 @@ keys = "Tuşlar"
 session-gone = { one = "Son oturumdaki bir çalışma alanı artık yok", other = "Son oturumdaki {n} çalışma alanı artık yok" }
 session-broken = "Son oturumun yalnızca bir kısmı okunabildi"
 session-unsaved = "Açık çalışma alanları hatırlanamadı"
+quit-title = "Bir ajan çalışırken çıkılsın mı?"
+quit-working = { one = "Bir ajan sekmesi hâlâ çalışıyor. Çıkınca kapsayıcısı durur, o an yaptığı iş yarıda kalır. Konuşması saklanır; çalışma alanını yeniden açınca kaldığı yerden sürer.", other = "{n} ajan sekmesi hâlâ çalışıyor. Çıkınca kapsayıcıları durur, o an yaptıkları iş yarıda kalır. Konuşmaları saklanır; çalışma alanını yeniden açınca kaldıkları yerden sürer." }
+quit-anyway = "Yine de çık"
+quit-stay = "Kal"
 
 [home]
 continue = "Devam et"
-continue-detail = { one = "{first}", other = "{first} +{more}" }
+continue-one = "{first}"
+continue-more = "{first} +{more}"
 new-workspace = "Yeni çalışma alanı"
 workspaces = "Çalışma alanları"
 profiles = "Profiller"
@@ -423,7 +428,7 @@ window.no-wayland = "Bu oturumda Wayland bileşiği yok; QCode pencereyi X11 üz
 window.no-socket = "Bileşiğin soketi artık {socket} değil. Yeniden başlayan bir bileşik açık pencereyi koparır; pencereyi yeniden açmak çözümdür."
 window.open = "Pencereyi aç"
 window.signin-opened = "Pencere giriş yapmak istedi, yanında küçük bir giriş penceresi açıldı. Girişi orada yap; uygulama sonucu kendiliğinden alır."
-window.signin-in-browser = "Pencere giriş yapmak istedi ama kendi giriş penceresi açılamadı, bu yüzden sayfa tarayıcında açıldı. Oradan yapılan giriş uygulamaya ulaşamaz. QCode'un eski bir sürümüyle yapılmış bir profilin imajında giriş penceresi yoktur; profili yeniden yapmak ona bir giriş penceresi verir."
+window.signin-in-browser = "Pencere giriş yapmak istedi ama kendi giriş penceresi açılamadı, bu yüzden sayfa tarayıcında açıldı. Oradan yapılan giriş uygulamaya ulaşamaz. QCode'un eski bir sürümüyle yapılmış bir profilin imajında giriş penceresi yoktur; Profiller sayfasındaki İmajı yeniden kur düğmesi ona bir giriş penceresi verir."
 window.signin-open-yourself = "Pencere bu sayfayı açmak istedi, burada gösterilemedi:"
 window.raise = "Öne getir"
 window.close = "Pencereyi kapat"
@@ -724,6 +729,19 @@ gives-unknown = "henüz ölçülmedi"
 cramped = "Bu pencere {tokens} belirtecin altında; bir kodlama ajanı için fazla dar: ajan önce kendi yönergelerini ve açık dosyalarını gönderir, bu sunucu da bunların başını tek kelime etmeden, hata bile vermeden atar."
 cramped-remedy = "Modele kendine ait bir pencere verip onun adını kullanabilirsin. İçinde FROM {model} ve PARAMETER num_ctx 32768 satırları olan bir dosya yaz, sonra şunu çalıştır: ollama create {model}-32k -f o-dosya. OLLAMA_CONTEXT_LENGTH ayarlamak da işe yarar, ama ancak çalışan servis gerçekten onunla yeniden başlatıldıysa."
 
+# ready-made providers
+region-europe = "Avrupa"
+region-singapore = "Singapur"
+region-china = "Çin"
+region-overseas = "Çin dışı"
+speaks-anthropic = "Anthropic biçimi: {address}"
+speaks-openai = "OpenAI biçimi: {address}"
+key-header = "Anahtar {header} başlığında, yalnızca bu makineden gider."
+ready-made-models = "Modeller: {models}"
+key-needed-for = "{kind} hizmetine bir anahtarla ulaşılır."
+claims-published = "yapımcısı {claimed} yayımlıyor"
+published-at = "{model}: servis penceresini söylemiyor; gösterilen sayı yapımcısının {source} adresinde yayımladığı."
+
 [known]
 image-missing = "{engine} içinde bunun için gereken imaj yok. Büyük olasılıkla öbür motorla kuruldu ya da silindi; yeniden kurmak onu geri getirir."
 not-running = "{engine} kurulu ama çalışmıyor. Başlat, sonra yeniden dene."
@@ -790,3 +808,22 @@ remove-text = { one = "Kapsayıcı gider; ev klasörü ve oturum birimleri {engi
 remove-do = "Kaldır"
 removing = "Kaldırılıyor…"
 removed = "QCode kapsayıcıları {engine} içinden kaldırıldı. Ev klasörleri ve oturumlar hâlâ orada."
+
+[profiles.rebuild]
+button = "İmajı yeniden kur"
+title = "{name} imajı yeniden kurulsun mu?"
+message = "İmaj, QCode'un bugün bu profilin imajına koyduklarıyla baştan kurulur ve harness yeniden indirilir; birkaç dakika sürer. Çalışma alanlarının ev klasörleri, giriş ve sohbetler olduğu gibi kalır. Bu profilin açık sekmeleri yeniden açılana kadar eski imajla çalışmaya devam eder. Kurulum başarısız olur ya da durdurulursa eski imaj yerinde kalır."
+confirm = "Yeniden kur"
+heading = "{name} imajı yeniden kuruluyor"
+running = "Kuruluyor. Motorun söylediği her şey aşağıda; durdurursan eski imaj yerinde kalır."
+stopping = "Durduruluyor. Eski imaj yerinde kalıyor."
+done = "{name} imajı yeniden kuruldu. Bu profilin sekmeleri bir sonraki açılışta yeni imajı kullanır."
+stopped = "Yeniden kurulum durduruldu. Önceki imaj yerinde kaldı."
+failed = "Yeniden kurulum başarısız oldu. Motorun söyledikleri aşağıda; önceki imaj yerinde kaldı."
+earlier = "Bu imajı QCode'un eski bir sürümü kurmuş. İmajı yeniden kur düğmesi onu QCode'un bugün koyduklarıyla yeniden kurar."
+
+[profiles.gemini]
+closed-title = "{name} profilinin girişini Google kapattı"
+closed = "Google, Gemini CLI'ın Google hesabıyla girişini kişisel hesaplara kapattı: Gemini artık bu girişe \"This client is no longer supported for Gemini Code Assist for individuals\" diye cevap veriyor. Gemini Code Assist Standard ve Enterprise için hâlâ çalışıyor. Kişisel bir hesapla devam etmenin yolları, QCode'da çalışan Antigravity IDE ile bir profil ya da Google AI Studio'dan alınan bir API anahtarıyla yeni bir Gemini CLI profili."
+login-why = "{harness}, Google AI Studio'dan alınan bir API anahtarıyla giriş yapar (aistudio.google.com/app/apikey). QCode bu profilin imajından bir kapsayıcı açar ve harness'ı aşağıdaki terminalde çalıştırır; orada yalnızca anahtarı sorar. Makinenden hiçbir şey o kapsayıcıda değildir."
+login-what = "Use Gemini API Key seçeneğini seç, anahtarı yapıştır ve Enter'a bas. Harness istemini gösterince altındaki düğmeye bas ya da harness'tan çık."

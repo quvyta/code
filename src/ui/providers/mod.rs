@@ -29,14 +29,15 @@ use qframe::widgets::{EmptyState, Field, Modal, RadioGroup, TextInput};
 
 use crate::provider::{
     Ask, AskError, CRAMPED, Key, Measured, Model, PermissionProblem, ProviderEntry, ProviderKind,
-    Providers as ProviderFile, Reached, Web, ask, permission_problems,
+    Providers as ProviderFile, Reached, Web, Wire, ask, permission_problems,
 };
 use crate::store::Loaded;
 
 pub use draft::{BASE_FIELD, Draft, KEY_FIELD, Problem, TAG_FIELD};
 
-/// Width of the add dialog. Wide enough for an address to read as one line.
-const DIALOG_WIDTH: u16 = 64;
+/// Width of the add dialog. Wide enough for an address to read as one line, the longest being a
+/// ready-made service's API root with the name of its shape in front of it.
+const DIALOG_WIDTH: u16 = 72;
 
 /// The name of the list of providers, for the focus and the tests.
 const LIST: &str = "providers";
@@ -91,6 +92,8 @@ pub enum Msg {
     PasteKey(String),
     /// A kind was chosen.
     PickKind(usize),
+    /// Where a ready-made provider answers was chosen, by its place among its kind's regions.
+    PickRegion(usize),
     /// Add the provider the dialog describes.
     Add,
     /// Deleting the chosen provider was asked for.
@@ -319,6 +322,12 @@ pub fn update(state: &mut Providers, message: Msg) -> Command<Msg> {
             }
             Command::none()
         }
+        Msg::PickRegion(index) => {
+            if let Some(draft) = &mut state.draft {
+                draft.pick_region(index);
+            }
+            Command::none()
+        }
         Msg::Add => add(state),
         Msg::DeleteAsked => match state.selected() {
             Some(entry) => Command::confirm(
@@ -528,15 +537,25 @@ fn draw_list(state: &Providers, ui: &mut View<'_, Msg>) {
 fn draw_chosen(state: &Providers, entry: &ProviderEntry, ui: &mut View<'_, Msg>) {
     let busy = state.busy();
     ui.add(Text::new(key_line(entry)).role("secondary")).fill_width();
+    if !entry.kind.regions().is_empty() {
+        ui.column(|ui| draw_speaks(entry.kind, &entry.base, ui)).fill_width();
+    }
 
     if entry.models.is_empty() {
         ui.add(Text::new(t!("provider.no-models")).role("secondary")).fill_width();
     } else {
-        let items = entry.models.iter().map(|model| ListItem::new(model.id.clone()).detail(windows(model)));
+        let items = entry.models.iter().map(|model| ListItem::new(model.id.clone()).detail(windows(model, entry.kind)));
         // A server can offer more models than the screen has rows. The list takes the rows the
         // rest of the page leaves and scrolls inside them, so the answer to Try and every button
         // under it stay where a hand can reach them.
         ui.add(List::new(items).selected(Some(state.model)).on_select(Msg::PickModel)).id(MODELS).fill();
+    }
+    // A figure QCode did not ask the service for says where it was read.
+    if let Some(model) = state.chosen_model()
+        && let Some(source) = model.published_at(entry.kind)
+    {
+        ui.add(Text::new(t!("provider.published-at", model = model.id.as_str(), source = source)).role("secondary"))
+            .fill_width();
     }
     // A window that is really this small is the one thing a person has to be told before they
     // point a coding agent at it, with what they can do about it on their own machine.
@@ -607,6 +626,9 @@ fn draw_dialog(draft: &Draft, ui: &mut View<'_, Msg>) {
         ui.column(|ui| {
             ui.add(RadioGroup::new(ProviderKind::ALL.map(kind_word)).selected(chosen).on_select(Msg::PickKind))
                 .id("provider-kind");
+            if !draft.kind.regions().is_empty() {
+                draw_ready_made(draft, ui);
+            }
             let tag_error = at(TAG_FIELD);
             ui.add_with(
                 Field::new(t!("provider.tag")).hint(t!("provider.tag-hint")).error(tag_error.clone()).required(true),
@@ -669,6 +691,45 @@ fn draw_dialog(draft: &Draft, ui: &mut View<'_, Msg>) {
     });
 }
 
+/// What a ready-made kind fills in, said before the person types their key: where its
+/// subscription answers, where each shape is asked, the header the key goes in, and the models
+/// it offers.
+fn draw_ready_made(draft: &Draft, ui: &mut View<'_, Msg>) {
+    let regions = draft.kind.regions().iter().map(|region| region_word(region.id));
+    ui.add(RadioGroup::new(regions).horizontal(true).selected(draft.region()).on_select(Msg::PickRegion))
+        .id("provider-region");
+    // One block, read together: it is what picking the kind filled in.
+    ui.column(|ui| {
+        draw_speaks(draft.kind, &draft.base, ui);
+        let models: Vec<&str> = draft.kind.published().iter().map(|model| model.id).collect();
+        ui.add(Text::new(t!("provider.ready-made-models", models = models.join(", ").as_str())).role("secondary"))
+            .fill_width();
+    })
+    .fill_width();
+}
+
+/// Where a provider of `kind` at `base` is asked in each shape, written as the base a client of
+/// that shape is given, and the header its key goes in: the same places the relay and the page's
+/// own requests go.
+fn draw_speaks(kind: ProviderKind, base: &str, ui: &mut View<'_, Msg>) {
+    let (header, _) = kind.key_header();
+    let anthropic = kind.api_address(base, Wire::Anthropic, "");
+    let openai = kind.api_address(base, Wire::OpenAi, "/v1");
+    ui.add(Text::new(t!("provider.speaks-anthropic", address = anthropic.as_str())).role("secondary")).fill_width();
+    ui.add(Text::new(t!("provider.speaks-openai", address = openai.as_str())).role("secondary")).fill_width();
+    ui.add(Text::new(t!("provider.key-header", header = header)).role("secondary")).fill_width();
+}
+
+/// How a region is named on the page.
+fn region_word(id: &str) -> String {
+    match id {
+        "europe" => t!("provider.region-europe"),
+        "singapore" => t!("provider.region-singapore"),
+        "china" => t!("provider.region-china"),
+        _ => t!("provider.region-overseas"),
+    }
+}
+
 /// The line that says where the key is written and what carries it away.
 fn key_file_line(state: &Providers) -> String {
     match &state.path {
@@ -686,9 +747,13 @@ fn key_line(entry: &ProviderEntry) -> String {
     }
 }
 
-/// The two windows of a model, side by side, each one saying plainly when it is not known.
-fn windows(model: &Model) -> String {
+/// The two windows of a model, side by side, each one saying plainly when it is not known, and a
+/// claim that is the maker's published figure rather than the service's answer saying so.
+fn windows(model: &Model, kind: ProviderKind) -> String {
     let claimed = match model.claimed {
+        Some(claimed) if model.published_at(kind).is_some() => {
+            t!("provider.claims-published", claimed = tokens(claimed))
+        }
         Some(claimed) => t!("provider.claims", claimed = tokens(claimed)),
         None => t!("provider.claims-unknown"),
     };
@@ -752,7 +817,8 @@ fn problem_message(problem: &Problem) -> String {
         Problem::NoBase => t!("provider.base-empty"),
         Problem::BaseNotAnAddress(written) => t!("provider.base-not-an-address", written = written.as_str()),
         Problem::BaseUnusable(written) => t!("provider.base-unusable", written = written.as_str()),
-        Problem::NoKey => t!("provider.key-needed"),
+        Problem::NoKey(ProviderKind::OpenRouter) => t!("provider.key-needed"),
+        Problem::NoKey(kind) => t!("provider.key-needed-for", kind = kind_word(*kind).as_str()),
     }
 }
 
@@ -762,6 +828,8 @@ fn kind_word(kind: ProviderKind) -> String {
     match kind {
         ProviderKind::Ollama => "ollama".to_owned(),
         ProviderKind::OpenRouter => "OpenRouter".to_owned(),
+        ProviderKind::MimoTokenPlan => "Xiaomi MiMo Token Plan".to_owned(),
+        ProviderKind::KimiCode => "Kimi Code".to_owned(),
     }
 }
 

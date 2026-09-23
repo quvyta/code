@@ -437,9 +437,15 @@ pub fn ensure_running(engine: &Engine, plan: &ContainerPlan, user: HostUser) -> 
         Some(ContainerState::Running) => return Ok(()),
         Some(_) => {
             let made_from = run::capture(&engine.container_label(&plan.name, PLAN_LABEL)).unwrap_or_default();
-            let current = made_from.trim() == plan.digest(engine, user);
+            let replaced = replaced_image(engine, plan);
+            let current = made_from.trim() == plan.digest(engine, user) && replaced.is_none();
             if !current {
                 run::capture(&engine.remove_container(&plan.name)).map_err(|error| LaunchFailure::from(&error))?;
+                // The image a rebuild left without a name goes with its last container; while
+                // another container still holds it the engine refuses, and that one takes it.
+                if let Some(old) = replaced {
+                    let _ = run::capture(&engine.remove_unused_image(&old));
+                }
             }
             current
         }
@@ -482,6 +488,35 @@ pub fn ensure_running(engine: &Engine, plan: &ContainerPlan, user: HostUser) -> 
     }
     run::capture(&engine.start_container(&plan.name)).map_err(|error| LaunchFailure::from(&error))?;
     Ok(())
+}
+
+/// Makes a stopped container of a profile anew when the profile's image was built again since the
+/// container was made, and starts it; answers whether it did.
+///
+/// The page of a new tab reads the conversations out of a profile's container and starts a
+/// stopped one to do it, and a tab then finds it running and takes it as it is. Without this
+/// the container made from the old image would be started there and never replaced, and a
+/// rebuild would reach no workspace that had run the profile before. Nothing of the person's is
+/// in the container: the conversations are in the home volume, which the new one mounts.
+///
+/// Runs engine commands and waits for them, so it belongs on a background thread.
+pub fn renew_rebuilt(engine: &Engine, plan: &ContainerPlan, user: HostUser) -> bool {
+    let state = run::capture(&engine.container_state(&plan.name)).map(|word| ContainerState::parse(&word)).ok();
+    let stopped = matches!(state, Some(state) if state != ContainerState::Running);
+    stopped && replaced_image(engine, plan).is_some() && ensure_running(engine, plan, user).is_ok()
+}
+
+/// The image a stopped container of a profile was made from, when the profile's image has been
+/// built again since: the plan names the image, and a rebuild keeps the name while the image
+/// under it changes, so the plan's digest alone would start the old container again and the
+/// rebuild would never reach a workspace. `None` when the image is the same, and when either
+/// answer cannot be had: a container is then kept as it was before QCode asked.
+fn replaced_image(engine: &Engine, plan: &ContainerPlan) -> Option<String> {
+    plan.home.as_ref()?;
+    let made_from = run::capture(&engine.container_image(&plan.name)).ok()?;
+    let now = run::capture(&engine.image_exists(&plan.image)).ok()?;
+    let (made_from, now) = (made_from.trim(), now.trim());
+    (!made_from.is_empty() && !now.is_empty() && made_from != now).then(|| made_from.to_owned())
 }
 
 /// What opening a window came to.

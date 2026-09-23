@@ -25,6 +25,11 @@
 //! for it names where it looked, not what it looked for. `QCODE_OPENROUTER_MODEL` names the model;
 //! without it, a free one that was seen to finish a turn with a tool in it.
 //!
+//! The ready-made services are asked the same way, with the owner's keys at
+//! `~/.config/quvyta/mimo-key` and `~/.config/quvyta/kimi-key`, one short question per run so a
+//! subscription's quota is barely touched; `QCODE_MIMO_MODEL` and `QCODE_KIMI_MODEL` name other
+//! models than the ones below.
+//!
 //! A local model answers slowly: a prompt of a few thousand tokens took half a minute on the
 //! machine this was written on, and a larger model four times that. The waits here are therefore
 //! generous rather than tight — a short limit would report a working provider as broken.
@@ -83,8 +88,13 @@ fn provider() -> (String, String) {
 /// is no such file. Held as a [`Key`], whose `Debug` is its last four characters, so no message
 /// here can print it by accident.
 fn openrouter_key() -> Option<Key> {
+    owners_key(OPENROUTER_KEY_FILE)
+}
+
+/// The key in the owner's file at `file` under the home folder, read into this process alone.
+fn owners_key(file: &str) -> Option<Key> {
     let home = std::env::var_os("HOME")?;
-    let text = std::fs::read_to_string(PathBuf::from(home).join(OPENROUTER_KEY_FILE)).ok()?;
+    let text = std::fs::read_to_string(PathBuf::from(home).join(file)).ok()?;
     Key::new(&text)
 }
 
@@ -579,4 +589,102 @@ fn claude_code_answers_on_every_system_through_a_provider_of_this_machine() {
 #[ignore = "needs a container engine, the network to build each system's images, and a model service; run with QCODE_CONTAINER_TESTS=1"]
 fn opencode_answers_on_every_system_through_a_provider_of_this_machine() {
     answers_on_every_system(HarnessKind::OpenCode);
+}
+
+/// `harness` on a ready-made service of `kind`, reached at the address the page offers first,
+/// with the owner's key from `key_file` and the model `model` (or the one `variable` names): one
+/// short question, answered through the relay from a container with no network, and then the
+/// container is searched for the key. The product's own entry is used — [`ProviderEntry::new`]
+/// fills in the models, [`ProviderKind::key_header`] the header, [`ProviderKind::api_root`] the
+/// root of each shape — so what is proven is what the page would have written.
+fn answers_on_a_ready_made_service(
+    harness: HarnessKind,
+    kind: ProviderKind,
+    key_file: &str,
+    variable: &str,
+    model: &str,
+) {
+    let Some(key) = owners_key(key_file) else {
+        println!("skipped: there is no key at ~/{key_file}");
+        return;
+    };
+    let model = std::env::var(variable).unwrap_or_else(|_| model.to_owned());
+    let profile = profile(harness, &model);
+    let mut entry = ProviderEntry::new(Tag::parse(TAG).expect("a tag"), kind, kind.suggested_base());
+    assert!(entry.model(&model).is_some() || std::env::var(variable).is_ok(), "{model} is one the page offers");
+    entry.key = Some(key.clone());
+    for engine in engines() {
+        let engine_kind = engine.kind();
+        let road = Road::open(engine, &profile, entry.clone(), Upstream::network());
+        let started = std::time::Instant::now();
+        let said = road
+            .ask_once("Reply with just the digits: what is 2+2?")
+            .unwrap_or_else(|trouble| panic!("{engine_kind:?}: the harness said nothing: {}", without(&trouble, &key)));
+        assert!(said.contains('4'), "{engine_kind:?}: {kind:?} answered through the relay: {}", without(&said, &key));
+        println!("{engine_kind:?} {harness:?}: {kind:?} {model} answered 2+2 in {} s", started.elapsed().as_secs());
+        let events = road.events();
+        println!("{engine_kind:?} {harness:?}: relay events {events:?}");
+        assert!(
+            events.iter().any(|event| matches!(event, super::RelayEvent::Forwarded { status: 200, .. })),
+            "{engine_kind:?}: QCode carried the requests and {kind:?} answered: {events:?}"
+        );
+        // Claude Code also knocks with `HEAD /api/hello` to see whether anything answers; that is
+        // not a request for a model and is refused like anything else the relay does not carry.
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                super::RelayEvent::NotAllowed { method, .. } if method == "GET" || method == "POST"
+            )),
+            "{engine_kind:?}: no request for a model or a listing was refused: {events:?}"
+        );
+        road.assert_no_trace_of(&key);
+    }
+}
+
+#[test]
+#[ignore = "needs a container engine, the network, and the owner's MiMo key; run with QCODE_CONTAINER_TESTS=1"]
+fn claude_code_answers_on_xiaomi_mimo_and_the_key_never_enters_its_container() {
+    answers_on_a_ready_made_service(
+        HarnessKind::ClaudeCode,
+        ProviderKind::MimoTokenPlan,
+        ".config/quvyta/mimo-key",
+        "QCODE_MIMO_MODEL",
+        "mimo-v2.6-flash",
+    );
+}
+
+#[test]
+#[ignore = "needs a container engine, the network, and the owner's Kimi key; run with QCODE_CONTAINER_TESTS=1"]
+fn claude_code_answers_on_kimi_code_and_the_key_never_enters_its_container() {
+    answers_on_a_ready_made_service(
+        HarnessKind::ClaudeCode,
+        ProviderKind::KimiCode,
+        ".config/quvyta/kimi-key",
+        "QCODE_KIMI_MODEL",
+        "kimi-for-coding",
+    );
+}
+
+#[test]
+#[ignore = "needs a container engine, the network, and the owner's MiMo key; run with QCODE_CONTAINER_TESTS=1"]
+fn opencode_answers_on_xiaomi_mimo_in_the_openai_shape_and_the_key_never_enters_its_container() {
+    answers_on_a_ready_made_service(
+        HarnessKind::OpenCode,
+        ProviderKind::MimoTokenPlan,
+        ".config/quvyta/mimo-key",
+        "QCODE_MIMO_MODEL",
+        "mimo-v2.6-flash",
+    );
+}
+
+#[test]
+#[ignore = "needs a container engine, the network, and the owner's Kimi key; run with QCODE_CONTAINER_TESTS=1"]
+fn opencode_answers_on_kimi_code_in_the_openai_shape_and_the_key_never_enters_its_container() {
+    answers_on_a_ready_made_service(
+        HarnessKind::OpenCode,
+        ProviderKind::KimiCode,
+        ".config/quvyta/kimi-key",
+        "QCODE_KIMI_MODEL",
+        "kimi-for-coding",
+    );
 }

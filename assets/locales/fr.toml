@@ -14,10 +14,15 @@ keys = "Touches"
 session-gone = { one = "Un espace de travail de la dernière session n’est plus là", other = "{n} espaces de travail de la dernière session ne sont plus là" }
 session-broken = "Seule une partie de la dernière session a pu être lue"
 session-unsaved = "Les espaces de travail ouverts n’ont pas pu être retenus"
+quit-title = "Quitter alors qu’un agent est au travail ?"
+quit-working = { one = "Un onglet d’agent tourne encore. Quitter arrête son conteneur, et ce qu’il fait en ce moment est coupé net. Sa conversation est conservée et reprend quand vous ouvrirez à nouveau l’espace de travail.", other = "{n} onglets d’agent tournent encore. Quitter arrête leurs conteneurs, et ce qu’ils font en ce moment est coupé net. Leurs conversations sont conservées et reprennent quand vous ouvrirez à nouveau l’espace de travail." }
+quit-anyway = "Quitter quand même"
+quit-stay = "Rester"
 
 [home]
 continue = "Reprendre"
-continue-detail = { one = "{first}", other = "{first} +{more}" }
+continue-one = "{first}"
+continue-more = "{first} +{more}"
 new-workspace = "Nouvel espace de travail"
 workspaces = "Espaces de travail"
 profiles = "Profils"
@@ -424,7 +429,7 @@ window.no-wayland = "Cette session n’a pas de compositeur Wayland, et QCode n�
 window.no-socket = "La socket du compositeur n’est plus à {socket}. Un compositeur redémarré laisse derrière lui une fenêtre ouverte ; la rouvrir est le chemin du retour."
 window.open = "Ouvrir la fenêtre"
 window.signin-opened = "La fenêtre a demandé à se connecter, une petite fenêtre de connexion s’est donc ouverte à côté. Connectez-vous là ; l’application en est informée d’elle-même."
-window.signin-in-browser = "La fenêtre a demandé à se connecter, mais sa propre fenêtre de connexion n’a pas pu démarrer, la page s’est donc ouverte dans votre navigateur. Une connexion faite là ne peut pas atteindre l’application. L’image d’un profil créé avec une version antérieure de QCode n’a pas de fenêtre de connexion ; recréer le profil lui en donne une."
+window.signin-in-browser = "La fenêtre a demandé une connexion, mais sa propre fenêtre de connexion n’a pas pu démarrer, la page s’est donc ouverte dans votre navigateur. Une connexion depuis là ne peut pas atteindre l’application. L’image d’un profil créé avec une version antérieure de QCode n’a pas de fenêtre de connexion ; Reconstruire l’image sur la page Profils lui en donne une."
 window.signin-open-yourself = "La fenêtre a demandé à ouvrir cette page, et elle n’a pas pu être affichée ici :"
 window.raise = "Mettre au premier plan"
 window.close = "Fermer la fenêtre"
@@ -724,6 +729,19 @@ gives-at-least = "ce serveur en donne au moins {tokens}"
 gives-unknown = "pas encore mesuré"
 cramped = "Cette fenêtre fait moins de {tokens} jetons, ce qui est trop petit pour un agent de code : il envoie d'abord ses propres consignes et vos fichiers ouverts, et ce serveur en jette le début sans un mot ni la moindre erreur."
 cramped-remedy = "Vous pouvez donner au modèle une fenêtre à lui et utiliser ce nom-là ensuite. Écrivez un fichier contenant les deux lignes FROM {model} et PARAMETER num_ctx 32768, puis lancez : ollama create {model}-32k -f ce-fichier. Définir OLLAMA_CONTEXT_LENGTH marche aussi, mais seulement une fois le service en marche vraiment redémarré avec cette variable."
+region-europe = "Europe"
+region-singapore = "Singapour"
+region-china = "Chine"
+region-overseas = "Hors de Chine"
+speaks-anthropic = "format Anthropic : {address}"
+speaks-openai = "format OpenAI : {address}"
+key-header = "La clé va dans son en-tête {header}, depuis cette machine uniquement."
+ready-made-models = "Modèles : {models}"
+key-needed-for = "{kind} s’atteint avec une clé."
+claims-published = "son éditeur publie {claimed}"
+published-at = "{model} : le service n’indique pas sa fenêtre, le chiffre affiché est donc celui que son éditeur publie sur {source}."
+
+# ready-made providers
 
 [known]
 image-missing = "{engine} n'a pas l'image dont ceci a besoin. Elle a sans doute été construite avec l'autre moteur, ou supprimée ; la reconstruire la remet en place."
@@ -791,3 +809,22 @@ remove-text = { one = "Le conteneur s'en va ; ses volumes de dossier personnel e
 remove-do = "Retirer"
 removing = "Retrait…"
 removed = "Les conteneurs de QCode ont quitté {engine}. Ses dossiers personnels et connexions y sont toujours."
+
+[profiles.rebuild]
+button = "Reconstruire l’image"
+title = "Reconstruire l’image de {name} ?"
+message = "L’image est reconstruite depuis le début, à partir de ce que QCode met aujourd’hui dans l’image de ce profil, et l’outil est téléchargé à nouveau ; cela prend quelques minutes. Les dossiers personnels des espaces de travail, la connexion et les conversations sont conservés. Les onglets ouverts de ce profil continuent de tourner sur l’ancienne image jusqu’à leur prochaine ouverture. Si la construction échoue ou est arrêtée, l’ancienne image reste."
+confirm = "La reconstruire"
+heading = "Reconstruction de l’image de {name}"
+running = "Construction. Tout ce que dit le moteur est ci-dessous ; l’arrêter conserve l’image qui était là."
+stopping = "Arrêt. L’image qui était là est conservée."
+done = "L’image de {name} est reconstruite. Les onglets de ce profil l’utilisent à partir de leur prochaine ouverture."
+stopped = "La reconstruction a été arrêtée. L’image qui était là auparavant est conservée."
+failed = "La reconstruction a échoué. Ce que le moteur a dit est ci-dessous ; l’image qui était là auparavant est conservée."
+earlier = "Cette image a été construite par une version antérieure de QCode. La reconstruire lui donne ce que QCode met aujourd’hui dans l’image de ce profil."
+
+[profiles.gemini]
+closed-title = "Google a fermé la connexion de {name}"
+closed = "Google a fermé la connexion de Gemini CLI avec un compte Google pour les comptes personnels : Gemini répond désormais « This client is no longer supported for Gemini Code Assist for individuals ». Cela fonctionne toujours pour Gemini Code Assist Standard et Enterprise. Avec un compte personnel, les solutions restantes sont un profil d’Antigravity IDE, qui tourne dans QCode, ou un nouveau profil Gemini CLI avec une clé API de Google AI Studio."
+login-why = "{harness} se connecte avec une clé API de Google AI Studio (aistudio.google.com/app/apikey). QCode ouvre un conteneur depuis l’image de ce profil et lance l’outil dans un terminal ci-dessous, où il demande la clé et rien d’autre. Rien de votre machine n’est dans ce conteneur."
+login-what = "Choisissez Use Gemini API Key, collez la clé et appuyez sur enter. Quand l’outil affiche son invite, appuyez sur le bouton en dessous, ou quittez simplement l’outil."

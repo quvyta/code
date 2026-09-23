@@ -13,10 +13,15 @@ keys = "Teclas"
 session-gone = { one = "Un espacio de trabajo de la última sesión ya no está", other = "{n} espacios de trabajo de la última sesión ya no están" }
 session-broken = "Solo se pudo leer una parte de la última sesión"
 session-unsaved = "No se pudieron recordar los espacios de trabajo abiertos"
+quit-title = "¿Salir mientras un agente está trabajando?"
+quit-working = { one = "Una pestaña de agente sigue en marcha. Al salir se detiene su contenedor, así que lo que esté haciendo ahora queda cortado. Su conversación se conserva y continúa cuando abras el espacio de trabajo de nuevo.", other = "{n} pestañas de agentes siguen en marcha. Al salir se detienen sus contenedores, así que lo que estén haciendo ahora queda cortado. Sus conversaciones se conservan y continúan cuando abras el espacio de trabajo de nuevo." }
+quit-anyway = "Salir de todos modos"
+quit-stay = "Quedarse"
 
 [home]
 continue = "Continuar"
-continue-detail = { one = "{first}", other = "{first} +{more}" }
+continue-one = "{first}"
+continue-more = "{first} +{more}"
 new-workspace = "Espacio de trabajo nuevo"
 workspaces = "Espacios de trabajo"
 profiles = "Perfiles"
@@ -423,7 +428,7 @@ window.no-wayland = "Esta sesión no tiene compositor Wayland, y QCode no abre v
 window.no-socket = "El socket del compositor ya no está en {socket}. Un compositor que se ha reiniciado deja atrás una ventana abierta; volver a abrirla es el camino de vuelta."
 window.open = "Abrir la ventana"
 window.signin-opened = "La ventana pidió iniciar sesión, así que a su lado se abrió una pequeña ventana de inicio de sesión. Inicia sesión ahí; la aplicación se entera sola."
-window.signin-in-browser = "La ventana pidió iniciar sesión, pero su propia ventana de inicio de sesión no pudo arrancar, así que la página se abrió en tu navegador. Un inicio de sesión desde ahí no llega a la aplicación. La imagen de un perfil creado con una versión anterior de QCode no tiene ventana de inicio de sesión; crear el perfil de nuevo se la da."
+window.signin-in-browser = "La ventana pidió iniciar sesión, pero su propia ventana de inicio de sesión no pudo arrancar, así que la página se abrió en tu navegador. Un inicio de sesión desde ahí no puede llegar a la aplicación. La imagen de un perfil hecho con un QCode anterior no tiene ventana de inicio de sesión; Reconstruir la imagen en la página de Perfiles le da una."
 window.signin-open-yourself = "La ventana pidió abrir esta página y no se pudo mostrar aquí:"
 window.raise = "Traer al frente"
 window.close = "Cerrar la ventana"
@@ -723,6 +728,19 @@ gives-at-least = "este servidor da al menos {tokens}"
 gives-unknown = "sin medir todavía"
 cramped = "Esta ventana está por debajo de {tokens} tokens, demasiado pequeña para un agente de programación: primero envía sus propias instrucciones y tus archivos abiertos, y este servidor tira el principio de todo eso sin decir una palabra ni dar un error."
 cramped-remedy = "Puedes darle al modelo una ventana propia y usar ese nombre a partir de entonces. Escribe un archivo con las dos líneas FROM {model} y PARAMETER num_ctx 32768, y luego ejecuta: ollama create {model}-32k -f ese-archivo. Fijar OLLAMA_CONTEXT_LENGTH también sirve, pero solo cuando el servicio en marcha se haya reiniciado de verdad con esa variable."
+region-europe = "Europa"
+region-singapore = "Singapur"
+region-china = "China"
+region-overseas = "Fuera de China"
+speaks-anthropic = "Formato Anthropic: {address}"
+speaks-openai = "Formato OpenAI: {address}"
+key-header = "La clave va en su cabecera {header}, solo desde esta máquina."
+ready-made-models = "Modelos: {models}"
+key-needed-for = "A {kind} se accede con una clave."
+claims-published = "su fabricante publica {claimed}"
+published-at = "{model}: el servicio no indica su ventana, así que la cifra que se muestra es la que publica su fabricante en {source}."
+
+# ready-made providers
 
 [known]
 image-missing = "{engine} no tiene la imagen que esto necesita. Lo más probable es que se construyera con el otro motor o que se borrara; construirla de nuevo la devuelve."
@@ -790,3 +808,22 @@ remove-text = { one = "El contenedor se va; sus volúmenes de carpeta personal y
 remove-do = "Quitar"
 removing = "Quitando…"
 removed = "Los contenedores de QCode ya no están en {engine}. Sus carpetas personales e inicios de sesión siguen ahí."
+
+[profiles.rebuild]
+button = "Reconstruir la imagen"
+title = "¿Reconstruir la imagen de {name}?"
+message = "La imagen se construye de nuevo desde cero, con lo que QCode pone hoy en la imagen de este perfil, y la herramienta se descarga otra vez; tarda unos minutos. Los hogares de los espacios de trabajo, el inicio de sesión y las conversaciones se conservan. Las pestañas de este perfil que estén abiertas siguen funcionando con la imagen antigua hasta que las abras de nuevo. Si la construcción falla o se detiene, la imagen antigua se conserva."
+confirm = "Construirla de nuevo"
+heading = "Reconstruyendo la imagen de {name}"
+running = "Construyendo. Todo lo que dice el motor está abajo; si lo detienes, se conserva la imagen que había."
+stopping = "Deteniendo. Se conserva la imagen que había."
+done = "La imagen de {name} está construida de nuevo. Las pestañas de este perfil la usarán a partir de la próxima vez que se abran."
+stopped = "La reconstrucción se detuvo. Se conserva la imagen que había antes."
+failed = "La reconstrucción falló. Lo que dijo el motor está abajo; se conserva la imagen que había antes."
+earlier = "Esta imagen la construyó un QCode anterior. Reconstruirla le da lo que QCode pone hoy en la imagen de este perfil."
+
+[profiles.gemini]
+closed-title = "Google cerró el inicio de sesión de {name}"
+closed = "Google cerró el inicio de sesión de Gemini CLI con una cuenta de Google para cuentas personales: Gemini responde ahora con \"This client is no longer supported for Gemini Code Assist for individuals\". Sigue funcionando con Gemini Code Assist Standard y Enterprise. Con una cuenta personal, las salidas son un perfil de Antigravity IDE, que se ejecuta en QCode, o un perfil nuevo de Gemini CLI con una clave de API de Google AI Studio."
+login-why = "{harness} inicia sesión con una clave de API de Google AI Studio (aistudio.google.com/app/apikey). QCode abre un contenedor desde la imagen de este perfil y ejecuta la herramienta en una terminal de abajo, donde pide la clave y nada más. Nada de tu máquina está en ese contenedor."
+login-what = "Elige Use Gemini API Key, pega la clave y pulsa Enter. Cuando la herramienta muestre su prompt, pulsa el botón de abajo, o simplemente sal de la herramienta."

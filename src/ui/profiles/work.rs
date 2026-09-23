@@ -10,13 +10,13 @@ use qframe::widgets::TerminalSession;
 
 use crate::base;
 use crate::engine::names;
-use crate::engine::run::{EngineError, build_image, capture};
+use crate::engine::run::{EngineError, build_image, capture, stream};
 use crate::engine::{Access, ContainerCreate, CopyIn, Engine, Exec, HostUser, ImageBuild, Mount, MountSource, Network};
 use crate::profile::identity::{self, STORE_DIR};
 use crate::profile::{Profile, SafeName};
 
 use super::recipe;
-use super::status::{Readiness, Status};
+use super::status::{Readiness, Revision, Status};
 
 /// How long a container that only waits to be `exec`'d into stays up: a day, which outlives any
 /// login and still lets a container forgotten after a crash disappear by itself.
@@ -70,20 +70,30 @@ impl Problem {
     }
 }
 
-/// Asks the engine about every profile: whether its image is built, and whether a login is kept
-/// for it.
+/// Asks the engine about every profile: whether its image is built and from which recipe, and
+/// whether a login is kept for it.
 #[must_use]
 pub fn probe(engine: &Engine, profiles: &[Profile]) -> Vec<Status> {
     let volumes = capture(&engine.list_volumes()).ok();
     profiles
         .iter()
         .map(|profile| {
-            let image = Readiness::of(capture(&engine.image_exists(&profile.image())).is_ok());
+            // The label is asked for rather than the image's identity: the engine answers only
+            // when the image is there, so the one question says both whether it is and what
+            // it was built from.
+            let asked = capture(&engine.image_label(&profile.image(), recipe::REVISION_LABEL));
+            let (image, revision) = match asked {
+                Ok(label) if label.trim() == recipe::image(profile).revision() => {
+                    (Readiness::Present, Revision::Current)
+                }
+                Ok(_) => (Readiness::Present, Revision::Earlier),
+                Err(_) => (Readiness::Missing, Revision::Unknown),
+            };
             let identity = match &volumes {
                 Some(listing) => Readiness::of(identity::is_stored(listing, &profile.name)),
                 None => Readiness::Unknown,
             };
-            Status { name: profile.name.clone(), image, identity }
+            Status { name: profile.name.clone(), image, revision, identity }
         })
         .collect()
 }
@@ -100,10 +110,31 @@ pub fn build(
     cancel: &dyn Fn() -> bool,
     line: &mut dyn FnMut(&str),
 ) -> Result<(), Problem> {
-    let context = scratch(&format!("build-{}", profile.name))?;
-    let recipe = recipe::image(profile);
+    build_from(engine, &profile.image(), &recipe::image(profile), Fresh::No, cancel, line)
+}
+
+/// Whether a build may reuse the layers an earlier one left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fresh {
+    /// It may: the image is not there, and whatever an earlier build left is as good as new.
+    No,
+    /// It may not, and a build that does not finish leaves the image that was there before.
+    Rebuild,
+}
+
+/// Writes the build context of `recipe` and builds `image` from it.
+fn build_from(
+    engine: &Engine,
+    image: &str,
+    recipe: &recipe::Recipe,
+    fresh: Fresh,
+    cancel: &dyn Fn() -> bool,
+    line: &mut dyn FnMut(&str),
+) -> Result<(), Problem> {
+    // The image's name as a folder name: `qcode/profile/x` has slashes a folder cannot.
+    let context = scratch(&format!("build-{}", image.replace('/', "-")))?;
     let containerfile = context.join("Containerfile");
-    let written = std::fs::write(&containerfile, &recipe.containerfile).and_then(|()| {
+    let written = std::fs::write(&containerfile, recipe.labelled()).and_then(|()| {
         for (path, contents) in &recipe.files {
             let target = context.join(path);
             if let Some(parent) = target.parent() {
@@ -115,8 +146,16 @@ pub fn build(
     });
     let result = match written {
         Ok(()) => {
-            let request = ImageBuild { image: &profile.image(), containerfile: &containerfile, context: &context };
-            build_image(engine, &request, cancel, line).map_err(Problem::from)
+            let request = ImageBuild { image, containerfile: &containerfile, context: &context };
+            match fresh {
+                Fresh::No => build_image(engine, &request, cancel, line).map_err(Problem::from),
+                // Not `build_image`, whose rule is to take the name away from anything but a
+                // finished build: here the name is on the image the person has been working in,
+                // and a rebuild that fails or is stopped must leave them that one. Measured on
+                // both engines: a build that fails at a step, or is killed halfway, never moves
+                // the name, which only a finished build does.
+                Fresh::Rebuild => stream(&engine.rebuild_image(&request), cancel, line).map_err(Problem::from),
+            }
         }
         Err(error) => Err(Problem::Machine(error.to_string())),
     };
@@ -142,6 +181,69 @@ pub fn build_whole(
     base_started: &mut dyn FnMut(),
     line: &mut dyn FnMut(&str),
 ) -> Result<(), Problem> {
+    ensure_base(engine, profile, cancel, base_started, line)?;
+    build(engine, profile, cancel, line)
+}
+
+/// Builds the image of a profile that has one again, from the recipe this QCode writes for it
+/// and from its first step, so that what the recipe installs is fetched again too.
+///
+/// Nothing of the person's is in an image: the homes of the workspaces, the login and the
+/// conversations are volumes, and a container made from the new image mounts the same ones. A
+/// container still running from the old image goes on running from it; the next time one of the
+/// profile's containers is made the new image is used, and the old one is removed once no
+/// container is made from it. A rebuild that fails or is stopped leaves the old image as it was.
+///
+/// # Errors
+///
+/// When a build context cannot be written, or the engine refuses, fails or is stopped.
+pub fn rebuild(
+    engine: &Engine,
+    profile: &Profile,
+    cancel: &dyn Fn() -> bool,
+    base_started: &mut dyn FnMut(),
+    line: &mut dyn FnMut(&str),
+) -> Result<(), Problem> {
+    ensure_base(engine, profile, cancel, base_started, line)?;
+    rebuild_from(engine, &profile.image(), &recipe::image(profile), cancel, line)
+}
+
+/// Builds `image` again from `recipe`, from its first step, and lets the image it replaces go
+/// when nothing is made from it; the whole of [`rebuild`] but the base image.
+///
+/// # Errors
+///
+/// When a build context cannot be written, or the engine refuses, fails or is stopped.
+pub(crate) fn rebuild_from(
+    engine: &Engine,
+    image: &str,
+    recipe: &recipe::Recipe,
+    cancel: &dyn Fn() -> bool,
+    line: &mut dyn FnMut(&str),
+) -> Result<(), Problem> {
+    let before = capture(&engine.image_exists(image)).ok();
+    build_from(engine, image, recipe, Fresh::Rebuild, cancel, line)?;
+    // The old image keeps its layers on the disk under no name at all. A running container still
+    // holds it and the engine then refuses, which is the answer wanted: the container goes on,
+    // and the next workspace container made for the profile removes the image after it.
+    let after = capture(&engine.image_exists(image)).ok();
+    if let Some(before) = before.as_deref().map(str::trim)
+        && after.as_deref().map(str::trim) != Some(before)
+    {
+        let _ = capture(&engine.remove_unused_image(before));
+    }
+    Ok(())
+}
+
+/// Makes sure the base image of the profile's system is there and current, telling
+/// `base_started` once when it has to be built.
+fn ensure_base(
+    engine: &Engine,
+    profile: &Profile,
+    cancel: &dyn Fn() -> bool,
+    base_started: &mut dyn FnMut(),
+    line: &mut dyn FnMut(&str),
+) -> Result<(), Problem> {
     let mut announced = false;
     base::ensure_os(engine, profile.os, cancel, &mut |text| {
         if !announced {
@@ -150,7 +252,7 @@ pub fn build_whole(
         }
         line(text);
     })?;
-    build(engine, profile, cancel, line)
+    Ok(())
 }
 
 /// A container opened for a login, and the directory it drops the login into.

@@ -244,6 +244,11 @@ pub enum Msg {
     Back,
     /// Leave QCode, however that was asked for.
     Quit,
+    /// The person asked to leave, with a key or the menu: leave, or first ask when an agent is
+    /// still at work.
+    AskQuit,
+    /// The person answered the question before quitting by staying.
+    QuitKept,
     /// The list of every key was opened or closed.
     Help(bool),
     /// The container engine was looked for again, and this is what was found.
@@ -304,6 +309,9 @@ pub struct QCode {
     workspace: Option<WorkspaceScreen>,
     settings: SettingsScreen,
     help: bool,
+    /// Whether the question before quitting is on screen, so that asking to quit again answers
+    /// it rather than asking a second time.
+    asking_quit: bool,
     /// Where the open workspaces are remembered between runs, or `None` where they are not.
     session_file: Option<PathBuf>,
     /// The session as the file holds it, or as it is being written: what "Continue" goes back to
@@ -429,6 +437,7 @@ impl QCode {
             workspace: None,
             settings,
             help: false,
+            asking_quit: false,
             session_file: None,
             saved: None,
             saved_problems: Vec::new(),
@@ -657,7 +666,7 @@ impl QCode {
     /// Opens a row of the home menu.
     fn open(&mut self, entry: Entry) -> Command<Msg> {
         match entry {
-            Entry::Quit => self.quit(),
+            Entry::Quit => self.ask_quit(),
             Entry::Workspaces => self.show_workspaces(false),
             Entry::NewWorkspace => self.show_workspaces(true),
             Entry::Profiles => self.show_profiles(),
@@ -1197,6 +1206,28 @@ impl QCode {
         Command::quit()
     }
 
+    /// Leaves at once when no agent is at work, and otherwise asks once first.
+    ///
+    /// Quitting stops every container of the open workspaces, so an agent in the middle of a task
+    /// is cut off there; its conversation is kept and goes on when the workspace is opened again.
+    /// A stray key costs a question, never someone's running work. Asking to quit again while the
+    /// question stands is the answer, so a person who meant it is never held by two questions.
+    fn ask_quit(&mut self) -> Command<Msg> {
+        let working = self.workspace.as_ref().map_or(0, ui::workspace::agents_at_work);
+        if working == 0 || self.asking_quit {
+            return self.quit();
+        }
+        self.asking_quit = true;
+        Command::confirm(
+            qframe::runtime::Confirm::new(t!("app.quit-title"), Msg::Quit)
+                .message(t!("app.quit-working", n = working))
+                .confirm_label(t!("app.quit-anyway"))
+                .cancel_label(t!("app.quit-stay"))
+                .on_cancel(Msg::QuitKept)
+                .danger(),
+        )
+    }
+
     /// Writes the settings file, off the render path, and tells the settings screen how it went.
     fn save(&self) -> Command<Msg> {
         self.config.settings().save_command(|stored| Msg::Settings(ui::settings::Msg::Stored(stored)))
@@ -1344,7 +1375,7 @@ impl App for QCode {
     /// Every way out passes through the same quit as the menu's, so that the workspaces open then
     /// are backed up however QCode was left.
     fn before_quit(&self) -> Option<Msg> {
-        Some(Msg::Quit)
+        Some(Msg::AskQuit)
     }
 
     /// Asks nothing, so a hangup, whose terminal is gone, is answered the same way.
@@ -1445,6 +1476,11 @@ impl App for QCode {
             }
             Msg::Back => self.leave(),
             Msg::Quit => self.quit(),
+            Msg::AskQuit => self.ask_quit(),
+            Msg::QuitKept => {
+                self.asking_quit = false;
+                Command::none()
+            }
             Msg::Help(open) => {
                 self.help = open;
                 Command::none()

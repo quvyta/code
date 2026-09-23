@@ -1544,6 +1544,17 @@ fn choose(screen: &mut WorkspaceScreen, key: TabKey, choice: Choice) -> Command<
     };
     let window = plan.window.is_some();
     let provider = provider_choice(workspace, &kind);
+    // A profile whose sign-in its harness's makers closed still opens, since it goes on working
+    // for some; the person is told why it may not, at the moment they open it.
+    let closed = kind
+        .profile()
+        .and_then(|name| workspace.profiles.iter().find(|profile| profile.name.as_str() == name))
+        .and_then(|profile| {
+            let words = crate::ui::profiles::closed_sign_in(profile)?;
+            let title = t!("profiles.gemini.closed-title", name = profile.name.as_str());
+            Some(Command::toast(Toast::warning(title).body(words)))
+        })
+        .unwrap_or_else(Command::none);
     let Some((_, tab)) = workspace.find(key) else { return Command::none() };
     tab.choose(kind, conversation);
     let run = tab.run();
@@ -1554,7 +1565,7 @@ fn choose(screen: &mut WorkspaceScreen, key: TabKey, choice: Choice) -> Command<
     // A window is not entered with a terminal, so it takes the window's own path and the keyboard
     // goes to the tab's one action rather than to a terminal that is not there.
     if window {
-        return Command::batch([desktop::open(screen, key, run), Command::focus(desktop::WINDOW_ID), record]);
+        return Command::batch([desktop::open(screen, key, run), Command::focus(desktop::WINDOW_ID), record, closed]);
     }
     let launch = Launch::new(key, run, token, provider, providers_path);
     Command::batch([
@@ -1566,12 +1577,14 @@ fn choose(screen: &mut WorkspaceScreen, key: TabKey, choice: Choice) -> Command<
         }),
         Command::focus(TERMINAL_ID),
         record,
+        closed,
     ])
 }
 
 impl WorkspaceScreen {
-    /// What this machine measured the provider's server really gives for the model `provider`
-    /// names, when it has been measured; `None` when it has not, or the provider is gone.
+    /// The window the model `provider` names is given on its server: what this machine measured,
+    /// or for a ready-made service what it says it gives ([`crate::provider::Model::window`]);
+    /// `None` when neither is known, or the provider is gone.
     ///
     /// Read from `providers.toml` as a tab starts rather than carried on the profile: a window
     /// measured again on the Providers page must reach the next tab, not the tab after QCode is
@@ -1579,7 +1592,8 @@ impl WorkspaceScreen {
     fn measured_window(&self, provider: &ProviderChoice) -> Option<u64> {
         let path = self.providers_path.as_ref()?;
         let providers = crate::provider::Providers::open(path).value;
-        Some(providers.get(&provider.tag)?.model(&provider.model)?.measured?.tokens())
+        let entry = providers.get(&provider.tag)?;
+        entry.model(&provider.model)?.window(entry.kind)
     }
 }
 
@@ -1730,17 +1744,22 @@ fn show_page(screen: &mut WorkspaceScreen, again: bool) -> Command<Msg> {
     }
     let Some(engine) = screen.engine.clone() else { return Command::none() };
     let registry = screen.registry.clone();
+    let user = screen.user;
     let Some(workspace) = screen.workspaces.get_mut(screen.active) else { return Command::none() };
     let mut commands = Vec::new();
     for profile in &workspace.profiles {
         let key = HistoryKey { workspace: workspace.id.as_str().to_owned(), profile: profile.name.as_str().to_owned() };
         let generation = workspace.history.entry(key.profile.clone()).or_default().start();
-        let container = ContainerPlan::profile(&workspace.id, &workspace.paths, profile).name;
+        let plan = ContainerPlan::profile(&workspace.id, &workspace.paths, profile);
         let (engine, harness, answer, registry) = (engine.clone(), profile.harness, key.clone(), registry.clone());
         commands.push(Command::perform(move || {
+            // A container made from an image that has been built again since is made anew before
+            // it is read, since reading starts it and the tab would then take it as it is.
+            let renewed = plan::renew_rebuilt(&engine, &plan, user);
             // Reading a stopped container starts it and leaves it running for the tab that opens
             // a conversation from it, so it is noted like any container QCode starts.
-            let mut started = false;
+            let mut started = renewed;
+            let container = plan.name;
             let read = history::read(&engine, &container, harness, &mut || started = true);
             let message = Msg::HistoryRead(answer, generation, read);
             if started { noted(registry.as_deref(), engine.kind(), &container, message) } else { message }
@@ -2640,6 +2659,20 @@ fn ended_text(code: Option<u32>) -> String {
         Some(0) | None => t!("workspace.ended"),
         Some(code) => t!("workspace.ended-code", code = code),
     }
+}
+
+/// How many tabs of the open workspaces have an agent in them that is running or starting: a
+/// harness in a terminal, or a harness's window. A shell, a file or a tab that has ended is left
+/// out, since quitting takes nothing from it that opening the workspace again does not give back.
+#[must_use]
+pub fn agents_at_work(screen: &WorkspaceScreen) -> usize {
+    screen
+        .workspaces
+        .iter()
+        .flat_map(|workspace| workspace.tabs.iter())
+        .filter(|tab| matches!(tab.kind(), TabKind::Profile(_) | TabKind::Desktop(_)))
+        .filter(|tab| matches!(tab.state(), TabState::Running | TabState::Starting))
+        .count()
 }
 
 /// A tab that is not running: what happened, the engine's own words when there are any, and the

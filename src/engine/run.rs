@@ -212,7 +212,7 @@ pub fn stream(
     let mut collected = String::new();
     let mut on_line = |text: Line| {
         let text = match text {
-            Line::Out(text) | Line::Err(text) => printable(&text),
+            Line::Out(text) | Line::Err(text) => qframe::text::printable(&text).into_owned(),
         };
         collected.push_str(&text);
         collected.push('\n');
@@ -228,38 +228,6 @@ pub fn stream(
         return Ok(());
     }
     Err(EngineError::Failed(Failure { command: command.clone(), code, output: collected.trim_end().to_owned() }))
-}
-
-/// A line an engine printed, as a terminal would have left it on screen: what a carriage return
-/// wrote over is gone, colour and cursor sequences are taken out, a tab becomes spaces and no
-/// other control character is left.
-///
-/// Engines print for a terminal. Docker ends its "Sending build context" line with `\r\r`, and a
-/// build step's own program may colour its output; a log that draws what it is handed cannot
-/// draw a control character at all.
-#[must_use]
-pub fn printable(text: &str) -> String {
-    // What stands after the last carriage return is what a terminal shows; a line that ends in
-    // one leaves what was written before it.
-    let shown = text.split('\r').rev().find(|part| !part.is_empty()).unwrap_or_default();
-    let mut out = String::with_capacity(shown.len());
-    let mut chars = shown.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            // An escape sequence: `ESC [` up to its final letter, or `ESC` and one character.
-            '\u{1b}' => {
-                if chars.next_if_eq(&'[').is_some() {
-                    while chars.next().is_some_and(|c| !('@'..='~').contains(&c)) {}
-                } else {
-                    chars.next();
-                }
-            }
-            '\t' => out.push_str("    "),
-            c if c.is_control() => {}
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 /// Builds an image, showing the build as it happens and leaving nothing behind when it is
@@ -288,7 +256,7 @@ pub fn build_image(
 
 #[cfg(test)]
 mod tests {
-    use super::{EngineError, capture, feed, pipe, printable, stream};
+    use super::{EngineError, capture, feed, pipe, stream};
     use crate::engine::EngineCommand;
     use std::cell::Cell;
     use std::ffi::OsString;
@@ -404,19 +372,6 @@ mod tests {
             pipe(&shell("echo data"), &shell("cat > /dev/null; echo full >&2; exit 4")).expect_err("the writer fails");
         let EngineError::Failed(failure) = writing else { panic!("{writing:?}") };
         assert_eq!((failure.code, failure.output.as_str()), (Some(4), "full"));
-    }
-
-    #[test]
-    fn a_line_is_kept_the_way_a_terminal_would_have_shown_it() {
-        // What docker 29's classic builder prints before every build.
-        assert_eq!(
-            printable("Sending build context to Docker daemon  2.048kB\r\r"),
-            "Sending build context to Docker daemon  2.048kB"
-        );
-        assert_eq!(printable("10%\r50%\r100%"), "100%");
-        assert_eq!(printable("\u{1b}[1;32mok\u{1b}[0m done"), "ok done");
-        assert_eq!(printable("a\tb\u{7}c"), "a    bc");
-        assert_eq!(printable("STEP 1/4: FROM qcode/base"), "STEP 1/4: FROM qcode/base");
     }
 
     #[cfg(unix)]

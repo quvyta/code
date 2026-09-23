@@ -13,10 +13,15 @@ keys = "キー"
 session-gone = "前回のセッションのワークスペースが {n} 件なくなっています"
 session-broken = "前回のセッションは一部しか読めませんでした"
 session-unsaved = "開いていたワークスペースを覚えておけませんでした"
+quit-title = "エージェントが作業中に終了しますか？"
+quit-working = { other = "エージェントタブが {n} 個動いています。終了するとコンテナが止まり、いま作業中の内容はそこで途切れます。会話は保存されるので、ワークスペースをもう一度開けば続きから再開します。" }
+quit-anyway = "それでも終了"
+quit-stay = "終了しない"
 
 [home]
 continue = "続きから"
-continue-detail = { one = "{first}", other = "{first} +{more}" }
+continue-one = "{first}"
+continue-more = "{first} +{more}"
 new-workspace = "新しいワークスペース"
 workspaces = "ワークスペース"
 profiles = "プロファイル"
@@ -423,7 +428,7 @@ window.no-wayland = "このセッションに Wayland のコンポジターが�
 window.no-socket = "コンポジターのソケットが {socket} にもうありません。再起動したコンポジターは開いたままのウィンドウを残します。開き直すのが戻り道です。"
 window.open = "ウィンドウを開く"
 window.signin-opened = "ウィンドウがサインインを求めたので、横に小さなサインイン用のウィンドウが開きました。そこでサインインすれば、結果はアプリにひとりでに届きます。"
-window.signin-in-browser = "ウィンドウがサインインを求めましたが、専用のサインイン用ウィンドウを起動できなかったため、ページをブラウザーで開きました。そこでのサインインはアプリに届きません。以前の QCode で作ったプロファイルのイメージにはサインイン用のウィンドウがありません。プロファイルを作り直すと使えるようになります。"
+window.signin-in-browser = "サインインを求められたものの、専用のサインインウィンドウを起動できなかったため、ページがブラウザで開かれました。ブラウザからのサインインはアプリケーションに届きません。以前の QCode で作ったプロファイルのイメージにはサインインウィンドウがありません。プロファイルのページでイメージを再ビルドすると入ります。"
 window.signin-open-yourself = "ウィンドウがこのページを開こうとしましたが、ここでは表示できませんでした:"
 window.raise = "手前に出す"
 window.close = "ウィンドウを閉じる"
@@ -723,6 +728,19 @@ gives-at-least = "このサーバーが渡すのは少なくとも {tokens}"
 gives-unknown = "まだ測っていません"
 cramped = "この窓は {tokens} トークン未満で、コーディングエージェントには小さすぎます。エージェントはまず自分の指示と開いているファイルを送りますが、このサーバーはその先頭を、何も言わずエラーも出さずに捨てます。"
 cramped-remedy = "モデルに専用の窓を持たせ、以後はその名前を使えます。FROM {model} と PARAMETER num_ctx 32768 の 2 行を書いたファイルを作り、ollama create {model}-32k -f そのファイル を実行してください。OLLAMA_CONTEXT_LENGTH を設定しても効きますが、動いているサービスがそれで本当に再起動されたあとだけです。"
+region-europe = "ヨーロッパ"
+region-singapore = "シンガポール"
+region-china = "中国"
+region-overseas = "中国国外"
+speaks-anthropic = "Anthropic 形式: {address}"
+speaks-openai = "OpenAI 形式: {address}"
+key-header = "キーは {header} ヘッダーに入れられます。このマシンからしか送られません。"
+ready-made-models = "モデル: {models}"
+key-needed-for = "{kind} にはキーでつながります。"
+claims-published = "開発元が公開しているのは {claimed}"
+published-at = "{model}: このサービスはウィンドウの大きさを明かしていないので、表示している数値は開発元が {source} で公開しているものです。"
+
+# ready-made providers
 
 [known]
 image-missing = "{engine} には、これに必要なイメージがありません。もう一方のエンジンでビルドされたか、削除された可能性が高いです。もう一度ビルドすれば戻ります。"
@@ -790,3 +808,22 @@ remove-text = "{n} 個のコンテナが削除されます。ホームとログ�
 remove-do = "削除"
 removing = "削除中…"
 removed = "QCode のコンテナを {engine} から削除しました。ホームとログインはまだそこにあります。"
+
+[profiles.rebuild]
+button = "イメージを再ビルド"
+title = "{name} のイメージを再ビルドしますか？"
+message = "イメージは最初から作り直されます。今日の QCode がこのプロファイルのイメージに入れるものから作られ、ツールもダウンロードし直します。数分かかります。ワークスペースのホーム、ログイン、会話はそのまま残ります。いま開いているこのプロファイルのタブは、次に開き直すまで古いイメージの上で動き続けます。ビルドに失敗しても止めても、古いイメージは残ります。"
+confirm = "作り直す"
+heading = "{name} のイメージを再ビルド中"
+running = "ビルドしています。エンジンの出力はすべて下に表示されます。止めても、いまあるイメージはそのまま残ります。"
+stopping = "停止しています。いまあるイメージはそのまま残ります。"
+done = "{name} のイメージを再ビルドしました。このプロファイルのタブは、次に開くときからこれを使います。"
+stopped = "再ビルドを停止しました。それまであったイメージはそのまま残っています。"
+failed = "再ビルドに失敗しました。エンジンの出力は下にあります。それまであったイメージはそのまま残っています。"
+earlier = "このイメージは以前の QCode でビルドされたものです。再ビルドすると、今日の QCode がこのプロファイルのイメージに入れるものが入ります。"
+
+[profiles.gemini]
+closed-title = "Google が {name} のサインインを閉じました"
+closed = "Google は個人アカウントでの Gemini CLI の Google アカウントサインインを閉じました。Gemini は今「This client is no longer supported for Gemini Code Assist for individuals」と答えます。Gemini Code Assist Standard と Enterprise ではまだ使えます。個人アカウントで続けるには、QCode で動く Antigravity IDE のプロファイルを使うか、Google AI Studio の API キーで新しい Gemini CLI プロファイルを作るかです。"
+login-why = "{harness} は Google AI Studio（aistudio.google.com/app/apikey）の API キーでサインインします。QCode はこのプロファイルのイメージからコンテナを開き、下のターミナルでツールを動かします。そこで聞かれるのはキーだけです。あなたのマシンのものは何もそのコンテナに入っていません。"
+login-what = "Use Gemini API Key を選び、キーを貼り付けて enter を押してください。ツールのプロンプトが出たら、その下のボタンを押すか、そのままツールから出るだけでも構いません。"

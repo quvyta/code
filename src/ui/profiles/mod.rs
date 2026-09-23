@@ -21,7 +21,7 @@ pub(crate) mod work;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use qframe::diagnostics::Diagnostic;
+use qframe::diagnostics::{Diagnostic, Severity};
 use qframe::prelude::*;
 use qframe::runtime::Task;
 use qframe::widgets::{
@@ -38,7 +38,7 @@ use crate::provider::{ProviderEntry, Providers};
 use crate::store::Store;
 use crate::ui::settings::engine::help;
 
-pub use status::{Readiness, Row, Status};
+pub use status::{Readiness, Revision, Row, Status};
 pub use wizard::{Blocked, Build, Draft, Login, Stage, Unfinished};
 pub use work::Problem;
 
@@ -98,6 +98,10 @@ pub enum Msg {
     SignOutConfirmed,
     /// The login was removed, or could not be.
     SignedOut(Result<(), Problem>),
+    /// Building the chosen profile's image again was asked for.
+    RebuildAsked,
+    /// The question was answered with yes: the image page opens on its own and the build starts.
+    RebuildConfirmed,
     /// Open the wizard.
     New,
     /// Open the wizard as soon as the store has been read, for a person who asked for a new
@@ -330,6 +334,15 @@ pub fn update(state: &mut Profiles, message: Msg) -> Command<Msg> {
             Command::focus("login-open")
         }
         Msg::SignOutAsked => ask_sign_out(state),
+        Msg::RebuildAsked => ask_rebuild(state),
+        Msg::RebuildConfirmed => {
+            let Some(row) = state.selected() else { return Command::none() };
+            if state.engine.is_none() || row.image != Readiness::Present {
+                return Command::none();
+            }
+            state.draft = Some(Draft::for_rebuild(&row.profile));
+            start_build(state)
+        }
         Msg::SignOutConfirmed => sign_out(state),
         Msg::SignedOut(result) => {
             state.signing_out = false;
@@ -483,7 +496,9 @@ pub fn update(state: &mut Profiles, message: Msg) -> Command<Msg> {
             let Build::Running(id) = draft.build else { return Command::none() };
             // The build removes the half-made image itself as soon as it notices the stop.
             draft.build = Build::Stopped;
-            draft.log.push(LogLine::new(LogLevel::Warn, t!("profiles.wizard.build-stopping")));
+            let stopping =
+                if draft.is_only_rebuild() { "profiles.rebuild.stopping" } else { "profiles.wizard.build-stopping" };
+            draft.log.push(LogLine::new(LogLevel::Warn, t!(stopping)));
             Command::cancel_task(id)
         }
         Msg::LoginStart => start_login(state),
@@ -568,6 +583,21 @@ fn ask_sign_out(state: &Profiles) -> Command<Msg> {
     )
 }
 
+/// Asks before building a profile's image again, saying what is built, what is kept and what
+/// the tabs already open go on running.
+fn ask_rebuild(state: &Profiles) -> Command<Msg> {
+    let Some(row) = state.selected() else { return Command::none() };
+    if state.engine.is_none() || row.image != Readiness::Present {
+        return Command::none();
+    }
+    let name = row.profile.name.to_string();
+    Command::confirm(
+        Confirm::new(t!("profiles.rebuild.title", name = name.as_str()), Msg::RebuildConfirmed)
+            .message(t!("profiles.rebuild.message"))
+            .confirm_label(t!("profiles.rebuild.confirm")),
+    )
+}
+
 /// Removes a profile's login.
 fn sign_out(state: &mut Profiles) -> Command<Msg> {
     let (Some(engine), Some(row)) = (state.engine.clone(), state.selected()) else { return Command::none() };
@@ -621,6 +651,18 @@ fn start_build(state: &mut Profiles) -> Command<Msg> {
         return Command::none();
     }
     draft.log.clear();
+    if draft.is_only_rebuild() {
+        let task = Task::new(t!("profiles.rebuild.button"), move |cx| {
+            let cancel = || cx.is_cancelled();
+            let mut line = |text: &str| cx.send(Msg::BuildLine(text.to_owned()));
+            // The definition file is already there and nothing of it changes, so only the image
+            // is made.
+            let built = work::rebuild(&engine, &profile, &cancel, &mut || cx.send(Msg::BaseImageStarted), &mut line);
+            Ok(Msg::BuildEnded(built))
+        });
+        draft.build = Build::Running(task.id());
+        return Command::task(task);
+    }
     let task = Task::new(t!("profiles.wizard.step-image"), move |cx| {
         let cancel = || cx.is_cancelled();
         let mut line = |text: &str| cx.send(Msg::BuildLine(text.to_owned()));
@@ -769,7 +811,9 @@ fn draw_list(state: &Profiles, ui: &mut View<'_, Msg>) {
     let busy = state.signing_out;
     let rows = state.rows();
     let selected = state.selected().cloned();
-    let problems = state.problems().len();
+    // Only a file that could not be read is counted as one: a warning is about a profile that
+    // loaded, and what it says is spelled out beside that profile instead.
+    let problems = state.problems().iter().filter(|problem| problem.severity == Severity::Error).count();
     let loading = state.is_loading();
     let store = state.root.is_some();
 
@@ -825,6 +869,12 @@ fn draw_list(state: &Profiles, ui: &mut View<'_, Msg>) {
             .gap(1);
             ui.add(Text::new(summary(&row.profile)).role("secondary")).fill_width();
             ui.add(Text::new(mounts(&row.profile)).role("secondary")).fill_width();
+            if let Some(closed) = closed_sign_in(&row.profile) {
+                ui.add(Text::new(closed).color("warning")).fill_width();
+            }
+            if row.image == Readiness::Present && row.revision == Revision::Earlier {
+                ui.add(Text::new(t!("profiles.rebuild.earlier")).color("warning")).fill_width();
+            }
             let signed_in = row.is_signed_in();
             ui.row(|ui| {
                 // Signing in and out mean nothing to a profile without an account, so it is not
@@ -841,6 +891,14 @@ fn draw_list(state: &Profiles, ui: &mut View<'_, Msg>) {
                     }
                     ui.add(out.variant("danger").disabled(engineless || !signed_in)).id("profile-sign-out");
                 }
+                // Only an image that is there can be built again; one that is not is built from
+                // the tab that needs it, with the words for that.
+                let rebuildable = !engineless && row.image == Readiness::Present;
+                let mut rebuild = Button::new(t!("profiles.rebuild.button"));
+                if rebuildable {
+                    rebuild = rebuild.on_press(Msg::RebuildAsked);
+                }
+                ui.add(rebuild.disabled(!rebuildable)).id("profile-rebuild");
                 ui.spacer();
                 ui.add(Button::new(t!("profiles.new")).variant("primary").on_press(Msg::New)).id("profile-new");
             })
@@ -899,6 +957,20 @@ fn mounts(profile: &Profile) -> String {
         assets = access_word(profile.assets).as_str(),
         network = network_word(profile.network).as_str()
     )
+}
+
+/// What the person is told about a profile whose account its harness's makers closed, in plain
+/// words: who closed it, what the harness now answers, for whom it still works, and the ways on.
+/// `None` for every profile whose sign-in still stands.
+#[must_use]
+pub fn closed_sign_in(profile: &Profile) -> Option<String> {
+    if !profile.harness.withdrawn(profile.account) {
+        return None;
+    }
+    match profile.harness {
+        HarnessKind::GeminiCli => Some(t!("profiles.gemini.closed")),
+        HarnessKind::ClaudeCode | HarnessKind::OpenCode | HarnessKind::Codex | HarnessKind::AntigravityIde => None,
+    }
 }
 
 /// The word for a template.
@@ -960,6 +1032,8 @@ fn draw_wizard(state: &Profiles, draft: &Draft, ui: &mut View<'_, Msg>) {
         ui.spacer().height(Length::Cells(top));
         if draft.is_only_login() {
             draw_sign_in(state, draft, ui);
+        } else if draft.is_only_rebuild() {
+            draw_rebuild(state, draft, ui);
         } else {
             draw_steps(state, draft, ui);
         }
@@ -976,6 +1050,23 @@ fn draw_sign_in(state: &Profiles, draft: &Draft, ui: &mut View<'_, Msg>) {
         ui.row(|ui| {
             ui.spacer();
             ui.add(Button::new(t!("profiles.wizard.close")).variant("primary").on_press(Msg::Finish)).id("login-close");
+        })
+        .fill_width();
+    })
+    .gap(1)
+    .width(Length::Cells(PAGE_WIDTH));
+}
+
+/// The image page on its own, building an existing profile's image again. Closing it while the
+/// build runs stops the build, which leaves the image that was there.
+fn draw_rebuild(state: &Profiles, draft: &Draft, ui: &mut View<'_, Msg>) {
+    ui.column(|ui| {
+        ui.add(Text::new(t!("profiles.rebuild.heading", name = draft.name.as_str())).bold());
+        draw_image(state, draft, ui);
+        ui.row(|ui| {
+            ui.spacer();
+            ui.add(Button::new(t!("profiles.wizard.close")).variant("primary").on_press(Msg::Cancel))
+                .id("rebuild-close");
         })
         .fill_width();
     })
@@ -1248,12 +1339,14 @@ fn draw_provider_choice(draft: &Draft, ui: &mut View<'_, Msg>) {
             .on_select(Msg::PickProviderModel),
     )
     .id("profile-provider-model");
-    // Only a window QCode measured is handed to Claude Code; without one it works to the room of
-    // its own models and prints a warning at every start. Measuring is left to the person on the
-    // Providers page, because it loads the model on their server.
+    // Only a window QCode measured, or one a ready-made service gives for its own models, is
+    // handed to Claude Code; without one it works to the room of its own models and prints a
+    // warning at every start. Measuring is left to the person on the Providers page, because it
+    // loads the model on their server.
+    let kind = draft.provider_tag.as_deref().and_then(|tag| draft.provider_entry(tag)).map(|entry| entry.kind);
     let unmeasured = models.iter().find(|model| Some(model.id.as_str()) == draft.provider_model.as_deref());
     if draft.harness == HarnessKind::ClaudeCode
-        && let Some(model) = unmeasured.filter(|model| model.measured.is_none())
+        && let Some(model) = unmeasured.filter(|model| kind.is_none_or(|kind| model.window(kind).is_none()))
     {
         let said = t!(
             "profiles.wizard.provider-model-unmeasured",
@@ -1296,7 +1389,14 @@ fn draw_permissions(draft: &Draft, ui: &mut View<'_, Msg>) {
 /// Building the image, with everything the engine says as it says it.
 fn draw_image(state: &Profiles, draft: &Draft, ui: &mut View<'_, Msg>) {
     let engineless = state.engine.is_none();
+    let rebuild = draft.is_only_rebuild();
     let lead = match &draft.build {
+        // A rebuild keeps the image that was there until the new one is finished, so its words
+        // for a build under way, stopped or failed are not the wizard's.
+        Build::Running(_) if rebuild => t!("profiles.rebuild.running"),
+        Build::Done if rebuild => t!("profiles.rebuild.done", name = draft.name.as_str()),
+        Build::Stopped if rebuild => t!("profiles.rebuild.stopped"),
+        Build::Failed(_) if rebuild => t!("profiles.rebuild.failed"),
         Build::Waiting => t!("profiles.wizard.build-waiting"),
         Build::Running(_) => t!("profiles.wizard.build-running"),
         Build::Done => t!("profiles.wizard.build-done"),
@@ -1309,7 +1409,7 @@ fn draw_image(state: &Profiles, draft: &Draft, ui: &mut View<'_, Msg>) {
     if let Build::Failed(problem) = &draft.build {
         recognised(state, problem, ui);
     }
-    if draft.build == Build::Done && !draft.account.needs_login() {
+    if draft.build == Build::Done && !draft.account.needs_login() && !rebuild {
         let harness = draft.harness.record().display_name;
         let ready = match draft.account {
             AccountKind::InApp => t!("profiles.wizard.in-app-ready", harness = harness),
@@ -1372,8 +1472,15 @@ fn draw_login(state: &Profiles, draft: &Draft, ui: &mut View<'_, Msg>) {
     let harness = draft.harness.record().display_name;
     match &draft.login {
         Login::Waiting => {
-            ui.add(Text::new(t!("profiles.wizard.login-why", harness = harness)).role("secondary")).fill_width();
-            ui.add(Text::new(t!("profiles.wizard.login-what")).role("secondary")).fill_width();
+            // Gemini CLI's own dialog is kept to the key in the image, so the page says where the
+            // key comes from and what the dialog will ask, rather than speak of a sign-in flow.
+            let (why, what) = if draft.harness == HarnessKind::GeminiCli && draft.account == AccountKind::ApiKey {
+                ("profiles.gemini.login-why", "profiles.gemini.login-what")
+            } else {
+                ("profiles.wizard.login-why", "profiles.wizard.login-what")
+            };
+            ui.add(Text::new(t!(why, harness = harness)).role("secondary")).fill_width();
+            ui.add(Text::new(t!(what)).role("secondary")).fill_width();
             ui.add(Text::new(t!("profiles.wizard.login-proof")).role("secondary")).fill_width();
             if engineless {
                 ui.add(Text::new(t!("profiles.no-engine-detail")).color("warning")).fill_width();
@@ -1521,7 +1628,7 @@ mod tests {
             .state
             .rows()
             .iter()
-            .map(|row| Status { name: row.profile.name.clone(), image, identity })
+            .map(|row| Status { name: row.profile.name.clone(), image, revision: Revision::Unknown, identity })
             .collect();
         harness.send(Msg::Probed(answers)).render();
     }
@@ -1981,6 +2088,52 @@ mod tests {
     }
 
     #[test]
+    fn a_gemini_cli_profile_with_a_key_is_told_where_the_key_comes_from_and_what_the_dialog_asks() {
+        let mut harness = with_engine();
+        let keyed = Profile { account: AccountKind::ApiKey, ..profile("gemini-key", HarnessKind::GeminiCli) };
+        harness.send(Msg::Loaded(Listing { profiles: vec![keyed], diagnostics: Vec::new() }));
+        answer(&mut harness, Readiness::Present, Readiness::Missing);
+        harness.click_text("Sign in").render();
+        let screen = harness.screen().split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(screen.contains("Gemini CLI signs in with an API key from Google AI Studio"), "{screen}");
+        assert!(screen.contains("aistudio.google.com/app/apikey"), "{screen}");
+        assert!(screen.contains("Choose Use Gemini API Key, paste the key"), "{screen}");
+        assert!(!screen.contains("signs in with its own flow"), "{screen}");
+    }
+
+    #[test]
+    fn a_gemini_cli_profile_made_with_the_closed_sign_in_says_so_where_it_is_listed_and_still_loads() {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let folder = std::env::temp_dir().join(format!("qcode-profiles-closed-{stamp}"));
+        let signed_in = profile("gemini-sub", HarnessKind::GeminiCli);
+        Store::new(&folder).write_profile(&signed_in).expect("the definition is written");
+        let state = Profiles::new(Some(folder.clone()), None).with_providers_file(None);
+        let mut harness = Harness::with_env(Host { state }, env(), SIZE.0, SIZE.1);
+        harness.set_locale("en").set_glyph_mode(GlyphMode::Unicode);
+        // The store is read the way the screen always reads it, from the file on the disk.
+        harness.send(Msg::Reload).render();
+        let _ = std::fs::remove_dir_all(&folder);
+        let screen = harness.screen().split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(harness.app().state.rows().len(), 1, "the profile still loads:\n{screen}");
+        assert!(
+            screen.contains("Google closed Gemini CLI's sign-in with a Google account for personal accounts"),
+            "{screen}"
+        );
+        assert!(screen.contains("no longer supported for Gemini Code Assist for individuals"), "{screen}");
+        assert!(screen.contains("Standard and Enterprise"), "{screen}");
+        assert!(screen.contains("Antigravity IDE"), "{screen}");
+        assert!(screen.contains("API key from Google AI Studio"), "{screen}");
+        assert!(!screen.contains("could not be read"), "a profile that loaded is not an unreadable file:\n{screen}");
+    }
+
+    #[test]
+    fn a_gemini_cli_profile_with_a_key_says_nothing_of_a_closed_sign_in() {
+        let keyed = Profile { account: AccountKind::ApiKey, ..profile("gemini-key", HarnessKind::GeminiCli) };
+        let harness = loaded(vec![keyed]);
+        assert!(!harness.screen().contains("Google closed"), "{}", harness.screen());
+    }
+
+    #[test]
     fn a_profile_without_an_image_cannot_be_signed_in() {
         let mut harness = with_engine();
         harness.send(Msg::Loaded(Listing {
@@ -2387,6 +2540,162 @@ mod tests {
         harness.set_locale("en").set_glyph_mode(GlyphMode::Unicode).set_reduced_motion(true);
         harness.send(Msg::Loaded(Listing { profiles: Vec::new(), diagnostics: Vec::new() })).render();
         (folder, harness)
+    }
+
+    /// A stand-in podman for building an image that is already there again. It writes down every
+    /// call; it has the profile's image under the identity `sha-old` with no revision label, the
+    /// way an image an earlier QCode built has, until a build finishes, and then `sha-new` with
+    /// the label the built Containerfile carried. The base image is always the current one. A build
+    /// fails when `fail` exists in the folder.
+    struct Rebuilt {
+        folder: PathBuf,
+        engine: Engine,
+    }
+
+    impl Rebuilt {
+        fn new(name: &str) -> Self {
+            let stamp =
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+            let folder = std::env::temp_dir().join(format!("qcode-profiles-{name}-{stamp}"));
+            std::fs::create_dir_all(&folder).expect("a scratch folder");
+            let script = r#"#!/bin/sh
+printf '%s\n' "$*" >> FOLDER/calls
+case "$1 $2 $4" in
+'image inspect {{.Id}}') [ -e FOLDER/label ] && echo sha-new || echo sha-old; exit 0 ;;
+esac
+[ "$1 $2 $5" = "image inspect qcode/base" ] && { echo BASE; exit 0; }
+[ "$1 $2" = "image inspect" ] && { cat FOLDER/label 2>/dev/null; echo; exit 0; }
+[ "$1" = build ] || exit 0
+echo 'STEP 1/9: FROM qcode/base'
+[ -e FOLDER/fail ] && { echo 'Error: building at STEP 4/9: exit status 1' >&2; exit 1; }
+while [ "$#" -gt 0 ]; do [ "$1" = --file ] && file="$2"; shift; done
+cp "$file" FOLDER/built
+sed -n 's/^LABEL qcode.profile.revision="\(.*\)"$/\1/p' "$file" > FOLDER/label
+echo 'COMMIT qcode/profile/claude-sub'
+"#
+            .replace("FOLDER", &folder.display().to_string())
+            .replace("BASE", &crate::base::revision());
+            let binary = folder.join("engine");
+            std::fs::write(&binary, script).expect("the stand-in engine is written");
+            std::fs::set_permissions(&binary, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("runnable");
+            let engine = Engine::new(crate::engine::EngineKind::Podman, &binary);
+            Self { folder, engine }
+        }
+
+        /// The profiles screen on this engine, holding `profile` and with the engine's answers
+        /// about it in, as the screen asks for them itself.
+        fn screen(&self, profile: Profile) -> Harness<Host> {
+            let state = Profiles::new(Some(self.folder.clone()), Some(self.engine.clone())).with_providers_file(None);
+            let mut harness = Harness::with_env(Host { state }, env(), SIZE.0, 40);
+            harness.set_locale("en").set_glyph_mode(GlyphMode::Unicode).set_reduced_motion(true);
+            harness.send(Msg::Loaded(Listing { profiles: vec![profile], diagnostics: Vec::new() })).render();
+            harness
+        }
+
+        fn calls(&self) -> Vec<String> {
+            std::fs::read_to_string(self.folder.join("calls")).unwrap_or_default().lines().map(str::to_owned).collect()
+        }
+
+        fn builds(&self) -> Vec<String> {
+            self.calls().into_iter().filter(|call| call.starts_with("build")).collect()
+        }
+    }
+
+    impl Drop for Rebuilt {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.folder);
+        }
+    }
+
+    #[test]
+    fn an_image_an_earlier_qcode_built_says_so_and_rebuilding_it_is_asked_first() {
+        let engine = Rebuilt::new("rebuild-asked");
+        let mut harness = engine.screen(profile("claude-sub", HarnessKind::ClaudeCode));
+        let screen = harness.screen();
+        assert!(screen.contains("Image ready"), "{screen}");
+        assert!(screen.contains("This image was built by an earlier QCode."), "{screen}");
+        harness.click_text("Rebuild image").advance(std::time::Duration::from_millis(400));
+        // The question wraps inside its frame, so it is read as one line of words.
+        let screen = harness.screen().split_whitespace().filter(|word| *word != "▌").collect::<Vec<_>>().join(" ");
+        assert!(screen.contains("Rebuild the image of claude-sub?"), "{screen}");
+        assert!(screen.contains("the harness is downloaded again"), "{screen}");
+        assert!(screen.contains("the login and the conversations are kept"), "{screen}");
+        assert!(screen.contains("keep running on the old image until they are opened again"), "{screen}");
+        assert!(screen.contains("the old image stays"), "{screen}");
+        assert!(engine.builds().is_empty(), "nothing is built before the answer: {:#?}", engine.calls());
+        harness.press("esc").advance(std::time::Duration::from_millis(400));
+        assert!(engine.builds().is_empty(), "a question put away builds nothing: {:#?}", engine.calls());
+        assert!(harness.app().state.draft().is_none(), "{}", harness.screen());
+    }
+
+    #[test]
+    fn rebuilding_builds_the_image_from_its_first_step_with_todays_recipe_and_lets_the_old_one_go() {
+        let engine = Rebuilt::new("rebuild-done");
+        let chosen = profile("claude-sub", HarnessKind::ClaudeCode);
+        let mut harness = engine.screen(chosen.clone());
+        harness.click_text("Rebuild image").advance(std::time::Duration::from_millis(400));
+        harness.click_text("Build it again").render();
+        let builds = engine.builds();
+        assert_eq!(builds.len(), 1, "{:#?}", engine.calls());
+        assert!(builds[0].starts_with("build --no-cache --tag qcode/profile/claude-sub --file "), "{builds:#?}");
+        let built = std::fs::read_to_string(engine.folder.join("built")).expect("a Containerfile was built");
+        let recipe = recipe::image(&chosen);
+        assert_eq!(built, recipe.labelled(), "today's recipe, labelled with its revision");
+        let screen = harness.screen();
+        assert!(screen.contains("Rebuilding the image of claude-sub"), "{screen}");
+        assert!(screen.contains("STEP 1/9: FROM qcode/base"), "the build's own lines are shown:\n{screen}");
+        assert!(screen.contains("The image of claude-sub is built again."), "{screen}");
+        let calls = engine.calls();
+        assert!(calls.contains(&"image rm sha-old".to_owned()), "the image it replaced is let go: {calls:#?}");
+        assert!(!calls.iter().any(|call| call.contains("--force")), "never by force: {calls:#?}");
+        assert!(
+            !std::fs::read_dir(&engine.folder)
+                .expect("the folder")
+                .flatten()
+                .any(|entry| entry.file_name() == "Profiles"),
+            "the definition is not written again"
+        );
+        harness.click_text("Close").render();
+        let screen = harness.screen();
+        assert!(harness.app().state.draft().is_none(), "{screen}");
+    }
+
+    #[test]
+    fn a_rebuilt_image_no_longer_says_an_earlier_qcode_built_it() {
+        let engine = Rebuilt::new("rebuild-current");
+        let chosen = profile("claude-sub", HarnessKind::ClaudeCode);
+        std::fs::write(engine.folder.join("label"), recipe::image(&chosen).revision()).expect("the label is set");
+        let harness = engine.screen(chosen);
+        let screen = harness.screen();
+        assert!(screen.contains("Image ready"), "{screen}");
+        assert!(!screen.contains("built by an earlier QCode"), "{screen}");
+    }
+
+    #[test]
+    fn a_rebuild_that_fails_says_the_old_image_is_kept_and_removes_nothing() {
+        let engine = Rebuilt::new("rebuild-failed");
+        std::fs::write(engine.folder.join("fail"), "").expect("the build will fail");
+        let mut harness = engine.screen(profile("claude-sub", HarnessKind::ClaudeCode));
+        harness.click_text("Rebuild image").advance(std::time::Duration::from_millis(400));
+        harness.click_text("Build it again").render();
+        let screen = harness.screen();
+        assert!(screen.contains("The rebuild failed."), "{screen}");
+        assert!(screen.contains("the image that was there before is kept"), "{screen}");
+        assert!(screen.contains("exit status 1"), "the engine's own words:\n{screen}");
+        let calls = engine.calls();
+        assert!(!calls.iter().any(|call| call.starts_with("image rm")), "the old image is kept: {calls:#?}");
+    }
+
+    #[test]
+    fn a_profile_without_an_image_offers_no_rebuild() {
+        let mut harness = with_engine();
+        harness.send(Msg::Loaded(Listing {
+            profiles: vec![profile("claude-sub", HarnessKind::ClaudeCode)],
+            diagnostics: Vec::new(),
+        }));
+        answer(&mut harness, Readiness::Missing, Readiness::Missing);
+        harness.click_text("Rebuild image").advance(std::time::Duration::from_millis(400));
+        assert!(!harness.screen().contains("Rebuild the image of"), "{}", harness.screen());
     }
 
     #[test]

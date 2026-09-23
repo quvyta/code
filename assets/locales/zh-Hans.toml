@@ -13,10 +13,15 @@ keys = "按键"
 session-gone = "上次会话中的 {n} 个工作区已经不在了"
 session-broken = "上次会话只读出了一部分"
 session-unsaved = "没能记住打开着的工作区"
+quit-title = "还有智能体在工作，要退出吗？"
+quit-working = { other = "还有 {n} 个智能体标签页在运行。退出会停止它们的容器，它们现在正在做的事会因此中断。对话会保留下来，等你再次打开这个工作区时继续。" }
+quit-anyway = "仍然退出"
+quit-stay = "留下"
 
 [home]
 continue = "继续"
-continue-detail = { one = "{first}", other = "{first} +{more}" }
+continue-one = "{first}"
+continue-more = "{first} +{more}"
 new-workspace = "新建工作区"
 workspaces = "工作区"
 profiles = "配置档"
@@ -423,7 +428,7 @@ window.no-wayland = "这个会话里没有 Wayland 合成器，而 QCode 不通�
 window.no-socket = "合成器的套接字已不在 {socket}。重启过的合成器会留下一个打开着的窗口；重新打开它就是回去的路。"
 window.open = "打开窗口"
 window.signin-opened = "窗口要求登录，于是在它旁边打开了一个小的登录窗口。在那里登录即可，应用会自己收到结果。"
-window.signin-in-browser = "窗口要求登录，但它自己的登录窗口没能启动，所以页面在你的浏览器中打开了。从那里登录无法回到应用。用较早版本的 QCode 创建的配置档，其镜像里没有登录窗口；重新创建这个配置档就会有。"
+window.signin-in-browser = "窗口要求登录，但它自己的登录窗口没能启动，页面于是开在你的浏览器里。从那里登录无法到达应用。用更早版本的 QCode 建的配置档，其镜像没有登录窗口；在「配置档」页面用「重建镜像」就能给它一个。"
 window.signin-open-yourself = "窗口要求打开这个页面，但无法在这里显示："
 window.raise = "移到最前"
 window.close = "关闭窗口"
@@ -723,6 +728,19 @@ gives-at-least = "这台服务器至少给 {tokens}"
 gives-unknown = "还没有测量"
 cramped = "这个窗口不到 {tokens} 个词元，对编码代理来说太小了：它会先发送自己的指令和你打开的文件，而这台服务器会把开头悄悄丢掉，不说一句话，也不报错。"
 cramped-remedy = "你可以给模型一个属于它自己的窗口，以后就用那个名字。写一个文件，里面两行：FROM {model} 和 PARAMETER num_ctx 32768，然后运行：ollama create {model}-32k -f 那个文件。设置 OLLAMA_CONTEXT_LENGTH 也可以，但前提是运行中的服务真的带着它重启过。"
+region-europe = "欧洲"
+region-singapore = "新加坡"
+region-china = "中国"
+region-overseas = "中国境外"
+speaks-anthropic = "Anthropic 接口：{address}"
+speaks-openai = "OpenAI 接口：{address}"
+key-header = "密钥放在它的 {header} 请求头里，且只从这台机器发出。"
+ready-made-models = "模型：{models}"
+key-needed-for = "访问 {kind} 需要密钥。"
+claims-published = "其厂商公布 {claimed}"
+published-at = "{model}：该服务没有说明它的窗口，所以显示的数字是其厂商在 {source} 公布的那个。"
+
+# ready-made providers
 
 [known]
 image-missing = "{engine} 里没有这里需要的镜像。它很可能是用另一个引擎构建的，或者已被删除；重新构建就能找回。"
@@ -790,3 +808,22 @@ remove-text = "这 {n} 个容器会被移除；它们的主目录和登录卷仍
 remove-do = "移除"
 removing = "正在移除…"
 removed = "QCode 的容器已从 {engine} 中移除。主目录和登录都还在。"
+
+[profiles.rebuild]
+button = "重建镜像"
+title = "要重建 {name} 的镜像吗？"
+message = "镜像会从头重新构建，用的是 QCode 如今放进这个配置档镜像的内容，工具也会重新下载；这需要几分钟。各工作区的主目录、登录状态和对话都会保留。这个配置档中已打开的标签页会继续用旧镜像运行，直到它们被再次打开。如果构建失败或被停止，旧镜像保持不变。"
+confirm = "重新构建"
+heading = "正在重建 {name} 的镜像"
+running = "正在构建。引擎输出的全部内容在下方；停止后原有的镜像会保留。"
+stopping = "正在停止。原有的镜像会保留。"
+done = "{name} 的镜像已重建。下次打开这个配置档的标签页时就会使用它。"
+stopped = "重建已停止。之前那个镜像保留了下来。"
+failed = "重建失败。引擎的输出在下方；之前那个镜像保留了下来。"
+earlier = "这个镜像由更早版本的 QCode 构建。重建后，它就含有 QCode 如今放进这个配置档镜像的内容。"
+
+[profiles.gemini]
+closed-title = "Google 已关闭 {name} 的登录"
+closed = "Google 已对个人账号关闭 Gemini CLI 用 Google 账号登录的方式：Gemini 现在会回复「This client is no longer supported for Gemini Code Assist for individuals」。Gemini Code Assist Standard 和 Enterprise 仍可使用。如果用的是个人账号，可行的办法是用 Antigravity IDE 的配置档（它可以跑在 QCode 里），或者新建一个 Gemini CLI 配置档，改用来自 Google AI Studio 的 API 密钥。"
+login-why = "{harness} 用来自 Google AI Studio 的 API 密钥登录（aistudio.google.com/app/apikey）。QCode 会用这个配置档的镜像开一个容器，在下方的终端里运行工具，它只问密钥，别的都不会问。那个容器里没有你机器上的任何东西。"
+login-what = "选择 Use Gemini API Key，粘贴密钥并按 Enter。等工具显示提示符后，按它下面的按钮，或者直接离开工具。"

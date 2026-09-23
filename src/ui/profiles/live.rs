@@ -218,3 +218,64 @@ fn a_login_container_is_removed_even_when_the_login_is_interrupted() {
         let _ = std::fs::remove_dir_all(&folder);
     }
 }
+
+/// The whole promise of Rebuild image, on every engine: building again from a recipe whose text
+/// did not change still runs every step (a harness installed by a step that reads the same would
+/// otherwise never move on), a changed recipe reaches the image, the label says which recipe it
+/// was, the image it replaced goes when nothing is made from it, and a rebuild that fails leaves
+/// the image that was there. The recipe is a small one of the product's own shape, built by the
+/// product's own function, so the test takes seconds rather than a harness download.
+#[test]
+#[ignore = "needs a container engine; run with QCODE_CONTAINER_TESTS=1"]
+fn a_rebuild_runs_every_step_again_takes_a_changed_recipe_and_keeps_the_image_when_it_fails() {
+    const IMAGE: &str = "qcode/profile/rebuildlive";
+    let recipe = |marker: &str| recipe::Recipe {
+        containerfile: format!(
+            "FROM {ALPINE}\nRUN echo {marker} > /marker\nRUN cat /proc/sys/kernel/random/uuid > /stamp\n"
+        ),
+        files: Vec::new(),
+    };
+    for engine in engines() {
+        let kind = engine.kind();
+        let _ = capture(&engine.remove_image(IMAGE));
+        let read = |path: &str| {
+            let command = engine.run_once(&crate::engine::RunOnce {
+                image: IMAGE,
+                mounts: &[],
+                network: crate::engine::Network::None,
+                user: crate::engine::HostUser::current().expect("the current user"),
+                workdir: None,
+                command: &["cat", path],
+            });
+            capture(&command).unwrap_or_else(|error| panic!("{kind:?}: {path} is read: {error:?}")).trim().to_owned()
+        };
+        let id = || capture(&engine.image_exists(IMAGE)).expect("the image is there").trim().to_owned();
+        let label = || capture(&engine.image_label(IMAGE, recipe::REVISION_LABEL)).expect("asked").trim().to_owned();
+
+        let one = recipe("one");
+        work::rebuild_from(&engine, IMAGE, &one, &|| false, &mut |_| {}).expect("the first build");
+        let (first, stamp) = (id(), read("/stamp"));
+        assert_eq!(label(), one.revision(), "{kind:?}: the recipe is written on the image");
+
+        work::rebuild_from(&engine, IMAGE, &one, &|| false, &mut |_| {}).expect("the same recipe again");
+        assert_ne!(read("/stamp"), stamp, "{kind:?}: every step ran again, none was taken from before");
+        let second = id();
+        assert_ne!(second, first, "{kind:?}");
+        assert!(capture(&engine.image_exists(&first)).is_err(), "{kind:?}: the replaced image is gone");
+
+        let two = recipe("two");
+        work::rebuild_from(&engine, IMAGE, &two, &|| false, &mut |_| {}).expect("a changed recipe");
+        assert_eq!(read("/marker"), "two", "{kind:?}: the change is in the image");
+        assert_eq!(label(), two.revision(), "{kind:?}");
+        let third = id();
+
+        let broken = recipe::Recipe { containerfile: format!("FROM {ALPINE}\nRUN false\n"), files: Vec::new() };
+        let failed = work::rebuild_from(&engine, IMAGE, &broken, &|| false, &mut |_| {});
+        assert!(matches!(failed, Err(Problem::Refused(_))), "{kind:?}: {failed:?}");
+        let kept = capture(&engine.image_exists(IMAGE)).map(|id| id.trim().to_owned());
+        let marker = kept.is_ok().then(|| read("/marker"));
+        let _ = capture(&engine.remove_image(IMAGE));
+        assert_eq!(kept.ok().as_deref(), Some(third.as_str()), "{kind:?}: the image that was there is kept");
+        assert_eq!(marker.as_deref(), Some("two"), "{kind:?}");
+    }
+}

@@ -523,3 +523,145 @@ fn a_quotation_mark_in_an_address_is_written_the_way_toml_writes_one() {
     providers.add(entry).expect("a new tag");
     assert_eq!(read(&providers.to_toml()).get("ev").expect("it").base, "http://h:1/\"odd\\path");
 }
+
+/// A providers file exactly as QCode wrote it before the ready-made kinds existed (the writer of
+/// 0.1.14), with the forms a person could have left in it: OpenRouter under the `/api` its own
+/// page names, a model whose edge was found and one whose edge was not.
+const WRITTEN_BY_0_1_14: &str = "\
+[[provider]]
+tag = \"ev\"
+kind = \"ollama\"
+base = \"http://192.168.122.1:11434\"
+wire = \"anthropic\"
+
+[[provider]]
+tag = \"yol\"
+kind = \"openrouter\"
+base = \"https://openrouter.ai/api\"
+wire = \"openai\"
+key = \"not-a-real-key-0000-wxyz\"
+
+[[model]]
+tag = \"ev\"
+id = \"qwen3.5-256k\"
+claimed-context = 262144
+measured-context = 31512
+measured = \"about\"
+
+[[model]]
+tag = \"yol\"
+id = \"nex-agi/nex-n2.5-mini:free\"
+claimed-context = 131072
+measured-context = 12415
+measured = \"at-least\"
+
+";
+
+#[test]
+fn a_file_written_before_the_ready_made_kinds_reads_and_writes_back_unchanged() {
+    let providers = read(WRITTEN_BY_0_1_14);
+    assert_eq!(providers.to_toml(), WRITTEN_BY_0_1_14, "not a byte of an older file moves when it is saved again");
+    let home = providers.get("ev").expect("the ollama server");
+    assert_eq!(home.models.len(), 1, "a kind of one's own is given no models it did not have");
+    assert_eq!(home.messages_address(), "http://192.168.122.1:11434/v1/messages");
+    let road = providers.get("yol").expect("OpenRouter");
+    assert_eq!(road.wire, Wire::OpenAi);
+    assert_eq!(road.messages_address(), "https://openrouter.ai/api/v1/chat/completions", "still its API");
+    assert_eq!(trial(road).secret.expect("its key").header, "Authorization", "and still its header");
+    assert_eq!(
+        road.model("nex-agi/nex-n2.5-mini:free").and_then(|model| model.measured),
+        Some(Measured::AtLeast(12_415))
+    );
+}
+
+#[test]
+fn a_ready_made_provider_is_written_with_its_kind_and_reads_back_as_itself() {
+    let mut providers = Providers::in_memory();
+    let mut entry =
+        ProviderEntry::new(tag("mimo"), ProviderKind::MimoTokenPlan, "https://token-plan-sgp.xiaomimimo.com");
+    entry.key = Key::new(MADE_UP);
+    providers.add(entry.clone()).expect("the tag is free");
+    let text = providers.to_toml();
+    assert!(text.contains("kind = \"mimo-token-plan\""), "{text}");
+    assert_eq!(read(&text).entries(), [entry], "{text}");
+}
+
+/// What Xiaomi's Token Plan answered for `/v1/models` on 2026-09-23: names, and no window.
+const MIMO_LISTING: &str = r#"{"object":"list","data":[{"id":"mimo-v2.5","object":"model","owned_by":"xiaomi"},{"id":"mimo-v2.5-asr","object":"model","owned_by":"xiaomi"},{"id":"mimo-v2.6-flash","object":"model","owned_by":"xiaomi"}]}"#;
+
+fn mimo() -> ProviderEntry {
+    let mut entry =
+        ProviderEntry::new(tag("mimo"), ProviderKind::MimoTokenPlan, ProviderKind::MimoTokenPlan.suggested_base());
+    entry.key = Key::new(MADE_UP);
+    entry
+}
+
+fn kimi() -> ProviderEntry {
+    let mut entry = ProviderEntry::new(tag("kimi"), ProviderKind::KimiCode, ProviderKind::KimiCode.suggested_base());
+    entry.key = Key::new(MADE_UP);
+    entry
+}
+
+#[test]
+fn xiaomi_is_asked_for_its_models_with_its_key_and_its_makers_window_fills_what_it_does_not_say() {
+    let (web, seen) = canned(vec![("/v1/models", MIMO_LISTING)]);
+    let models = ask::list_models(&web, &mimo()).expect("the service answered");
+    let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+    assert_eq!(ids, ["mimo-v2.5", "mimo-v2.5-asr", "mimo-v2.6-flash"], "what the service lists, in its order");
+    assert_eq!(models[2].claimed, Some(1_048_576), "the published window of a model it names");
+    assert_eq!(models[1].claimed, None, "nothing is invented for a model nobody published a window for");
+    let asked = seen.lock().expect("the list");
+    assert_eq!(asked[0].line(), "GET https://token-plan-ams.xiaomimimo.com/v1/models");
+    let secret = asked[0].secret.as_ref().expect("the listing is asked with the key");
+    assert_eq!((secret.header.as_str(), secret.prefix.as_str()), ("api-key", ""));
+}
+
+#[test]
+fn kimi_gives_each_models_window_with_its_listing_and_that_is_taken_over_the_published_one() {
+    let body = r#"{"data":[{"id":"kimi-for-coding","context_length":524288},{"id":"k3","context_length":1048576}]}"#;
+    let (web, seen) = canned(vec![("/coding/v1/models", body)]);
+    let models = ask::list_models(&web, &kimi()).expect("the service answered");
+    assert_eq!(models[0].claimed, Some(524_288), "the service's own answer, not the page's 1 048 576");
+    assert_eq!(models[1].claimed, Some(1_048_576), "a plan that gives k3 its whole window says so");
+    let asked = seen.lock().expect("the list");
+    assert_eq!(asked[0].line(), "GET https://api.kimi.com/coding/v1/models");
+    assert_eq!(asked[0].secret.as_ref().expect("with the key").header, "x-api-key");
+}
+
+#[test]
+fn a_ready_made_service_that_lists_nothing_still_offers_the_models_its_maker_publishes() {
+    let (web, _) = canned(Vec::new());
+    let models = ask::list_models(&web, &mimo()).expect("a 404 listing is not a broken provider");
+    assert_eq!(models.len(), 4);
+    assert!(models.iter().all(|model| model.claimed == Some(1_048_576)));
+    // A refusal of the key is still said as one.
+    let web = Web::new(|_| Ok(Answer { status: 401, body: "bad key".to_owned() }));
+    assert!(matches!(ask::list_models(&web, &mimo()), Err(AskError::Refused { status: 401, .. })));
+}
+
+#[test]
+fn trying_a_ready_made_service_asks_for_its_models_with_the_key_and_spends_nothing() {
+    for (entry, ending, header) in [
+        (mimo(), "https://token-plan-ams.xiaomimimo.com/v1/models", "api-key"),
+        (kimi(), "https://api.kimi.com/coding/v1/models", "x-api-key"),
+    ] {
+        let (web, seen) = canned(vec![("/v1/models", MIMO_LISTING)]);
+        assert_eq!(ask::try_connection(&web, &entry), Ok(Reached::KeyAccepted), "{ending}");
+        let asked = seen.lock().expect("the list");
+        assert_eq!(asked[0].line(), format!("GET {ending}"));
+        assert_eq!(asked[0].secret.as_ref().expect("the key is what is tried").header, header);
+    }
+}
+
+#[test]
+fn a_ready_made_services_window_is_measured_where_a_harness_asks_with_the_key_where_it_reads_it() {
+    let ask = probing(&mimo(), "mimo-v2.6-flash", 10, "m1");
+    assert_eq!(ask.url, "https://token-plan-ams.xiaomimimo.com/anthropic/v1/messages");
+    let secret = ask.secret.expect("a probe carries the key");
+    assert_eq!(secret.header, "api-key");
+    assert_eq!(secret.key.expose(), MADE_UP);
+    assert!(!ask.url.contains(MADE_UP) && ask.headers.iter().all(|(_, value)| !value.contains(MADE_UP)));
+    let ask = probing(&kimi(), "kimi-for-coding", 10, "m1");
+    assert_eq!(ask.url, "https://api.kimi.com/coding/v1/messages");
+    assert_eq!(ask.secret.expect("a probe carries the key").header, "x-api-key");
+}

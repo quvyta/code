@@ -126,7 +126,7 @@ fn an_address_typed_after_the_offered_one_is_refused_beside_the_field() {
     harness.type_text("http://192.168.122.1:11434");
     press_add(&mut harness);
     let screen = harness.screen();
-    assert!(screen.contains("does not read as one address"), "the reason is beside the field:\n{screen}");
+    assert!(screen.contains("read as one address"), "the reason is beside the field:\n{screen}");
     assert!(!path.exists(), "nothing was written:\n{screen}");
     assert_eq!(seen.lock().expect("the list").len(), 0, "refusing it reached nothing");
 }
@@ -601,4 +601,107 @@ fn nothing_is_bracketed_lined_or_framed() {
         }
     }
     let _ = std::fs::remove_dir_all(path.parent().expect("its folder"));
+}
+
+/// Every file under `folder` that holds `text`, for a test that has to show a key went to one
+/// place and no other.
+fn holding(folder: &std::path::Path, text: &str) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(folder) else { return Vec::new() };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(holding(&path, text));
+        } else if std::fs::read(&path).is_ok_and(|bytes| String::from_utf8_lossy(&bytes).contains(text)) {
+            found.push(path);
+        }
+    }
+    found
+}
+
+#[test]
+fn picking_xiaomi_fills_everything_but_the_key_and_the_key_is_written_in_the_providers_file_alone() {
+    let path = file("mimo");
+    let (web, seen) = canned(Vec::new());
+    let mut harness = opened(&path, web);
+    harness.click_text("Add a provider").render();
+    harness.click_text("Xiaomi MiMo Token Plan").render();
+    let screen = harness.screen();
+    // Before a key is typed the dialog already says where requests will go, the header the key
+    // goes in and what the service offers.
+    assert!(screen.contains("Anthropic shape: https://token-plan-ams.xiaomimimo.com/anthropic"), "{screen}");
+    assert!(screen.contains("api-key"), "{screen}");
+    assert!(screen.contains("mimo-v2.6-flash"), "{screen}");
+
+    // The subscription page named the Singapore cluster; the person picks it.
+    harness.click_text("Singapore").render();
+    let screen = harness.screen();
+    assert!(screen.contains("Anthropic shape: https://token-plan-sgp.xiaomimimo.com/anthropic"), "{screen}");
+    assert!(screen.contains("OpenAI shape: https://token-plan-sgp.xiaomimimo.com/v1"), "{screen}");
+    // Tag and address are filled; Tab walks past them to the key, the one thing typed.
+    harness.press("tab");
+    harness.press("tab");
+    harness.press("tab");
+    harness.type_text(MADE_UP);
+    press_add(&mut harness);
+    harness.render();
+
+    let written =
+        std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("the provider was added:\n{}", harness.screen()));
+    assert!(written.contains("tag = \"mimo\""), "{written}");
+    assert!(written.contains("kind = \"mimo-token-plan\""), "{written}");
+    assert!(written.contains("base = \"https://token-plan-sgp.xiaomimimo.com\""), "{written}");
+    assert!(written.contains("id = \"mimo-v2.6-flash\"\nclaimed-context = 1048576"), "{written}");
+    assert_eq!(written.matches(MADE_UP).count(), 1, "the key is written once: {written}");
+    assert_eq!(
+        holding(path.parent().expect("its folder"), MADE_UP),
+        std::slice::from_ref(&path),
+        "and in no other file there"
+    );
+    assert_eq!(holding(&testing::scratch("providers-store"), MADE_UP), Vec::<std::path::PathBuf>::new());
+    let screen = harness.screen();
+    assert!(!screen.contains("not-a-real"), "the key is on the screen:\n{screen}");
+    assert!(screen.contains("mimo-v2.6-pro") && screen.contains("its maker publishes 1048576"), "{screen}");
+    assert!(seen.lock().expect("the list").is_empty(), "adding a provider reached nothing");
+    let _ = std::fs::remove_dir_all(path.parent().expect("its folder"));
+}
+
+#[test]
+fn trying_kimi_asks_its_own_listing_with_the_key_in_the_header_kimi_reads() {
+    let path = file("kimi");
+    let (web, seen) =
+        canned(vec![("/coding/v1/models", r#"{"data":[{"id":"kimi-for-coding","context_length":1048576}]}"#)]);
+    let mut harness = opened(&path, web);
+    harness.click_text("Add a provider").render();
+    harness.click_text("Kimi Code").render();
+    for _ in 0..4 {
+        harness.press("tab");
+    }
+    harness.type_text(MADE_UP);
+    press_add(&mut harness);
+    harness.render();
+    let screen = harness.screen();
+    assert!(screen.contains("GET https://api.kimi.com/coding/v1/models"), "the page says where Try goes:\n{screen}");
+    harness.click_text("Try the connection").render();
+    harness.render();
+    assert!(harness.screen().contains("The key was accepted."), "{}", harness.screen());
+    let asked = seen.lock().expect("the list");
+    assert_eq!(asked.len(), 1, "one press, one request");
+    assert_eq!(asked[0].line(), "GET https://api.kimi.com/coding/v1/models");
+    let secret = asked[0].secret.as_ref().expect("the key is what is tried");
+    assert_eq!(secret.header, "x-api-key");
+    let _ = std::fs::remove_dir_all(path.parent().expect("its folder"));
+}
+
+#[test]
+fn a_ready_made_service_is_not_added_without_a_key_and_says_whose_key_is_missing() {
+    let path = file("kimi-no-key");
+    let (web, _) = canned(Vec::new());
+    let mut harness = opened(&path, web);
+    harness.click_text("Add a provider").render();
+    harness.click_text("Kimi Code").render();
+    press_add(&mut harness);
+    harness.render();
+    assert!(harness.screen().contains("Kimi Code is reached with a key."), "{}", harness.screen());
+    assert!(!path.exists(), "nothing was written");
 }

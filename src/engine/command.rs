@@ -59,6 +59,27 @@ impl Engine {
         self.command(args)
     }
 
+    /// Builds the image `image` from `containerfile` again from its first step, reusing no layer
+    /// an earlier build left behind.
+    ///
+    /// A layer is reused whenever the step that made it reads the same, and a step such as
+    /// `npm install -g <harness>` reads the same while what it installs moves on; so an image
+    /// the person asked to have built again would come back as it was. Neither engine looks for
+    /// the image it starts `FROM` on a registry because of this: measured on both, `--no-cache`
+    /// only stops the reuse.
+    #[must_use]
+    pub fn rebuild_image(&self, request: &ImageBuild<'_>) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("build");
+        args.push("--no-cache");
+        args.push("--tag");
+        args.push(request.image);
+        args.push("--file");
+        args.push(request.containerfile);
+        args.push(request.context);
+        self.command(args)
+    }
+
     /// Removes the image `image`, running containers and all.
     #[must_use]
     pub fn remove_image(&self, image: &str) -> EngineCommand {
@@ -66,6 +87,31 @@ impl Engine {
         args.push("image");
         args.push("rm");
         args.push("--force");
+        args.push(image);
+        self.command(args)
+    }
+
+    /// Removes the image `image` only when no container is made from it: the engine refuses
+    /// otherwise, and that refusal is the answer wanted. It is how an image a rebuild replaced
+    /// goes once nothing uses it any more.
+    #[must_use]
+    pub fn remove_unused_image(&self, image: &str) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("image");
+        args.push("rm");
+        args.push(image);
+        self.command(args)
+    }
+
+    /// Asks for the value of one label of an image. The image being absent is a failure; a
+    /// label it does not carry comes back empty or as `<no value>`, depending on the engine.
+    #[must_use]
+    pub fn image_label(&self, image: &str, label: &str) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("image");
+        args.push("inspect");
+        args.push("--format");
+        args.push(format!("{{{{index .Config.Labels \"{label}\"}}}}"));
         args.push(image);
         self.command(args)
     }
@@ -452,6 +498,21 @@ impl Engine {
         args.push("inspect");
         args.push("--format");
         args.push("{{.State.Status}}");
+        args.push(name);
+        self.command(args)
+    }
+
+    /// Asks which image a container was made from, by the image's identity rather than its
+    /// name: the same thing [`image_exists`](Self::image_exists) answers about a name, spelled
+    /// the same way on each engine (measured: podman gives the bare digest to both questions,
+    /// Docker `sha256:` and the digest to both).
+    #[must_use]
+    pub fn container_image(&self, name: &str) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("container");
+        args.push("inspect");
+        args.push("--format");
+        args.push("{{.Image}}");
         args.push(name);
         self.command(args)
     }
@@ -901,6 +962,42 @@ mod tests {
             ["build", "--tag", "qcode/profile/claude-sub", "--file", "/build/Containerfile", "/build"]
         );
         assert_eq!(args(&docker().build_image(&request)), args(&command));
+    }
+
+    #[test]
+    fn builds_an_image_again_without_reusing_a_layer() {
+        let request = ImageBuild {
+            image: "qcode/profile/anti",
+            containerfile: Path::new("/build/Containerfile"),
+            context: Path::new("/build"),
+        };
+        let spelled =
+            ["build", "--no-cache", "--tag", "qcode/profile/anti", "--file", "/build/Containerfile", "/build"];
+        assert_eq!(args(&podman().rebuild_image(&request)), spelled);
+        assert_eq!(args(&docker().rebuild_image(&request)), spelled);
+    }
+
+    #[test]
+    fn removes_an_image_only_when_nothing_is_made_from_it() {
+        assert_eq!(args(&podman().remove_unused_image("0123abcd")), ["image", "rm", "0123abcd"]);
+    }
+
+    #[test]
+    fn asks_an_image_for_a_label_and_a_container_for_its_image() {
+        assert_eq!(
+            args(&podman().image_label("qcode/profile/anti", "qcode.profile.revision")),
+            [
+                "image",
+                "inspect",
+                "--format",
+                "{{index .Config.Labels \"qcode.profile.revision\"}}",
+                "qcode/profile/anti"
+            ]
+        );
+        assert_eq!(
+            args(&docker().container_image("qcode-w-anti")),
+            ["container", "inspect", "--format", "{{.Image}}", "qcode-w-anti"]
+        );
     }
 
     #[test]

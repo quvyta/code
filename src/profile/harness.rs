@@ -64,6 +64,17 @@ pub struct ConfigFile {
     pub contents: &'static str,
 }
 
+/// A file the image carries outside the home directory, written as root and readable by everyone:
+/// the harness reads it on every machine the image runs on, and no home volume a workspace keeps
+/// can hold an older copy of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SystemFile {
+    /// Where the file goes, as an absolute path in the container.
+    pub path: &'static str,
+    /// What the file holds, written as the harness expects to read it.
+    pub contents: &'static str,
+}
+
 /// Where a harness draws.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Surface {
@@ -210,6 +221,10 @@ pub struct Harness {
     pub surface: Surface,
     /// Where the harness reads the MCP servers it starts; `None` for one that reads none.
     pub mcp: Option<McpSettings>,
+    /// What keeps the harness's own sign-in to an API key, in the image of a profile whose
+    /// account is [`AccountKind::ApiKey`]; `None` for a harness that offers nothing else there,
+    /// or cannot be told to.
+    pub key_only: Option<SystemFile>,
 }
 
 /// Where npm keeps what it downloads while an install step of an image runs, and where nothing is
@@ -432,6 +447,7 @@ static CLAUDE_CODE: Harness = Harness {
     resume: Some(Resume::Option("--resume")),
     surface: Surface::Terminal,
     mcp: Some(McpSettings { path: ".claude.json", shape: McpShape::Claude }),
+    key_only: None,
 };
 
 /// Claude Code's answers to its first-start questions, for the workspace mounted at
@@ -486,6 +502,7 @@ static OPENCODE: Harness = Harness {
     resume: Some(Resume::Option("--session")),
     surface: Surface::Terminal,
     mcp: Some(McpSettings { path: ".config/opencode/opencode.json", shape: McpShape::OpenCode }),
+    key_only: None,
 };
 
 /// Gemini CLI. Install and start command from the workspace's readme, the argument from
@@ -539,7 +556,30 @@ static OPENCODE: Harness = Harness {
 /// the paid Pro and Ultra plans) and removed "Login with Google" for them on 2026-06-18
 /// (`developers.google.com/gemini-code-assist/docs/deprecations/code-assist-individuals`). Code
 /// Assist Standard and Enterprise still sign in that way, so a profile made with a sign-in keeps
-/// loading; a new one is offered an API key.
+/// loading; a new one is offered an API key. On 2026-09-23 a personal account signing in from
+/// 0.60.0 was answered "This client is no longer supported for Gemini Code Assist for
+/// individuals. To continue using Gemini, please migrate to the Antigravity suite of products".
+///
+/// The harness's own sign-in dialog still offers Google first, so an API-key profile's image
+/// keeps it to the key, read from 0.60.0 and then watched in a container. `AuthDialog.tsx` in
+/// `interactiveCli-*.js` lists "Sign in with Google", "Use Gemini API Key" and "Vertex AI", then
+/// `if (settings.merged.security.auth.enforcedType) { items = items.filter((item) => item.value
+/// === settings.merged.security.auth.enforcedType) }`, with `AuthType.USE_GEMINI =
+/// "gemini-api-key"`. The file is the system settings, `getSystemSettingsPath()` answering
+/// `/etc/gemini-cli/settings.json` on Linux, which is merged above the user's: it is in the image
+/// rather than in `~/.gemini/settings.json` because that one lives in each workspace's home
+/// volume, where an image built later never reaches, and because the `base` template writes
+/// none. `selectedType` is left out on purpose: set with no key stored, the start answers
+/// "Authenticated with gemini-api-key" and asks nothing, while without it the dialog opens. Run
+/// in a pty with the file in place, a fresh home showed "How would you like to authenticate for
+/// this project? ● 1. Use Gemini API Key" and nothing else, then "Enter Gemini API Key … You can
+/// get an API key from https://aistudio.google.com/app/apikey". The key typed there went through
+/// `saveApiKey` in `core/apiKeyCredentialStorage.js` (service `gemini-cli-api-key`) into the file
+/// keychain, which is `.gemini/gemini-credentials.json`: decrypted with the salt below it held
+/// the one entry `gemini-cli-api-key` with the key typed, and the next start answered
+/// "Authenticated with gemini-api-key" without asking. So the first file of [`Harness::identity`]
+/// is where an API key lands too, and `store_login` finds it there. The dialog also wrote
+/// `security.auth.selectedType` into the user's settings, beside the template's.
 ///
 /// MCP servers, from `geminicli.com/docs/tools/mcp-server` (`mcpServers` in `settings.json`,
 /// `trust` skips the confirmation of each call) and checked against 0.60.0: `gemini mcp list`
@@ -565,6 +605,10 @@ static GEMINI_CLI: Harness = Harness {
     resume: Some(Resume::Option("--resume")),
     surface: Surface::Terminal,
     mcp: Some(McpSettings { path: ".gemini/settings.json", shape: McpShape::Gemini }),
+    key_only: Some(SystemFile {
+        path: "/etc/gemini-cli/settings.json",
+        contents: "{\n  \"security\": {\n    \"auth\": {\n      \"enforcedType\": \"gemini-api-key\"\n    }\n  }\n}\n",
+    }),
 };
 
 /// Codex CLI. Install and start command from the workspace's readme, the argument from the source
@@ -621,6 +665,7 @@ static CODEX: Harness = Harness {
     resume: Some(Resume::Subcommand("resume")),
     surface: Surface::Terminal,
     mcp: Some(McpSettings { path: ".codex/config.toml", shape: McpShape::Codex }),
+    key_only: None,
 };
 
 /// Antigravity IDE, the one harness here that opens a window instead of drawing in a terminal.
@@ -691,6 +736,7 @@ static ANTIGRAVITY_IDE: Harness = Harness {
     resume: None,
     surface: Surface::Desktop(&ANTIGRAVITY),
     mcp: Some(McpSettings { path: ".gemini/config/mcp_config.json", shape: McpShape::Antigravity }),
+    key_only: None,
 };
 
 /// The window Antigravity IDE opens, as the trial measured it.
@@ -931,6 +977,18 @@ mod tests {
         assert!(HarnessKind::GeminiCli.withdrawn(AccountKind::Subscription));
         for harness in [HarnessKind::ClaudeCode, HarnessKind::OpenCode, HarnessKind::Codex] {
             assert!(!harness.withdrawn(AccountKind::Subscription), "{harness:?}");
+        }
+    }
+
+    #[test]
+    fn gemini_cli_is_kept_to_a_key_by_its_system_settings_and_no_other_harness_is() {
+        let file = HarnessKind::GeminiCli.record().key_only.expect("Gemini CLI can be kept to a key");
+        assert_eq!(file.path, "/etc/gemini-cli/settings.json");
+        let settings: serde_json::Value = serde_json::from_str(file.contents).expect("the file is JSON");
+        assert_eq!(settings, serde_json::json!({ "security": { "auth": { "enforcedType": "gemini-api-key" } } }));
+        for harness in [HarnessKind::ClaudeCode, HarnessKind::OpenCode, HarnessKind::Codex, HarnessKind::AntigravityIde]
+        {
+            assert_eq!(harness.record().key_only, None, "{harness:?}");
         }
     }
 

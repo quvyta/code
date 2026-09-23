@@ -5,6 +5,24 @@ Every release of quvyta-code, newest first. The format follows
 [Semantic Versioning](https://semver.org/); while the version starts with 0, a minor release may
 change files qcode writes, and the notes say so when it does.
 
+## 0.1.15 - 2026-09-23
+
+### Added
+
+- **Rebuild a profile's image.** Every profile on the Profiles screen has **Rebuild image**. It asks once, then builds the image again from what qcode puts in it today, with the build shown as it runs. The workspaces' homes, the login and the conversations are kept; if the build fails or you stop it, the old image stays. Tabs that are open keep running on the old image until they are opened again. An image built by an earlier qcode says so. This is how an Antigravity profile made with 0.1.13 or earlier gets the sign-in window 0.1.14 added.
+- **Two ready-made providers: Xiaomi MiMo Token Plan and Kimi Code.** On the Providers page, pick one and paste only your key: the address, the region, the header the key goes in and the models are filled in. The key stays in `providers.toml` and is added on its way out, never inside a container. Claude Code and opencode were run against MiMo in a container with no network; Kimi's road was checked up to the service, which answered with the subscription's usage limit that day.
+
+### Changed
+
+- **Gemini CLI asks only for an API key.** Google closed Gemini CLI's sign-in with a personal Google account ("This client is no longer supported for Gemini Code Assist for individuals"). A Gemini CLI profile's sign-in now offers only the key, and a profile made earlier with a Google sign-in says so in the list and when its tab opens, with the ways on: an API key, or Antigravity IDE.
+- **Ctrl+Q asks once while an agent is at work.** When a tab of any open workspace has a harness running or starting, or a harness's window open, quitting (Ctrl+Q or **Quit** on the home screen) asks first, because quitting stops the containers and cuts off whatever the agents are doing. Their conversations are kept either way. **Stay** keeps everything; pressing Ctrl+Q again while the question is on screen quits. With no agent at work qcode quits at once, as before.
+- **Continue shows the right count in every language.** With 21 workspaces open, Russian lost the "+20"; with one, Japanese showed "+0".
+
+### Fixed
+
+- **The README says what 0.1.14 already did.** Its Desktop harnesses section still said Antigravity's sign-in did not finish; it does, inside the container. The update check's headers now list `Host` too.
+- A build's log is cleaned by the framework's own `printable` rather than a copy of it in qcode. Built against quvyta-framework 0.1.19.
+
 ## 0.1.14 - 2026-09-22
 
 ### Added

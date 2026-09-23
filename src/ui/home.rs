@@ -99,10 +99,16 @@ impl Home {
 
     /// What the "Continue" row says beside its label: the first workspace, and how many more
     /// there are after it.
+    ///
+    /// One workspace or several is a choice of layout, not of grammar, so it is made here rather
+    /// than by a language's plural forms: Russian files 21 under "one" and Japanese has no "one" at
+    /// all, and either would drop the count or show "+0".
     fn detail(&self) -> Option<String> {
         let first = self.open.first()?;
-        let n = self.open.len();
-        Some(t!("home.continue-detail", n = n, first = first.as_str(), more = n - 1))
+        Some(match self.open.len() {
+            1 => t!("home.continue-one", first = first.as_str()),
+            n => t!("home.continue-more", first = first.as_str(), more = n - 1),
+        })
     }
 }
 
@@ -240,6 +246,39 @@ mod tests {
         three.set_open(vec!["Moth".to_owned()]);
         assert_eq!(one.entries()[0], Entry::NewWorkspace, "nothing to go back to is a new workspace again");
         assert_eq!(three.selected, 3, "a new list of workspaces leaves the selection where it was");
+    }
+
+    /// The home screen of a session that left `ids` open, in `locale`.
+    fn continued(what: &str, ids: &[String], locale: &str) -> String {
+        let session = testing::scratch(what);
+        let _ = std::fs::remove_dir_all(&session);
+        std::fs::create_dir_all(&session).expect("a folder");
+        let file = session.join("session.toml");
+        let text: String = ids.iter().map(|id| format!("[[workspace]]\nid = \"{id}\"\n\n")).collect();
+        std::fs::write(&file, text).expect("a session file");
+        let store = testing::scratch("home-store");
+        let app = testing::app(testing::config(&store, &[]), &testing::settled(), None).with_session(Some(file));
+        let mut harness = testing::harness(app, SIZE.0, SIZE.1);
+        harness.set_locale(locale).render();
+        let screen = harness.screen();
+        let _ = std::fs::remove_dir_all(&session);
+        screen
+    }
+
+    #[test]
+    fn twenty_one_open_workspaces_keep_their_count_in_russian() {
+        // Russian files 21 under the same plural form as 1, which is where the count was lost.
+        let ids: Vec<String> = (0..21).map(|at| format!("ws{at}")).collect();
+        let screen = continued("home-twenty-one", &ids, "ru");
+        assert!(screen.contains("ws0 +20"), "{screen}");
+    }
+
+    #[test]
+    fn one_open_workspace_shows_no_count_in_japanese() {
+        // Japanese has no plural "one", so a count of one reached the several-workspaces text.
+        let screen = continued("home-one-ja", &["firefly".to_owned()], "ja");
+        assert!(screen.contains("firefly"), "{screen}");
+        assert!(!screen.contains("+0"), "{screen}");
     }
 
     #[test]

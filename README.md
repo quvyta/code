@@ -122,8 +122,8 @@ qcode collects no statistics and sends nothing about you, your machine or your w
 It asks one question of its own accord: whether a newer qcode is out. When qcode starts, at most
 once a day, it reads the list of published versions of `quvyta-code` from crates.io, the same file
 `cargo install` reads: one HTTPS `GET` of `https://index.crates.io/qu/vy/quvyta-code`. The request
-carries no cookie and no identifier; its headers are `User-Agent: quvyta-code/<the version you
-run>`, `Accept: */*` and `Accept-Encoding: gzip`. crates.io sees, as with any connection, the
+carries no cookie and no identifier; its headers are `Host: index.crates.io`, `User-Agent:
+quvyta-code/<the version you run>`, `Accept: */*` and `Accept-Encoding: gzip`. crates.io sees, as with any connection, the
 address it comes from. When a newer version is out, a notice says which one and how to update. When
 there is no network, or crates.io does not answer within ten seconds, nothing is said and the next
 day asks again. Nothing is asked while the first-run setup is open. The time of the last question is
@@ -145,6 +145,13 @@ provider on the **Providers** page, and then only to that provider's address:
   answer and for the list of models are carried from its container to the provider by qcode,
   which adds the key on the way out. Nothing else the container asks for is carried, and the key
   never enters the container.
+
+Two providers are ready-made: picking one fills in its address and you paste only your key. They
+are the only addresses qcode knows of its own, and nothing is sent to either until you have added
+it: **Xiaomi MiMo Token Plan** at `token-plan-ams.xiaomimimo.com`, `token-plan-sgp.xiaomimimo.com`
+or `token-plan-cn.xiaomimimo.com`, whichever your subscription names, and **Kimi Code** at
+`api.kimi.com` or `api.kimi.ai`. For them, **Try the connection** is a `GET` of the service's
+model list with your key, which spends nothing.
 
 A version of qcode before 0.1.13 said here that it had no network code at all. That stopped being
 true in 0.1.12, which added providers, and the sentence was not changed with it.
@@ -329,11 +336,13 @@ from:
   nothing extra for that. Docker's default seccomp profile refuses the calls the sandbox is built
   from, so qcode hands docker a profile of its own: docker's default plus `clone`, `setns` and
   `unshare`. It is in `assets/seccomp/desktop.json` with a comment saying what it costs.
-- **Signing in does not finish yet.** The application cannot be used without a Google account.
-  The sign-in page it asks for opens in your own browser and its address is shown on the tab, but
-  Google then answers on a port inside the container that qcode does not yet carry back from your
-  machine, so the sign-in never completes. Everything else — that the window opens, keeps its
-  settings, and closes cleanly — works.
+- **Signing in happens inside the container.** The application cannot be used without a Google
+  account. When it asks to sign in, the page opens in a small window inside the container, so
+  Google's answer comes back to the application there and the sign-in completes; you sign in once
+  per profile and it is remembered in that workspace. Your own browser is only the fallback when
+  that window cannot start, and a sign-in from there cannot reach the application. A profile made
+  with qcode 0.1.13 or earlier has no such window in its image: **Rebuild image** on the Profiles
+  screen gives it one.
 - **A profile with the network off makes no sense here.** The application does all its work on its
   maker's servers; the tab says so if you try.
 

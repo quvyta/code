@@ -572,3 +572,62 @@ fn choosing_the_window_writes_this_tabs_token_into_the_settings_before_the_windo
     let run = calls.iter().position(|call| call.starts_with("run ")).expect("the window is run");
     assert!(removed < run, "the settings are finished with before the window starts: {calls:?}");
 }
+
+/// QCode itself on the workspace screen `screen`, in a harness, so a key reaches the application's
+/// own quit rather than the screen's.
+fn qcode_on(screen: WorkspaceScreen) -> Harness<crate::QCode> {
+    use crate::testing::{app_with_absent_engine, config, harness, scratch};
+    let app = app_with_absent_engine(config(&scratch("quit-asks"), &[])).with_workspace(screen);
+    harness(app, SIZE.0, SIZE.1)
+}
+
+#[test]
+fn ctrl_q_asks_once_while_an_agents_window_is_open_and_staying_keeps_everything() {
+    let engine = Recording::new("quit-stay");
+    let mut screen = engine.screen();
+    open(&mut screen, window());
+    let key = key(&screen, 0);
+    apply(&mut screen, Msg::WindowOpened(key, 0, Ok(Opening::Up)));
+    let mut harness = qcode_on(screen);
+    harness.press("ctrl+q").render();
+    assert!(!harness.quit_requested(), "an agent is at work, so the key asks first");
+    let asked = harness.screen();
+    assert!(asked.contains("Quit while an agent is at work?"), "{asked}");
+    assert!(asked.contains("An agent tab is still running"), "{asked}");
+    harness.click_text("Stay").render();
+    assert!(!harness.quit_requested(), "staying stays");
+    assert!(!harness.screen().contains("Quit while an agent is at work?"), "{}", harness.screen());
+    // Staying is forgotten: the next Ctrl+Q asks again rather than leaving on the spot.
+    harness.press("ctrl+q").render();
+    assert!(!harness.quit_requested());
+    assert!(harness.screen().contains("Quit while an agent is at work?"), "{}", harness.screen());
+    harness.click_text("Quit anyway").render();
+    assert!(harness.quit_requested(), "the person said so");
+}
+
+#[test]
+fn a_second_ctrl_q_while_the_question_stands_is_the_answer() {
+    let engine = Recording::new("quit-twice");
+    let mut screen = engine.screen();
+    open(&mut screen, window());
+    let key = key(&screen, 0);
+    apply(&mut screen, Msg::WindowOpened(key, 0, Ok(Opening::Up)));
+    let mut harness = qcode_on(screen);
+    harness.press("ctrl+q").render();
+    assert!(!harness.quit_requested());
+    harness.press("ctrl+q").render();
+    assert!(harness.quit_requested(), "pressing it again means it");
+}
+
+#[test]
+fn ctrl_q_leaves_without_a_question_when_the_agents_window_has_closed() {
+    let engine = Recording::new("quit-closed");
+    let mut screen = engine.screen();
+    open(&mut screen, window());
+    let key = key(&screen, 0);
+    apply(&mut screen, Msg::WindowOpened(key, 0, Ok(Opening::Up)));
+    apply(&mut screen, Msg::WindowEnded(key, 0, Some(0)));
+    let mut harness = qcode_on(screen);
+    harness.press("ctrl+q").render();
+    assert!(harness.quit_requested(), "nothing is at work, so nothing is asked:\n{}", harness.screen());
+}

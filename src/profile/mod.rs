@@ -24,7 +24,9 @@ mod name;
 mod template;
 
 pub use definition::{ASSUMED_CONTEXT_TOKENS, Loaded, MountAccess, NetworkMode, Profile, ProviderChoice};
-pub use harness::{AccountKind, ConfigFile, Desktop, Harness, HarnessKind, McpSettings, McpShape, Resume, Surface};
+pub use harness::{
+    AccountKind, ConfigFile, Desktop, Harness, HarnessKind, McpSettings, McpShape, Resume, Surface, SystemFile,
+};
 pub use name::SafeName;
 pub use template::{
     Addition, CLAUDE_MARKETPLACES, CLAUDE_PLUGINS, Extra, GRAPHIFY_HOME, GRAPHIFY_PACKAGE, OH_MY_OPENAGENT, Template,

@@ -13,10 +13,15 @@ keys = "Teclas"
 session-gone = { one = "Um espaço de trabalho da última sessão não está mais aí", other = "{n} espaços de trabalho da última sessão não estão mais aí" }
 session-broken = "Só deu para ler uma parte da última sessão"
 session-unsaved = "Não foi possível lembrar os espaços de trabalho abertos"
+quit-title = "Sair enquanto um agente está trabalhando?"
+quit-working = { one = "Uma aba de agente ainda está em execução. Sair interrompe o contêiner dela, então o que ela estiver fazendo agora é cortado. A conversa dela é mantida e continua quando você abrir o espaço de trabalho novamente.", other = "{n} abas de agente ainda estão em execução. Sair interrompe os contêineres delas, então o que elas estiverem fazendo agora é cortado. As conversas delas são mantidas e continuam quando você abrir o espaço de trabalho novamente." }
+quit-anyway = "Sair mesmo assim"
+quit-stay = "Ficar"
 
 [home]
 continue = "Continuar"
-continue-detail = { one = "{first}", other = "{first} +{more}" }
+continue-one = "{first}"
+continue-more = "{first} +{more}"
 new-workspace = "Novo espaço de trabalho"
 workspaces = "Espaços de trabalho"
 profiles = "Perfis"
@@ -423,7 +428,7 @@ window.no-wayland = "Esta sessão não tem compositor Wayland, e o QCode não ab
 window.no-socket = "O socket do compositor não está mais em {socket}. Um compositor que reiniciou deixa para trás uma janela aberta; abri-la de novo é o caminho de volta."
 window.open = "Abrir a janela"
 window.signin-opened = "A janela pediu para entrar, então uma pequena janela de login se abriu ao lado dela. Entre por ali; o aplicativo recebe a resposta sozinho."
-window.signin-in-browser = "A janela pediu para entrar, mas a própria janela de login dela não conseguiu abrir, então a página foi aberta no seu navegador. Um login feito por lá não chega ao aplicativo. A imagem de um perfil criado com uma versão anterior do QCode não tem janela de login; criar o perfil de novo dá uma a ele."
+window.signin-in-browser = "A janela pediu login, mas a janela de login dela não conseguiu iniciar, então a página abriu no seu navegador. Um login feito lá não chega ao aplicativo. A imagem de um perfil feito com um QCode mais antigo não tem janela de login; Reconstruir imagem na página Perfis dá uma a ela."
 window.signin-open-yourself = "A janela pediu para abrir esta página, e ela não pôde ser mostrada aqui:"
 window.raise = "Trazer para a frente"
 window.close = "Fechar a janela"
@@ -723,6 +728,19 @@ gives-at-least = "este servidor dá pelo menos {tokens}"
 gives-unknown = "ainda não medido"
 cramped = "Esta janela está abaixo de {tokens} tokens, pequena demais para um agente de programação: ele manda primeiro as próprias instruções e os seus arquivos abertos, e este servidor joga fora o começo disso sem uma palavra e sem erro nenhum."
 cramped-remedy = "Você pode dar ao modelo uma janela própria e usar esse nome daí em diante. Escreva um arquivo com as duas linhas FROM {model} e PARAMETER num_ctx 32768 e então rode: ollama create {model}-32k -f esse-arquivo. Definir OLLAMA_CONTEXT_LENGTH também funciona, mas só depois que o serviço em execução for mesmo reiniciado com ela."
+region-europe = "Europa"
+region-singapore = "Singapura"
+region-china = "China"
+region-overseas = "Fora da China"
+speaks-anthropic = "Formato Anthropic: {address}"
+speaks-openai = "Formato OpenAI: {address}"
+key-header = "A chave vai no cabeçalho {header}, vinda só desta máquina."
+ready-made-models = "Modelos: {models}"
+key-needed-for = "{kind} é acessado com uma chave."
+claims-published = "o fabricante publica {claimed}"
+published-at = "{model}: o serviço não informa a janela de contexto dele, então o número mostrado é o que o fabricante publica em {source}."
+
+# ready-made providers
 
 [known]
 image-missing = "{engine} não tem a imagem de que isto precisa. O mais provável é que ela tenha sido construída com o outro motor, ou apagada; construí-la de novo a traz de volta."
@@ -790,3 +808,22 @@ remove-text = { one = "O contêiner sai; os volumes de pasta pessoal e de login 
 remove-do = "Remover"
 removing = "Removendo…"
 removed = "Os contêineres do QCode saíram do {engine}. As pastas pessoais e os logins continuam lá."
+
+[profiles.rebuild]
+button = "Reconstruir imagem"
+title = "Reconstruir a imagem de {name}?"
+message = "A imagem é construída do zero, a partir do que o QCode coloca na imagem deste perfil hoje, e a ferramenta é baixada de novo; leva alguns minutos. Os homes dos espaços de trabalho, o login e as conversas são mantidos. As abas deste perfil que estão abertas continuam rodando na imagem antiga até serem abertas novamente. Se a construção falhar ou for interrompida, a imagem antiga permanece."
+confirm = "Construir de novo"
+heading = "Reconstruindo a imagem de {name}"
+running = "Construindo. Tudo o que o motor diz está abaixo; interromper mantém a imagem que estava aí."
+stopping = "Interrompendo. A imagem que estava aí é mantida."
+done = "A imagem de {name} foi construída de novo. As abas deste perfil passam a usá-la na próxima vez que forem abertas."
+stopped = "A reconstrução foi interrompida. A imagem que estava aí antes é mantida."
+failed = "A reconstrução falhou. O que o motor disse está abaixo; a imagem que estava aí antes é mantida."
+earlier = "Esta imagem foi construída por um QCode mais antigo. Reconstruí-la dá a ela o que o QCode coloca na imagem deste perfil hoje."
+
+[profiles.gemini]
+closed-title = "O Google encerrou o login de {name}"
+closed = "O Google encerrou o login do Gemini CLI com conta Google em contas pessoais: agora o Gemini responde com \"This client is no longer supported for Gemini Code Assist for individuals\". Ele ainda funciona com Gemini Code Assist Standard e Enterprise. Com uma conta pessoal, os caminhos são um perfil do Antigravity IDE, que roda no QCode, ou um novo perfil do Gemini CLI com uma chave de API do Google AI Studio."
+login-why = "{harness} faz login com uma chave de API do Google AI Studio (aistudio.google.com/app/apikey). O QCode abre um contêiner a partir da imagem deste perfil e roda a ferramenta em um terminal abaixo, onde ela pede a chave e mais nada. Nada da sua máquina está nesse contêiner."
+login-what = "Escolha Use Gemini API Key, cole a chave e pressione Enter. Quando a ferramenta mostrar o prompt, pressione o botão abaixo dela, ou simplesmente saia da ferramenta."

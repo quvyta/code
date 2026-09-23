@@ -12,7 +12,8 @@ use crate::base::paths::{OPEN_HOME, USER};
 use crate::desktop::signin;
 use crate::profile::guidance;
 use crate::profile::{
-    Addition, CLAUDE_MARKETPLACES, Desktop, GRAPHIFY_HOME, GRAPHIFY_PACKAGE, HarnessKind, OH_MY_OPENAGENT, Profile,
+    AccountKind, Addition, CLAUDE_MARKETPLACES, Desktop, GRAPHIFY_HOME, GRAPHIFY_PACKAGE, HarnessKind, OH_MY_OPENAGENT,
+    Profile,
 };
 
 /// Where the build context puts the files a template writes, so the `COPY` never has to know
@@ -30,6 +31,35 @@ pub struct Recipe {
     pub containerfile: String,
     /// Files the build copies in, by their path inside the context directory.
     pub files: Vec<(PathBuf, String)>,
+}
+
+/// The label a profile's image carries the [`Recipe::revision`] it was built from in.
+pub const REVISION_LABEL: &str = "qcode.profile.revision";
+
+impl Recipe {
+    /// Which recipe this is: a digest of everything the build reads, the Containerfile and every
+    /// file beside it with its path. It answers "was the image built from this text?", the way
+    /// the base image's revision does, so an image an earlier QCode built can be told apart
+    /// without anybody remembering to raise a number.
+    #[must_use]
+    pub fn revision(&self) -> String {
+        let mut spelled = self.containerfile.clone();
+        for (path, contents) in &self.files {
+            spelled.push('\0');
+            spelled.push_str(&path.to_string_lossy());
+            spelled.push('\0');
+            spelled.push_str(contents);
+        }
+        format!("{:016x}", crate::base::digest(&spelled))
+    }
+
+    /// The Containerfile as the engine is given it: the recipe's own, and last the label that
+    /// says which recipe it was. Last, so that no step before it reads differently and every
+    /// layer an unchanged recipe made before is still reused.
+    #[must_use]
+    pub fn labelled(&self) -> String {
+        format!("{}LABEL {REVISION_LABEL}=\"{}\"\n", self.containerfile, self.revision())
+    }
 }
 
 /// The recipe that builds `profile`'s image.
@@ -68,6 +98,17 @@ pub fn image(profile: &Profile) -> Recipe {
     for (key, value) in harness.environment {
         lines.push(format!("ENV {key}=\"{value}\""));
     }
+    let mut files = Vec::new();
+    // Copied as root whoever the image's user is, and left readable by the person the container
+    // runs as. Only a profile that signs in with a key is kept to one: a profile made with a
+    // sign-in that still works for somebody must go on offering it.
+    if profile.account == AccountKind::ApiKey
+        && let Some(file) = harness.key_only
+    {
+        let staged = PathBuf::from("system").join(file.path.trim_start_matches('/'));
+        lines.push(format!("COPY {} {}", staged.display(), file.path));
+        files.push((staged, file.contents.to_owned()));
+    }
     if additions.contains(&Addition::Graphify) {
         // A window's image is root at this point already, and goes back at the end.
         if desktop.is_none() {
@@ -87,7 +128,6 @@ pub fn image(profile: &Profile) -> Recipe {
         lines.push("ENV OMO_SEND_ANONYMOUS_TELEMETRY=\"0\"".to_owned());
         lines.push("ENV OMO_DISABLE_POSTHOG=\"1\"".to_owned());
     }
-    let mut files = Vec::new();
     let written = profile.files();
     if !written.is_empty() {
         lines.push(format!("COPY template {STAGING}"));
@@ -285,6 +325,62 @@ mod tests {
             without: Vec::new(),
             os: crate::base::Os::Debian,
         }
+    }
+
+    #[test]
+    fn a_gemini_cli_profile_with_a_key_is_kept_to_the_key_whatever_its_template() {
+        for template in Template::ALL {
+            let keyed = Profile { account: AccountKind::ApiKey, ..profile(HarnessKind::GeminiCli, template) };
+            let recipe = image(&keyed);
+            assert!(
+                recipe
+                    .containerfile
+                    .contains("\nCOPY system/etc/gemini-cli/settings.json /etc/gemini-cli/settings.json\n"),
+                "{template:?}: {}",
+                recipe.containerfile
+            );
+            let (_, contents) = recipe
+                .files
+                .iter()
+                .find(|(path, _)| path == &PathBuf::from("system/etc/gemini-cli/settings.json"))
+                .expect("the file is in the context");
+            let settings: serde_json::Value = serde_json::from_str(contents).expect("the file is JSON");
+            assert_eq!(settings["security"]["auth"]["enforcedType"], "gemini-api-key", "{contents}");
+            assert!(
+                settings["security"]["auth"].get("selectedType").is_none(),
+                "the dialog must still open: {contents}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_profile_made_with_a_sign_in_or_of_another_harness_is_not_kept_to_a_key() {
+        let signed_in = image(&profile(HarnessKind::GeminiCli, Template::Recommended));
+        assert!(!signed_in.containerfile.contains("/etc/gemini-cli"), "{}", signed_in.containerfile);
+        for harness in [HarnessKind::ClaudeCode, HarnessKind::Codex, HarnessKind::OpenCode] {
+            let keyed = Profile { account: AccountKind::ApiKey, ..profile(harness, Template::Recommended) };
+            assert!(!image(&keyed).containerfile.contains("COPY system/"), "{harness:?}");
+        }
+    }
+
+    #[test]
+    fn a_recipes_revision_changes_with_its_file_or_any_file_beside_it_and_ends_the_labelled_file() {
+        let high = image(&profile(HarnessKind::ClaudeCode, Template::High));
+        assert_eq!(high.revision(), image(&profile(HarnessKind::ClaudeCode, Template::High)).revision());
+        assert_ne!(high.revision(), image(&profile(HarnessKind::ClaudeCode, Template::Base)).revision());
+        let mut step = high.clone();
+        step.containerfile.push_str("RUN true\n");
+        assert_ne!(step.revision(), high.revision(), "a changed step is another recipe");
+        let mut file = high.clone();
+        let (_, contents) = file.files.first_mut().expect("QCode high copies files in");
+        contents.push(' ');
+        assert_ne!(file.revision(), high.revision(), "a changed file beside it is another recipe");
+        let labelled = high.labelled();
+        assert!(labelled.starts_with(&high.containerfile), "every step before the label reads as it did");
+        assert_eq!(
+            labelled.lines().last(),
+            Some(format!("LABEL qcode.profile.revision=\"{}\"", high.revision()).as_str())
+        );
     }
 
     #[test]

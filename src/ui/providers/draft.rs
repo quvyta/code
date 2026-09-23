@@ -25,7 +25,7 @@ pub enum Problem {
     /// together when a person typed theirs after the one that was offered.
     BaseUnusable(String),
     /// This kind is reached with a key and none was pasted.
-    NoKey,
+    NoKey(ProviderKind),
 }
 
 impl Problem {
@@ -35,7 +35,7 @@ impl Problem {
         match self {
             Self::Tag(_) | Self::Taken(_) => TAG_FIELD,
             Self::NoBase | Self::BaseNotAnAddress(_) | Self::BaseUnusable(_) => BASE_FIELD,
-            Self::NoKey => KEY_FIELD,
+            Self::NoKey(_) => KEY_FIELD,
         }
     }
 }
@@ -76,13 +76,41 @@ impl Draft {
     }
 
     /// Chooses a kind, and moves the address along with it when the person has not changed the
-    /// one that was offered. A person who typed their own address keeps it.
+    /// one that was offered. A person who typed their own address keeps it. A ready-made kind
+    /// brings its own tag too, on the same terms: only into a field the person has not written.
     pub fn pick_kind(&mut self, kind: ProviderKind) {
-        if self.base == self.kind.suggested_base() {
+        if self.offered_base() {
             self.base = kind.suggested_base().to_owned();
+        }
+        let tag = self.tag.trim();
+        if tag.is_empty() || self.kind.suggested_tag() == Some(tag) {
+            self.tag = kind.suggested_tag().unwrap_or_default().to_owned();
         }
         self.kind = kind;
         self.problem = None;
+    }
+
+    /// Chooses where a ready-made provider answers, the `index`th of its kind's regions. The
+    /// address is the region's whatever was in the field: picking a region is saying which
+    /// address, and nothing else does that.
+    pub fn pick_region(&mut self, index: usize) {
+        if let Some(region) = self.kind.regions().get(index) {
+            self.base = region.base.to_owned();
+            self.problem = None;
+        }
+    }
+
+    /// Which of the kind's regions the address is, or `None` when the person wrote one of their
+    /// own.
+    #[must_use]
+    pub fn region(&self) -> Option<usize> {
+        let base = crate::provider::trim_base(&self.base);
+        self.kind.regions().iter().position(|region| region.base == base)
+    }
+
+    /// Whether the address is one QCode offered rather than one the person wrote.
+    fn offered_base(&self) -> bool {
+        self.base == self.kind.suggested_base() || self.region().is_some()
     }
 
     /// The provider this form describes, or the first reason it is not one.
@@ -109,7 +137,7 @@ impl Draft {
         }
         let key = Key::new(&self.key);
         if self.kind.needs_key() && key.is_none() {
-            return Err(Problem::NoKey);
+            return Err(Problem::NoKey(self.kind));
         }
         let mut entry = ProviderEntry::new(tag, self.kind, base);
         // Judged on an address a request really goes to, so what is refused here is exactly what
@@ -192,8 +220,8 @@ mod tests {
     #[test]
     fn a_kind_that_is_reached_with_a_key_is_not_added_without_one() {
         let without = filled("yol", ProviderKind::OpenRouter, "https://openrouter.ai", "");
-        assert_eq!(without.build(|_| false), Err(Problem::NoKey));
-        assert_eq!(Problem::NoKey.field(), KEY_FIELD);
+        assert_eq!(without.build(|_| false), Err(Problem::NoKey(ProviderKind::OpenRouter)));
+        assert_eq!(Problem::NoKey(ProviderKind::OpenRouter).field(), KEY_FIELD);
         let with = filled("yol", ProviderKind::OpenRouter, "https://openrouter.ai", "not-a-real-key-0000-wxyz");
         let entry = with.build(|_| false).expect("the key is there");
         assert_eq!(entry.key.expect("a key").last_four().as_deref(), Some("wxyz"));
