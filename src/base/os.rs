@@ -37,7 +37,9 @@ pub enum Refusal {
     /// The harness installs, and the terminal library it opens every shell command through is a
     /// glibc build that takes the whole program down on musl. Gemini CLI on Alpine: its
     /// `@lydell/node-pty-linux-x64` has no musl build, and loading it into Alpine's Node ended the
-    /// process with a segmentation fault (measured 2026-09-22 with 0.60.0).
+    /// process with a segmentation fault (measured 2026-09-22 with 0.60.0). Qwen Code, Gemini CLI's
+    /// fork, carries the same library: on Alpine it started, and the first shell command typed into
+    /// it ended the program (measured 2026-09-23 with 0.24.4; loading the library alone faulted).
     TerminalLibrary,
     /// The application is a glibc program and the system has no glibc loader, so it does not
     /// start at all. Antigravity IDE on Alpine: its program asks for `/lib64/ld-linux-x86-64.so.2`,
@@ -170,11 +172,14 @@ impl Os {
     /// Each answer was measured on the system's own base image, by installing the harness the
     /// way its recipe does and running it; the variants of [`Refusal`] say what was seen. Where a
     /// harness is offered here, it was seen to install and start there: on Alpine, Claude Code
-    /// and opencode install their own musl builds and Codex's program is a static musl build.
+    /// and opencode install their own musl builds and Codex's program is a static musl build; Kimi
+    /// Code CLI is JavaScript and runs its shell commands without a terminal library, and a command
+    /// typed into it ran on all four systems (measured 2026-09-23 with 2.1.0), as one typed into
+    /// Qwen Code did on Debian, Arch and Ubuntu.
     #[must_use]
     pub fn refuses(self, harness: HarnessKind) -> Option<Refusal> {
         match (self, harness) {
-            (Self::Alpine, HarnessKind::GeminiCli) => Some(Refusal::TerminalLibrary),
+            (Self::Alpine, HarnessKind::GeminiCli | HarnessKind::QwenCode) => Some(Refusal::TerminalLibrary),
             (Self::Alpine, HarnessKind::AntigravityIde) => Some(Refusal::GlibcProgram),
             (Self::Arch | Self::Ubuntu, HarnessKind::AntigravityIde) => Some(Refusal::WindowOnDebianOnly),
             _ => None,
@@ -352,11 +357,13 @@ mod tests {
     }
 
     #[test]
-    fn alpine_refuses_the_two_harnesses_that_do_not_run_on_musl_and_nothing_else() {
+    fn alpine_refuses_the_three_harnesses_that_do_not_run_on_musl_and_nothing_else() {
         let refused: Vec<HarnessKind> =
             HarnessKind::ALL.into_iter().filter(|harness| Os::Alpine.refuses(*harness).is_some()).collect();
-        assert_eq!(refused, [HarnessKind::GeminiCli, HarnessKind::AntigravityIde]);
+        assert_eq!(refused, [HarnessKind::GeminiCli, HarnessKind::QwenCode, HarnessKind::AntigravityIde]);
         assert_eq!(Os::Alpine.refuses(HarnessKind::GeminiCli), Some(Refusal::TerminalLibrary));
+        assert_eq!(Os::Alpine.refuses(HarnessKind::QwenCode), Some(Refusal::TerminalLibrary));
+        assert_eq!(Os::Alpine.refuses(HarnessKind::KimiCode), None);
         assert!(!Os::Alpine.recommended());
         for os in [Os::Debian, Os::Arch, Os::Ubuntu] {
             assert!(os.recommended(), "{os:?}");

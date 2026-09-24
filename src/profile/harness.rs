@@ -30,6 +30,10 @@ pub enum HarnessKind {
     GeminiCli,
     /// Codex CLI.
     Codex,
+    /// Kimi Code CLI.
+    KimiCode,
+    /// Qwen Code.
+    QwenCode,
     /// Antigravity IDE, which opens a window instead of drawing in a terminal.
     AntigravityIde,
 }
@@ -170,6 +174,10 @@ pub enum McpShape {
     Gemini,
     /// TOML, one `[mcp_servers.<name>]` table per server with `command` and `args`.
     Codex,
+    /// JSON, servers under `mcpServers` with `command` and `args` alone: a server with a `command`
+    /// is read as one started on standard input and output, so no `type` is needed, and there is
+    /// no `trust` to give.
+    Kimi,
     /// JSON, servers under `mcpServers` with `command`, `args` and `env`. Its schema names every
     /// field a server may have and takes no other, so neither Claude Code's `type` nor Gemini
     /// CLI's `trust` belongs in this file.
@@ -277,13 +285,22 @@ pub enum Resume {
 impl HarnessKind {
     /// Every harness, in the order the profile wizard offers them. The ones that draw in a
     /// terminal come first, because that is what nearly every profile is.
-    pub const ALL: [Self; 5] = [Self::ClaudeCode, Self::OpenCode, Self::GeminiCli, Self::Codex, Self::AntigravityIde];
+    pub const ALL: [Self; 7] = [
+        Self::ClaudeCode,
+        Self::OpenCode,
+        Self::GeminiCli,
+        Self::Codex,
+        Self::KimiCode,
+        Self::QwenCode,
+        Self::AntigravityIde,
+    ];
 
     /// The harnesses that draw in the tab's own terminal, in the same order.
     ///
     /// Most of what QCode knows about a harness — the install from a registry, the unattended
     /// arguments, the conversation script, the login file it carries — is only true of these.
-    pub const TERMINAL: [Self; 4] = [Self::ClaudeCode, Self::OpenCode, Self::GeminiCli, Self::Codex];
+    pub const TERMINAL: [Self; 6] =
+        [Self::ClaudeCode, Self::OpenCode, Self::GeminiCli, Self::Codex, Self::KimiCode, Self::QwenCode];
 
     /// What QCode knows about this harness.
     #[must_use]
@@ -293,6 +310,8 @@ impl HarnessKind {
             Self::OpenCode => &OPENCODE,
             Self::GeminiCli => &GEMINI_CLI,
             Self::Codex => &CODEX,
+            Self::KimiCode => &KIMI_CODE,
+            Self::QwenCode => &QWEN_CODE,
             Self::AntigravityIde => &ANTIGRAVITY_IDE,
         }
     }
@@ -647,10 +666,24 @@ static GEMINI_CLI: Harness = Harness {
 /// `enabled: true, transport: stdio`, and `codex exec` starts the server even before it finds
 /// there is no login. Codex hands a server only a short list of variables, so the server finds
 /// its tab's token in the harness's own process instead (see the server's `token`).
+///
+/// A provider of one's own is a `[model_providers.<id>]` table of its configuration, given for
+/// one run with `-c` (see `ProviderChoice::arguments`). Checked against 0.156.1: the program
+/// answers `wire_api = "chat"` with "`wire_api = "chat"` is no longer supported", so it speaks
+/// only OpenAI's Responses shape (`/v1/responses`) to a provider. Through the relay, from a
+/// container with no network, it answered on Xiaomi MiMo (`mimo-v2.6-flash`), Kimi Code
+/// (`kimi-for-coding`) and OpenRouter, each of which serves that path; MiMo refused the first
+/// request for naming Codex's web search, a tool only OpenAI's own servers run, so it is turned
+/// off for such a profile.
+///
+/// First start, checked against 0.156.1 on a terminal at `/work` with a provider: before its
+/// prompt it asks "Trust this folder?", and the answer lands in the same `config.toml` as
+/// `[projects."/work"] trust_level = "trusted"`. So the template's settings carry that answer;
+/// with them the prompt comes up with no key pressed.
 static CODEX: Harness = Harness {
     id: "codex",
     display_name: "Codex",
-    accounts: &[AccountKind::Subscription, AccountKind::ApiKey],
+    accounts: &[AccountKind::Subscription, AccountKind::ApiKey, AccountKind::Provider],
     withdrawn: &[],
     install: &["npm install -g @openai/codex"],
     command: "codex",
@@ -659,12 +692,145 @@ static CODEX: Harness = Harness {
     identity: &[".codex/auth.json"],
     settings: Some(ConfigFile {
         path: ".codex/config.toml",
-        contents: "approval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\n",
+        contents: "approval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\n\n[projects.\"/work\"]\ntrust_level = \"trusted\"\n",
     }),
     first_start: None,
     resume: Some(Resume::Subcommand("resume")),
     surface: Surface::Terminal,
     mcp: Some(McpSettings { path: ".codex/config.toml", shape: McpShape::Codex }),
+    key_only: None,
+};
+
+/// Kimi Code CLI, Moonshot's coding agent. Install, start command, data folder and sign-in from
+/// its documentation (`moonshotai.github.io/kimi-code`, whose `llms-full.txt` holds every page):
+/// "npm install -g @moonshot-ai/kimi-code", `kimi` to start, everything under `~/.kimi-code/`
+/// (`KIMI_CODE_HOME` moves it), `/login` inside the interface or `kimi login` for Kimi Code's
+/// device-code sign-in, and "Managed provider credentials are stored as `credentials/<name>.json`".
+/// The TypeScript CLI replaced an older Python one of the same name; this is the npm package.
+///
+/// Checked against 2.1.0 in the image, whose program is one bundle (`dist/main.mjs`). `kimi
+/// --help` lists `--auto`, "Start in Never Ask mode: never interrupts you; everything runs and is
+/// decided automatically", beside `-y, --yolo`, which still asks for "risky actions", so `--auto`
+/// is the unattended argument; it refuses to be combined with `-p`, which is why a one-shot run
+/// leaves it out.
+///
+/// The login: the bundle's `resolveKimiTokenStorageName` turns the default slot `oauth/kimi-code`
+/// into `kimi-code`, and its `FileTokenStorage` writes `<name>.json` under `credentials/`, so a
+/// sign-in lands in `.kimi-code/credentials/kimi-code.json`. That file is not the whole login:
+/// `applyManagedKimiCodeConfig` writes the provider `managed:kimi-code`, which names that slot,
+/// its models and the default model into `.kimi-code/config.toml`, and without that entry the
+/// token is never looked for (a fresh home answers "LLM not set, send /login to login"). So the
+/// config file is carried beside the token, and no template writes it. The default slot is the
+/// mainland (`auth.kimi.com`) one, which is what `/login` picks unless the person chooses the
+/// global region; a global sign-in goes into a slot named after a hash of its hosts
+/// (`kimi-code-env-<hash>`), which this record does not carry, and QCode then finds no login
+/// rather than half of one. The key sign-in the same dialog offers (a Kimi Platform key) is
+/// written into `config.toml` alone and is not offered here: a Kimi Code key is used through the
+/// Providers page instead, where it never enters the container.
+///
+/// A provider is handed over in the `KIMI_MODEL_*` variables, which the documentation's
+/// "Define a model from environment variables" describes and the bundle reads at start: with
+/// `KIMI_MODEL_NAME` set it makes a provider of `KIMI_MODEL_PROVIDER_TYPE` at
+/// `KIMI_MODEL_BASE_URL` with `KIMI_MODEL_API_KEY`, in memory, and nothing is written. Pointed at
+/// an ollama server that way it sent its request there and printed the server's own answer.
+///
+/// First start, checked against 2.1.0 on a terminal at `/work`: a fresh home asks "Trust this
+/// folder?" with "Trust this folder" highlighted and "Don't trust" leaving. The answer is a file
+/// of its own, `.kimi-code/workspace-trust/<key>` holding `{"root":"/work","trustedAt":…}`, where
+/// the key is the bundle's `encodeWorkDirKey`: `wd_`, the folder's last name, and the first twelve
+/// hexadecimal digits of the SHA-256 of its path. With that file in place and no key pressed the
+/// prompt comes up at once.
+///
+/// Resuming, from `kimi --help` (`-S, --session [id]`) and checked against 2.1.0: `kimi --auto
+/// --session <id>` with an id no session has answers `Session "<id>" not found`, and with the id
+/// [`history`](super::history) lists it opens that session.
+///
+/// MCP servers, from the documentation's MCP page (`~/.kimi-code/mcp.json`, `mcpServers`, "Entries
+/// with a `command` field are stdio servers") and checked against 2.1.0: with the entry the bridge
+/// writes, `/mcp` in the interface lists `qcode connected stdio 2 tools`.
+///
+/// Instructions: the documentation's agents page names the workspace's `AGENTS.md` and the
+/// home's `~/.agents/skills/` for skills shared between tools, which is where graphify's `agents`
+/// installer puts its section and its skill. graphify's own `kimi` platform (0.9.66) was tried and
+/// does not fit: there is no `graphify kimi install` for the workspace, and `graphify install
+/// --platform kimi` writes the skill to `~/.kimi/skills`, the folder of the older Python CLI.
+/// Kimi Code CLI does not read it there; instead the folder's mere existence makes it open on a
+/// "Migrate from kimi-cli" dialog in place of its prompt. `kimi migrate --run` would move the skill
+/// to `~/.kimi-code/skills` and silence the dialog, but the workspace section would still need the
+/// `agents` installer, which leaves a second copy of the same skill in `~/.agents/skills`.
+static KIMI_CODE: Harness = Harness {
+    id: "kimi-code",
+    display_name: "Kimi Code CLI",
+    accounts: &[AccountKind::Subscription, AccountKind::Provider],
+    withdrawn: &[],
+    install: &["npm install -g @moonshot-ai/kimi-code"],
+    command: "kimi",
+    auto_run: &["--auto"],
+    environment: &[],
+    identity: &[".kimi-code/credentials/kimi-code.json", ".kimi-code/config.toml"],
+    settings: None,
+    first_start: Some(ConfigFile {
+        path: ".kimi-code/workspace-trust/wd_work_0c9a453fad61",
+        contents: "{\"root\":\"/work\",\"trustedAt\":0}\n",
+    }),
+    resume: Some(Resume::Option("--session")),
+    surface: Surface::Terminal,
+    mcp: Some(McpSettings { path: ".kimi-code/mcp.json", shape: McpShape::Kimi }),
+    key_only: None,
+};
+
+/// Qwen Code, Alibaba's fork of Gemini CLI. Install and start command from its readme
+/// ("npm install -g @qwen-code/qwen-code@latest", `qwen`), the argument from `qwen --help`
+/// (`--approval-mode` with `yolo`, "Automatically approve all tools"), and the rest from its
+/// authentication guide (`qwenlm.github.io/qwen-code-docs/en/users/configuration/auth/`).
+///
+/// There is no sign-in to carry. The guide says "The Qwen OAuth free tier was discontinued on
+/// 2026-04-15", and the 0.24.4 help lists `qwen auth` as "(removed)". What remains is a key typed
+/// into `/auth`, which the harness stores in `~/.qwen/settings.json` beside everything else, the
+/// very file the template writes; that is not a login QCode could carry without carrying the
+/// settings, so a key goes through the Providers page instead, and the key never enters the
+/// container. A provider is handed over in `OPENAI_BASE_URL`, `OPENAI_API_KEY` and `OPENAI_MODEL`,
+/// which the guide lists: with them set, a fresh home starts on its prompt saying "API Key |
+/// <model>" and asks for nothing.
+///
+/// Checked against 0.24.4 in the image. The folder trust of its parent is still there
+/// (`packages/cli/src/config/config.ts`: "Approval mode overridden to "default" because the current
+/// folder is not trusted"), but `isFolderTrustEnabled` reads `settings.security?.folderTrust?.enabled
+/// ?? false`, so it is off unless turned on; the template writes it off all the same, so a later
+/// default cannot quietly undo the argument. The template also turns off the usage statistics,
+/// `privacy.usageStatisticsEnabled`, which the settings schema of the same build defaults to
+/// `true` and which the bundle sends to Alibaba Cloud's `gb4w8c3ygj-default-sea.rum.aliyuncs.com`.
+///
+/// Resuming, from `qwen --help` (`-r, --resume`, "Resume a specific session by its ID") and checked
+/// against 0.24.4: with an id no session has it answers "No saved session found with ID <id>", and
+/// with the id [`history`](super::history) lists it goes on to ask the model.
+///
+/// MCP servers, as its parent keeps them (`mcpServers` in `settings.json`, `trust` to skip the
+/// confirmation of each call) and checked against 0.24.4: `qwen mcp list` starts the bridge's
+/// server and prints `✓ qcode: node … (stdio) - Connected`.
+///
+/// Instructions: `memory-constants.ts` in the bundle reads `QWEN.md` and `AGENTS.md`, and its skill
+/// folders are `~/.qwen/skills` and `~/.agents/skills`. graphify has no platform of Qwen Code's
+/// own; its `agents` installer (0.9.66) writes its section into `AGENTS.md` and its skill into
+/// `~/.agents/skills/graphify/`, both of which Qwen Code reads.
+static QWEN_CODE: Harness = Harness {
+    id: "qwen-code",
+    display_name: "Qwen Code",
+    accounts: &[AccountKind::Provider],
+    withdrawn: &[],
+    install: &["npm install -g @qwen-code/qwen-code"],
+    command: "qwen",
+    auto_run: &["--approval-mode=yolo"],
+    environment: &[],
+    identity: &[],
+    settings: Some(ConfigFile {
+        path: ".qwen/settings.json",
+        contents: "{\n  \"security\": {\n    \"folderTrust\": {\n      \"enabled\": false\n    }\n  },\n  \"privacy\": {\n    \"usageStatisticsEnabled\": false\n  }\n}\n",
+    }),
+    first_start: None,
+    resume: Some(Resume::Option("--resume")),
+    surface: Surface::Terminal,
+    mcp: Some(McpSettings { path: ".qwen/settings.json", shape: McpShape::Gemini }),
     key_only: None,
 };
 
@@ -798,7 +964,10 @@ mod tests {
             let record = harness.record();
             assert!(!record.install.is_empty(), "{harness:?} must say how it is installed");
             assert!(!record.auto_run.is_empty(), "{harness:?} must say how unattended mode is turned on");
-            assert!(!record.identity.is_empty(), "{harness:?} must say where its identity lives");
+            // A harness with nothing to sign in to has no login to carry; one with a sign-in must
+            // say where it lands.
+            let signs_in = record.accounts.iter().chain(record.withdrawn).any(|account| account.needs_login());
+            assert_eq!(!record.identity.is_empty(), signs_in, "{harness:?} must say where its identity lives");
             assert!(record.resume.is_some(), "{harness:?} must say how a conversation is opened again");
             assert_eq!(harness.desktop(), None, "{harness:?} draws in the terminal");
         }
@@ -845,7 +1014,7 @@ mod tests {
     fn where_a_template_writes_settings_the_servers_go_into_the_same_file() {
         // Otherwise the harness would read two files, and the one the template wrote could hide
         // the servers.
-        for harness in [HarnessKind::OpenCode, HarnessKind::GeminiCli, HarnessKind::Codex] {
+        for harness in [HarnessKind::OpenCode, HarnessKind::GeminiCli, HarnessKind::Codex, HarnessKind::QwenCode] {
             let record = harness.record();
             assert_eq!(record.settings.map(|file| file.path), record.mcp.map(|mcp| mcp.path), "{harness:?}");
         }
@@ -872,7 +1041,10 @@ mod tests {
             seen.push(id);
             assert_eq!(HarnessKind::parse(id), Some(harness));
         }
-        assert_eq!(seen, ["claude-code", "opencode", "gemini-cli", "codex", "antigravity-ide"]);
+        assert_eq!(
+            seen,
+            ["claude-code", "opencode", "gemini-cli", "codex", "kimi-code", "qwen-code", "antigravity-ide"]
+        );
         assert_eq!(HarnessKind::parse("Claude-Code"), None, "identifiers are written one way only");
         assert_eq!(HarnessKind::parse("cursor"), None);
         assert_eq!(HarnessKind::parse("antigravity-ide"), Some(HarnessKind::AntigravityIde));
@@ -890,10 +1062,17 @@ mod tests {
     }
 
     #[test]
-    fn claude_code_and_opencode_are_offered_a_provider_of_ones_own_and_nothing_else_is() {
-        assert!(HarnessKind::ClaudeCode.supports(AccountKind::Provider));
-        assert!(HarnessKind::OpenCode.supports(AccountKind::Provider));
-        for harness in [HarnessKind::GeminiCli, HarnessKind::Codex, HarnessKind::AntigravityIde] {
+    fn the_harnesses_proven_through_the_relay_are_offered_a_provider_of_ones_own_and_nothing_else_is() {
+        for harness in [
+            HarnessKind::ClaudeCode,
+            HarnessKind::OpenCode,
+            HarnessKind::Codex,
+            HarnessKind::KimiCode,
+            HarnessKind::QwenCode,
+        ] {
+            assert!(harness.supports(AccountKind::Provider), "{harness:?}");
+        }
+        for harness in [HarnessKind::GeminiCli, HarnessKind::AntigravityIde] {
             assert!(!harness.supports(AccountKind::Provider), "{harness:?}");
         }
         assert!(!AccountKind::Provider.needs_login(), "the key already lives in providers.toml");
@@ -902,7 +1081,13 @@ mod tests {
     #[test]
     fn only_opencode_is_offered_for_free_and_offers_it_first() {
         assert_eq!(HarnessKind::OpenCode.record().accounts.first(), Some(&AccountKind::Free));
-        for harness in [HarnessKind::ClaudeCode, HarnessKind::GeminiCli, HarnessKind::Codex] {
+        for harness in [
+            HarnessKind::ClaudeCode,
+            HarnessKind::GeminiCli,
+            HarnessKind::Codex,
+            HarnessKind::KimiCode,
+            HarnessKind::QwenCode,
+        ] {
             assert!(!harness.supports(AccountKind::Free), "{harness:?}");
         }
         assert!(!AccountKind::Free.needs_login());
@@ -921,6 +1106,8 @@ mod tests {
         assert_eq!(HarnessKind::OpenCode.command_line(None), ["opencode", "--auto"]);
         assert_eq!(HarnessKind::GeminiCli.command_line(None), ["gemini", "--approval-mode=yolo"]);
         assert_eq!(HarnessKind::Codex.command_line(None), ["codex", "--dangerously-bypass-approvals-and-sandbox"]);
+        assert_eq!(HarnessKind::KimiCode.command_line(None), ["kimi", "--auto"]);
+        assert_eq!(HarnessKind::QwenCode.command_line(None), ["qwen", "--approval-mode=yolo"]);
     }
 
     #[test]
@@ -940,6 +1127,9 @@ mod tests {
             HarnessKind::Codex.command_line(Some(id)),
             ["codex", "resume", "--dangerously-bypass-approvals-and-sandbox", id]
         );
+        let kimi = "session_e3f864de-1a92-4498-a9f7-5fd551a34703";
+        assert_eq!(HarnessKind::KimiCode.command_line(Some(kimi)), ["kimi", "--auto", "--session", kimi]);
+        assert_eq!(HarnessKind::QwenCode.command_line(Some(id)), ["qwen", "--approval-mode=yolo", "--resume", id]);
     }
 
     #[test]
@@ -986,8 +1176,7 @@ mod tests {
         assert_eq!(file.path, "/etc/gemini-cli/settings.json");
         let settings: serde_json::Value = serde_json::from_str(file.contents).expect("the file is JSON");
         assert_eq!(settings, serde_json::json!({ "security": { "auth": { "enforcedType": "gemini-api-key" } } }));
-        for harness in [HarnessKind::ClaudeCode, HarnessKind::OpenCode, HarnessKind::Codex, HarnessKind::AntigravityIde]
-        {
+        for harness in HarnessKind::ALL.into_iter().filter(|harness| *harness != HarnessKind::GeminiCli) {
             assert_eq!(harness.record().key_only, None, "{harness:?}");
         }
     }
@@ -1072,5 +1261,53 @@ mod tests {
         assert_eq!(record.auto_run, ["--dangerously-bypass-approvals-and-sandbox"]);
         assert_eq!(record.identity, [".codex/auth.json"]);
         assert!(record.install.iter().any(|step| step.contains("@openai/codex")));
+        // The folder's trust is answered where Codex keeps the answer, so a tab opens on its prompt.
+        let settings = record.settings.expect("the template writes its settings");
+        assert!(settings.contents.contains("[projects.\"/work\"]\ntrust_level = \"trusted\""), "{}", settings.contents);
+    }
+
+    #[test]
+    fn verified_kimi_code_facts() {
+        let record = HarnessKind::KimiCode.record();
+        assert_eq!(record.command, "kimi");
+        // `--yolo` still asks before what it counts as risky; only `--auto` never asks.
+        assert_eq!(record.auto_run, ["--auto"]);
+        assert!(record.install.iter().any(|step| step.contains("@moonshot-ai/kimi-code")));
+        // The token alone is never looked for: the provider entry that names its slot is in the
+        // configuration, so both go, the token first because it is the proof of a sign-in.
+        assert_eq!(record.identity, [".kimi-code/credentials/kimi-code.json", ".kimi-code/config.toml"]);
+        assert_eq!(record.settings, None, "the configuration is part of the login and no template writes it");
+        assert_eq!(record.accounts, [AccountKind::Subscription, AccountKind::Provider]);
+        let mcp = record.mcp.expect("it reads servers");
+        assert_eq!((mcp.path, mcp.shape), (".kimi-code/mcp.json", McpShape::Kimi));
+    }
+
+    #[test]
+    fn kimi_code_opens_on_its_prompt_in_the_workspace_it_trusts() {
+        let trust = HarnessKind::KimiCode.record().first_start.expect("the trust question is answered");
+        // The file's name is Kimi Code's own key for the folder: `wd_`, the folder's last name, and
+        // the first twelve hexadecimal digits of the SHA-256 of `/work`. The live test has the
+        // installed harness answer the question and compares the name it wrote.
+        assert_eq!(crate::base::paths::CODE_DIR, "/work");
+        assert_eq!(trust.path, ".kimi-code/workspace-trust/wd_work_0c9a453fad61");
+        let answer: serde_json::Value = serde_json::from_str(trust.contents).expect("the answer is JSON");
+        assert_eq!(answer["root"], crate::base::paths::CODE_DIR);
+    }
+
+    #[test]
+    fn verified_qwen_code_facts() {
+        let record = HarnessKind::QwenCode.record();
+        assert_eq!(record.command, "qwen");
+        assert_eq!(record.auto_run, ["--approval-mode=yolo"]);
+        assert!(record.install.iter().any(|step| step.contains("@qwen-code/qwen-code")));
+        // Its own sign-in was discontinued and a key it keeps lives in its settings, so a provider
+        // of one's own is the one way in, and there is no login to carry.
+        assert_eq!(record.accounts, [AccountKind::Provider]);
+        assert!(record.identity.is_empty());
+        let settings: serde_json::Value =
+            serde_json::from_str(record.settings.expect("the template writes settings").contents).expect("JSON");
+        assert_eq!(settings["security"]["folderTrust"]["enabled"], false);
+        assert_eq!(settings["privacy"]["usageStatisticsEnabled"], false);
+        assert_eq!(record.mcp.expect("it reads servers").shape, McpShape::Gemini);
     }
 }

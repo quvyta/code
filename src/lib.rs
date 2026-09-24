@@ -713,6 +713,13 @@ impl QCode {
         Command::batch([refresh, start]).map(Msg::Workspaces)
     }
 
+    /// The workspaces open on the workspace screen right now.
+    fn open_workspaces(&self) -> Vec<WorkspaceId> {
+        self.workspace.as_ref().map_or_else(Vec::new, |screen| {
+            screen.workspaces().iter().filter_map(|workspace| WorkspaceId::parse(workspace.id()).ok()).collect()
+        })
+    }
+
     /// Opens the profiles screen.
     fn show_profiles(&mut self) -> Command<Msg> {
         let Some(store) = self.store() else { return self.repair(SetupStep::Location) };
@@ -1328,15 +1335,30 @@ fn under_rail(ui: &mut View<'_, Msg>) {
     });
 }
 
-/// The one key hint every screen carries, at the bottom right: the key that opens the list of
-/// every key, which is also a button for the pointer. The hint bars the screens once had are that
-/// list now, so the screens keep their room and nothing they listed is lost.
-fn keys_hint(ui: &mut View<'_, Msg>) {
-    let key = ui.env().keymap().chords_for(Scope::Global, "help").first().map(KeyChord::label);
+/// The foot every screen but the workspace screen carries: the way back at the bottom left, when
+/// the screen can be left, and at the bottom right the key that opens the list of every key. Both
+/// are drawn the same way — the key, then what it does — and both are buttons for the pointer too.
+///
+/// The way back stands at the foot rather than over the screen because the top row is where a
+/// pointer on its way to the screen's own first controls passes, and a Back there was pressed by
+/// accident. The workspace screen keeps the same order at the foot of its rail. The hint bars the
+/// screens once had are the list of keys now, so the screens keep their room and nothing they
+/// listed is lost.
+fn foot(can_leave: bool, ui: &mut View<'_, Msg>) {
+    let keymap = ui.env().keymap();
+    let back = keymap.chords_for(Scope::App, "back").first().map(KeyChord::label);
+    let help = keymap.chords_for(Scope::Global, "help").first().map(KeyChord::label);
     ui.row(|ui| {
+        if can_leave {
+            let mut button = Button::new(t!("app.back")).on_press(Msg::Back);
+            if let Some(key) = back {
+                button = button.shortcut(key);
+            }
+            ui.add(button).id("back");
+        }
         ui.spacer();
         let mut button = Button::new(t!("app.keys")).on_press(Msg::Help(true));
-        if let Some(key) = key {
+        if let Some(key) = help {
             button = button.shortcut(key);
         }
         ui.add(button).id("keys");
@@ -1389,9 +1411,19 @@ impl App for QCode {
             Msg::Open(entry) => self.open(entry),
             Msg::Setup(message) => self.wizard(message),
             Msg::Workspaces(message) => {
+                // What is open is read at every message rather than when the screen opened: the
+                // workspace screen stays alive behind this one and opens workspaces of its own.
+                let open = self.open_workspaces();
                 let Some(screen) = self.workspaces.as_mut() else { return Command::none() };
+                screen.set_open(open);
                 let (command, opened) = ui::workspaces::update(screen, message);
                 let command = command.map(Msg::Workspaces);
+                // A deleted workspace is not offered again as the one to continue with.
+                if let Some(gone) = screen.just_deleted() {
+                    self.config.forget_workspace(&gone);
+                    self.refresh_home();
+                    return Command::batch([command, self.save()]);
+                }
                 match opened {
                     Some(id) => Command::batch([command, self.read_workspaces(vec![id.clone()], Opening::One(id))]),
                     None => command,
@@ -1555,26 +1587,25 @@ impl QCode {
             ui::workspace::view(screen, ui, Msg::Workspace, |ui| self.header(page, ui), |_| (), under_rail);
             return;
         }
-        AppShell::new().header(|ui| self.header(page, ui)).body(|ui| self.body(page, ui)).footer(keys_hint).show(ui);
+        let can_leave = self.can_leave();
+        AppShell::new()
+            .header(|ui| self.header(page, ui))
+            .body(|ui| self.body(page, ui))
+            .footer(move |ui| foot(can_leave, ui))
+            .show(ui);
     }
 
-    /// What stands over every screen: the strip while the engine is gone, and the way back.
+    /// What stands over every screen: the strip while the engine is gone.
+    ///
+    /// Whatever Esc does, the way out is also on screen, at the foot (see [`foot`]): a screen that
+    /// can be left says so. The setup itself cannot be — it is left by finishing it — while the
+    /// single step the repair strip opens can, because it stands over an application that already
+    /// works.
     fn header(&self, page: Page, ui: &mut View<'_, Msg>) {
         // The wizard is where a missing engine is put right, so the strip that leads there does
         // not stand over it.
         if page != Page::Setup {
             ui.map(Msg::Settings, |ui| ui::settings::bar::view(&self.engine, ui)).fill_width();
-        }
-        // Whatever Esc does, the way out is also on screen: a screen that can be left says so.
-        // The setup itself cannot be — it is left by finishing it — while the single step the
-        // repair strip opens can, because it stands over an application that already works.
-        // The workspace screen keeps its own at the foot of the rail, where it costs no row.
-        if self.can_leave() && page != Page::Workspace {
-            ui.row(|ui| {
-                ui.add(Button::new(t!("app.back")).icon("arrow-left").on_press(Msg::Back)).id("back");
-                ui.spacer();
-            })
-            .fill_width();
         }
     }
 
@@ -1947,6 +1978,19 @@ mod tests {
         harness.screen().lines().last().unwrap_or_default().to_owned()
     }
 
+    /// Clicks the way back where it stands, at the foot of the screen: the lowest Back on screen,
+    /// since a screen's own rows may say the word too ("Back up open workspaces").
+    fn click_back(harness: &mut qframe::runtime::Harness<super::QCode>) {
+        let screen = harness.screen();
+        let (y, x) = screen
+            .lines()
+            .enumerate()
+            .filter_map(|(y, row)| row.find("Back").map(|at| (y, row[..at].chars().count())))
+            .last()
+            .unwrap_or_else(|| panic!("no way back on screen:\n{screen}"));
+        harness.click(i32::try_from(x).expect("on screen"), i32::try_from(y).expect("on screen"));
+    }
+
     /// Presses one of the ways out at the foot of the workspace rail: the way back on the last
     /// row, the settings above it and the list of keys above that.
     ///
@@ -1981,6 +2025,29 @@ mod tests {
         harness.click_text("Firefly").advance(MOMENT);
         assert_eq!(harness.app().page(), Page::Workspace, "{}", harness.screen());
         harness
+    }
+
+    #[test]
+    fn a_workspace_left_open_behind_the_list_is_not_deleted_from_under_its_tabs() {
+        let root = scratch("delete-open");
+        let mut harness = open_workspace(&root);
+        // Back to the list the way the rail leads there, with the workspace still open behind it.
+        rail_back(&mut harness);
+        harness.advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Workspaces, "{}", harness.screen());
+        harness.click_text("Delete a workspace").advance(MOMENT);
+        let screen = harness.screen();
+        let rows: Vec<&str> = screen.lines().collect();
+        let start = rows.iter().position(|row| row.contains("Choose the workspace")).expect("the choice opened");
+        let (y, row) =
+            rows.iter().enumerate().skip(start + 1).find(|(_, row)| row.contains("Firefly")).expect("listed");
+        let x = row[..row.find("Firefly").unwrap_or_default()].chars().count();
+        harness.click(i32::try_from(x).expect("on screen"), i32::try_from(y).expect("on screen")).advance(MOMENT);
+        let screen = harness.screen();
+        assert!(screen.contains("Firefly is open"), "{screen}");
+        assert!(!screen.contains("Delete Firefly?"), "nothing is asked:\n{screen}");
+        assert!(root.join("Workspaces").join("firefly").is_dir(), "and nothing is deleted");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2129,7 +2196,8 @@ mod tests {
         harness.press("esc").advance(MOMENT);
         rail_settings(&mut harness);
         assert_eq!(harness.app().page(), Page::Settings, "the settings opened:\n{}", harness.screen());
-        harness.click_text("Back").advance(MOMENT);
+        click_back(&mut harness);
+        harness.advance(MOMENT);
         rail_back(&mut harness);
         assert_eq!(harness.app().page(), Page::Workspaces, "the way back led back:\n{}", harness.screen());
         let _ = std::fs::remove_dir_all(&root);
@@ -2212,7 +2280,8 @@ mod tests {
         for row in ["Workspaces", "Profiles", "Settings"] {
             home.click_text(row).advance(MOMENT);
             screens.push((home.app().page(), last_row(&home), home.screen()));
-            home.click_text("Back").advance(MOMENT);
+            click_back(&mut home);
+            home.advance(MOMENT);
         }
         let root = scratch("hint-bar-workspace");
         let workspace = open_workspace(&root);
@@ -2229,12 +2298,43 @@ mod tests {
                     assert_eq!(keys, "?", "the way to the keys is in the rail:\n{screen}");
                     assert!(!screen.contains("Keys"), "and nowhere else:\n{screen}");
                 }
-                _ => assert_eq!(last.split_whitespace().collect::<Vec<_>>(), ["?", "Keys"], "{page:?}:\n{screen}"),
+                // The home screen is where every way back leads, and the setup is left by
+                // finishing it, so neither has a way back of its own.
+                Page::Home | Page::Setup => {
+                    assert_eq!(last.split_whitespace().collect::<Vec<_>>(), ["?", "Keys"], "{page:?}:\n{screen}");
+                }
+                // Every other screen has the way back in the other corner of the same row, drawn
+                // the same way: the key, then what it does.
+                _ => assert_eq!(
+                    last.split_whitespace().collect::<Vec<_>>(),
+                    ["esc", "Back", "?", "Keys"],
+                    "{page:?}:\n{screen}"
+                ),
             }
             // The words of the old bars are gone: moving, choosing, quitting and the tab keys.
             for word in ["move", "choose", "quit", "close tab"] {
                 assert!(!screen.contains(word), "{page:?} still says `{word}`:\n{screen}");
             }
+        }
+    }
+
+    #[test]
+    fn the_way_back_sits_in_the_bottom_left_corner_and_leads_back_on_a_click_and_on_esc() {
+        let mut harness = harness(app(config(&scratch("back-corner"), &[]), &settled(), None), SIZE.0, SIZE.1);
+        assert!(harness.find("Back").is_none(), "the home screen has nowhere to go back to:\n{}", harness.screen());
+        for leave in ["click", "esc"] {
+            harness.click_text("Profiles").advance(MOMENT);
+            assert_eq!(harness.app().page(), Page::Profiles, "{}", harness.screen());
+            let (x, y) = harness.find("esc").expect("the way back is on screen");
+            assert_eq!(y, i32::from(SIZE.1) - 1, "on the last row:\n{}", harness.screen());
+            assert!(x <= 3, "at the left edge:\n{}", harness.screen());
+            assert_eq!(harness.find("Back").map(|(_, row)| row), Some(y), "with its word beside its key");
+            if leave == "click" {
+                harness.click(x, y).advance(MOMENT);
+            } else {
+                harness.press("esc").advance(MOMENT);
+            }
+            assert_eq!(harness.app().page(), Page::Home, "{leave} led back:\n{}", harness.screen());
         }
     }
 
@@ -2405,7 +2505,8 @@ mod tests {
             harness.click_text(row).advance(MOMENT);
             assert_eq!(harness.app().page(), page, "`{row}` opens its screen:\n{}", harness.screen());
             assert!(harness.screen().contains(word), "`{word}` is on the screen `{row}` opened:\n{}", harness.screen());
-            harness.click_text("Back").advance(MOMENT);
+            click_back(&mut harness);
+            harness.advance(MOMENT);
             assert_eq!(harness.app().page(), Page::Home, "the way back leads home:\n{}", harness.screen());
         }
     }
@@ -2484,7 +2585,8 @@ mod tests {
             os: crate::base::Os::Debian,
         };
         store.write_profile(&profile).expect("the store takes a profile");
-        harness.click_text("Back").advance(MOMENT);
+        click_back(&mut harness);
+        harness.advance(MOMENT);
         assert_eq!(harness.app().page(), Page::Workspace, "{}", harness.screen());
         let offered: Vec<String> = harness
             .app()
@@ -2576,7 +2678,8 @@ mod tests {
         harness.type_text("http://192.168.122.1:11434");
         harness.click_text("Add").advance(MOMENT);
         assert!(std::fs::read_to_string(&providers).is_ok_and(|text| text.contains("\"ev\"")), "it was added");
-        harness.click_text("Back").advance(MOMENT);
+        click_back(&mut harness);
+        harness.advance(MOMENT);
 
         assert_eq!(harness.app().page(), Page::Profiles, "{}", harness.screen());
         let screen = harness.screen();
@@ -2665,7 +2768,8 @@ mod tests {
     fn coming_back_puts_the_keyboard_on_the_menu_again() {
         let mut harness = harness(app(config(&scratch("focus-home"), &[]), &settled(), None), SIZE.0, SIZE.1);
         harness.click_text("Settings").advance(MOMENT);
-        harness.click_text("Back").advance(MOMENT);
+        click_back(&mut harness);
+        harness.advance(MOMENT);
         assert!(harness.is_focused("menu"), "{}", harness.screen());
         // The click left the selection on Settings, so one press up is the row above it, and
         // that press is the first key after coming back.
@@ -3014,7 +3118,8 @@ mod tests {
             (tab.key(), tab.state().clone())
         });
         rail_back(&mut harness);
-        harness.click_text("Back").advance(MOMENT);
+        click_back(&mut harness);
+        harness.advance(MOMENT);
         assert_eq!(harness.app().page(), Page::Home);
         assert!(harness.screen().contains("Continue"), "{}", harness.screen());
         assert!(harness.screen().contains("Alpha"), "the row names the open workspace:\n{}", harness.screen());

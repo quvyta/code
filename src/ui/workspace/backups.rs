@@ -475,6 +475,11 @@ pub(super) fn last_text(screen: &WorkspaceScreen, workspace: &OpenWorkspace, now
     }
 }
 
+/// Whether a backup of `workspace` is being made right now, which the panel lets shine.
+pub(super) fn is_running(screen: &WorkspaceScreen, workspace: &OpenWorkspace) -> bool {
+    workspace.backup.running && screen.backup_every != BackupEvery::Off && screen.engine.is_some()
+}
+
 /// The moment `at` as a clock on the wall shows it: the time of day when it is today, and the
 /// date before it otherwise.
 #[must_use]

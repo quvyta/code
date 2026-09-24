@@ -27,7 +27,8 @@ pub use config::{APP, Config, OnClose, SetupStep};
 pub use containers::{PREFIX, Registered, Registry};
 pub use identity::{WorkspaceId, WorkspaceIdError};
 pub use layout::{
-    NewWorkspaceError, Store, WorkspaceEntry, WorkspacePaths, add_profile, set_backup_assets, set_backup_skip,
+    NewWorkspaceError, Store, WorkspaceEntry, WorkspacePaths, add_profile, remove_profile, set_backup_assets,
+    set_backup_skip,
 };
 pub use paths::{APP_TITLE, HostDirs, Platform};
 pub use session::{Session, SessionTab, SessionTabKind, SessionWorkspace};

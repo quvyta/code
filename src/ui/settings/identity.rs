@@ -2,7 +2,7 @@
 //! it, and signing out.
 
 use qframe::prelude::*;
-use qframe::widgets::{EmptyState, Skeleton};
+use qframe::widgets::Skeleton;
 
 use super::Msg;
 use super::engine::Gate;
@@ -44,27 +44,25 @@ impl ProfileIdentity {
 
 /// Draws the logins: one row per profile with its state, and the two actions on the chosen one.
 ///
-/// `profiles` is `None` while the store has not been read yet, which is drawn as faint lines
-/// rather than as an empty state: an empty state there would claim there are no profiles before
-/// anyone has looked.
+/// `profiles` is `None` while the store has not been read yet, which is drawn as faint lines. A
+/// store without profiles has no logins, and the settings screen does not draw this at all then.
 pub fn view(profiles: Option<&[ProfileIdentity]>, chosen: usize, engine: &Gate, ui: &mut View<'_, Msg>) {
     let Some(profiles) = profiles else {
         ui.add(Skeleton::lines(PLACEHOLDER_LINES)).fill_width();
         return;
     };
-    if profiles.is_empty() {
-        ui.add(
-            EmptyState::new(t!("settings.profiles-empty")).icon("inbox").message(t!("settings.profiles-empty-text")),
-        )
-        .fill_width();
-        return;
-    }
 
     let items = profiles.iter().map(|profile| {
-        let state = if profile.stored() { t!("settings.identity-saved") } else { t!("settings.identity-none") };
+        let state = if profile.stored() { t!("settings.logins.kept") } else { t!("settings.logins.none") };
         ListItem::new(profile.name().as_str().to_owned()).detail(state)
     });
-    ui.add(List::new(items).selected(Some(chosen)).on_select(Msg::Profile)).id("profiles").fill_width();
+    // As tall as its rows: a list left to size itself takes what the screen offers, and the page
+    // is measured before it is placed in the middle, so its height must not depend on the room.
+    let rows = u16::try_from(profiles.len()).unwrap_or(u16::MAX);
+    ui.add(List::new(items).selected(Some(chosen)).on_select(Msg::Profile))
+        .id("profiles")
+        .height(Length::Cells(rows))
+        .fill_width();
 
     // The nearer reason wins: without a profile or without a login there is nothing to do even
     // with an engine running, and saying "needs an engine" there would send the person after the
@@ -124,21 +122,13 @@ mod tests {
     }
 
     #[test]
-    fn a_store_without_profiles_says_where_they_are_made() {
-        let harness = with_profiles(Health::Working, &[]);
-        let screen = harness.screen();
-        assert!(screen.contains("No profiles yet"), "{screen}");
-        assert!(screen.contains("profiles screen"), "{screen}");
-    }
-
-    #[test]
     fn every_profile_says_whether_a_login_is_stored_for_it() {
         let harness = with_profiles(Health::Working, &[("claude-sub", true), ("codex-key", false)]);
         let screen = harness.screen();
         assert!(screen.contains("claude-sub"), "{screen}");
-        assert!(screen.contains("identity: saved"), "{screen}");
+        assert!(screen.contains("login kept"), "{screen}");
         assert!(screen.contains("codex-key"), "{screen}");
-        assert!(screen.contains("identity: none"), "{screen}");
+        assert!(screen.contains("no login"), "{screen}");
     }
 
     #[test]

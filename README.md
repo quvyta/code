@@ -1,6 +1,6 @@
 # qcode
 
-**Run Claude Code, opencode, Gemini CLI and Codex side by side in Podman or Docker containers, with tabs like a browser, from one terminal app.**
+**Run Claude Code, opencode, Gemini CLI, Codex, Kimi Code CLI and Qwen Code side by side in Podman or Docker containers, with tabs like a browser, from one terminal app.**
 
 ![qcode in forty seconds: Continue opens a workspace, a shell lists its files, an opencode tab answers a question about the workspace's own code while a Claude Code tab waits beside it on the strip, a new tab lists each profile's recent conversations, the side panel shows the containers and a file made in the shell appearing in the tree, three files are selected with their menu open, and the README opens in a tab of its own](https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/qcode.gif)
 
@@ -31,9 +31,9 @@ source under the MIT licence.
   memory and settings never leak from one workspace into another. A copy can be refreshed from the
   profile later, and the profile can be signed out. A profile that runs on one of your own
   providers has nothing to sign in to.
-- **Providers of your own.** An ollama server on your network or an OpenRouter account can stand
-  in for a harness's own account, for Claude Code and opencode. The provider's key stays on your
-  machine and never enters a container. See [Providers of your own](#providers-of-your-own).
+- **Providers of your own.** An ollama server on your network, an OpenRouter account, or a Xiaomi
+  MiMo or Kimi Code subscription can stand in for a harness's own account, for every harness but
+  Gemini CLI. The provider's key stays on your machine and never enters a container. See [Providers of your own](#providers-of-your-own).
 - **Workspaces.** A workspace starts empty, from a copy of a folder, or from a git address (the clone
   runs inside a container, so git does not have to be installed on your machine). The workspace
   screen has tabs for shells, harnesses and files, and a side panel with the workspace's files, its
@@ -56,12 +56,21 @@ The harnesses qcode knows today:
 | Claude Code | subscription, API key, a provider of your own |
 | opencode | free models, subscription, API key, a provider of your own |
 | Gemini CLI | API key |
-| Codex CLI | subscription, API key |
+| Codex CLI | subscription, API key, a provider of your own |
+| Kimi Code CLI | subscription (Kimi Code), a provider of your own |
+| Qwen Code | a provider of your own |
 
 Google closed Gemini CLI's "Login with Google" to personal accounts (Code Assist for
 individuals, Google AI Pro and Ultra) on 18 June 2026, so a new Gemini CLI profile signs in with
 an API key. A profile made earlier with a Google sign-in still loads, with a note saying so: that
 sign-in keeps working for Gemini Code Assist Standard and Enterprise.
+
+Qwen Code's own sign-in ended on 15 April 2026, when Alibaba closed its free tier, and a key typed
+into it is kept in its settings file beside everything else; so a Qwen Code profile runs on a
+provider of your own, where the key stays on your machine. An Alibaba Cloud Coding Plan is an
+OpenAI-compatible service and can be added on the **Providers** page like any other. Kimi Code
+CLI's sign-in is Kimi Code's own (mainland `kimi.com`, the default); a sign-in to the global
+region is not carried yet, and a Kimi Code key goes through the **Providers** page instead.
 
 Each harness is installed from its own published package when a profile's image is built; qcode
 does not ship or change any of them. The interface follows your system language (English and
@@ -167,10 +176,14 @@ builds an image (the base image, the harness packages and, for QCode high, what 
 adds) or clones a workspace from a git address; the command that installs a container engine,
 when you let qcode run it in the setup; and your own browser, when a sign-in page is handed to
 it. That hand-over is the one time qcode listens for a connection itself: on your machine's own
-loopback, on the port the sign-in comes back to, until it has (see Desktop harnesses). Inside the containers, the harnesses keep their own behaviour, including any telemetry of
-their own; their documentation says what that is. Two are switched off by qcode's templates:
-QCode basic turns off Antigravity's telemetry, and QCode high turns off that of oh-my-openagent,
-which it adds.
+loopback, on the port the sign-in comes back to, until it has (see Desktop harnesses). Inside the
+containers, the harnesses keep their own behaviour, including any telemetry of their own; their
+documentation says what that is. Some are switched off by qcode's templates: QCode basic turns off
+Antigravity's telemetry and Qwen Code's usage statistics (which Qwen Code otherwise sends to Alibaba
+Cloud), and QCode high turns off that of oh-my-openagent, which it adds. Kimi Code CLI sends
+anonymous telemetry to Moonshot unless `telemetry = false` is in its `~/.kimi-code/config.toml`;
+qcode leaves that file alone, because it is where Kimi Code CLI keeps its sign-in. A profile without
+the network sends none of this anywhere.
 
 ## Screens
 
@@ -195,11 +208,12 @@ which it adds.
   with no background service) or [Docker](https://docs.docker.com/engine/install/) with its daemon
   running.
 - **An account** with the harness you want to use: a subscription or an API key from its provider,
-  or, for Claude Code and opencode, a model service of your own (an ollama server or OpenRouter).
+  or, for every harness but Gemini CLI, a model service of your own (an ollama server, OpenRouter,
+  Xiaomi MiMo or Kimi Code).
 - **Disk space and a network connection** for the first images. The base image is Debian with
   Node.js (about 520 MB); each profile adds its harness on top of it. A profile can instead be
   built on Arch Linux (about 810 MB), Ubuntu 24.04 LTS (about 510 MB) or Alpine (about 310 MB,
-  not recommended: Gemini CLI and Antigravity IDE do not run on it).
+  not recommended: Gemini CLI, Qwen Code and Antigravity IDE do not run on it).
 - Rust 1.95 or later to install from source.
 
 qcode is developed and tested on Linux. The paths, engine checks and container settings for macOS
@@ -235,8 +249,8 @@ The program is installed as `qcode` and also as `quvyta-code`.
 4. **Tabs.** In the workspace, the `+` after the last tab (or `ctrl+t`) opens a new tab at once.
    It lists the shell of the workspace's own container and, for every profile, **New chat** and
    the profile's latest conversations in this workspace, newest first, with when each was last
-   used. Choosing a conversation opens the harness on it again, where it left off; Claude Code,
-   opencode, Gemini CLI and Codex CLI all resume a conversation this way. A profile the workspace
+   used. Choosing a conversation opens the harness on it again, where it left off; every harness
+   that draws in a terminal resumes a conversation this way. A profile the workspace
    does not have yet is added to it the moment you open it, and is written into the workspace's
    `workspace.qcode`. With no profile at all, the list offers **New profile**, which leads to the
    profiles screen.
@@ -486,14 +500,17 @@ while the server quietly keeps three thousand and drops the front of everything 
 shows both numbers. Each of these goes out only when you press its button; see
 [what goes over the network](#no-telemetry-and-what-goes-over-the-network).
 
-A Claude Code or opencode profile can then sign in with **a provider of your own** and one of its
-models. Its tab talks to a small relay that runs inside the container, on the container's own
-loopback address; the relay hands each request to qcode through a socket in the workspace's
-`Containers/MCP/` folder, and qcode sends it on to the provider with the key added. So the
-container never holds the key and needs no network of its own, and the harness is told the window
-that was measured, so it does not assume room the server does not give. Only two kinds of request
-are carried: a message and the list of models. Gemini CLI and Codex do not offer a provider yet,
-because pointing them at another address has not been checked.
+A Claude Code, opencode, Codex, Kimi Code CLI or Qwen Code profile can then sign in with **a
+provider of your own** and one of its models. Its tab talks to a small relay that runs inside the
+container, on the container's own loopback address; the relay hands each request to qcode through
+a socket in the workspace's `Containers/MCP/` folder, and qcode sends it on to the provider with
+the key added. So the container never holds the key and needs no network of its own, and the
+harness is told the window that was measured, so it does not assume room the server does not give
+(Qwen Code has no way to be told one that its tabs do not share, so it is not). Only two kinds of
+request are carried: a message and the list of models. Codex speaks OpenAI's newer Responses
+shape to a provider, which ollama, OpenRouter, Xiaomi MiMo and Kimi Code all answer; its web
+search, which only OpenAI's own servers run, is turned off in such a tab. Gemini CLI does not offer
+a provider yet, because pointing it at another address has not been checked.
 
 ## When QCode closes
 

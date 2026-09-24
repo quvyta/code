@@ -216,8 +216,10 @@ fn verify(harness: HarnessKind, more: impl Fn(&Lab, &Harness)) {
         let behind = lab.ok(&format!("{} {arguments} --version", record.command));
         assert!(names_a_version(&behind), "{kind:?}: `{} {arguments} --version` printed `{behind}`", record.command);
 
-        // 4: the package's own text names every file the record says the login is in.
-        for path in record.identity {
+        // 4: the package's own text names every file the record says the login is in. Kimi Code
+        // CLI joins its token file's name from the slot it signs in to, so no text holds it
+        // whole; its own check below makes the harness read the file instead.
+        for path in record.identity.iter().filter(|_| harness != HarnessKind::KimiCode) {
             let file = path.rsplit('/').next().expect("a path has a last part");
             lab.expect_in_package(file, "the login file the record names");
         }
@@ -413,6 +415,107 @@ fn codex_installs_answers_and_keeps_its_login_where_the_record_says() {
         let broken = lab.run("codex login status 2>&1").unwrap_or_else(|said| said);
         assert!(broken.contains("Error loading configuration"), "{kind:?}: the settings file is not read: {broken}");
         lab.ok(&format!("mv \"$HOME/{path}.aside\" \"$HOME/{path}\"", path = settings.path));
+    });
+}
+
+#[test]
+#[ignore = "needs a container engine and the network; run with QCODE_CONTAINER_TESTS=1"]
+fn kimi_code_installs_answers_and_keeps_its_login_where_the_record_says() {
+    verify(HarnessKind::KimiCode, |lab, record| {
+        let kind = lab.engine.kind();
+        let help = lab.ok("kimi --help");
+        assert!(help.contains(record.auto_run[0]) && help.contains("Never Ask"), "{kind:?}: {help}");
+        // Its parser refuses what it does not know, and says so before anything else runs.
+        let unknown = lab.run("kimi --no-such-argument -p hi 2>&1").unwrap_or_else(|said| said);
+        assert!(unknown.contains("unknown option"), "{kind:?}: {unknown}");
+
+        // The login is two files, and each is read: the configuration names the provider and the
+        // slot its token is in, the token is in that slot. With only one of them the harness
+        // stops before it asks anybody, each time for its own reason; with both it goes on to
+        // Kimi's server, which a container without a network cannot reach.
+        let [token, config] = record.identity else { panic!("{kind:?}: the login is a token and a configuration") };
+        lab.ok(&format!(
+            "mkdir -p \"$HOME/$(dirname '{config}')\" && cat > \"$HOME/{config}\" <<'EOF'
+default_model = \"kimi-code/kimi-for-coding\"
+
+[providers.\"managed:kimi-code\"]
+type = \"kimi\"
+base_url = \"https://api.kimi.com/coding/v1\"
+api_key = \"\"
+oauth = {{ storage = \"file\", key = \"oauth/kimi-code\" }}
+
+[models.\"kimi-code/kimi-for-coding\"]
+provider = \"managed:kimi-code\"
+model = \"kimi-for-coding\"
+max_context_size = 262144
+EOF"
+        ));
+        let untokened = lab.run("kimi -p hi 2>&1").unwrap_or_else(|said| said);
+        assert!(untokened.contains("has no credential configured"), "{kind:?}: {untokened}");
+        lab.ok(&format!(
+            "mkdir -p \"$HOME/$(dirname '{token}')\" && printf '%s' \
+             '{{\"access_token\":\"x\",\"refresh_token\":\"x\",\"expires_at\":9999999999,\"token_type\":\"Bearer\"}}' \
+             > \"$HOME/{token}\""
+        ));
+        let signed = lab.run("kimi -p hi 2>&1").unwrap_or_else(|said| said);
+        assert!(!signed.contains("no credential configured"), "{kind:?}: the file at {token} is not read: {signed}");
+        assert!(!signed.contains("No model configured"), "{kind:?}: {signed}");
+        lab.ok(&format!("rm \"$HOME/{config}\""));
+        let unconfigured = lab.run("kimi -p hi 2>&1").unwrap_or_else(|said| said);
+        assert!(unconfigured.contains("No model configured"), "{kind:?}: {config} is not read: {unconfigured}");
+        lab.ok(&format!("rm \"$HOME/{token}\""));
+
+        // The first start: the harness answers its own trust question into a file of that name.
+        // The template's answer is taken away, the question is answered by Return on a terminal,
+        // and the file the harness writes is the one the record writes.
+        let trust = record.first_start.expect("the trust question is answered");
+        assert_eq!(lab.ok(&format!("cat \"$HOME/{}\"", trust.path)), trust.contents, "{kind:?}: the template wrote it");
+        lab.ok(&format!("rm \"$HOME/{}\"", trust.path));
+        lab.ok("cd /work && (sleep 12; printf '\\r'; sleep 6) | TERM=xterm-256color timeout 40 script -q -c 'kimi --auto' /dev/null > /dev/null 2>&1; true");
+        let answered = lab.ok(&format!("ls \"$HOME/$(dirname '{}')\"", trust.path));
+        let name = trust.path.rsplit('/').next().expect("a name");
+        assert_eq!(answered.trim(), name, "{kind:?}: the harness keeps its answer for /work under another name");
+
+        // A provider of one's own: with the variables set, it asks the address they name rather
+        // than asking anybody to sign in.
+        let provider = lab.run(
+            "KIMI_MODEL_NAME=m KIMI_MODEL_API_KEY=t KIMI_MODEL_PROVIDER_TYPE=openai \
+             KIMI_MODEL_BASE_URL=http://127.0.0.1:9/v1 kimi -p hi 2>&1",
+        );
+        let provider = provider.unwrap_or_else(|said| said);
+        assert!(!provider.contains("No model configured") && !provider.contains("/login"), "{kind:?}: {provider}");
+        lab.expect_in_package("KIMI_MODEL_BASE_URL", "the variable the provider's address is handed over in");
+    });
+}
+
+#[test]
+#[ignore = "needs a container engine and the network; run with QCODE_CONTAINER_TESTS=1"]
+fn qwen_code_installs_answers_and_reads_the_settings_the_template_writes() {
+    verify(HarnessKind::QwenCode, |lab, record| {
+        let kind = lab.engine.kind();
+        let help = lab.ok("qwen --help");
+        assert!(help.contains("--approval-mode") && help.contains("yolo"), "{kind:?}: {help}");
+        let refused = lab.fails("qwen --approval-mode=bogus hi 2>&1");
+        assert!(refused.contains("Invalid values"), "{kind:?}: {refused}");
+
+        // A provider of one's own, from the three variables: it goes to the address they name
+        // and says it could not connect, rather than asking how to sign in.
+        let provider = "OPENAI_BASE_URL=http://127.0.0.1:9/v1 OPENAI_API_KEY=t OPENAI_MODEL=m";
+        let asked = lab.ok(&format!("cd /work && {provider} qwen {} hi 2>&1 || true", record.auto_run.join(" ")));
+        assert!(asked.contains("Connection error"), "{kind:?}: {asked}");
+        assert!(!asked.contains("overridden"), "{kind:?}: the unattended mode was put back: {asked}");
+
+        // The settings are read on every start, and the template's are taken: a broken file in
+        // their place stops the same start with the file's name, the template's file does not.
+        let settings = record.settings.expect("Qwen Code has a settings file");
+        assert!(!asked.contains(settings.path), "{kind:?}: the template's settings are refused: {asked}");
+        lab.ok(&format!("cp \"$HOME/{path}\" \"$HOME/{path}.aside\"", path = settings.path));
+        lab.ok(&format!("printf '%s' '{{ broken' > \"$HOME/{}\"", settings.path));
+        let broken = lab.ok(&format!("cd /work && {provider} qwen {} hi 2>&1 || true", record.auto_run.join(" ")));
+        assert!(broken.contains(settings.path), "{kind:?}: the settings file is not read: {broken}");
+        lab.ok(&format!("mv \"$HOME/{path}.aside\" \"$HOME/{path}\"", path = settings.path));
+        lab.expect_in_package("folderTrust", "the setting that keeps the unattended mode");
+        lab.expect_in_package("usageStatisticsEnabled", "the setting that stops its usage statistics");
     });
 }
 

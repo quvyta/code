@@ -121,6 +121,7 @@ pub fn merge(shape: McpShape, existing: Option<&str>, token: &str) -> Merged {
         }
         McpShape::Gemini => json_merge(existing, &["mcpServers"], &gemini_entry(), &Map::new()),
         McpShape::Codex => toml_merge(existing),
+        McpShape::Kimi => json_merge(existing, &["mcpServers"], &kimi_entry(), &Map::new()),
         McpShape::Antigravity => json_merge(existing, &["mcpServers"], &antigravity_entry(token), &Map::new()),
     }
 }
@@ -140,6 +141,13 @@ fn opencode_entry() -> Value {
 /// QCode starts unattended; without it Gemini CLI asks before each message.
 fn gemini_entry() -> Value {
     json!({ "command": "node", "args": [script_in_container()], "trust": true })
+}
+
+/// Kimi Code CLI's entry: the command and its arguments, which is all its schema asks of a server
+/// started on standard input and output. The tab's token is found by the server in the harness's
+/// own process, like Codex's.
+fn kimi_entry() -> Value {
+    json!({ "command": "node", "args": [script_in_container()] })
 }
 
 /// Antigravity IDE's entry: the command alone, and the tab's token in `env`.
@@ -357,7 +365,7 @@ mod tests {
 
     #[test]
     fn a_json_file_that_has_the_server_already_is_not_written_again() {
-        for shape in [McpShape::Claude, McpShape::OpenCode, McpShape::Gemini, McpShape::Antigravity] {
+        for shape in [McpShape::Claude, McpShape::OpenCode, McpShape::Gemini, McpShape::Kimi, McpShape::Antigravity] {
             let once = written(merge(shape, None, TOKEN));
             assert_eq!(merge(shape, Some(&once), TOKEN), Merged::Unchanged, "{shape:?}");
         }
@@ -366,6 +374,19 @@ mod tests {
             r#"{{"mcpServers":{{"qcode":{{"command":"node","args":["{SCRIPT}"],"trust":true,"timeout":600000}}}}}}"#
         );
         assert_eq!(merge(McpShape::Gemini, Some(&grown), TOKEN), Merged::Unchanged);
+    }
+
+    #[test]
+    fn kimi_code_gets_the_command_alone_and_keeps_the_persons_servers() {
+        let existing = "{\n  \"mcpServers\": {\n    \"notes\": { \"command\": \"notes-mcp\" }\n  }\n}\n";
+        let result = json(&written(merge(McpShape::Kimi, Some(existing), TOKEN)));
+        assert_eq!(result["mcpServers"]["notes"]["command"], "notes-mcp", "the person's server stays");
+        let entry = result["mcpServers"]["qcode"].as_object().expect("an object");
+        assert_eq!(entry.get("command"), Some(&json!("node")));
+        assert_eq!(entry.get("args"), Some(&json!([SCRIPT])));
+        // The token is never written into a file the workspace keeps; the server finds it in the
+        // harness's own process.
+        assert_eq!(entry.len(), 2, "{entry:?}");
     }
 
     #[test]

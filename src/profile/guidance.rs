@@ -61,7 +61,7 @@ description: How to reach the other agent tabs of this QCode workspace.
 pub fn file(harness: HarnessKind) -> &'static str {
     match harness {
         HarnessKind::ClaudeCode => "CLAUDE.md",
-        HarnessKind::OpenCode | HarnessKind::Codex => "AGENTS.md",
+        HarnessKind::OpenCode | HarnessKind::Codex | HarnessKind::KimiCode | HarnessKind::QwenCode => "AGENTS.md",
         HarnessKind::GeminiCli => "GEMINI.md",
         HarnessKind::AntigravityIde => ".agents/rules/qcode.md",
     }
@@ -77,6 +77,14 @@ pub fn platform(harness: HarnessKind) -> &'static str {
         HarnessKind::OpenCode => "opencode",
         HarnessKind::GeminiCli => "gemini",
         HarnessKind::Codex => "codex",
+        // graphify has no installer named after either; its `agents` installer writes its section
+        // into `AGENTS.md`, which both read, and its skill into `~/.agents/skills`, where both look
+        // for skills shared between tools (measured with graphify 0.9.66). Codex's installer
+        // would write the same section and leave a `.codex/hooks.json` in the workspace besides.
+        // Its `install --platform kimi` puts the skill in `~/.kimi/skills`, the folder of the older
+        // Python CLI of that name, which Kimi Code CLI does not read, and there is no `graphify
+        // kimi install` for the workspace at all.
+        HarnessKind::KimiCode | HarnessKind::QwenCode => "agents",
         HarnessKind::AntigravityIde => "antigravity",
     }
 }
@@ -90,6 +98,7 @@ pub fn skill(harness: HarnessKind) -> &'static str {
         HarnessKind::OpenCode => ".config/opencode/skills/graphify/SKILL.md",
         HarnessKind::GeminiCli => ".gemini/skills/graphify/SKILL.md",
         HarnessKind::Codex => ".codex/skills/graphify/SKILL.md",
+        HarnessKind::KimiCode | HarnessKind::QwenCode => ".agents/skills/graphify/SKILL.md",
         HarnessKind::AntigravityIde => ".gemini/config/skills/graphify/SKILL.md",
     }
 }
@@ -209,13 +218,7 @@ pub fn lock() -> MutexGuard<'static, ()> {
 mod tests {
     use super::*;
 
-    const HARNESSES: [HarnessKind; 5] = [
-        HarnessKind::ClaudeCode,
-        HarnessKind::OpenCode,
-        HarnessKind::GeminiCli,
-        HarnessKind::Codex,
-        HarnessKind::AntigravityIde,
-    ];
+    const HARNESSES: [HarnessKind; 7] = HarnessKind::ALL;
 
     /// What graphify wrote into a `CLAUDE.md` in the measured container, word for word.
     const GRAPHIFY: &str = "## graphify\n\nThis project has a knowledge graph at graphify-out/ with god nodes, \
@@ -234,6 +237,8 @@ mod tests {
         assert_eq!(file(HarnessKind::OpenCode), "AGENTS.md");
         assert_eq!(file(HarnessKind::Codex), "AGENTS.md");
         assert_eq!(file(HarnessKind::GeminiCli), "GEMINI.md");
+        assert_eq!(file(HarnessKind::KimiCode), "AGENTS.md");
+        assert_eq!(file(HarnessKind::QwenCode), "AGENTS.md");
         assert_eq!(file(HarnessKind::AntigravityIde), ".agents/rules/qcode.md");
         // Beside graphify's own rule, never in place of it.
         assert_ne!(file(HarnessKind::AntigravityIde), ".agents/rules/graphify.md");
@@ -242,7 +247,7 @@ mod tests {
     #[test]
     fn each_harness_is_known_to_graphify_by_its_own_word() {
         let words: Vec<&str> = HARNESSES.iter().map(|harness| platform(*harness)).collect();
-        assert_eq!(words, ["claude", "opencode", "gemini", "codex", "antigravity"]);
+        assert_eq!(words, ["claude", "opencode", "gemini", "codex", "agents", "agents", "antigravity"]);
     }
 
     #[test]

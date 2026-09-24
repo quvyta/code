@@ -250,12 +250,34 @@ impl Road {
         self.ask(&[command, "run".to_owned(), prompt.to_owned()])
     }
 
-    /// The harness of this road asked `prompt` once.
+    /// The harness of this road asked `prompt` once, in the form of its program that answers
+    /// without a terminal and ends; the tab runs its interface instead, with the very same
+    /// environment, arguments and relay in front of it.
     fn ask_once(&self, prompt: &str) -> Result<String, String> {
-        match self.profile.harness {
-            HarnessKind::OpenCode => self.ask_opencode(prompt),
-            _ => self.ask_claude(prompt),
+        let harness = self.profile.harness;
+        let record = harness.record();
+        let choice = self.profile.provider.as_ref().expect("a provider profile");
+        let mut line = vec![record.command.to_owned()];
+        line.extend(choice.arguments(harness));
+        match harness {
+            HarnessKind::OpenCode => return self.ask_opencode(prompt),
+            HarnessKind::ClaudeCode => return self.ask_claude(prompt),
+            // `--auto` is refused beside `-p`, which never stops to ask anyway.
+            HarnessKind::KimiCode => line.extend(["-p".to_owned(), prompt.to_owned()]),
+            HarnessKind::QwenCode => {
+                line.extend(record.auto_run.iter().map(|word| (*word).to_owned()));
+                line.push(prompt.to_owned());
+            }
+            HarnessKind::Codex => {
+                line.push("exec".to_owned());
+                line.extend(record.auto_run.iter().map(|word| (*word).to_owned()));
+                line.extend(["--skip-git-repo-check".to_owned(), prompt.to_owned()]);
+            }
+            HarnessKind::GeminiCli | HarnessKind::AntigravityIde => {
+                panic!("{harness:?} is not asked through the relay")
+            }
         }
+        self.ask(&line)
     }
 
     /// Gathers everything inside the container, after leaving a word in the home folder and in
@@ -687,4 +709,102 @@ fn opencode_answers_on_kimi_code_in_the_openai_shape_and_the_key_never_enters_it
         "QCODE_KIMI_MODEL",
         "kimi-for-coding",
     );
+}
+
+#[test]
+#[ignore = "needs a container engine, the network, and the owner's MiMo key; run with QCODE_CONTAINER_TESTS=1"]
+fn kimi_code_answers_on_xiaomi_mimo_and_the_key_never_enters_its_container() {
+    answers_on_a_ready_made_service(
+        HarnessKind::KimiCode,
+        ProviderKind::MimoTokenPlan,
+        ".config/quvyta/mimo-key",
+        "QCODE_MIMO_MODEL",
+        "mimo-v2.6-flash",
+    );
+}
+
+#[test]
+#[ignore = "needs a container engine, the network, and the owner's Kimi key; run with QCODE_CONTAINER_TESTS=1"]
+fn kimi_code_answers_on_kimi_code_and_the_key_never_enters_its_container() {
+    answers_on_a_ready_made_service(
+        HarnessKind::KimiCode,
+        ProviderKind::KimiCode,
+        ".config/quvyta/kimi-key",
+        "QCODE_KIMI_MODEL",
+        "kimi-for-coding",
+    );
+}
+
+#[test]
+#[ignore = "needs a container engine, the network, and the owner's MiMo key; run with QCODE_CONTAINER_TESTS=1"]
+fn qwen_code_answers_on_xiaomi_mimo_and_the_key_never_enters_its_container() {
+    answers_on_a_ready_made_service(
+        HarnessKind::QwenCode,
+        ProviderKind::MimoTokenPlan,
+        ".config/quvyta/mimo-key",
+        "QCODE_MIMO_MODEL",
+        "mimo-v2.6-flash",
+    );
+}
+
+#[test]
+#[ignore = "needs a container engine, the network, and the owner's Kimi key; run with QCODE_CONTAINER_TESTS=1"]
+fn qwen_code_answers_on_kimi_code_and_the_key_never_enters_its_container() {
+    answers_on_a_ready_made_service(
+        HarnessKind::QwenCode,
+        ProviderKind::KimiCode,
+        ".config/quvyta/kimi-key",
+        "QCODE_KIMI_MODEL",
+        "kimi-for-coding",
+    );
+}
+
+#[test]
+#[ignore = "needs a container engine, the network, and the owner's MiMo key; run with QCODE_CONTAINER_TESTS=1"]
+fn codex_answers_on_xiaomi_mimo_in_the_responses_shape_and_the_key_never_enters_its_container() {
+    answers_on_a_ready_made_service(
+        HarnessKind::Codex,
+        ProviderKind::MimoTokenPlan,
+        ".config/quvyta/mimo-key",
+        "QCODE_MIMO_MODEL",
+        "mimo-v2.6-flash",
+    );
+}
+
+#[test]
+#[ignore = "needs a container engine, the network, and the owner's Kimi key; run with QCODE_CONTAINER_TESTS=1"]
+fn codex_answers_on_kimi_code_in_the_responses_shape_and_the_key_never_enters_its_container() {
+    answers_on_a_ready_made_service(
+        HarnessKind::Codex,
+        ProviderKind::KimiCode,
+        ".config/quvyta/kimi-key",
+        "QCODE_KIMI_MODEL",
+        "kimi-for-coding",
+    );
+}
+
+#[test]
+#[ignore = "needs a container engine, the network, and the owner's OpenRouter key; run with QCODE_CONTAINER_TESTS=1"]
+fn codex_answers_on_openrouter_in_the_responses_shape_and_the_key_never_enters_its_container() {
+    let Some(key) = openrouter_key() else {
+        println!("skipped: there is no key at ~/{OPENROUTER_KEY_FILE}");
+        return;
+    };
+    let model = std::env::var("QCODE_OPENROUTER_MODEL").unwrap_or_else(|_| OPENROUTER_MODEL.to_owned());
+    let profile = profile(HarnessKind::Codex, &model);
+    let mut entry = ProviderEntry::new(
+        Tag::parse(TAG).expect("a tag"),
+        ProviderKind::OpenRouter,
+        ProviderKind::OpenRouter.suggested_base(),
+    );
+    entry.key = Some(key.clone());
+    for engine in engines() {
+        let kind = engine.kind();
+        let road = Road::open(engine, &profile, entry.clone(), Upstream::network());
+        let said = road.ask_once("Reply with just the digits: what is 2+2?").unwrap_or_else(|trouble| trouble);
+        let events = road.events();
+        println!("{kind:?}: Codex on OpenRouter {model} said: {}\nrelay events {events:?}", without(&said, &key));
+        assert!(said.contains('4'), "{kind:?}: OpenRouter answered through the relay: {}", without(&said, &key));
+        road.assert_no_trace_of(&key);
+    }
 }

@@ -465,3 +465,72 @@ fn opencode_conversations_are_what_its_own_list_says_for_the_workspace() {
         assert!(found.windows(2).all(|pair| pair[0].used_ms >= pair[1].used_ms), "{kind:?}: newest first");
     }
 }
+
+/// The ids a harness's own list gives for `folder`, printed by `list` (a shell script that is
+/// given the folder as `$1`) as JSON: one array over many lines, or one object a line. The ids
+/// are under `field`.
+fn own_ids(lab: &Lab, list: &str, field: &str) -> Vec<String> {
+    let printed = lab.sh(list, &[CODE_DIR]);
+    let items: Vec<serde_json::Value> = match serde_json::from_str::<serde_json::Value>(&printed) {
+        Ok(serde_json::Value::Array(items)) => items,
+        _ => printed.lines().filter_map(|line| serde_json::from_str(line).ok()).collect(),
+    };
+    let mut ids: Vec<String> = items.iter().filter_map(|item| item[field].as_str().map(str::to_owned)).collect();
+    ids.sort_unstable();
+    ids
+}
+
+#[test]
+#[ignore = "needs a container engine and the network; run with QCODE_CONTAINER_TESTS=1"]
+fn kimi_code_conversations_are_what_its_own_list_says_for_the_workspace() {
+    for engine in engines() {
+        let lab = Lab::open(engine, HarnessKind::KimiCode, Network::Full);
+        let kind = lab.engine.kind();
+        for step in HarnessKind::KimiCode.record().install {
+            lab.sh(step, &[]);
+        }
+        assert_eq!(lab.read(), [], "{kind:?}: the empty list Kimi Code CLI prints is no conversations");
+
+        // A turn asked of a provider that is not there still leaves its session behind, which is
+        // all a list needs; one in the workspace, one in another folder.
+        let run = r#"d="$1"; shift; mkdir -p "$d" && cd "$d" && KIMI_MODEL_NAME=m KIMI_MODEL_API_KEY=t \
+            KIMI_MODEL_PROVIDER_TYPE=openai KIMI_MODEL_BASE_URL=http://127.0.0.1:9/v1 \
+            timeout 40 kimi -p "$@" >/dev/null 2>&1; true"#;
+        lab.sh(run, &[CODE_DIR, "reply with the word ok"]);
+        lab.sh(run, &[OTHER_DIR, "reply with the word ok"]);
+
+        let own = own_ids(&lab, r#"kimi session list --cwd "$1" --json"#, "id");
+        assert_eq!(own.len(), 1, "{kind:?}: the harness made its session in the workspace: {own:?}");
+        let found = lab.read();
+        let mut ids: Vec<String> = found.iter().map(|conversation| conversation.id.clone()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, own, "{kind:?}: every conversation of the workspace and nothing else");
+        // What the harness is given back opens that session: the id is one its argument takes.
+        assert!(ids.iter().all(|id| history::is_safe_id(id) && id.starts_with("session_")), "{kind:?}: {ids:?}");
+    }
+}
+
+#[test]
+#[ignore = "needs a container engine and the network; run with QCODE_CONTAINER_TESTS=1"]
+fn qwen_code_conversations_are_what_its_own_list_says_for_the_workspace() {
+    for engine in engines() {
+        let lab = Lab::open(engine, HarnessKind::QwenCode, Network::Full);
+        let kind = lab.engine.kind();
+        for step in HarnessKind::QwenCode.record().install {
+            lab.sh(step, &[]);
+        }
+        assert_eq!(lab.read(), [], "{kind:?}: no conversations before the first");
+
+        let run = r#"d="$1"; shift; mkdir -p "$d" && cd "$d" && OPENAI_API_KEY=t \
+            OPENAI_BASE_URL=http://127.0.0.1:9/v1 OPENAI_MODEL=m timeout 120 qwen "$@" >/dev/null 2>&1; true"#;
+        lab.sh(run, &[CODE_DIR, "History test, first words"]);
+        lab.sh(run, &[OTHER_DIR, "reply with the word ok"]);
+
+        let own = own_ids(&lab, r#"cd "$1" && qwen sessions list --json --limit 1000"#, "sessionId");
+        assert_eq!(own.len(), 1, "{kind:?}: the harness made its session in the workspace: {own:?}");
+        let found = lab.read();
+        let ids: Vec<String> = found.iter().map(|conversation| conversation.id.clone()).collect();
+        assert_eq!(ids, own, "{kind:?}: every conversation of the workspace and nothing else");
+        assert_eq!(listed(&found)[0].1, Some("History test, first words"), "{kind:?}: the first prompt is its title");
+    }
+}

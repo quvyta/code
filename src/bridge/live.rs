@@ -106,6 +106,10 @@ fn harness_says(harness: HarnessKind) -> (&'static str, &'static [&'static str])
         HarnessKind::OpenCode => ("opencode mcp list", &["qcode", "connected"]),
         HarnessKind::GeminiCli => ("gemini mcp list", &["qcode", "Connected"]),
         HarnessKind::Codex => ("codex mcp get qcode", &["enabled: true", "command: node", "qcode-bridge.mjs"]),
+        // Kimi Code CLI lists its servers only inside its interface (`/mcp`); outside it, the
+        // file it reads is what can be asked, and `bridge_delivery` proves the server answers it.
+        HarnessKind::KimiCode => ("cat \"$HOME/.kimi-code/mcp.json\"", &["\"qcode\"", "qcode-bridge.mjs"]),
+        HarnessKind::QwenCode => ("qwen mcp list", &["qcode", "Connected"]),
         // A harness that opens a window runs no agent of QCode's, so it is never registered and
         // never asked. `verify` is called for the four that are.
         HarnessKind::AntigravityIde => unreachable!("a window harness is not registered"),
@@ -382,7 +386,11 @@ fn prompt_of(harness: HarnessKind) -> &'static str {
         HarnessKind::ClaudeCode => "shift+tab to cycle",
         HarnessKind::OpenCode => "Ask anything",
         HarnessKind::GeminiCli => "Type your message",
+        // Signed in to nothing it stops at its sign-in page, which says this; with a model to
+        // speak to its prompt is up, whose placeholder says the other.
         HarnessKind::Codex => "To get started",
+        HarnessKind::KimiCode => "Never Ask",
+        HarnessKind::QwenCode => "Type your message",
         HarnessKind::AntigravityIde => unreachable!("a window harness has no prompt in a tab"),
     }
 }
@@ -631,4 +639,144 @@ fn claude_code_opens_on_its_prompt_under_qcode_basic_without_a_key_pressed() {
 #[ignore = "needs a container engine, the network once for the image, and a model service; run with QCODE_CONTAINER_TESTS=1, QCODE_PROVIDER_URL and QCODE_PROVIDER_MODEL"]
 fn claude_code_opens_on_its_prompt_under_qcode_high_without_a_key_pressed() {
     claude_code_opens_on_its_prompt(Template::High);
+}
+
+#[test]
+#[ignore = "needs a container engine and the network; run with QCODE_CONTAINER_TESTS=1"]
+fn kimi_code_starts_the_bridge_and_reaches_qcode() {
+    verify(HarnessKind::KimiCode);
+}
+
+#[test]
+#[ignore = "needs a container engine and the network; run with QCODE_CONTAINER_TESTS=1"]
+fn qwen_code_starts_the_bridge_and_reaches_qcode() {
+    verify(HarnessKind::QwenCode);
+}
+
+/// A tab of `harness` on Xiaomi MiMo, started exactly as the product starts a provider tab — the
+/// container of [`ContainerPlan::profile`], the bridge registered the way a workspace registers
+/// it, the relay of [`crate::provider::relay::wrapping`] in front of the harness with the
+/// provider's arguments after the program, and the environment of
+/// [`crate::profile::ProviderChoice::environment`] — opens on its own prompt with not one key
+/// pressed, finds the bridge's server where it looks for servers, and takes a message from
+/// another tab into that prompt. The container has no network and never holds the key: QCode's
+/// relay adds it on the way out, from the owner's `~/.config/quvyta/mimo-key` (or `kimi-key`).
+fn delivered_on_a_provider(harness: HarnessKind) {
+    use crate::provider::relay::{self, Listener as Relay, Upstream};
+    use crate::provider::{Key, ProviderEntry, ProviderKind, Tag};
+    use qframe::runtime::Harness as Screen;
+    use qframe::widgets::TerminalSession;
+
+    // MiMo unless `QCODE_DELIVERY_PROVIDER=kimi` asks for Kimi Code, whose plan has a five-hour
+    // limit the other tests may already have spent.
+    let kimi = std::env::var("QCODE_DELIVERY_PROVIDER").is_ok_and(|asked| asked == "kimi");
+    let (key_file, variable, default_model, kind_of) = if kimi {
+        (".config/quvyta/kimi-key", "QCODE_KIMI_MODEL", "kimi-for-coding", ProviderKind::KimiCode)
+    } else {
+        (".config/quvyta/mimo-key", "QCODE_MIMO_MODEL", "mimo-v2.6-flash", ProviderKind::MimoTokenPlan)
+    };
+    let Some(key) = std::env::var_os("HOME")
+        .and_then(|home| std::fs::read_to_string(PathBuf::from(home).join(key_file)).ok())
+        .and_then(|text| Key::new(&text))
+    else {
+        println!("skipped: there is no key at ~/{key_file}");
+        return;
+    };
+    let model = std::env::var(variable).unwrap_or_else(|_| default_model.to_owned());
+    let profile = Profile {
+        name: SafeName::parse(&format!("bridgetest-{}-provider", harness.record().id)).expect("the name is safe"),
+        account: AccountKind::Provider,
+        provider: Some(crate::profile::ProviderChoice { tag: PROVIDER_TAG.to_owned(), model }),
+        ..self::profile(harness)
+    };
+    let choice = profile.provider.clone().expect("the profile names a provider");
+    let mut entry = ProviderEntry::new(Tag::parse(PROVIDER_TAG).expect("a tag"), kind_of, kind_of.suggested_base());
+    entry.key = Some(key);
+    let sent = "Through QCode, from the Claude Code · claude-sub tab:";
+    let task = "please write the test for the parser and run it";
+
+    for engine in engines() {
+        let kind = engine.kind();
+        let scratch = Scratch::new(&format!("{}-provider-delivery", harness.record().id));
+        let paths = scratch.paths();
+        let workspace = WorkspaceId::parse(WORKSPACE).expect("a workspace id");
+        let plan = ContainerPlan::profile(&workspace, &paths, &profile);
+        let home = Home::new(profile.name.clone(), workspace.clone());
+        let _ = capture(&engine.remove_container(&plan.name));
+        let _ = capture(&engine.remove_volume(&home.volume()));
+        build(&engine, &profile);
+
+        let token = super::token();
+        let mine = token.clone();
+        let carried = entry.clone();
+        let relay = Relay::open(
+            &paths.mcp(),
+            move |asked| (asked == mine).then(|| carried.clone()),
+            Upstream::network(),
+            |_| (),
+        )
+        .expect("the workspace's relay socket opens");
+        let user = HostUser::current().expect("the current user");
+        ensure_running(&engine, &plan, user).unwrap_or_else(|failure| panic!("{kind:?}: {failure:?}"));
+        config::register(&engine, &plan.name, harness, &token)
+            .unwrap_or_else(|trouble| panic!("{kind:?}: {trouble:?}"));
+
+        let mut line = harness.command_line(None);
+        line.splice(1..1, choice.arguments(harness));
+        let parts = relay::wrapping(&line);
+        let words: Vec<&str> = parts.iter().map(String::as_str).collect();
+        let mut carried = vec![(super::TOKEN_VARIABLE.to_owned(), token.clone())];
+        carried.extend(choice.environment(harness, &token, None));
+        let envs: Vec<(&str, &str)> = carried.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
+        let command = plan.enter_with(&engine, &words, &envs);
+        let session = TerminalSession::spawn(command.program.as_os_str(), &command.args, &scratch.0)
+            .expect("a pseudo-terminal for the tab");
+        let mut screen = Screen::new(Watched(session.clone()), 120, 36);
+
+        // No key is pressed until the prompt is up: a question in the way means it never comes.
+        let started = std::time::Instant::now();
+        let prompt = if harness == HarnessKind::Codex { "Ask Codex to do anything" } else { prompt_of(harness) };
+        let drawn = until_shown(&mut screen, prompt);
+        assert!(drawn.contains(prompt), "{kind:?} {harness:?}: no prompt without a key pressed:\n{drawn}");
+        // A harness may draw its prompt first and a question over it a moment later; the prompt
+        // counts only once the screen has settled on it.
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        screen.render();
+        let settled = screen.screen();
+        assert!(
+            settled.contains(prompt) && !settled.contains("Trust this folder"),
+            "{kind:?} {harness:?}: a question came up over the prompt:\n{settled}"
+        );
+        eprintln!("{kind:?} {harness:?}: the prompt came up {} s after the start", started.elapsed().as_secs());
+
+        session.paste(&format!("{sent}\n\n{task}")).unwrap_or_else(|error| panic!("{kind:?}: the paste: {error}"));
+        session.write(b"\r").unwrap_or_else(|error| panic!("{kind:?}: the Return: {error}"));
+        let drawn = until_shown(&mut screen, task);
+        assert!(drawn.contains(task), "{kind:?} {harness:?}: the message never reached the prompt:\n{drawn}");
+        assert!(drawn.contains("QCode"), "{kind:?} {harness:?}: the sender is not named:\n{drawn}");
+
+        session.kill();
+        drop(relay);
+        capture(&engine.remove_container(&plan.name)).expect("the container is removed");
+        capture(&engine.remove_volume(&home.volume())).expect("the home is removed");
+        clear(&engine, &profile, &plan.name);
+    }
+}
+
+#[test]
+#[ignore = "needs a container engine, the network, and the owner's MiMo key; run with QCODE_CONTAINER_TESTS=1"]
+fn a_message_delivered_into_kimi_code_on_a_provider_reaches_its_own_prompt() {
+    delivered_on_a_provider(HarnessKind::KimiCode);
+}
+
+#[test]
+#[ignore = "needs a container engine, the network, and the owner's MiMo key; run with QCODE_CONTAINER_TESTS=1"]
+fn a_message_delivered_into_qwen_code_on_a_provider_reaches_its_own_prompt() {
+    delivered_on_a_provider(HarnessKind::QwenCode);
+}
+
+#[test]
+#[ignore = "needs a container engine, the network, and the owner's MiMo key; run with QCODE_CONTAINER_TESTS=1"]
+fn a_message_delivered_into_codex_on_a_provider_reaches_its_own_prompt() {
+    delivered_on_a_provider(HarnessKind::Codex);
 }

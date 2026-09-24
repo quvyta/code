@@ -64,6 +64,26 @@ pub const ASSUMED_CONTEXT_TOKENS: u64 = 200_000;
 /// OPENCODE_CONFIG_CONTENT` when it is set.
 pub const OPENCODE_CONFIG_CONTENT: &str = "OPENCODE_CONFIG_CONTENT";
 
+/// The variable that switches Kimi Code CLI to a provider made from the `KIMI_MODEL_*` variables,
+/// and names the model to ask for. These five are from its documentation's "Define a model from
+/// environment variables" and are read by its 2.1.0 bundle.
+pub const KIMI_MODEL_NAME: &str = "KIMI_MODEL_NAME";
+/// The shape Kimi Code CLI asks that provider in: `kimi`, `anthropic` or `openai`.
+pub const KIMI_MODEL_PROVIDER_TYPE: &str = "KIMI_MODEL_PROVIDER_TYPE";
+/// The address Kimi Code CLI asks that provider at.
+pub const KIMI_MODEL_BASE_URL: &str = "KIMI_MODEL_BASE_URL";
+/// The key Kimi Code CLI sends that provider; the tab's token here, never the provider's key.
+pub const KIMI_MODEL_API_KEY: &str = "KIMI_MODEL_API_KEY";
+/// How much room Kimi Code CLI is told the model has.
+pub const KIMI_MODEL_MAX_CONTEXT_SIZE: &str = "KIMI_MODEL_MAX_CONTEXT_SIZE";
+
+/// The address Qwen Code sends OpenAI-shaped requests to, as its authentication guide lists it.
+pub const OPENAI_BASE_URL: &str = "OPENAI_BASE_URL";
+/// The key Qwen Code sends; the tab's token here.
+pub const OPENAI_API_KEY: &str = "OPENAI_API_KEY";
+/// The model Qwen Code asks for.
+pub const OPENAI_MODEL: &str = "OPENAI_MODEL";
+
 impl ProviderChoice {
     /// The environment a tab of `harness` on this provider is started with, so the harness
     /// speaks to the workspace's relay at `http://127.0.0.1:<`[`crate::provider::relay::PORT`]`>`
@@ -83,8 +103,42 @@ impl ProviderChoice {
         match harness {
             HarnessKind::ClaudeCode => self.claude_code(token, window),
             HarnessKind::OpenCode => vec![(OPENCODE_CONFIG_CONTENT.to_owned(), self.opencode(token, window))],
+            HarnessKind::KimiCode => self.kimi_code(token, window),
+            HarnessKind::QwenCode => self.qwen_code(token),
             HarnessKind::GeminiCli | HarnessKind::Codex | HarnessKind::AntigravityIde => Vec::new(),
         }
+    }
+
+    /// The arguments a tab of `harness` on this provider is started with, right after the
+    /// program, for a harness that is told of a provider on its command line rather than in its
+    /// environment. Empty for every other harness.
+    ///
+    /// Codex is the one: it reads a provider of one's own only from its configuration, which `-c`
+    /// sets for one run, and nothing of it is a secret. The provider is named `qcode`, asked at the
+    /// relay's `/v1` in the Responses shape, and sends as its key the variable that already holds
+    /// the tab's token ([`crate::bridge::TOKEN_VARIABLE`]). Its web search is turned off: that
+    /// tool is one OpenAI's own servers run, and a provider that is not OpenAI refuses the whole
+    /// request for naming it (MiMo, measured: "tool type 'web_search' is not supported").
+    #[must_use]
+    pub fn arguments(&self, harness: HarnessKind) -> Vec<String> {
+        if harness != HarnessKind::Codex {
+            return Vec::new();
+        }
+        let provider = format!(
+            "model_providers.{CODEX_PROVIDER}={{ name = {}, base_url = {}, env_key = {}, wire_api = \"responses\" }}",
+            toml_string(&self.tag),
+            toml_string(&Self::endpoint(Wire::OpenAi)),
+            toml_string(crate::bridge::TOKEN_VARIABLE),
+        );
+        [
+            format!("model_provider={}", toml_string(CODEX_PROVIDER)),
+            format!("model={}", toml_string(&self.model)),
+            provider,
+            format!("web_search={}", toml_string("disabled")),
+        ]
+        .into_iter()
+        .flat_map(|setting| ["-c".to_owned(), setting])
+        .collect()
     }
 
     /// The address a harness inside the container is given for this provider in shape `wire`:
@@ -156,6 +210,56 @@ impl ProviderChoice {
         })
         .to_string()
     }
+
+    /// Kimi Code CLI makes a provider of its own, in memory, from the `KIMI_MODEL_*` variables it
+    /// reads at start, and asks it in the OpenAI completion shape when told `openai`. That shape
+    /// rather than its own `kimi` one, because every provider the relay carries answers it, and
+    /// rather than the Anthropic one, which Xiaomi's own page says fails MiMo on turns with tools.
+    ///
+    /// Told of no window, it assumes 262 144 tokens (its documentation's default for
+    /// `KIMI_MODEL_MAX_CONTEXT_SIZE`), so a known window is handed over as it is to the others.
+    fn kimi_code(&self, token: &str, window: Option<u64>) -> Vec<(String, String)> {
+        let mut environment = vec![
+            (KIMI_MODEL_NAME.to_owned(), self.model.clone()),
+            (KIMI_MODEL_PROVIDER_TYPE.to_owned(), "openai".to_owned()),
+            (KIMI_MODEL_BASE_URL.to_owned(), Self::endpoint(Wire::OpenAi)),
+            (KIMI_MODEL_API_KEY.to_owned(), token.to_owned()),
+        ];
+        if let Some(window) = window {
+            environment.push((KIMI_MODEL_MAX_CONTEXT_SIZE.to_owned(), window.to_string()));
+        }
+        environment
+    }
+
+    /// Qwen Code reads an OpenAI-compatible provider from three variables and needs nothing else
+    /// to start on its prompt. It has no variable for a model's window: that is only read from its
+    /// settings file, which every tab of the profile shares, so a measured window is not handed
+    /// to it.
+    fn qwen_code(&self, token: &str) -> Vec<(String, String)> {
+        vec![
+            (OPENAI_BASE_URL.to_owned(), Self::endpoint(Wire::OpenAi)),
+            (OPENAI_API_KEY.to_owned(), token.to_owned()),
+            (OPENAI_MODEL.to_owned(), self.model.clone()),
+        ]
+    }
+}
+
+/// The name Codex is told the provider of a tab goes by in its configuration.
+const CODEX_PROVIDER: &str = "qcode";
+
+/// `text` as a TOML basic string, which is what Codex reads the value of each `-c` as.
+fn toml_string(text: &str) -> String {
+    let mut quoted = String::from("\"");
+    for c in text.chars() {
+        match c {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            c if c.is_control() => quoted.push_str(&format!("\\u{:04X}", u32::from(c))),
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 /// Where a harness inside a profile container reaches the relay: its loopback interface, on the
@@ -834,12 +938,82 @@ mode = \"full\"
     }
 
     #[test]
+    fn kimi_code_makes_an_openai_provider_of_the_relay_from_its_own_variables() {
+        let provider = ProviderChoice { tag: "ev1".to_owned(), model: "mimo-v2.6-flash".to_owned() };
+        let env = provider.environment(HarnessKind::KimiCode, "tab-token-abc", None);
+        let get = |env: &Vec<(String, String)>, name: &str| {
+            env.iter().find(|(key, _)| key == name).map(|(_, value)| value.to_owned())
+        };
+        assert_eq!(get(&env, KIMI_MODEL_NAME).as_deref(), Some("mimo-v2.6-flash"));
+        assert_eq!(get(&env, KIMI_MODEL_PROVIDER_TYPE).as_deref(), Some("openai"));
+        assert_eq!(get(&env, KIMI_MODEL_BASE_URL).as_deref(), Some("http://127.0.0.1:41417/v1"));
+        assert_eq!(get(&env, KIMI_MODEL_API_KEY).as_deref(), Some("tab-token-abc"), "the tab's token, never a key");
+        assert_eq!(env.len(), 4, "a window nobody measured is not invented: {env:?}");
+        let measured = provider.environment(HarnessKind::KimiCode, "tab-token-abc", Some(31_512));
+        assert_eq!(get(&measured, KIMI_MODEL_MAX_CONTEXT_SIZE).as_deref(), Some("31512"));
+    }
+
+    #[test]
+    fn qwen_code_is_pointed_at_the_relays_openai_root() {
+        let provider = ProviderChoice { tag: "ev1".to_owned(), model: "kimi-for-coding".to_owned() };
+        let env = provider.environment(HarnessKind::QwenCode, "tab-token-abc", Some(31_512));
+        assert_eq!(
+            env,
+            [
+                (OPENAI_BASE_URL.to_owned(), "http://127.0.0.1:41417/v1".to_owned()),
+                (OPENAI_API_KEY.to_owned(), "tab-token-abc".to_owned()),
+                (OPENAI_MODEL.to_owned(), "kimi-for-coding".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
     fn a_harness_offered_no_provider_is_given_no_environment_for_one() {
         let provider = ProviderChoice { tag: "ev1".to_owned(), model: "m".to_owned() };
-        for harness in [HarnessKind::GeminiCli, HarnessKind::Codex, HarnessKind::AntigravityIde] {
+        for harness in [HarnessKind::GeminiCli, HarnessKind::AntigravityIde] {
             assert!(!harness.supports(AccountKind::Provider), "{harness:?}");
             assert!(provider.environment(harness, "t", None).is_empty(), "{harness:?}");
+            assert!(provider.arguments(harness).is_empty(), "{harness:?}");
         }
+    }
+
+    #[test]
+    fn codex_is_told_of_the_relay_on_its_command_line_in_the_responses_shape() {
+        let provider = ProviderChoice { tag: "ev1".to_owned(), model: "kimi-for-coding".to_owned() };
+        assert!(
+            provider.environment(HarnessKind::Codex, "tab-token-abc", None).is_empty(),
+            "nothing in the environment"
+        );
+        assert_eq!(
+            provider.arguments(HarnessKind::Codex),
+            [
+                "-c",
+                "model_provider=\"qcode\"",
+                "-c",
+                "model=\"kimi-for-coding\"",
+                "-c",
+                "model_providers.qcode={ name = \"ev1\", base_url = \"http://127.0.0.1:41417/v1\", \
+                 env_key = \"QCODE_BRIDGE\", wire_api = \"responses\" }",
+                "-c",
+                "web_search=\"disabled\"",
+            ]
+        );
+        // The token is never on the command line, where every process of the container reads it;
+        // Codex is only told which variable holds it.
+        assert!(!provider.arguments(HarnessKind::Codex).concat().contains("tab-token-abc"));
+        for harness in [HarnessKind::ClaudeCode, HarnessKind::OpenCode, HarnessKind::KimiCode, HarnessKind::QwenCode] {
+            assert!(provider.arguments(harness).is_empty(), "{harness:?} is told in its environment");
+        }
+    }
+
+    #[test]
+    fn a_model_name_is_one_toml_string_whatever_it_holds() {
+        let provider = ProviderChoice { tag: "ev1".to_owned(), model: "a\"b\\c".to_owned() };
+        let arguments = provider.arguments(HarnessKind::Codex);
+        assert_eq!(arguments[3], "model=\"a\\\"b\\\\c\"");
+        let parsed = toml::de::DeTable::parse(&arguments[3]).expect("TOML");
+        let value = parsed.get_ref().get("model").map(|value| value.get_ref().clone());
+        assert!(matches!(&value, Some(toml::de::DeValue::String(text)) if text == "a\"b\\c"), "{value:?}");
     }
 
     #[test]

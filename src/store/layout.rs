@@ -431,6 +431,30 @@ pub fn add_profile(paths: &WorkspacePaths, name: &str, added: Date) -> Result<Wo
     Ok(file)
 }
 
+/// Records in the workspace at `paths` that it no longer carries the profile `name`, because the
+/// profile was deleted, and answers with the file as it now stands.
+///
+/// Like [`add_profile`], the file is read again first, so a change made to it meanwhile is kept,
+/// and it is written only when it named the profile. The profile's folder under
+/// `Containers/Harness/` goes with the entry while it is empty; one that holds anything is left as
+/// it is.
+///
+/// # Errors
+///
+/// A `workspace.qcode` that cannot be read, names no workspace or cannot be written.
+pub fn remove_profile(paths: &WorkspacePaths, name: &str) -> Result<WorkspaceFile, Diagnostic> {
+    let mut file = read_workspace_at(paths)?;
+    let before = file.profiles.len();
+    file.profiles.retain(|carried| carried.name != name);
+    if file.profiles.len() != before {
+        write_workspace_at(paths, &file)?;
+    }
+    // Only an empty folder is removed, and one that will not go is no reason to call the rest a
+    // failure: the workspace file no longer names it.
+    let _ = fs::remove_dir(paths.harness_profile(name));
+    Ok(file)
+}
+
 /// Records in the workspace at `paths` that its backup leaves `keys` out, or takes them in again
 /// when `skip` is false, and answers with the file as it now stands.
 ///

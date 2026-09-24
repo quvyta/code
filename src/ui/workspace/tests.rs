@@ -37,6 +37,7 @@ mod history;
 mod missing_image;
 mod rebuilt_image;
 mod registry;
+mod shine;
 mod sound;
 mod viewers;
 mod watch;
@@ -538,6 +539,79 @@ fn an_opencode_tab_on_a_provider_is_told_of_the_relay_in_its_own_configuration_w
     assert_eq!(config["model"], "ev1/qwen3-coder:30b");
     // A value only the measurement on the Providers page could have put there.
     assert_eq!(provider["models"]["qwen3-coder:30b"]["limit"]["context"], 31_512);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_codex_tab_on_a_provider_names_the_relay_on_its_command_line_before_a_conversation_it_resumes() {
+    let scratch = Scratch::new("provider-codex");
+    let profiles =
+        vec![Profile { harness: HarnessKind::Codex, ..provider_profile("cx-tab", "ev1", "kimi-for-coding") }];
+    let mut screen = WorkspaceScreen::new(
+        Some(engine()),
+        HostUser::Ids { uid: 1000, gid: 1000 },
+        vec![workspace("firefly", "Firefly", scratch.paths(), profiles)],
+    );
+    apply(&mut screen, Msg::OpenWorkspace(0));
+    open(&mut screen, Choice::NewChat("cx-tab".to_owned()));
+    open(&mut screen, Choice::Resume("cx-tab".to_owned(), "01a0cf22-23dc-7fd0-8c28-6a9fef67a234".to_owned()));
+
+    let editor = screen.editor();
+    let workspace = screen.workspace().expect("a workspace");
+    let program = workspace.program(&workspace.tabs()[0], editor).expect("a harness tab runs something");
+    assert!(program[1].ends_with("qcode-relay.mjs"), "the relay starts Codex too: {program:?}");
+    assert_eq!(program[2], "codex");
+    assert_eq!(program[3], "-c", "the provider comes right after the program: {program:?}");
+    assert!(program.contains(&"model=\"kimi-for-coding\"".to_owned()), "{program:?}");
+    assert_eq!(program.last().map(String::as_str), Some("--dangerously-bypass-approvals-and-sandbox"));
+    // Resuming, the subcommand still follows the provider, and the unattended argument still
+    // follows the subcommand.
+    let resumed = workspace.program(&workspace.tabs()[1], editor).expect("a harness tab runs something");
+    let at = resumed.iter().position(|word| word == "resume").expect("the subcommand is there");
+    assert_eq!(
+        &resumed[at..],
+        ["resume", "--dangerously-bypass-approvals-and-sandbox", "01a0cf22-23dc-7fd0-8c28-6a9fef67a234"]
+    );
+    assert!(resumed[3..at].iter().any(|word| word.starts_with("model_providers.qcode=")), "{resumed:?}");
+
+    let env = envs(&screen.launch_command(key(&screen, 0)).expect("a chosen tab has a command"));
+    assert!(env.contains_key("QCODE_BRIDGE"), "the variable Codex sends as its key is set: {env:?}");
+}
+
+#[test]
+fn kimi_code_and_qwen_code_tabs_on_a_provider_are_told_of_the_relay_in_their_own_variables() {
+    let scratch = Scratch::new("provider-kimi-qwen");
+    let path = measured_providers_file("kimi-qwen", "ev1", "qwen3-coder:30b", 31_512);
+    let profiles = vec![
+        Profile { harness: HarnessKind::KimiCode, ..provider_profile("kimi-tab", "ev1", "qwen3-coder:30b") },
+        Profile { harness: HarnessKind::QwenCode, ..provider_profile("qwen-tab", "ev1", "qwen3-coder:30b") },
+    ];
+    let mut screen = WorkspaceScreen::new(
+        Some(engine()),
+        HostUser::Ids { uid: 1000, gid: 1000 },
+        vec![workspace("firefly", "Firefly", scratch.paths(), profiles)],
+    )
+    .with_providers_path(Some(path.clone()));
+    apply(&mut screen, Msg::OpenWorkspace(0));
+    open(&mut screen, Choice::NewChat("kimi-tab".to_owned()));
+    open(&mut screen, Choice::NewChat("qwen-tab".to_owned()));
+
+    let editor = screen.editor();
+    let workspace = screen.workspace().expect("a workspace");
+    let kimi = workspace.program(&workspace.tabs()[0], editor).expect("a harness tab runs something");
+    assert_eq!(&kimi[2..], ["kimi", "--auto"], "{kimi:?}");
+    let qwen = workspace.program(&workspace.tabs()[1], editor).expect("a harness tab runs something");
+    assert_eq!(&qwen[2..], ["qwen", "--approval-mode=yolo"], "{qwen:?}");
+
+    let env = envs(&screen.launch_command(key(&screen, 0)).expect("a chosen tab has a command"));
+    assert_eq!(env.get("KIMI_MODEL_BASE_URL").map(String::as_str), Some("http://127.0.0.1:41417/v1"), "{env:?}");
+    assert_eq!(env.get("KIMI_MODEL_NAME").map(String::as_str), Some("qwen3-coder:30b"));
+    // A value only the measurement on the Providers page could have put there.
+    assert_eq!(env.get("KIMI_MODEL_MAX_CONTEXT_SIZE").map(String::as_str), Some("31512"));
+    let env = envs(&screen.launch_command(key(&screen, 1)).expect("a chosen tab has a command"));
+    assert_eq!(env.get("OPENAI_BASE_URL").map(String::as_str), Some("http://127.0.0.1:41417/v1"), "{env:?}");
+    assert_eq!(env.get("OPENAI_MODEL").map(String::as_str), Some("qwen3-coder:30b"));
+    assert_eq!(env.get("OPENAI_API_KEY"), env.get("QCODE_BRIDGE"), "the tab's own token, never a provider's key");
     let _ = std::fs::remove_file(&path);
 }
 

@@ -60,8 +60,8 @@ use qframe::prelude::*;
 use qframe::runtime::Task;
 use qframe::storage::FolderChange;
 use qframe::widgets::{
-    CollapsedMarker, EmptyState, LogView, Markdown, RailTab, ScrollView, Side, SidePanel, Spinner, TabEdit, TabRail,
-    TabWidth, Terminal, TerminalEvent, TerminalSession, Toast,
+    CollapsedMarker, EmptyState, LogView, Markdown, RailTab, ScrollView, ShimmerText, Side, SidePanel, Spinner,
+    TabEdit, TabRail, TabWidth, Terminal, TerminalEvent, TerminalSession, Toast,
 };
 
 use std::path::{Path, PathBuf};
@@ -556,11 +556,19 @@ impl OpenWorkspace {
             TabKind::Shell => Some(plan::SHELL.iter().map(|part| (*part).to_owned()).collect()),
             TabKind::Profile(name) => {
                 let profile = self.profiles.iter().find(|profile| profile.name.as_str() == name)?;
-                let command = profile.harness.command_line(tab.conversation());
+                let mut command = profile.harness.command_line(tab.conversation());
                 // A profile that runs on a provider of the person's own is pointed at the relay's
                 // address, so the relay has to be listening inside the container before the
-                // harness says anything: it is what starts the harness.
-                Some(if profile.provider.is_some() { crate::provider::relay::wrapping(&command) } else { command })
+                // harness says anything: it is what starts the harness. A harness told of the
+                // provider on its command line gets that right after its program, where it is
+                // read whatever else the line says.
+                Some(match &profile.provider {
+                    Some(provider) => {
+                        command.splice(1..1, provider.arguments(profile.harness));
+                        crate::provider::relay::wrapping(&command)
+                    }
+                    None => command,
+                })
             }
             TabKind::Image(file) => Some(apps::picture(&inside_container(file))),
             TabKind::Editor(file) => Some(editor.command(&inside_container(file))),
@@ -2454,7 +2462,7 @@ fn tab_body(screen: &WorkspaceScreen, ui: &mut View<'_, Msg>) {
         }
         TabState::Waiting | TabState::Starting => {
             ui.column(|ui| {
-                ui.add(Spinner::new().label(t!("workspace.starting")));
+                ui.add(ShimmerText::new(t!("workspace.starting")));
             })
             .fill()
             .align(Align::Center)
@@ -2467,7 +2475,7 @@ fn tab_body(screen: &WorkspaceScreen, ui: &mut View<'_, Msg>) {
                 terminal(ui, session);
             }
             None => {
-                ui.add(Spinner::new().label(t!("workspace.starting"))).fill();
+                ui.add(ShimmerText::new(t!("workspace.starting"))).fill();
             }
         },
         // Leaving the editor is how a file is closed, so that is what the tab says, and the way
@@ -2532,7 +2540,7 @@ fn building(tab: &Tab, ui: &mut View<'_, Msg>) {
     };
     ui.column(|ui| {
         ui.row(|ui| {
-            ui.add(Spinner::new().label(t!("workspace.image.building", profile = profile)));
+            ui.add(ShimmerText::new(t!("workspace.image.building", profile = profile)));
             ui.spacer();
             ui.add(Button::new(t!("workspace.image.stop")).on_press(Msg::StopBuild(key))).id("workspace-stop-build");
         })
@@ -2558,7 +2566,7 @@ fn picture(tab: &Tab, ui: &mut View<'_, Msg>) {
                 terminal(ui, session);
             }
             None if tab.state() == &TabState::Running => {
-                ui.add(Spinner::new().label(t!("workspace.starting"))).fill();
+                ui.add(ShimmerText::new(t!("workspace.starting"))).fill();
             }
             None => {
                 ui.spacer();

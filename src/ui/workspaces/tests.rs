@@ -47,6 +47,8 @@ struct Screen {
     state: Workspaces,
     /// Every workspace the screen handed on to be opened, in order.
     opened: Vec<String>,
+    /// Every workspace the screen said it deleted, in order.
+    deleted: Vec<String>,
 }
 
 impl App for Screen {
@@ -55,6 +57,7 @@ impl App for Screen {
     fn update(&mut self, message: Msg) -> Command<Msg> {
         let (command, opened) = update(&mut self.state, message);
         self.opened.extend(opened.map(|id| id.as_str().to_owned()));
+        self.deleted.extend(self.state.just_deleted().map(|id| id.as_str().to_owned()));
         command
     }
 
@@ -69,8 +72,13 @@ fn env() -> Env {
 
 /// A harness over the store at `root`, with the first listing already answered.
 fn screen(root: &Path, engine: Option<Engine>) -> Harness<Screen> {
-    let state = Workspaces::new(Store::new(root), engine, Vec::new());
-    let mut harness = Harness::with_env(Screen { state, opened: Vec::new() }, env(), SIZE.0, SIZE.1);
+    screen_over(Workspaces::new(Store::new(root), engine, Vec::new()))
+}
+
+/// A harness over `state`, with the first listing already answered.
+fn screen_over(state: Workspaces) -> Harness<Screen> {
+    let mut harness =
+        Harness::with_env(Screen { state, opened: Vec::new(), deleted: Vec::new() }, env(), SIZE.0, SIZE.1);
     harness.set_locale("en").set_glyph_mode(GlyphMode::Unicode).set_reduced_motion(true);
     harness.send(Msg::Refresh).render();
     harness
@@ -100,7 +108,7 @@ fn an_empty_store_says_what_a_workspace_is_and_offers_one() {
 fn the_first_reading_stands_in_for_the_list_before_it_answers() {
     let scratch = Scratch::new("skeleton");
     let state = Workspaces::new(Store::new(scratch.path()), None, Vec::new());
-    let harness = Harness::with_env(Screen { state, opened: Vec::new() }, env(), SIZE.0, SIZE.1);
+    let harness = Harness::with_env(Screen { state, opened: Vec::new(), deleted: Vec::new() }, env(), SIZE.0, SIZE.1);
     // Nothing has been read yet, so neither the list nor the empty state may claim the screen.
     let text = harness.screen();
     assert!(!text.contains("No workspaces yet"), "{text}");
@@ -123,7 +131,8 @@ fn the_workspace_opened_last_says_so_instead_of_its_day() {
     let store = Store::new(scratch.path());
     store.create_workspace("Firefly", qframe::date::Date::today_utc()).expect("made");
     let state = Workspaces::new(Store::new(scratch.path()), None, vec!["firefly".to_owned()]);
-    let mut harness = Harness::with_env(Screen { state, opened: Vec::new() }, env(), SIZE.0, SIZE.1);
+    let mut harness =
+        Harness::with_env(Screen { state, opened: Vec::new(), deleted: Vec::new() }, env(), SIZE.0, SIZE.1);
     harness.set_locale("en").set_glyph_mode(GlyphMode::Unicode).send(Msg::Refresh).render();
     let text = harness.screen();
     assert!(text.contains("Opened last"), "{text}");
@@ -311,7 +320,7 @@ fn cloning_without_an_engine_is_passive_and_says_why() {
     typed(&mut harness, "Firefly");
     harness.send(Msg::Source(super::Source::Git.index())).render();
     let text = harness.screen();
-    assert!(text.contains("No container engine was found"), "{text}");
+    assert!(text.contains("No container engine was"), "{text}");
     harness.send(Msg::Submit).render();
     assert!(!scratch.path().join("Workspaces").join("firefly").exists(), "nothing was made");
 }
@@ -529,4 +538,226 @@ fn a_new_workspace_starts_empty_and_says_so_with_the_mark_of_a_choice() {
 fn bold(harness: &Harness<Screen>, word: &str) -> bool {
     let (x, y) = harness.find(word).unwrap_or_else(|| panic!("`{word}` is shown:\n{}", harness.screen()));
     harness.is_bold(u16::try_from(x).expect("on screen"), u16::try_from(y).expect("on screen"))
+}
+
+/// A stand-in engine that lists `containers` (name, a tab, the state; a line each) and `volumes`
+/// (a name a line), answers every other command with success and writes down every command it is
+/// given, so a test reads exactly what the engine was asked to do.
+#[cfg(unix)]
+fn stand_in(scratch: &Scratch, containers: &str, volumes: &str) -> (Engine, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch.path().join("engine");
+    fs::create_dir_all(&dir).expect("a folder for the stand-in");
+    fs::write(dir.join("ps"), containers).expect("the containers");
+    fs::write(dir.join("volumes"), volumes).expect("the volumes");
+    let asked = dir.join("asked");
+    let script = format!(
+        "#!/bin/sh\necho \"$*\" >> '{asked}'\ncase \"$1 $2\" in\n  ps\\ *) cat '{ps}' ;;\n  'volume ls') cat '{volumes}' ;;\nesac\nexit 0\n",
+        asked = asked.display(),
+        ps = dir.join("ps").display(),
+        volumes = dir.join("volumes").display(),
+    );
+    let bin = dir.join("podman");
+    fs::write(&bin, script).expect("the stand-in");
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).expect("runnable");
+    (Engine::new(EngineKind::Podman, bin), asked)
+}
+
+/// What the stand-in engine was asked to do, a command a line.
+fn asked(path: &Path) -> Vec<String> {
+    fs::read_to_string(path).unwrap_or_default().lines().map(str::to_owned).collect()
+}
+
+/// The removals among what the stand-in engine was asked to do.
+fn removals(path: &Path) -> Vec<String> {
+    asked(path).into_iter().filter(|line| line.starts_with("rm ") || line.starts_with("volume rm ")).collect()
+}
+
+/// Lets background work answer until `done` holds, for a generous but finite while.
+fn settle(harness: &mut Harness<Screen>, done: impl Fn(&Harness<Screen>) -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !done(harness) && std::time::Instant::now() < deadline {
+        harness.advance(Duration::from_millis(20)).render();
+    }
+}
+
+/// Clicks `text` on the first line below the line that holds `anchor`: a row of a dialog whose
+/// words are also on the screen behind it.
+fn click_below(harness: &mut Harness<Screen>, anchor: &str, text: &str) {
+    let screen = harness.screen();
+    let lines: Vec<&str> = screen.lines().collect();
+    let start = lines.iter().position(|line| line.contains(anchor)).unwrap_or_else(|| panic!("`{anchor}`:\n{screen}"));
+    let (y, x) = lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find_map(|(y, line)| line.find(text).map(|at| (y, line[..at].chars().count())))
+        .unwrap_or_else(|| panic!("`{text}` under `{anchor}`:\n{screen}"));
+    harness.click(i32::try_from(x).expect("on screen"), i32::try_from(y).expect("on screen"));
+}
+
+/// A store with Firefly, which carries the profile claude, and Serenity beside it.
+fn two_workspaces(scratch: &Scratch) -> Store {
+    let store = Store::new(scratch.path());
+    let today = qframe::date::Date::today_utc();
+    let firefly = store.create_workspace("Firefly", today).expect("made");
+    store.create_workspace("Serenity", today).expect("made");
+    crate::store::add_profile(&store.workspace_paths(&firefly.id), "claude", today).expect("carried");
+    fs::write(store.workspace_paths(&firefly.id).code.join("main.rs"), "fn main() {}").expect("some code");
+    store
+}
+
+const CONTAINERS: &str =
+    "qcode-firefly-base\texited\nqcode-firefly-claude\texited\nqcode-serenity-base\texited\nsomeone-else\trunning\n";
+const VOLUMES: &str = "qcode-home-firefly-claude\nqcode-home-serenity-claude\nqcode-cred-claude\nsomeone-elses\n";
+
+#[cfg(unix)]
+#[test]
+fn deleting_a_workspace_asks_once_naming_what_goes_and_takes_exactly_that() {
+    let scratch = Scratch::new("delete");
+    let store = two_workspaces(&scratch);
+    let (engine, log) = stand_in(&scratch, CONTAINERS, VOLUMES);
+    let mut harness = screen(scratch.path(), Some(engine));
+
+    harness.click_text("Delete a workspace").render();
+    let text = harness.screen();
+    assert!(text.contains("Choose the workspace to delete"), "{text}");
+    click_below(&mut harness, "Choose the workspace to delete", "Firefly");
+    settle(&mut harness, |harness| harness.screen().contains("Delete Firefly?"));
+    let text = harness.screen();
+    assert!(text.contains("Delete Firefly?"), "{text}");
+    for named in ["qcode-firefly-base", "qcode-firefly-claude", "qcode-home-firefly-claude"] {
+        assert!(text.contains(named), "`{named}` is named in the question:\n{text}");
+    }
+    for other in ["qcode-serenity-base", "qcode-home-serenity-claude", "qcode-cred-claude", "someone-else"] {
+        assert!(!text.contains(other), "`{other}` is not Firefly's:\n{text}");
+    }
+    assert_eq!(removals(&log), [] as [String; 0], "nothing is removed before the answer");
+
+    // The question opens on Cancel; the answer is the button beside it.
+    harness.press("tab").press("enter").render();
+    settle(&mut harness, |harness| harness.screen().contains("Firefly was deleted"));
+    assert!(harness.screen().contains("Firefly was deleted"), "{}", harness.screen());
+
+    assert_eq!(
+        removals(&log),
+        ["rm --force qcode-firefly-base", "rm --force qcode-firefly-claude", "volume rm qcode-home-firefly-claude"],
+        "exactly Firefly's containers and home, and nothing of Serenity's or of the profile's"
+    );
+    assert!(!store.workspaces_dir().join("firefly").exists(), "the folder is gone");
+    assert!(store.workspaces_dir().join("serenity").is_dir(), "the other workspace stays");
+    settle(&mut harness, |harness| !harness.screen().contains("Firefly"));
+    assert!(!harness.screen().contains("Firefly"), "and the list says so:\n{}", harness.screen());
+    assert_eq!(harness.app().deleted, ["firefly"], "the application is told, once");
+}
+
+/// Opens the question about Firefly the way a person does: the button, then Firefly in the list
+/// it opens.
+fn ask_about_firefly(harness: &mut Harness<Screen>) {
+    harness.click_text("Delete a workspace").render();
+    click_below(harness, "Choose the workspace to delete", "Firefly");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_workspace_with_a_running_container_is_not_deleted_and_the_container_is_named() {
+    let scratch = Scratch::new("delete-running");
+    let store = two_workspaces(&scratch);
+    let running = CONTAINERS.replace("qcode-firefly-claude\texited", "qcode-firefly-claude\trunning");
+    let (engine, log) = stand_in(&scratch, &running, VOLUMES);
+    let mut harness = screen(scratch.path(), Some(engine));
+    ask_about_firefly(&mut harness);
+    settle(&mut harness, |harness| harness.screen().contains("has a container running"));
+    let text = harness.screen();
+    assert!(text.contains("Firefly has a container running"), "{text}");
+    assert!(text.contains("qcode-firefly-claude"), "the running one is named:\n{text}");
+    assert!(!text.contains("Delete Firefly?"), "and nothing is asked:\n{text}");
+    assert_eq!(removals(&log), [] as [String; 0]);
+    assert!(store.workspaces_dir().join("firefly").is_dir());
+    assert!(harness.app().deleted.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_workspace_open_in_this_qcode_is_not_deleted_and_the_engine_is_not_even_asked() {
+    let scratch = Scratch::new("delete-open");
+    let store = two_workspaces(&scratch);
+    let (engine, log) = stand_in(&scratch, CONTAINERS, VOLUMES);
+    let mut state = Workspaces::new(Store::new(scratch.path()), Some(engine), Vec::new());
+    state.set_open(vec![crate::store::WorkspaceId::parse("firefly").expect("an identifier")]);
+    let mut harness = screen_over(state);
+    ask_about_firefly(&mut harness);
+    settle(&mut harness, |harness| harness.screen().contains("Firefly is open"));
+    let text = harness.screen();
+    assert!(text.contains("Firefly is open"), "{text}");
+    assert!(!text.contains("Delete Firefly?"), "{text}");
+    assert_eq!(asked(&log), [] as [String; 0], "the engine was not asked anything");
+    assert!(store.workspaces_dir().join("firefly").is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn saying_no_keeps_everything_and_the_button_works_again() {
+    let scratch = Scratch::new("delete-kept");
+    let store = two_workspaces(&scratch);
+    let (engine, log) = stand_in(&scratch, CONTAINERS, VOLUMES);
+    let mut harness = screen(scratch.path(), Some(engine));
+    ask_about_firefly(&mut harness);
+    settle(&mut harness, |harness| harness.screen().contains("Delete Firefly?"));
+    harness.press("enter").render();
+    assert!(!harness.screen().contains("Delete Firefly?"), "{}", harness.screen());
+    harness.advance(Duration::from_millis(200)).render();
+    assert_eq!(removals(&log), [] as [String; 0]);
+    assert!(store.workspaces_dir().join("firefly").join("Work").join("main.rs").is_file());
+    // The same way in opens the question again: nothing was left waiting.
+    ask_about_firefly(&mut harness);
+    settle(&mut harness, |harness| harness.screen().contains("Delete Firefly?"));
+    assert!(harness.screen().contains("Delete Firefly?"), "{}", harness.screen());
+}
+
+#[test]
+fn without_an_engine_the_folder_goes_and_the_question_says_the_engine_keeps_its_part() {
+    let scratch = Scratch::new("delete-engineless");
+    let store = two_workspaces(&scratch);
+    let outside = scratch.path().join("my-own-code");
+    fs::create_dir_all(&outside).expect("a folder of the person's own");
+    fs::write(outside.join("main.rs"), "fn main() {}").expect("their file");
+    let mut harness = screen(scratch.path(), None);
+    ask_about_firefly(&mut harness);
+    settle(&mut harness, |harness| harness.screen().contains("Delete Firefly?"));
+    let text = harness.screen();
+    assert!(text.contains("No container engine was"), "{text}");
+    harness.press("tab").press("enter").render();
+    settle(&mut harness, |harness| harness.screen().contains("Firefly was deleted"));
+    assert!(!store.workspaces_dir().join("firefly").exists());
+    assert!(outside.join("main.rs").is_file(), "a folder outside the store is never touched");
+}
+
+#[test]
+fn a_new_workspace_is_the_first_row_of_the_list_for_the_pointer_and_the_keyboard() {
+    let scratch = Scratch::new("new-row");
+    let store = Store::new(scratch.path());
+    store.create_workspace("Alpha", qframe::date::Date::today_utc()).expect("made");
+    let mut harness = screen(scratch.path(), None);
+    let text = harness.screen();
+    let lines: Vec<&str> = text.lines().collect();
+    let new = lines.iter().position(|line| line.contains("New workspace")).expect("the row is there");
+    let alpha = lines.iter().position(|line| line.contains("Alpha")).expect("the workspace is there");
+    assert_eq!(alpha, new + 1, "the new row stands first, right over the workspaces:\n{text}");
+    assert_eq!(text.matches("New workspace").count(), 1, "and it is the only way to one:\n{text}");
+
+    harness.click_text("New workspace").render();
+    assert!(matches!(harness.app().state.overlay, Some(Overlay::New(_))), "a click opens the dialog");
+    harness.press("esc").render();
+
+    while !harness.is_focused(super::LIST) {
+        harness.press("tab");
+    }
+    // The keyboard starts on the first workspace, so Enter still opens it as it always did; one
+    // row up is the way to a new one, and moving there opens nothing by itself.
+    harness.press("up").render();
+    assert!(harness.app().state.overlay.is_none(), "moving onto the row only chooses it");
+    harness.press("enter").render();
+    assert!(matches!(harness.app().state.overlay, Some(Overlay::New(_))), "Enter on it opens the dialog");
+    assert!(harness.app().opened.is_empty(), "and no workspace was opened on the way");
 }

@@ -3,8 +3,8 @@
 use qframe::date::DateTime;
 use qframe::prelude::*;
 use qframe::widgets::{
-    ContextItem, ContextMenu, Field, Form, FormErrors, Modal, Popover, Section, Spinner, Switch, TextInput, Tooltip,
-    Tree, TreeNode, WidgetDock,
+    ContextItem, ContextMenu, Field, Form, FormErrors, Modal, Popover, Section, ShimmerText, Spinner, Switch,
+    TextInput, Tooltip, Tree, TreeNode, WidgetDock,
 };
 
 use crate::engine::ContainerState;
@@ -550,8 +550,19 @@ fn info_widget(screen: &WorkspaceScreen, workspace: &OpenWorkspace, ui: &mut Vie
         (t!("workspace.info.left-out"), super::backups::left_out_text(workspace)),
         (t!("workspace.info.backup-size"), super::backups::size_text(workspace)),
     ];
+    let backing_up = super::backups::is_running(screen, workspace);
+    let backup_label = t!("workspace.info.backup");
     ui.column(|ui| {
         for (label, value) in rows {
+            // A backup under way shines in its row, whatever the last one was; it is the panel's
+            // only moving thing, and it stops the moment the round is over.
+            if backing_up && label == backup_label {
+                ui.row(|ui| {
+                    ui.add(Text::new(format!("{label}  ")).role("faint"));
+                    ui.add(ShimmerText::new(t!("workspace.backup.running"))).id("workspace-backing-up");
+                });
+                continue;
+            }
             ui.add(Text::rich([Span::new(format!("{label}  ")).role("faint"), Span::new(value)]));
         }
     })

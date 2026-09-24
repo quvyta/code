@@ -23,7 +23,7 @@ repository = "https://github.com/quvyta/code"
 readme = "README.md"
 keywords = ["tui", "terminal", "agent", "podman", "docker"]
 categories = ["command-line-utilities", "development-tools"]
-version = "0.1.16"
+version = "0.1.17"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -54,7 +54,7 @@ path = "src/bin/quvyta-code.rs"
 [dependencies]
 # The terminal tabs and the sign-in flow run a harness in a pseudo-terminal; `updates` is the
 # family's notice that a newer version is out.
-quvyta-framework = { version = "0.1.19", features = ["pty", "updates"] }
+quvyta-framework = { version = "0.1.22", features = ["pty", "updates"] }
 # The bridge between tabs reads JSON from containers, which is untrusted input, and merges the
 # harnesses' JSON settings, which the person also edits; `preserve_order` keeps their keys where
 # they wrote them.

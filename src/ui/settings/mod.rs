@@ -439,200 +439,224 @@ pub fn view(screen: &Settings, ui: &mut View<'_, Msg>) {
     let gate = screen.gate();
 
     let width = ui.size().width.min(PAGE_WIDTH);
-    ui.add_with(ScrollView::new(), |ui| {
-        ui.row(|ui| {
-            ui.column(|ui| {
-                report(&Report::LEFT_BEHIND, &screen.left_behind, ui);
-                if !screen.repairs_read {
-                    report(&Report::REPAIRS, &screen.repairs, ui);
-                }
-                if let Some(reason) = &screen.failure {
-                    ui.add(Text::new(t!("settings.store-failed", reason = reason.clone())).color("danger"))
-                        .fill_width();
-                }
-
-                let list = SettingsList::show(ui, |list| {
-                    list.heading(t!("settings.appearance"));
-
-                    let codes: Vec<String> = languages.iter().map(|(code, _)| code.clone()).collect();
-                    let names: Vec<String> = languages.iter().map(|(_, name)| name.clone()).collect();
-                    let chosen = codes.iter().position(|code| *code == language);
-                    list.row(SettingRow::new(t!("settings.language")), |ui| {
-                        ui.add(
-                            Select::new(names)
-                                .selected(chosen)
-                                .on_select(move |index| Msg::Language(codes[index].clone())),
-                        )
-                        .id("language")
-                        .width(Length::Cells(CONTROL_WIDTH));
-                    });
-
-                    let ids: Vec<String> = themes.iter().map(|(id, _)| id.clone()).collect();
-                    let titles: Vec<String> = themes.iter().map(|(_, name)| name.clone()).collect();
-                    let chosen = ids.iter().position(|id| *id == theme);
-                    list.row(SettingRow::new(t!("settings.theme")), |ui| {
-                        ui.add(
-                            Select::new(titles).selected(chosen).on_select(move |index| Msg::Theme(ids[index].clone())),
-                        )
-                        .id("theme")
-                        .width(Length::Cells(CONTROL_WIDTH));
-                    });
-
-                    let modes = IconMode::ALL.map(|mode| t!(&format!("settings.icons-{}", mode.name())));
-                    let chosen = IconMode::ALL.iter().position(|mode| *mode == icons);
-                    list.row(SettingRow::new(t!("settings.icons")), |ui| {
-                        ui.add(
-                            Select::new(modes)
-                                .selected(chosen)
-                                .on_select(move |index| Msg::Icons(IconMode::ALL[index])),
-                        )
-                        .id("icons")
-                        .width(Length::Cells(CONTROL_WIDTH));
-                    });
-
-                    let note = motion_note(forced, reduced).unwrap_or_else(|| t!("settings.reduce-motion-text"));
-                    list.row(SettingRow::new(t!("settings.reduce-motion")).description(note).disabled(forced), |ui| {
-                        ui.add(Switch::new(reduced).disabled(forced).on_toggle(Msg::ReduceMotion));
-                    });
-
-                    // The family's switch, in the family's own words: it is one setting for every
-                    // Quvyta application, and each says the same thing about it.
-                    if let Some(on) = screen.update_notice {
-                        let about = t!("quvyta.appearance.updates-text", family = Family::QUVYTA.title());
-                        list.row(SettingRow::new(t!("quvyta.appearance.updates")).description(about), |ui| {
-                            ui.add(Switch::new(on).on_toggle(Msg::UpdateNotice)).id("update-notice");
-                        });
-                    }
-
-                    list.heading(t!("settings.containers"));
-                    let row = SettingRow::new(t!("settings.engine")).description(screen.engine.summary());
-                    list.row(row, |ui| match screen.engine.health() {
-                        Health::Checking => {
-                            ui.add(Spinner::new());
-                        }
-                        Health::Working | Health::Missing(_) => {
-                            let names = ENGINES.map(engine::name);
-                            let chosen = ENGINES.iter().position(|kind| *kind == screen.engine.kind()).unwrap_or(0);
-                            ui.add(
-                                Segmented::new(names)
-                                    .selected(chosen)
-                                    .on_select(move |index| Msg::Engine(ENGINES[index])),
-                            )
-                            .id("engine");
-                        }
-                    });
-
-                    let choices = OnClose::ALL.map(|choice| t!(&format!("settings.on-close-{}", choice.key())));
-                    let chosen = OnClose::ALL.iter().position(|choice| *choice == screen.on_close).unwrap_or(0);
-                    // Where nothing can tell that the last QCode closed, the choice is kept for
-                    // the file's sake but the row says plainly that it changes nothing here.
-                    let about = if screen.service == Some(ServiceRow::Unsupported) {
-                        t!("settings.on-close-windows")
-                    } else {
-                        t!("settings.on-close-text")
-                    };
-                    list.row(SettingRow::new(t!("settings.on-close")).description(about), |ui| {
-                        ui.add(
-                            Segmented::new(choices)
-                                .selected(chosen)
-                                .on_select(|index| Msg::OnClose(OnClose::ALL[index])),
-                        )
-                        .id("on-close");
-                    });
-                    if let Some(row) = screen.service {
-                        service_row(list, row);
-                    }
-
-                    list.heading(t!("settings.backup"));
-                    let choices = BackupEvery::ALL.map(|choice| t!(&format!("settings.backup-every-{}", choice.key())));
-                    let chosen = BackupEvery::ALL.iter().position(|choice| *choice == screen.backup_every);
-                    let row =
-                        SettingRow::new(t!("settings.backup-every")).description(t!("settings.backup-every-text"));
-                    list.row(row, |ui| {
-                        ui.add(
-                            Segmented::new(choices)
-                                .selected(chosen.unwrap_or(0))
-                                .on_select(|index| Msg::BackupEvery(BackupEvery::ALL[index])),
-                        )
-                        .id("backup-every");
-                    });
-
-                    list.heading(t!("settings.apps"));
-                    // The program's own name is the label: it is what the person knows it by, in
-                    // every language.
-                    let names = Editor::ALL.map(Editor::key);
-                    let chosen = Editor::ALL.iter().position(|editor| *editor == screen.editor).unwrap_or(0);
-                    list.row(SettingRow::new(t!("settings.editor")).description(t!("settings.editor-text")), |ui| {
-                        ui.add(
-                            Segmented::new(names)
-                                .selected(chosen)
-                                .on_select(move |index| Msg::Editor(Editor::ALL[index])),
-                        )
-                        .id("editor");
-                    });
-                    let choices = Sound::ALL.map(|choice| t!(&format!("settings.sound-{}", choice.key())));
-                    let chosen = Sound::ALL.iter().position(|sound| *sound == screen.sound).unwrap_or(0);
-                    list.row(SettingRow::new(t!("settings.sound")).description(t!("settings.sound-text")), |ui| {
-                        ui.add(
-                            Segmented::new(choices).selected(chosen).on_select(|index| Msg::Sound(Sound::ALL[index])),
-                        )
-                        .id("sound");
-                    });
-
-                    list.heading(t!("settings.folder"));
-                    let folder = screen
-                        .store
-                        .as_ref()
-                        .map_or_else(|| t!("settings.folder-unset"), |path| path.display().to_string());
-                    let row = SettingRow::new(t!("settings.folder-path"))
-                        .description(folder)
-                        .on_activate(Msg::Request(Request::OpenLocationStep));
-                    list.row(row, |ui| {
-                        ui.add(Text::new(t!("settings.folder-change")).role("secondary"));
-                    });
-
-                    list.heading(t!("settings.bridge"));
-                    let row = SettingRow::new(t!("settings.bridge-ask")).description(t!("settings.bridge-ask-text"));
-                    list.row(row, |ui| {
-                        ui.add(Switch::new(screen.ask_first).on_toggle(Msg::AskFirst)).id("ask-first");
-                    });
-                });
-                list.id("settings");
-                // Everything under the list keeps the list's own left margin, so the screen reads as
-                // one column rather than as a list with loose text beside it.
+    // The scroll view is as tall as the page when the page fits, so the column around it can hold
+    // the page in the middle of the screen; a page taller than the screen fills it and scrolls.
+    ui.column(|ui| {
+        ui.add_with(ScrollView::new(), |ui| {
+            ui.row(|ui| {
                 ui.column(|ui| {
-                    // What to do about a missing engine, and whatever the engine said, follow the
-                    // list rather than the strip: here there is a screen to read them on.
-                    if let Health::Missing(trouble) = screen.engine.health() {
-                        let kind = screen.engine.kind();
-                        // A refusal QCode recognises is said plainly, with the line that puts it
-                        // right, in place of the general advice to repair.
-                        match trouble.said().and_then(|said| engine::help(kind, said)) {
-                            Some(help) => help.show(ui),
-                            None => {
-                                ui.add(Text::new(trouble.remedy(kind)).role("secondary")).fill_width();
+                    report(&Report::LEFT_BEHIND, &screen.left_behind, ui);
+                    if !screen.repairs_read {
+                        report(&Report::REPAIRS, &screen.repairs, ui);
+                    }
+                    if let Some(reason) = &screen.failure {
+                        ui.add(Text::new(t!("settings.store-failed", reason = reason.clone())).color("danger"))
+                            .fill_width();
+                    }
+
+                    let list = SettingsList::show(ui, |list| {
+                        list.heading(t!("settings.appearance"));
+
+                        let codes: Vec<String> = languages.iter().map(|(code, _)| code.clone()).collect();
+                        let names: Vec<String> = languages.iter().map(|(_, name)| name.clone()).collect();
+                        let chosen = codes.iter().position(|code| *code == language);
+                        list.row(SettingRow::new(t!("settings.language")), |ui| {
+                            ui.add(
+                                Select::new(names)
+                                    .selected(chosen)
+                                    .on_select(move |index| Msg::Language(codes[index].clone())),
+                            )
+                            .id("language")
+                            .width(Length::Cells(CONTROL_WIDTH));
+                        });
+
+                        let ids: Vec<String> = themes.iter().map(|(id, _)| id.clone()).collect();
+                        let titles: Vec<String> = themes.iter().map(|(_, name)| name.clone()).collect();
+                        let chosen = ids.iter().position(|id| *id == theme);
+                        list.row(SettingRow::new(t!("settings.theme")), |ui| {
+                            ui.add(
+                                Select::new(titles)
+                                    .selected(chosen)
+                                    .on_select(move |index| Msg::Theme(ids[index].clone())),
+                            )
+                            .id("theme")
+                            .width(Length::Cells(CONTROL_WIDTH));
+                        });
+
+                        let modes = IconMode::ALL.map(|mode| t!(&format!("settings.icons-{}", mode.name())));
+                        let chosen = IconMode::ALL.iter().position(|mode| *mode == icons);
+                        list.row(SettingRow::new(t!("settings.icons")), |ui| {
+                            ui.add(
+                                Select::new(modes)
+                                    .selected(chosen)
+                                    .on_select(move |index| Msg::Icons(IconMode::ALL[index])),
+                            )
+                            .id("icons")
+                            .width(Length::Cells(CONTROL_WIDTH));
+                        });
+
+                        let note = motion_note(forced, reduced).unwrap_or_else(|| t!("settings.reduce-motion-text"));
+                        list.row(
+                            SettingRow::new(t!("settings.reduce-motion")).description(note).disabled(forced),
+                            |ui| {
+                                ui.add(Switch::new(reduced).disabled(forced).on_toggle(Msg::ReduceMotion));
+                            },
+                        );
+
+                        // The family's switch, in the family's own words: it is one setting for every
+                        // Quvyta application, and each says the same thing about it.
+                        if let Some(on) = screen.update_notice {
+                            let about = t!("quvyta.appearance.updates-text", family = Family::QUVYTA.title());
+                            list.row(SettingRow::new(t!("quvyta.appearance.updates")).description(about), |ui| {
+                                ui.add(Switch::new(on).on_toggle(Msg::UpdateNotice)).id("update-notice");
+                            });
+                        }
+
+                        list.heading(t!("settings.containers"));
+                        let row = SettingRow::new(t!("settings.engine")).description(screen.engine.summary());
+                        list.row(row, |ui| match screen.engine.health() {
+                            Health::Checking => {
+                                ui.add(Spinner::new());
+                            }
+                            Health::Working | Health::Missing(_) => {
+                                let names = ENGINES.map(engine::name);
+                                let chosen = ENGINES.iter().position(|kind| *kind == screen.engine.kind()).unwrap_or(0);
+                                ui.add(
+                                    Segmented::new(names)
+                                        .selected(chosen)
+                                        .on_select(move |index| Msg::Engine(ENGINES[index])),
+                                )
+                                .id("engine");
+                            }
+                        });
+
+                        let choices = OnClose::ALL.map(|choice| t!(&format!("settings.on-close-{}", choice.key())));
+                        let chosen = OnClose::ALL.iter().position(|choice| *choice == screen.on_close).unwrap_or(0);
+                        // Where nothing can tell that the last QCode closed, the choice is kept for
+                        // the file's sake but the row says plainly that it changes nothing here.
+                        let about = if screen.service == Some(ServiceRow::Unsupported) {
+                            t!("settings.on-close-windows")
+                        } else {
+                            t!("settings.on-close-text")
+                        };
+                        list.row(SettingRow::new(t!("settings.on-close")).description(about), |ui| {
+                            ui.add(
+                                Segmented::new(choices)
+                                    .selected(chosen)
+                                    .on_select(|index| Msg::OnClose(OnClose::ALL[index])),
+                            )
+                            .id("on-close");
+                        });
+                        if let Some(row) = screen.service {
+                            service_row(list, row);
+                        }
+
+                        list.heading(t!("settings.backup"));
+                        let choices =
+                            BackupEvery::ALL.map(|choice| t!(&format!("settings.backup-every-{}", choice.key())));
+                        let chosen = BackupEvery::ALL.iter().position(|choice| *choice == screen.backup_every);
+                        let row =
+                            SettingRow::new(t!("settings.backup-every")).description(t!("settings.backup-every-text"));
+                        list.row(row, |ui| {
+                            ui.add(
+                                Segmented::new(choices)
+                                    .selected(chosen.unwrap_or(0))
+                                    .on_select(|index| Msg::BackupEvery(BackupEvery::ALL[index])),
+                            )
+                            .id("backup-every");
+                        });
+
+                        list.heading(t!("settings.apps"));
+                        // The program's own name is the label: it is what the person knows it by, in
+                        // every language.
+                        let names = Editor::ALL.map(Editor::key);
+                        let chosen = Editor::ALL.iter().position(|editor| *editor == screen.editor).unwrap_or(0);
+                        list.row(
+                            SettingRow::new(t!("settings.editor")).description(t!("settings.editor-text")),
+                            |ui| {
+                                ui.add(
+                                    Segmented::new(names)
+                                        .selected(chosen)
+                                        .on_select(move |index| Msg::Editor(Editor::ALL[index])),
+                                )
+                                .id("editor");
+                            },
+                        );
+                        let choices = Sound::ALL.map(|choice| t!(&format!("settings.sound-{}", choice.key())));
+                        let chosen = Sound::ALL.iter().position(|sound| *sound == screen.sound).unwrap_or(0);
+                        list.row(SettingRow::new(t!("settings.sound")).description(t!("settings.sound-text")), |ui| {
+                            ui.add(
+                                Segmented::new(choices)
+                                    .selected(chosen)
+                                    .on_select(|index| Msg::Sound(Sound::ALL[index])),
+                            )
+                            .id("sound");
+                        });
+
+                        list.heading(t!("settings.folder"));
+                        let folder = screen
+                            .store
+                            .as_ref()
+                            .map_or_else(|| t!("settings.folder-unset"), |path| path.display().to_string());
+                        let row = SettingRow::new(t!("settings.folder-path"))
+                            .description(folder)
+                            .on_activate(Msg::Request(Request::OpenLocationStep));
+                        list.row(row, |ui| {
+                            ui.add(Text::new(t!("settings.folder-change")).role("secondary"));
+                        });
+
+                        list.heading(t!("settings.bridge"));
+                        let row =
+                            SettingRow::new(t!("settings.bridge-ask")).description(t!("settings.bridge-ask-text"));
+                        list.row(row, |ui| {
+                            ui.add(Switch::new(screen.ask_first).on_toggle(Msg::AskFirst)).id("ask-first");
+                        });
+                    });
+                    list.id("settings");
+                    // Everything under the list keeps the list's own left margin, so the screen reads as
+                    // one column rather than as a list with loose text beside it.
+                    ui.column(|ui| {
+                        // What to do about a missing engine, and whatever the engine said, follow the
+                        // list rather than the strip: here there is a screen to read them on.
+                        if let Health::Missing(trouble) = screen.engine.health() {
+                            let kind = screen.engine.kind();
+                            // A refusal QCode recognises is said plainly, with the line that puts it
+                            // right, in place of the general advice to repair.
+                            match trouble.said().and_then(|said| engine::help(kind, said)) {
+                                Some(help) => help.show(ui),
+                                None => {
+                                    ui.add(Text::new(trouble.remedy(kind)).role("secondary")).fill_width();
+                                }
+                            }
+                            if let Some(said) = trouble.said() {
+                                let words = t!("settings.engine-said", engine = engine::name(kind), output = said);
+                                ui.add(Text::new(words).role("faint")).fill_width();
                             }
                         }
-                        if let Some(said) = trouble.said() {
-                            let words = t!("settings.engine-said", engine = engine::name(kind), output = said);
-                            ui.add(Text::new(words).role("faint")).fill_width();
+                        // The logins kept for the profiles, and the one thing only this place does with
+                        // them: giving a login again to every workspace that uses its profile. A store
+                        // without profiles has no logins, and the section is not drawn to say so.
+                        if screen.profiles.as_ref().is_none_or(|profiles| !profiles.is_empty()) {
+                            ui.spacer().height(Length::Cells(BLOCK_GAP));
+                            ui.add(Text::new(t!("settings.logins.title")).role("secondary").bold());
+                            ui.add(Text::new(t!("settings.logins.text")).role("secondary")).fill_width();
+                            identity::view(screen.profiles.as_deref(), screen.chosen, &gate, ui);
                         }
-                    }
-                    ui.spacer().height(Length::Cells(BLOCK_GAP));
-                    ui.add(Text::new(t!("settings.profiles")).role("secondary").bold());
-                    identity::view(screen.profiles.as_deref(), screen.chosen, &gate, ui);
+                    })
+                    .fill_width()
+                    .padding(Padding { left: LEAD, ..Padding::default() });
                 })
-                .fill_width()
-                .padding(Padding { left: LEAD, ..Padding::default() });
+                .width(Length::Cells(width))
+                .gap(BLOCK_GAP)
+                .id("settings-page");
             })
-            .width(Length::Cells(width))
-            .gap(BLOCK_GAP)
-            .id("settings-page");
+            .fill_width()
+            .justify(Align::Center);
         })
-        .fill_width()
-        .justify(Align::Center);
+        .fill_width();
     })
-    .fill();
+    .fill()
+    .justify(Align::Center);
 }
 
 /// The row of the background service: what it does and whether it is there, with the button
@@ -881,6 +905,70 @@ mod tests {
         assert!(harness.screen().contains("Language"), "{}", harness.screen());
         let (label, _) = harness.find("Language").expect("the language row is shown");
         assert!(label < 8, "a narrow terminal keeps the column at its edge:\n{}", harness.screen());
+    }
+
+    /// The rows of `screen` between the first and the last one that say anything.
+    fn written_rows(screen: &str) -> (usize, usize) {
+        let rows: Vec<&str> = screen.lines().collect();
+        let first = rows.iter().position(|row| !row.trim().is_empty()).unwrap_or_default();
+        let last = rows.iter().rposition(|row| !row.trim().is_empty()).unwrap_or_default();
+        (first, last)
+    }
+
+    #[test]
+    fn a_page_that_fits_stands_in_the_middle_from_top_to_bottom_and_a_taller_one_starts_at_the_top() {
+        let height = 90;
+        let mut screen = testing::screen(EngineKind::Podman, Health::Working);
+        super::update(&mut screen, super::Msg::Profiles(vec![testing::profile("claude-sub", true)]));
+        let mut harness = testing::host(screen, 120, height);
+        harness.render();
+        let text = harness.screen();
+        let (first, last) = written_rows(&text);
+        let below = usize::from(height) - 1 - last;
+        assert!(first > 5, "the page does not stick to the top:\n{text}");
+        assert!(first.abs_diff(below) <= 1, "as much room over it as under it ({first}, {below}):\n{text}");
+
+        harness.resize(120, 30).render();
+        let (first, _) = written_rows(&harness.screen());
+        assert!(first <= 1, "a page taller than the screen starts at its top:\n{}", harness.screen());
+    }
+
+    #[test]
+    fn the_last_row_of_a_centred_page_is_drawn_whatever_the_width() {
+        // The page is centred by its measure, so a measure one row short of what is drawn cut the
+        // Logins buttons off the end of it: the page's width in cells has to be measured as it is
+        // drawn.
+        for width in [80, 120] {
+            let mut screen = testing::screen(EngineKind::Podman, Health::Working);
+            super::update(&mut screen, super::Msg::Profiles(vec![testing::profile("claude-sub", true)]));
+            let mut harness = testing::host(screen, width, 90);
+            harness.render();
+            assert!(harness.screen().contains("Refresh identity"), "at {width} columns:\n{}", harness.screen());
+            harness.click_text("Refresh identity").render();
+            assert!(
+                harness.screen().contains("Refresh claude-sub"),
+                "and it answers at {width}:\n{}",
+                harness.screen()
+            );
+        }
+    }
+
+    #[test]
+    fn the_logins_are_said_to_be_what_they_are_and_are_not_drawn_without_a_profile() {
+        let mut screen = testing::screen(EngineKind::Podman, Health::Working);
+        super::update(&mut screen, super::Msg::Profiles(Vec::new()));
+        let harness = testing::host(screen, 120, 90);
+        let text = harness.screen();
+        assert!(!text.contains("LOGINS"), "no empty section:\n{text}");
+        assert!(!text.contains("PROFILES"), "{text}");
+
+        let mut screen = testing::screen(EngineKind::Podman, Health::Working);
+        super::update(&mut screen, super::Msg::Profiles(vec![testing::profile("claude-sub", true)]));
+        let harness = testing::host(screen, 120, 90);
+        let text = harness.screen();
+        for words in ["Refresh identity", "LOGINS", "given again", "claude-sub", "login kept"] {
+            assert!(text.contains(words), "`{words}`:\n{text}");
+        }
     }
 
     #[test]

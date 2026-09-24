@@ -152,6 +152,12 @@ fn parse_incoming(line: &str) -> Result<Incoming, Malformed> {
     Ok(Incoming { token, method, path, headers })
 }
 
+/// Where Codex sends its conversation: OpenAI's Responses shape, the only one Codex still speaks
+/// to a provider of one's own (its 0.156.1 program answers `wire_api = "chat"` with "is no longer
+/// supported"). It is a conversation in the OpenAI shape like the completion path, so it goes to
+/// the same root.
+pub const RESPONSES_PATH: &str = "/v1/responses";
+
 /// The path without its query string, which is what a rule about what may be asked checks
 /// against; the query string still travels with the request that is actually sent.
 fn path_only(path: &str) -> &str {
@@ -163,7 +169,7 @@ fn path_only(path: &str) -> &str {
 fn allowed(method: &str, path: &str) -> bool {
     let path = path_only(path);
     match method {
-        "POST" => super::Wire::ALL.iter().any(|wire| path == wire.messages_path()),
+        "POST" => super::Wire::ALL.iter().any(|wire| path == wire.messages_path()) || path == RESPONSES_PATH,
         "GET" => path == "/v1/models",
         _ => false,
     }
@@ -895,6 +901,9 @@ mod tests {
     fn every_path_the_script_or_the_host_disagrees_on_is_refused_the_same_way() {
         assert!(allowed("POST", "/v1/messages"), "what Claude Code sends");
         assert!(allowed("POST", "/v1/chat/completions"), "what opencode sends");
+        assert!(allowed("POST", "/v1/responses"), "what Codex sends");
+        assert!(!allowed("GET", "/v1/responses"), "a stored answer is not asked for");
+        assert!(!allowed("POST", "/v1/responses/compact"), "only the conversation itself");
         assert!(allowed("GET", "/v1/models"));
         assert!(allowed("GET", "/v1/models?x=1"), "a query string does not change what path was asked for");
         assert!(!allowed("POST", "/v1/models"));

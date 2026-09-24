@@ -5,6 +5,23 @@ Every release of quvyta-code, newest first. The format follows
 [Semantic Versioning](https://semver.org/); while the version starts with 0, a minor release may
 change files qcode writes, and the notes say so when it does.
 
+## 0.1.17 - 2026-09-24
+
+### Added
+
+- **Two new harnesses: Kimi Code CLI and Qwen Code.** Both install into a profile like the others, take messages from other tabs, and can run on a provider of your own through the relay, the key staying outside the container. Qwen Code does not run on Alpine (the same terminal library as Gemini CLI). Kimi Code CLI sends anonymous telemetry to Moonshot unless you turn it off in its own settings, and Qwen Code's usage statistics are turned off by QCode basic; the README says both.
+- **Codex can run on a provider of your own.** Pick a provider in the profile wizard, as for Claude Code and opencode.
+- **Delete a workspace or a profile.** Each asks once and names everything that goes. A workspace that is open or has a running container is left alone. Deleting a profile removes its definition, image, login and containers; the homes the workspaces keep of it go only when you choose that.
+
+### Changed
+
+- **The way back is at the bottom left of every screen**, as `esc Back`, drawn like the `? Keys` hint on the right. A new workspace or a new profile is the first row of its list (`+ New workspace`, `+ New profile`) rather than a separate button.
+- Built against quvyta-framework 0.1.22, whose layout measures a width in cells the way it draws it; with 0.1.21 the last row of Settings could be cut off.
+- **The profile wizard says the sign-in is once for every workspace.** From the account page on it tells you that the login made at the end is kept with the profile and handed to every workspace that uses it, and what finishing without it means.
+- **Profiles stand in a table.** The image and sign-in columns line up, and the actions of the chosen profile appear once under the rows instead of on every row.
+- **Settings stand in the middle of the screen** when they fit. The section called Profiles, often empty, is now Logins: it says what it is for and is left out when there are no profiles.
+- **Waiting shines.** An image build, a starting container, a sign-in being opened or stored and a backup under way shine while they work, and stand still when reduced motion is on.
+
 ## 0.1.16 - 2026-09-23
 
 ### Changed

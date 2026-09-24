@@ -26,9 +26,9 @@
 //!
 //! Where each harness keeps its conversations was read from its documentation and source and
 //! checked in throwaway containers against Claude Code 2.1.276, opencode 1.18.31, Gemini CLI
-//! 0.60.0 and Codex 0.155.0; the script of each one says what it relies on, and
-//! `history_live.rs` runs every script against records written the way those versions write
-//! them.
+//! 0.60.0, Codex 0.155.0, Kimi Code CLI 2.1.0 and Qwen Code 0.24.4; the script of each one says
+//! what it relies on, and `history_live.rs` runs every script against records written the way
+//! those versions write them.
 
 use super::HarnessKind;
 use crate::base::paths::{CODE_DIR, LEGACY_CODE_DIR};
@@ -352,6 +352,61 @@ const CODEX: &str = concat!(
 "#
 );
 
+/// Kimi Code CLI keeps its sessions in a store of its own under `~/.kimi-code/sessions/`, indexed
+/// by a small database beside it, so it is asked instead: `kimi session list --cwd <folder> --json`
+/// (`kimi session list --help`) prints `[{"id","title","lastPrompt","workDir","updatedAt",
+/// "metadata",…}]` with times in milliseconds, `[]` for a folder it never worked in, and leaves
+/// out a field it has no value for. Each workspace directory is asked in turn. A title is what the
+/// harness or the person named the session; without one, the last thing the person asked stands
+/// for it. A session the harness opened for one of its own helpers says so in
+/// `metadata.child_session_kind` and is left out, as its own list leaves it out.
+const KIMI_CODE: &str = concat!(
+    prelude!(),
+    r#"try {
+  for (const w of workspaces) {
+    let out = '';
+    try {
+      out = require('child_process').execFileSync('kimi', ['session', 'list', '--cwd', w, '--json'], {
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 << 20, timeout: 60000,
+      });
+    } catch (e) {}
+    const all = json(out.slice(Math.max(out.indexOf('['), 0)));
+    for (const s of Array.isArray(all) ? all : []) {
+      if (!s || !here(s.workDir) || s.archived === true) continue;
+      if (s.metadata && s.metadata.child_session_kind === 'child') continue;
+      emit(s.id, s.updatedAt, clean(s.title) || clean(s.lastPrompt));
+    }
+  }
+} catch (e) {}
+"#
+);
+
+/// Qwen Code keeps a file per conversation, `~/.qwen/projects/<folder>/chats/<id>.jsonl`, and
+/// lists them itself: `qwen sessions list --json` prints one line per conversation of the folder it
+/// runs in, `{"sessionId","mtime","prompt","customTitle","cwd",…}`, with `mtime` in milliseconds,
+/// at most `--limit` of them, twenty unless told otherwise. Each workspace directory is asked in
+/// its own folder, and the line's `cwd` is checked all the same. A title the person gave comes
+/// first, then the first thing they asked.
+const QWEN_CODE: &str = concat!(
+    prelude!(),
+    r#"try {
+  for (const w of workspaces) {
+    let out = '';
+    try {
+      out = require('child_process').execFileSync('qwen', ['sessions', 'list', '--json', '--limit', '1000'], {
+        cwd: w, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 << 20, timeout: 60000,
+      });
+    } catch (e) {}
+    for (const l of out.split('\n')) {
+      const s = json(l);
+      if (!s || typeof s !== 'object' || !here(s.cwd)) continue;
+      emit(s.sessionId, s.mtime, clean(s.customTitle) || clean(s.prompt));
+    }
+  }
+} catch (e) {}
+"#
+);
+
 impl HarnessKind {
     /// The Node script that prints this harness's conversations in the workspace whose folder is
     /// its first argument, in the shape [`parse`] reads.
@@ -366,6 +421,8 @@ impl HarnessKind {
             Self::OpenCode => Some(OPENCODE),
             Self::GeminiCli => Some(GEMINI_CLI),
             Self::Codex => Some(CODEX),
+            Self::KimiCode => Some(KIMI_CODE),
+            Self::QwenCode => Some(QWEN_CODE),
             Self::AntigravityIde => None,
         }
     }
@@ -389,6 +446,12 @@ impl HarnessKind {
             ],
             Self::GeminiCli => &[".gemini/tmp", ".gemini/projects.json"],
             Self::Codex => &[".codex/sessions", ".codex/session_index.jsonl"],
+            // The sessions and the index Kimi Code lists them by; `cache/` holds the search
+            // index it rebuilds from them, and `credentials/` the login, so neither goes.
+            Self::KimiCode => &[".kimi-code/sessions", ".kimi-code/session_index.jsonl"],
+            // One folder per workspace directory, holding `chats/`; the settings and the rest of
+            // `~/.qwen` stay out.
+            Self::QwenCode => &[".qwen/projects"],
             // The agent inside the window keeps its work here: the trial found `conversations/`,
             // `brain/`, `knowledge/` and `html_artifacts/` under it after one session. QCode does
             // not read the shape of any of it; it only knows the folder, which is what a backup
@@ -407,7 +470,12 @@ impl HarnessKind {
     pub fn conversation_database(self) -> Option<&'static str> {
         match self {
             Self::OpenCode => Some(".local/share/opencode/opencode.db"),
-            Self::ClaudeCode | Self::GeminiCli | Self::Codex | Self::AntigravityIde => None,
+            Self::ClaudeCode
+            | Self::GeminiCli
+            | Self::Codex
+            | Self::KimiCode
+            | Self::QwenCode
+            | Self::AntigravityIde => None,
         }
     }
 }

@@ -12,6 +12,9 @@
 
 mod draft;
 mod fill;
+mod remove;
+
+pub(crate) use remove::Names;
 #[cfg(test)]
 mod tests;
 
@@ -19,7 +22,7 @@ use std::path::PathBuf;
 
 use qframe::date::Date;
 use qframe::prelude::*;
-use qframe::runtime::{Task, TaskEvent, TaskId, TaskOutcome, Tasks};
+use qframe::runtime::{Confirm, Task, TaskEvent, TaskId, TaskOutcome, Tasks};
 use qframe::widgets::{
     EmptyState, Field, FilePicker, FilePickerMsg, Form, FormErrors, LogBuffer, LogLevel, LogLine, LogView, Modal,
     RadioGroup, ScrollView, Skeleton, TaskList, TextInput, Toast,
@@ -32,6 +35,7 @@ pub use draft::Source;
 
 use draft::{Draft, FOLDER_FIELD, NAME_FIELD, Problem, URL_FIELD};
 use fill::{Fill, Job};
+use remove::{Outcome, Reach, Survey};
 
 /// Width of the dialogs, in cells. Wide enough for a path and a git address to read as one line
 /// on a normal terminal; a narrower screen shrinks them.
@@ -62,8 +66,10 @@ pub enum Msg {
         /// Why the store itself could not be read, when that is what happened.
         trouble: Option<String>,
     },
-    /// The selection moved to a row.
+    /// The selection moved to the workspace at this place in the list.
     Select(usize),
+    /// The selection moved to the row that makes a new workspace.
+    SelectNew,
     /// A row was opened with Enter or a click.
     Activate(usize),
     /// Open the new-workspace dialog.
@@ -88,6 +94,20 @@ pub enum Msg {
     Stop(TaskId),
     /// The filling finished.
     Filled,
+    /// Open the dialog that asks which workspace to delete.
+    Delete,
+    /// The selection of that dialog moved.
+    DeleteSelect(usize),
+    /// A workspace was chosen in that dialog: the engine is asked what it holds of it first.
+    DeletePick(usize),
+    /// The engine answered what it holds of the workspace to be deleted.
+    Surveyed(Box<Survey>),
+    /// The question was answered with yes.
+    DeleteConfirmed,
+    /// The question was answered with no.
+    DeleteKept,
+    /// The deletion is over.
+    Deleted(Box<Survey>, Outcome),
 }
 
 /// What is open over the list.
@@ -97,6 +117,8 @@ enum Overlay {
     New(Box<Draft>),
     /// The problems of the broken workspace at this place in the list.
     Problems(usize),
+    /// The choice of the workspace to delete, with the one at this place in the list chosen.
+    Delete(usize),
 }
 
 /// The workspaces screen.
@@ -109,10 +131,20 @@ pub struct Workspaces {
     trouble: Option<String>,
     listed: bool,
     selected: usize,
+    /// Whether the selection is on the row that makes a new workspace rather than on `selected`.
+    on_new: bool,
     overlay: Option<Overlay>,
     tasks: Tasks,
     log: LogBuffer,
     job: Option<TaskId>,
+    /// The workspaces open in this QCode, which are not deleted from under their tabs.
+    open: Vec<WorkspaceId>,
+    /// A workspace is being looked at or deleted, so the button takes no second press.
+    deleting: bool,
+    /// What the question being asked is about.
+    doomed: Option<Box<Survey>>,
+    /// The workspace deleted last, for the application to forget, taken once.
+    deleted: Option<WorkspaceId>,
 }
 
 impl Workspaces {
@@ -128,11 +160,28 @@ impl Workspaces {
             trouble: None,
             listed: false,
             selected: 0,
+            on_new: false,
             overlay: None,
             tasks: Tasks::new(),
             log: LogBuffer::new(LOG_LINES),
             job: None,
+            open: Vec::new(),
+            deleting: false,
+            doomed: None,
+            deleted: None,
         }
+    }
+
+    /// Tells the screen which workspaces are open in this QCode right now: those are not deleted,
+    /// because their tabs are working in them.
+    pub fn set_open(&mut self, open: Vec<WorkspaceId>) {
+        self.open = open;
+    }
+
+    /// The workspace deleted last, taken once, so the application can forget it wherever it
+    /// remembers it.
+    pub fn just_deleted(&mut self) -> Option<WorkspaceId> {
+        self.deleted.take()
     }
 
     /// Whether a workspace is being filled right now, which is what makes leaving the screen
@@ -167,7 +216,12 @@ pub fn update(workspaces: &mut Workspaces, message: Msg) -> (Command<Msg>, Optio
         Msg::Select(index) => {
             if index < workspaces.entries.len() {
                 workspaces.selected = index;
+                workspaces.on_new = false;
             }
+            Command::none()
+        }
+        Msg::SelectNew => {
+            workspaces.on_new = true;
             Command::none()
         }
         Msg::Activate(index) => activate(workspaces, index, &mut opened),
@@ -205,6 +259,31 @@ pub fn update(workspaces: &mut Workspaces, message: Msg) -> (Command<Msg>, Optio
         // The task's own success message; the screen acts on the outcome that follows it, so
         // there is only one place where a finished job is tidied away.
         Msg::Filled => Command::none(),
+        Msg::Delete => {
+            if workspaces.deleting || workspaces.entries.is_empty() {
+                Command::none()
+            } else {
+                workspaces.overlay = Some(Overlay::Delete(workspaces.selected));
+                Command::focus(DELETE_LIST)
+            }
+        }
+        Msg::DeleteSelect(index) => {
+            if let Some(Overlay::Delete(chosen)) = workspaces.overlay.as_mut()
+                && index < workspaces.entries.len()
+            {
+                *chosen = index;
+            }
+            Command::none()
+        }
+        Msg::DeletePick(index) => ask_delete(workspaces, index),
+        Msg::Surveyed(survey) => surveyed(workspaces, survey),
+        Msg::DeleteConfirmed => delete(workspaces),
+        Msg::DeleteKept => {
+            workspaces.deleting = false;
+            workspaces.doomed = None;
+            Command::none()
+        }
+        Msg::Deleted(survey, outcome) => deleted(workspaces, &survey, outcome),
     };
     (command, opened)
 }
@@ -214,6 +293,9 @@ const NAME_INPUT: &str = "workspace-name";
 
 /// The name of the list, for the focus and the tests.
 const LIST: &str = "workspaces";
+
+/// The name of the list the workspace to delete is chosen from.
+const DELETE_LIST: &str = "workspace-delete-list";
 
 /// Reads the store on a background thread.
 ///
@@ -356,6 +438,104 @@ fn finished(workspaces: &mut Workspaces, outcome: &TaskOutcome) -> Command<Msg> 
     Command::batch([told, list(&workspaces.store)])
 }
 
+/// Starts deleting the workspace at `index` by asking the engine what it holds of it, so that the
+/// question can name everything that goes. A workspace open in this QCode is refused at once.
+fn ask_delete(workspaces: &mut Workspaces, index: usize) -> Command<Msg> {
+    if workspaces.deleting {
+        return Command::none();
+    }
+    let Some(entry) = workspaces.entries.get(index).cloned() else { return Command::none() };
+    workspaces.overlay = None;
+    let name = display_name(&entry);
+    let open = entry.file.as_ref().is_some_and(|file| workspaces.open.contains(&file.id));
+    if open {
+        return Command::toast(
+            Toast::warning(t!("workspaces.removal.open", name = name.as_str()))
+                .body(t!("workspaces.removal.open-body")),
+        );
+    }
+    workspaces.deleting = true;
+    let store = workspaces.store.clone();
+    let engine = workspaces.engine.clone();
+    Command::perform(move || Msg::Surveyed(Box::new(remove::survey(&store, engine.as_ref(), &entry, name))))
+}
+
+/// Asks the question, once, naming what goes and what stays; or says why there is nothing to
+/// ask, when a container of the workspace is running.
+fn surveyed(workspaces: &mut Workspaces, survey: Box<Survey>) -> Command<Msg> {
+    let running = survey.running();
+    if !running.is_empty() {
+        workspaces.deleting = false;
+        return Command::toast(running_toast(&survey.name, running));
+    }
+    let message = format!(
+        "{} {} {}",
+        t!("workspaces.removal.folder", path = survey.dir.display().to_string()),
+        engine_words(&survey.engine),
+        t!("workspaces.removal.kept")
+    );
+    let question = Confirm::new(t!("workspaces.removal.title", name = survey.name.as_str()), Msg::DeleteConfirmed)
+        .message(message)
+        .confirm_label(t!("workspaces.removal.confirm"))
+        .on_cancel(Msg::DeleteKept)
+        .danger();
+    workspaces.doomed = Some(survey);
+    Command::confirm(question)
+}
+
+/// What the question says about the engine's part of the workspace.
+fn engine_words(reach: &Reach) -> String {
+    match reach {
+        Reach::Absent => t!("workspaces.removal.no-engine"),
+        Reach::Unreachable(said) => t!("workspaces.removal.unreachable", said = said.as_str()),
+        Reach::Listed { containers, volumes, .. } if containers.is_empty() && volumes.is_empty() => {
+            t!("workspaces.removal.nothing-in-engine")
+        }
+        Reach::Listed { containers, volumes, .. } => {
+            let all: Vec<&str> = containers.iter().chain(volumes).map(String::as_str).collect();
+            t!("workspaces.removal.engine", names = all.join(", "))
+        }
+    }
+}
+
+/// The toast that says a running container is what keeps a workspace from being deleted.
+fn running_toast(name: &str, running: &[String]) -> Toast<Msg> {
+    Toast::warning(t!("workspaces.removal.running", name = name))
+        .body(t!("workspaces.removal.running-body", containers = running.join(", ")))
+}
+
+/// Deletes what the question was about, on a background thread.
+fn delete(workspaces: &mut Workspaces) -> Command<Msg> {
+    let Some(survey) = workspaces.doomed.take() else { return Command::none() };
+    let store = workspaces.store.clone();
+    let engine = workspaces.engine.clone();
+    Command::perform(move || {
+        let outcome = remove::remove(&store, engine.as_ref(), &survey);
+        Msg::Deleted(survey, outcome)
+    })
+}
+
+/// Says how the deletion went and reads the list again, which is the only honest account of what
+/// is left.
+fn deleted(workspaces: &mut Workspaces, survey: &Survey, outcome: Outcome) -> Command<Msg> {
+    workspaces.deleting = false;
+    let told = match outcome {
+        Outcome::Deleted => {
+            workspaces.deleted.clone_from(&survey.id);
+            Toast::success(t!("workspaces.removal.done", name = survey.name.as_str()))
+        }
+        Outcome::Running(running) => running_toast(&survey.name, &running),
+        Outcome::Partly(left) => {
+            // The folder may be gone even so; whatever is left is named, and the list says the rest.
+            if !survey.dir.exists() {
+                workspaces.deleted.clone_from(&survey.id);
+            }
+            Toast::danger(t!("workspaces.removal.partly", name = survey.name.as_str())).body(left.join("\n"))
+        }
+    };
+    Command::batch([Command::toast(told), list(&workspaces.store)])
+}
+
 /// Which input a problem asks the person to go back to.
 fn field_input(field: &str) -> &'static str {
     match field {
@@ -380,13 +560,7 @@ fn start_folder(store: &Store) -> PathBuf {
 /// Draws the workspaces screen.
 pub fn view(workspaces: &Workspaces, ui: &mut View<'_, Msg>) {
     ui.column(|ui| {
-        ui.row(|ui| {
-            ui.add(Text::new(t!("workspaces.title")).bold().no_wrap());
-            ui.spacer();
-            ui.add(Button::new(t!("workspaces.new")).icon("add").variant("primary").on_press(Msg::Start));
-        })
-        .fill_width()
-        .gap(2);
+        ui.add(Text::new(t!("workspaces.title")).bold().no_wrap());
         body(workspaces, ui);
     })
     .fill()
@@ -422,10 +596,25 @@ fn body(workspaces: &Workspaces, ui: &mut View<'_, Msg>) {
         .fill();
         return;
     }
-    let items = workspaces.entries.iter().map(|entry| row(workspaces, entry));
-    ui.add(List::new(items).selected(Some(workspaces.selected)).on_select(Msg::Select).on_activate(Msg::Activate))
-        .id(LIST)
-        .fill();
+    // The way to a new workspace is the list's first row, so the keyboard reaches it the way it
+    // reaches every workspace, and the list and its one action start on the same edge.
+    let new = ListItem::new(t!("workspaces.new")).icon("add", Some("accent"));
+    let items = std::iter::once(new).chain(workspaces.entries.iter().map(|entry| row(workspaces, entry)));
+    let selected = if workspaces.on_new { 0 } else { workspaces.selected + 1 };
+    let list = List::new(items)
+        .selected(Some(selected))
+        .on_select(|row| row.checked_sub(1).map_or(Msg::SelectNew, Msg::Select))
+        .on_activate(|row| row.checked_sub(1).map_or(Msg::Start, Msg::Activate));
+    ui.add(list).id(LIST).fill();
+    ui.row(|ui| {
+        ui.spacer();
+        let mut delete = Button::new(t!("workspaces.removal.button")).variant("danger").loading(workspaces.deleting);
+        if !workspaces.deleting {
+            delete = delete.on_press(Msg::Delete);
+        }
+        ui.add(delete).id("workspace-delete");
+    })
+    .fill_width();
 }
 
 /// One workspace's row: what it is called, and either why it is broken or when it was last seen.
@@ -474,7 +663,31 @@ fn overlay(workspaces: &Workspaces, ui: &mut View<'_, Msg>) {
                 problems(entry, ui);
             }
         }
+        Some(Overlay::Delete(chosen)) => choose_doomed(workspaces, *chosen, ui),
     }
+}
+
+/// The choice of the workspace to delete.
+///
+/// A click on a row of the list opens that workspace, so the list itself cannot also be where a
+/// workspace is picked for deleting; this dialog is, and a click here only chooses. Nothing is
+/// deleted from it: the question that names everything that goes comes after it.
+fn choose_doomed(workspaces: &Workspaces, chosen: usize, ui: &mut View<'_, Msg>) {
+    let dialog = Modal::new()
+        .title(t!("workspaces.removal.choose-title"))
+        .width(DIALOG_WIDTH)
+        .on_close(Msg::Dismiss)
+        .close_on_click_outside(true)
+        .action(Button::new(t!("workspaces.cancel")).on_press(Msg::Dismiss));
+    let items: Vec<ListItem> = workspaces.entries.iter().map(|entry| row(workspaces, entry)).collect();
+    let rows = u16::try_from(items.len()).unwrap_or(u16::MAX).min(LOG_ROWS);
+    ui.add_with(dialog, |ui| {
+        ui.add(Text::new(t!("workspaces.removal.choose-message")).role("secondary")).fill_width();
+        ui.add(List::new(items).selected(Some(chosen)).on_select(Msg::DeleteSelect).on_activate(Msg::DeletePick))
+            .id(DELETE_LIST)
+            .height(Length::Cells(rows))
+            .fill_width();
+    });
 }
 
 /// The new-workspace dialog: the form, or the work it started.
