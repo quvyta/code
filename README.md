@@ -2,8 +2,6 @@
 
 **Run Claude Code, opencode, Gemini CLI, Codex, Kimi Code CLI and Qwen Code side by side in Podman or Docker containers, with tabs like a browser, from one terminal app.**
 
-![qcode in forty seconds: Continue opens a workspace, a shell lists its files, an opencode tab answers a question about the workspace's own code while a Claude Code tab waits beside it on the strip, a new tab lists each profile's recent conversations, the side panel shows the containers and a file made in the shell appearing in the tree, three files are selected with their menu open, and the README opens in a tab of its own](https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/qcode.gif)
-
 **quvyta-code** runs coding harnesses inside containers, from the terminal. You set up a
 profile once, sign it in, and from then on open that harness in any of your workspaces in a few
 seconds, moving between harnesses and shells the way you move between tabs. Nothing the harness
