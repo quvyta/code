@@ -25,8 +25,9 @@ change files qcode writes, and the notes say so when it does.
 - **Closing a tab never ends a working agent without asking.** Closing a harness tab or an Antigravity window whose agent is still running, with its `×` or `ctrl+w`, asks first, as quitting already did. A tab that still holds messages from other tabs asks before they are thrown away.
 - **No harness stops to ask before it acts**, under any template: the container is what keeps the work apart from your machine.
 - **An engine that stops answering is named.** When Podman or Docker does not answer a short question within a minute, qcode stops waiting and says it may be stuck on a lock of its own. Builds, copies, backups and installs are still waited for however long they take.
+- **Shift+Enter and Ctrl+Enter write a new line in a harness tab** instead of sending the message; Enter still sends. Claude Code and every harness that reads the kitty keyboard protocol get the key as its own, the others get the Alt+Enter they already read as a new line.
 - **Messages between tabs never join a line you started**, and text that arrives in a tab all at once keeps its spaces and Returns.
-- Built against quvyta-framework 0.1.29.
+- Built against quvyta-framework 0.1.30.
 
 ### Fixed
 
