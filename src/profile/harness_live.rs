@@ -76,8 +76,12 @@ impl Lab {
     /// when it failed.
     fn run(&self, script: &str) -> Result<String, String> {
         let command = ["sh", "-c", script];
-        capture(&self.engine.exec_without_terminal(&Exec { container: &self.container, command: &command }))
-            .map_err(|error| format!("{error:?}"))
+        // Generous and finite: a harness answering for the first time, offline, can take minutes.
+        let command = self
+            .engine
+            .exec_without_terminal(&Exec { container: &self.container, command: &command })
+            .within(std::time::Duration::from_secs(600));
+        capture(&command).map_err(|error| format!("{error:?}"))
     }
 
     /// Runs `script` and fails the test with the shell's own words when it refuses.
@@ -212,7 +216,8 @@ fn verify(harness: HarnessKind, more: impl Fn(&Lab, &Harness)) {
 
         // 3: the unattended-mode arguments are taken; a program that rejected them would refuse
         // to print its version behind them. Which of them is really parsed is `more`'s work.
-        let arguments = record.auto_run.join(" ");
+        // Each argument quoted for the shell: Claude Code's include a JSON object.
+        let arguments = record.auto_run.iter().map(|word| format!("'{word}'")).collect::<Vec<_>>().join(" ");
         let behind = lab.ok(&format!("{} {arguments} --version", record.command));
         assert!(names_a_version(&behind), "{kind:?}: `{} {arguments} --version` printed `{behind}`", record.command);
 
@@ -224,14 +229,23 @@ fn verify(harness: HarnessKind, more: impl Fn(&Lab, &Harness)) {
             lab.expect_in_package(file, "the login file the record names");
         }
 
-        // 5: the template's file is in the home directory and the package knows its keys.
+        // 5: the template's file is in the home directory and the package knows its keys. A JSON
+        // file may have graphify's hooks merged into it since; every key of the template's is
+        // still there with its value.
         if let Some(file) = record.settings {
             let written = lab.ok(&format!("cat \"$HOME/{}\"", file.path));
-            assert_eq!(written, file.contents, "{kind:?}: the template's file reached the image");
+            match serde_json::from_str::<serde_json::Value>(file.contents) {
+                Ok(wanted) => {
+                    let found: serde_json::Value = serde_json::from_str(&written).expect("the file is still JSON");
+                    assert!(holds(&found, &wanted), "{kind:?}: the template's keys reached the image: {written}");
+                }
+                Err(_) => assert_eq!(written, file.contents, "{kind:?}: the template's file reached the image"),
+            }
         }
 
-        // 6: every variable the record sets is set in the container and read by the package.
-        for (key, value) in record.environment {
+        // 6: every variable the record and the template set is set in the container and read by
+        // the package.
+        for (key, value) in record.environment.iter().chain(profile.template.environment(harness)) {
             assert_eq!(lab.ok(&format!("printf '%s' \"${key}\"")), *value, "{kind:?}: {key} is set in the image");
             lab.expect_in_package(key, "a variable the record sets");
         }
@@ -519,18 +533,139 @@ fn qwen_code_installs_answers_and_reads_the_settings_the_template_writes() {
     });
 }
 
-/// A profile of `harness` under QCode high, whose checks run without the network like every
+/// Whether `found` has every key of `wanted` with the same value, at every depth.
+fn holds(found: &serde_json::Value, wanted: &serde_json::Value) -> bool {
+    match (found, wanted) {
+        (serde_json::Value::Object(found), serde_json::Value::Object(wanted)) => {
+            wanted.iter().all(|(key, value)| found.get(key).is_some_and(|there| holds(there, value)))
+        }
+        _ => found == wanted,
+    }
+}
+
+/// A server on the container's own loopback that writes down every request it gets and answers
+/// each with an error: the provider a harness is pointed at, so what the harness would have sent a
+/// model can be read without any model and without the network.
+const CAPTURE: &str = "import http.server\nclass H(http.server.BaseHTTPRequestHandler):\n    def do_POST(self):\n        body = self.rfile.read(int(self.headers.get('content-length') or 0))\n        open('/tmp/captured', 'ab').write(body + b'\\n')\n        self.send_response(500)\n        self.end_headers()\n        self.wfile.write(b'{\"error\":{\"message\":\"capture\"}}')\n    do_GET = do_POST\n    def log_message(self, *a):\n        pass\nhttp.server.HTTPServer(('127.0.0.1', 8765), H).serve_forever()\n";
+
+/// graphify's heading, which only its section carries: the skill the harnesses list is named
+/// `graphify`, but none of them lists it under a Markdown heading. The sentences of the section
+/// differ between harnesses (Codex's is shorter), so the heading is what is looked for.
+const GRAPHIFY_LINE: &str = "## graphify";
+
+/// How `harness` is made to send one prompt to the server at [`CAPTURE`], in `/work`, without a
+/// terminal: the variables each already takes a provider of one's own by, and a command that
+/// gives up after a generous minute. Codex prints the prompt it would send instead.
+fn prompt(harness: HarnessKind) -> String {
+    let at = "http://127.0.0.1:8765";
+    match harness {
+        HarnessKind::ClaudeCode => format!("ANTHROPIC_BASE_URL={at} ANTHROPIC_AUTH_TOKEN=x timeout 90 claude -p hi"),
+        HarnessKind::OpenCode => format!(
+            "OPENCODE_CONFIG_CONTENT='{{\"provider\":{{\"cap\":{{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"cap\",\"options\":{{\"baseURL\":\"{at}/v1\",\"apiKey\":\"x\"}},\"models\":{{\"m\":{{\"name\":\"m\"}}}}}}}},\"model\":\"cap/m\",\"small_model\":\"cap/m\"}}' timeout 90 opencode run hi"
+        ),
+        // Without a key chosen in its settings it refuses before it sends anything, whatever the
+        // variables say; the dialog of a real profile writes the same key.
+        HarnessKind::GeminiCli => format!(
+            "python3 -c \"import json, os; p = os.path.expanduser('~/.gemini/settings.json'); d = json.load(open(p)); \
+             d.setdefault('security', {{}}).setdefault('auth', {{}})['selectedType'] = 'gemini-api-key'; \
+             json.dump(d, open(p, 'w'))\" && GEMINI_API_KEY=x GOOGLE_GEMINI_BASE_URL={at} timeout 90 gemini -p hi"
+        ),
+        // In a shell of its own, so its output goes to the file the others' requests go to.
+        HarnessKind::Codex => "sh -c 'codex debug prompt-input > /tmp/captured'".to_owned(),
+        HarnessKind::KimiCode => format!(
+            "KIMI_MODEL_NAME=m KIMI_MODEL_PROVIDER_TYPE=openai KIMI_MODEL_BASE_URL={at}/v1 KIMI_MODEL_API_KEY=x \
+             KIMI_MODEL_MAX_CONTEXT_SIZE=100000 timeout 90 kimi -p hi"
+        ),
+        HarnessKind::QwenCode => {
+            format!("OPENAI_BASE_URL={at}/v1 OPENAI_API_KEY=x OPENAI_MODEL=m timeout 90 qwen -p hi")
+        }
+        HarnessKind::AntigravityIde => String::new(),
+    }
+}
+
+#[test]
+#[ignore = "needs a container engine and the network; run with QCODE_CONTAINER_TESTS=1"]
+fn qcode_recommended_tells_each_harness_of_graphify_from_its_home_and_the_harness_reads_it() {
+    // `QCODE_LIVE_HARNESS=<id>` runs one harness alone, for a second look at one that failed.
+    let only = std::env::var("QCODE_LIVE_HARNESS").ok();
+    for harness in
+        HarnessKind::TERMINAL.into_iter().filter(|harness| only.as_deref().is_none_or(|id| id == harness.record().id))
+    {
+        let profile = profile(harness);
+        for engine in engines() {
+            let started = std::time::Instant::now();
+            let lab = open(engine, &profile);
+            // Taken away however the checks end.
+            let _cleared = Cleared(&lab, &profile);
+            let kind = lab.engine.kind();
+            eprintln!(
+                "{kind:?} {}: QCode recommended image built in {} s",
+                harness.record().id,
+                started.elapsed().as_secs()
+            );
+            assert!(lab.ok("graphify --version").starts_with("graphify "), "{kind:?}");
+            // The section is in the file the harness reads from the home, and the file graphify
+            // wrote in the home is gone.
+            let user = super::guidance::user_file(harness);
+            let text = lab.ok(&format!("cat \"$HOME/{user}\""));
+            assert!(text.contains(GRAPHIFY_LINE), "{kind:?} {harness:?}: {text}");
+            let left = super::guidance::graphify_file(harness);
+            lab.fails(&format!("test -e \"$HOME/{left}\""));
+            // Nothing is in the workspace folder of the image.
+            assert_eq!(lab.ok("ls -A /work 2>/dev/null || true").trim(), "", "{kind:?} {harness:?}");
+            // The hooks, where the harness has them, are in its own settings in the home.
+            match harness {
+                HarnessKind::ClaudeCode => {
+                    let settings = lab.ok("cat \"$HOME/.claude/settings.json\"");
+                    assert!(settings.contains("graphify hook-guard search"), "{kind:?}: {settings}");
+                }
+                HarnessKind::GeminiCli => {
+                    let settings = lab.ok("cat \"$HOME/.gemini/settings.json\"");
+                    assert!(settings.contains("graphify hook-guard gemini"), "{kind:?}: {settings}");
+                }
+                HarnessKind::OpenCode => {
+                    let config = lab.ok("cd /work && opencode debug config 2>&1");
+                    assert!(config.contains("/.config/opencode/plugins/graphify.js"), "{kind:?}: {config}");
+                    lab.fails("test -e \"$HOME/.opencode\"");
+                }
+                _ => {}
+            }
+            // And the harness reads it: the line is in what it sends its provider.
+            lab.ok(&format!("cat > /tmp/capture.py <<'PYTHON'\n{CAPTURE}PYTHON"));
+            lab.ok("cd /tmp && (nohup python3 capture.py > /dev/null 2>&1 &) && sleep 2");
+            let _ = lab.run(&format!("cd /work && {} > /tmp/said 2>&1", prompt(harness)));
+            let sent = lab.ok("cat /tmp/captured 2>/dev/null || true");
+            assert!(
+                sent.contains(GRAPHIFY_LINE),
+                "{kind:?} {harness:?}: the harness did not read {user}:\n{}",
+                lab.ok("tail -c 2000 /tmp/said")
+            );
+        }
+    }
+}
+
+/// Clears a lab's container and images when it goes, also when a check failed on the way.
+struct Cleared<'a>(&'a Lab, &'a Profile);
+
+impl Drop for Cleared<'_> {
+    fn drop(&mut self) {
+        clear(&self.0.engine, self.1, &self.0.container);
+    }
+}
+
+/// A profile of `harness` under `template`, whose checks run without the network like every
 /// profile here: what the build installed has to work from the image alone.
-fn high(harness: HarnessKind) -> Profile {
+fn on(template: Template, harness: HarnessKind) -> Profile {
     Profile {
-        name: SafeName::parse(&format!("harnesstest-high-{}", harness.record().id)).expect("the name is safe"),
-        template: Template::High,
+        name: SafeName::parse(&format!("harnesstest-{}-{}", template.id(), harness.record().id))
+            .expect("the name is safe"),
+        template,
         ..profile(harness)
     }
 }
 
-/// The size of `image` as the engine reports it, in whole megabytes, for the record of what QCode
-/// high costs.
+/// The size of `image` as the engine reports it, in whole megabytes, for the record of what a
+/// template costs.
 fn image_mb(engine: &Engine, image: &str) -> u64 {
     let program = match engine.kind() {
         EngineKind::Podman => "podman",
@@ -543,16 +678,38 @@ fn image_mb(engine: &Engine, image: &str) -> u64 {
     String::from_utf8_lossy(&out.stdout).trim().parse::<u64>().unwrap_or(0) / 1_000_000
 }
 
-/// Builds the QCode high image of `harness` on every engine, checks what every harness gets, then
-/// `more` for what only that harness gets, and says how long the build took and what it weighs.
-fn verify_high(harness: HarnessKind, more: impl Fn(&Lab)) {
-    let profile = high(harness);
-    for engine in engines() {
+/// The engines a run is asked for: every one found, or only the one `QCODE_LIVE_ENGINE` names
+/// (`podman` or `docker`), for a run that should not take twice as long.
+fn chosen_engines() -> Vec<Engine> {
+    let only = std::env::var("QCODE_LIVE_ENGINE").ok();
+    engines()
+        .into_iter()
+        .filter(|engine| {
+            only.as_deref().is_none_or(|name| match engine.kind() {
+                EngineKind::Podman => name == "podman",
+                EngineKind::Docker => name == "docker",
+            })
+        })
+        .collect()
+}
+
+/// Builds the image of `profile` through the product's own recipe on every engine asked for,
+/// checks what every QCode template gives — graphify answering from outside the home and
+/// mapping code offline, its section where the harness reads it and the harness reading it —
+/// then `more` for what only that harness gets, and says how long the build took and what it
+/// weighs.
+fn verify_template(profile: &Profile, more: impl Fn(&Lab)) {
+    let harness = profile.harness;
+    let template = profile.template;
+    for engine in chosen_engines() {
         let started = std::time::Instant::now();
-        let lab = open(engine, &profile);
+        let lab = open(engine, profile);
+        // Taken away however the checks end.
+        let _cleared = Cleared(&lab, profile);
         let kind = lab.engine.kind();
         eprintln!(
-            "{kind:?} {}: QCode high image built in {} s, {} MB",
+            "{kind:?} {} {}: image built in {} s, {} MB",
+            template.id(),
             harness.record().id,
             started.elapsed().as_secs(),
             image_mb(&lab.engine, &profile.image())
@@ -565,62 +722,173 @@ fn verify_high(harness: HarnessKind, more: impl Fn(&Lab)) {
         let home = lab.ok("ls -A \"$HOME\"; du -sm \"$HOME\" | cut -f1");
         assert!(!home.contains("pipx") && !home.contains(".local/share/pipx"), "{kind:?}: {home}");
         eprintln!(
-            "{kind:?} {}: home directory of the image: {} MB",
+            "{kind:?} {} {}: home directory of the image: {} MB",
+            template.id(),
             harness.record().id,
             home.lines().last().unwrap_or("")
         );
-        let sizes = lab.ok("du -sm /opt/pipx /var/cache/npm /usr/local/npm/lib/node_modules/* 2>/dev/null || true");
-        eprintln!("{kind:?} {}: sizes in MB:\n{sizes}", harness.record().id);
+        let sizes = lab.ok("du -sm /opt/pipx /usr/local/npm/lib/node_modules/* 2>/dev/null || true");
+        eprintln!("{kind:?} {} {}: sizes in MB:\n{sizes}", template.id(), harness.record().id);
         // It maps code without asking anyone: the part of it that needs no model.
         lab.ok("mkdir -p /tmp/g && cd /tmp/g && printf 'def a():\\n    return b()\\n\\ndef b():\\n    return 1\\n' > m.py && graphify update . > /dev/null 2>&1 && test -s graphify-out/graph.json");
 
+        // graphify's section: under QCode recommended the image carries it in the file the
+        // harness reads from the home; under QCode extra it is written into the workspace when a
+        // container comes up, by graphify's own installer run in `/work`, which is done here the
+        // way the workspace does it (`plan::guidance`).
+        let user = super::guidance::user_file(harness);
+        let in_home = lab.ok(&format!("cat \"$HOME/{user}\" 2>/dev/null || true"));
+        if template.carries_high() {
+            assert!(!in_home.contains(GRAPHIFY_LINE), "{kind:?}: extra keeps it out of the home: {in_home}");
+            lab.ok(&format!("cd /work && graphify {} install", super::guidance::platform(harness)));
+        } else {
+            assert!(in_home.contains(GRAPHIFY_LINE), "{kind:?}: {user}: {in_home}");
+            assert_eq!(lab.ok("ls -A /work 2>/dev/null || true").trim(), "", "{kind:?}: nothing in the workspace");
+        }
+        // Its hooks, where the harness runs them.
+        match harness {
+            HarnessKind::ClaudeCode => {
+                let settings = if template.carries_high() {
+                    lab.ok("cat /work/.claude/settings.json")
+                } else {
+                    lab.ok("cat \"$HOME/.claude/settings.json\"")
+                };
+                assert!(settings.contains("graphify hook-guard search"), "{kind:?}: {settings}");
+            }
+            HarnessKind::OpenCode => {
+                let config = lab.ok("cd /work && opencode debug config 2>&1");
+                assert!(config.contains("plugins/graphify.js"), "{kind:?}: {config}");
+            }
+            _ => {}
+        }
+        // And the harness reads graphify's guidance: its heading is in what it sends its provider.
+        lab.ok(&format!("cat > /tmp/capture.py <<'PYTHON'\n{CAPTURE}PYTHON"));
+        lab.ok("cd /tmp && (nohup python3 capture.py > /dev/null 2>&1 &) && sleep 2");
+        let _ = lab.run(&format!("cd /work && {} > /tmp/said 2>&1", prompt(harness)));
+        let sent = lab.ok("cat /tmp/captured 2>/dev/null || true");
+        assert!(
+            sent.contains(GRAPHIFY_LINE),
+            "{kind:?} {template:?} {harness:?}: the harness did not get graphify's guidance:\n{}",
+            lab.ok("tail -c 2000 /tmp/said")
+        );
+
         more(&lab);
-        clear(&lab.engine, &profile, &lab.container);
     }
 }
 
-#[test]
-#[ignore = "needs a container engine and the network; run with QCODE_CONTAINER_TESTS=1"]
-fn qcode_high_gives_claude_code_graphify_and_the_five_plugins() {
-    verify_high(HarnessKind::ClaudeCode, |lab| {
-        let kind = lab.engine.kind();
-        let listed = lab.ok("claude plugin list 2>&1");
-        for plugin in super::CLAUDE_PLUGINS {
-            let at = listed.find(plugin).unwrap_or_else(|| panic!("{kind:?}: {plugin} is not installed:\n{listed}"));
-            let status = listed[at..].lines().find(|line| line.contains("Status:")).unwrap_or_default();
-            assert!(status.contains("enabled"), "{kind:?}: {plugin}: {status}");
-        }
-        // The plugins were added to the settings the template wrote, not written over them, and
-        // the first-start answers are still where Claude Code reads them.
-        let settings = lab.ok("cat \"$HOME/.claude/settings.json\"");
-        assert!(settings.contains("\"skipDangerousModePermissionPrompt\": true"), "{kind:?}: {settings}");
-        assert!(settings.contains("bypassPermissions") && settings.contains("enabledPlugins"), "{kind:?}: {settings}");
-        let state = lab.ok("cat \"$HOME/.claude.json\"");
-        assert!(state.contains("\"hasTrustDialogAccepted\": true"), "{kind:?}: {state}");
-        assert!(state.contains("\"hasCompletedOnboarding\": true"), "{kind:?}: {state}");
-        assert!(!lab.ok("ls /usr/local/npm/lib/node_modules").contains("oh-my-openagent"), "{kind:?}");
-        eprintln!("{kind:?}: plugins in the home: {} MB", lab.ok("du -sm \"$HOME/.claude/plugins\" | cut -f1").trim());
-    });
+/// The plugins `claude plugin list` names, as `name@marketplace`, in the order it lists them.
+fn listed_plugins(listed: &str) -> Vec<String> {
+    listed
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix("❯ "))
+        .map(|plugin| plugin.trim().to_owned())
+        .collect()
+}
+
+/// Checks that Claude Code of `profile` has exactly the plugins its template and switches give,
+/// every one enabled, on top of the settings and first-start answers the template wrote.
+fn claude_code_has_its_plugins(lab: &Lab, profile: &Profile) {
+    let kind = lab.engine.kind();
+    let listed = lab.ok("claude plugin list 2>&1");
+    let mut found = listed_plugins(&listed);
+    found.sort();
+    let mut wanted: Vec<String> = profile.claude_plugins().into_iter().map(str::to_owned).collect();
+    wanted.sort();
+    assert_eq!(found, wanted, "{kind:?}: exactly the chosen plugins:\n{listed}");
+    for plugin in &wanted {
+        let at = listed.find(plugin.as_str()).unwrap_or_default();
+        let status = listed[at..].lines().find(|line| line.contains("Status:")).unwrap_or_default();
+        assert!(status.contains("enabled"), "{kind:?}: {plugin}: {status}");
+    }
+    // The plugins were added to the settings the template wrote, not written over them, and
+    // the first-start answers are still where Claude Code reads them.
+    let settings = lab.ok("cat \"$HOME/.claude/settings.json\"");
+    assert!(settings.contains("\"skipDangerousModePermissionPrompt\": true"), "{kind:?}: {settings}");
+    assert!(settings.contains("bypassPermissions") && settings.contains("enabledPlugins"), "{kind:?}: {settings}");
+    let state = lab.ok("cat \"$HOME/.claude.json\"");
+    assert!(state.contains("\"hasTrustDialogAccepted\": true"), "{kind:?}: {state}");
+    assert!(state.contains("\"hasCompletedOnboarding\": true"), "{kind:?}: {state}");
+    assert!(!lab.ok("ls /usr/local/npm/lib/node_modules").contains("oh-my-openagent"), "{kind:?}");
+    eprintln!(
+        "{kind:?} {}: plugins in the home: {} MB",
+        profile.template.id(),
+        lab.ok("du -sm \"$HOME/.claude/plugins\" | cut -f1").trim()
+    );
+}
+
+/// Checks that opencode loads oh-my-openagent from the image: its agents are opencode's own
+/// agents, with no network and nothing downloaded into the home at start.
+fn opencode_loads_oh_my_openagent(lab: &Lab) {
+    let kind = lab.engine.kind();
+    let agents = lab.ok("cd /work && opencode agent list 2>&1");
+    // These come from the plugin alone; opencode without it lists build, plan, explore,
+    // general and its own helpers.
+    for agent in ["Sisyphus - ultraworker", "Prometheus - Plan Builder", "Metis - Plan Consultant"] {
+        assert!(agents.contains(agent), "{kind:?}: opencode does not load oh-my-openagent:\n{agents}");
+    }
+    let config = lab.ok("cd /work && opencode debug config 2>&1");
+    assert!(config.contains("file:///usr/local/npm/lib/node_modules/oh-my-openagent"), "{kind:?}: {config}");
+    let fetched = lab.ok("ls \"$HOME/.cache/opencode/packages\" 2>/dev/null || true");
+    assert!(!fetched.contains("oh-my-openagent"), "{kind:?}: a second copy was fetched: {fetched}");
+    assert_eq!(lab.ok("printf '%s' \"$OMO_SEND_ANONYMOUS_TELEMETRY\""), "0", "{kind:?}");
+    assert!(!lab.ok("claude --version 2>&1 || true").contains("Claude Code"), "{kind:?}: no plugins here");
 }
 
 #[test]
 #[ignore = "needs a container engine and the network; run with QCODE_CONTAINER_TESTS=1"]
-fn qcode_high_gives_opencode_graphify_and_loads_oh_my_openagent_from_the_image() {
-    verify_high(HarnessKind::OpenCode, |lab| {
-        let kind = lab.engine.kind();
-        // Loaded, not only installed: its agents are opencode's own agents now, with no network
-        // and nothing downloaded into the home at start.
-        let agents = lab.ok("cd /work && opencode agent list 2>&1");
-        // These come from the plugin alone; opencode without it lists build, plan, explore,
-        // general and its own helpers.
-        for agent in ["Sisyphus - ultraworker", "Prometheus - Plan Builder", "Metis - Plan Consultant"] {
-            assert!(agents.contains(agent), "{kind:?}: opencode does not load oh-my-openagent:\n{agents}");
-        }
-        let config = lab.ok("cd /work && opencode debug config 2>&1");
-        assert!(config.contains("file:///usr/local/npm/lib/node_modules/oh-my-openagent"), "{kind:?}: {config}");
-        let fetched = lab.ok("ls \"$HOME/.cache/opencode/packages\" 2>/dev/null || true");
-        assert!(!fetched.contains("oh-my-openagent"), "{kind:?}: a second copy was fetched: {fetched}");
-        assert_eq!(lab.ok("printf '%s' \"$OMO_SEND_ANONYMOUS_TELEMETRY\""), "0", "{kind:?}");
-        assert!(!lab.ok("claude --version 2>&1 || true").contains("Claude Code"), "{kind:?}: no plugins here");
-    });
+fn qcode_recommended_gives_claude_code_graphify_and_the_starter_plugins() {
+    let profile = on(Template::Recommended, HarnessKind::ClaudeCode);
+    verify_template(&profile, |lab| claude_code_has_its_plugins(lab, &profile));
+}
+
+#[test]
+#[ignore = "needs a container engine and the network; run with QCODE_CONTAINER_TESTS=1"]
+fn qcode_extra_gives_claude_code_graphify_and_every_plugin_with_one_switched_off_left_out() {
+    // One plugin switched off, as the wizard writes it: the list must lack exactly that one.
+    let profile = Profile {
+        without: vec![super::Extra::Plugin("hookify@claude-plugins-official")],
+        ..on(Template::High, HarnessKind::ClaudeCode)
+    };
+    assert_eq!(profile.claude_plugins().len(), super::CLAUDE_PLUGINS.len() - 1);
+    verify_template(&profile, |lab| claude_code_has_its_plugins(lab, &profile));
+}
+
+#[test]
+#[ignore = "needs a container engine and the network; run with QCODE_CONTAINER_TESTS=1"]
+fn qcode_recommended_gives_opencode_graphify_and_loads_oh_my_openagent_from_the_image() {
+    verify_template(&on(Template::Recommended, HarnessKind::OpenCode), opencode_loads_oh_my_openagent);
+}
+
+#[test]
+#[ignore = "needs a container engine and the network; run with QCODE_CONTAINER_TESTS=1"]
+fn qcode_extra_gives_opencode_graphify_and_loads_oh_my_openagent_from_the_image() {
+    verify_template(&on(Template::High, HarnessKind::OpenCode), opencode_loads_oh_my_openagent);
+}
+
+/// Checks that opencode loads oh-my-opencode-slim from the image, and nothing of
+/// oh-my-openagent: the slim team's agents are opencode's own, the settings name the image's copy,
+/// and nothing is downloaded into the home at start.
+fn opencode_loads_oh_my_opencode_slim(lab: &Lab) {
+    let kind = lab.engine.kind();
+    let agents = lab.ok("cd /work && opencode agent list 2>&1");
+    for agent in ["orchestrator", "explorer", "oracle", "librarian", "designer", "fixer"] {
+        assert!(agents.contains(agent), "{kind:?}: opencode does not load oh-my-opencode-slim ({agent}):\n{agents}");
+    }
+    assert!(!agents.contains("Sisyphus"), "{kind:?}: oh-my-openagent's team is here too:\n{agents}");
+    let config = lab.ok("cat \"$HOME/.config/opencode/opencode.json\"");
+    assert!(config.contains("file:///usr/local/npm/lib/node_modules/oh-my-opencode-slim"), "{kind:?}: {config}");
+    assert!(!config.contains("oh-my-openagent"), "{kind:?}: {config}");
+    assert!(!lab.ok("ls /usr/local/npm/lib/node_modules").contains("oh-my-openagent"), "{kind:?}");
+    let fetched = lab.ok("ls \"$HOME/.cache/opencode/packages\" 2>/dev/null || true");
+    assert!(!fetched.contains("oh-my-opencode-slim"), "{kind:?}: a second copy was fetched: {fetched}");
+    eprintln!(
+        "{kind:?} slim: {} MB in the image",
+        lab.ok("du -sm /usr/local/npm/lib/node_modules/oh-my-opencode-slim | cut -f1").trim()
+    );
+}
+
+#[test]
+#[ignore = "needs a container engine and the network; run with QCODE_CONTAINER_TESTS=1"]
+fn oh_my_opencode_slim_gives_opencode_graphify_and_loads_its_team_from_the_image() {
+    verify_template(&on(Template::Slim, HarnessKind::OpenCode), opencode_loads_oh_my_opencode_slim);
 }

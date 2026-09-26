@@ -578,7 +578,7 @@ mod tests {
         std::fs::write(&script, format!("#!/bin/sh\nhead -n 1 > '{}'\nprintf '{answer}'\n", seen.display()))
             .expect("a stand-in carrier");
         std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("runnable");
-        (EngineCommand { program: script, args: Vec::new() }, seen)
+        (EngineCommand { program: script, args: Vec::new(), deadline: None }, seen)
     }
 
     fn folder(name: &str) -> PathBuf {
@@ -630,7 +630,7 @@ mod tests {
         let port = free_port();
         let listener = Listener::bind(&back(port, "/cb", Loopback::V4)).expect("it listens");
         let mut slept = Duration::ZERO;
-        let carrier = EngineCommand { program: PathBuf::from("/qcode-nothing-here"), args: Vec::new() };
+        let carrier = EngineCommand { program: PathBuf::from("/qcode-nothing-here"), args: Vec::new(), deadline: None };
         let ending = listener.serve(&carrier, |pause| {
             slept += pause;
             true
@@ -645,7 +645,7 @@ mod tests {
         let port = free_port();
         let listener = Listener::bind(&back(port, "/cb", Loopback::V4)).expect("it listens");
         let (stop, flag) = Stop::new();
-        let carrier = EngineCommand { program: PathBuf::from("/qcode-nothing-here"), args: Vec::new() };
+        let carrier = EngineCommand { program: PathBuf::from("/qcode-nothing-here"), args: Vec::new(), deadline: None };
         let serving = std::thread::spawn(move || {
             listener.serve(&carrier, |pause| {
                 std::thread::sleep(pause);

@@ -95,6 +95,7 @@ impl BackupTrouble {
             EngineError::NotRunnable { error, .. } => Self::Said(error.to_string()),
             EngineError::Failed(failure) => Self::Said(failure.output.clone()),
             EngineError::Cancelled { .. } => Self::Stopped,
+            EngineError::TimedOut { command, after } => Self::Said(crate::engine::run::timed_out(command, *after)),
         };
         match error {
             BackupError::Place(bad) => Self::Outside(bad.path.clone()),
@@ -391,9 +392,11 @@ pub(super) fn backed_up(
 pub(super) fn set_assets(workspace: &OpenWorkspace, assets: bool) -> Command<Msg> {
     let id = workspace.id().to_owned();
     let paths = workspace.paths().clone();
+    let code = qframe::i18n::active_code();
     Command::perform(move || {
-        let written =
-            set_backup_assets(&paths, assets).map(|file| file.backup_assets).map_err(|problem| problem.to_string());
+        let written = crate::ui::in_language(&code, || set_backup_assets(&paths, assets))
+            .map(|file| file.backup_assets)
+            .map_err(|problem| problem.to_string());
         Msg::AssetsWritten(id, written)
     })
 }
@@ -421,9 +424,11 @@ pub(super) fn leave_out(workspace: &OpenWorkspace, keys: Vec<String>, out: bool)
     }
     let id = workspace.id().to_owned();
     let paths = workspace.paths().clone();
+    let code = qframe::i18n::active_code();
     Command::perform(move || {
-        let written =
-            set_backup_skip(&paths, &keys, out).map(|file| file.backup_skip).map_err(|problem| problem.to_string());
+        let written = crate::ui::in_language(&code, || set_backup_skip(&paths, &keys, out))
+            .map(|file| file.backup_skip)
+            .map_err(|problem| problem.to_string());
         Msg::SkipWritten(id, written)
     })
 }

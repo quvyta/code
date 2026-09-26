@@ -23,10 +23,12 @@ use std::path::{Path, PathBuf};
 use qframe::date::Date;
 use qframe::diagnostics::Diagnostic;
 use qframe::storage::atomic_write;
+use qframe::t;
 
 use crate::backup::Place;
 use crate::profile::Profile;
 
+use super::workspace::outside;
 use super::{Loaded, WorkspaceFile, WorkspaceId, WorkspaceIdError, WorkspaceProfile};
 
 /// The name of a workspace's own file.
@@ -241,6 +243,20 @@ impl Store {
         }
     }
 
+    /// Where everything of the workspace `file` describes is: [`Store::workspace_paths`], with the
+    /// person's own folder as the code folder when the workspace works in one where it stands.
+    ///
+    /// Everything that opens a workspace reads its folders from here, so the file tree, the shell,
+    /// every container's work folder and the backup all see the same folder.
+    #[must_use]
+    pub fn paths_of(&self, file: &WorkspaceFile) -> WorkspacePaths {
+        let mut paths = self.workspace_paths(&file.id);
+        if let Some(folder) = &file.folder {
+            paths.code.clone_from(folder);
+        }
+        paths
+    }
+
     /// Makes a workspace the user called `name` and gives it the tree of the design.
     ///
     /// # Errors
@@ -250,6 +266,24 @@ impl Store {
     /// case, which a file system that ignores case would treat as the same folder — and
     /// [`NewWorkspaceError::Blocked`] when the store cannot be written.
     pub fn create_workspace(&self, name: &str, created: Date) -> Result<WorkspaceFile, NewWorkspaceError> {
+        self.create_workspace_in(name, created, None)
+    }
+
+    /// Makes a workspace the user called `name` that works in `folder` where it stands, or in a
+    /// `Work/` of its own when `folder` is `None`.
+    ///
+    /// The person's folder is only named in the workspace file: nothing is made, moved or written
+    /// in it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::create_workspace`].
+    pub fn create_workspace_in(
+        &self,
+        name: &str,
+        created: Date,
+        folder: Option<PathBuf>,
+    ) -> Result<WorkspaceFile, NewWorkspaceError> {
         let id = WorkspaceId::from_display_name(name).map_err(NewWorkspaceError::Name)?;
         self.prepare().map_err(NewWorkspaceError::Blocked)?;
         for taken in self.folder_names().map_err(NewWorkspaceError::Blocked)? {
@@ -257,7 +291,8 @@ impl Store {
                 return Err(NewWorkspaceError::Taken(id));
             }
         }
-        let file = WorkspaceFile::new(id, name, created);
+        let mut file = WorkspaceFile::new(id, name, created);
+        file.folder = folder;
         self.write_workspace(&file).map_err(NewWorkspaceError::Blocked)?;
         Ok(file)
     }
@@ -357,7 +392,7 @@ impl Store {
             Err(problem) => {
                 problems.push(Diagnostic::error(
                     None,
-                    format!("{}: this folder name is no workspace id: {problem:?}", dir.display()),
+                    t!("workspaces.problem.not-an-id", dir = dir.display().to_string(), problem = problem.said()),
                 ));
                 return WorkspaceEntry { dir, file: None, problems };
             }
@@ -369,17 +404,22 @@ impl Store {
             if !matches {
                 problems.push(Diagnostic::error(
                     None,
-                    format!("{}: the workspace file calls this workspace `{}`", dir.display(), file.id),
+                    t!("workspaces.problem.other-id", dir = dir.display().to_string(), id = file.id.as_str()),
                 ));
             }
             matches
         });
-        let paths = self.workspace_paths(&id);
+        let paths = file.as_ref().map_or_else(|| self.workspace_paths(&id), |file| self.paths_of(file));
+        let in_place = file.as_ref().is_some_and(|file| file.folder.is_some());
         for missing in [&paths.code, &paths.assets, &paths.harness].into_iter().filter(|path| !path.is_dir()) {
-            problems.push(Diagnostic::error(
-                None,
-                format!("{}: this folder of the workspace is missing", missing.display()),
-            ));
+            // The person's own folder is theirs to bring back: an unplugged disk, a folder moved.
+            // It is said as theirs, so nobody reads it as something QCode will make again.
+            let key = if in_place && *missing == paths.code {
+                "workspaces.problem.theirs-missing"
+            } else {
+                "workspaces.problem.missing"
+            };
+            problems.push(Diagnostic::error(None, t!(key, path = missing.display().to_string())));
         }
         WorkspaceEntry { dir, file, problems }
     }
@@ -401,8 +441,14 @@ impl Store {
 
 /// Writes `file` as the `workspace.qcode` at `paths` atomically, and makes sure the workspace's
 /// folders — including one per profile it names — are there.
+///
+/// A workspace that works in the person's own folder gets no `Work/`, and that folder is never
+/// made: when it is gone, making an empty one in its place would hide that it is gone.
 fn write_workspace_at(paths: &WorkspacePaths, file: &WorkspaceFile) -> Result<(), Diagnostic> {
-    let mut dirs = vec![paths.code.clone(), paths.assets.clone(), paths.harness.clone()];
+    let mut dirs = vec![paths.assets.clone(), paths.harness.clone()];
+    if file.folder.is_none() {
+        dirs.push(paths.code.clone());
+    }
     dirs.extend(file.profiles.iter().map(|profile| paths.harness_profile(&profile.name)));
     for dir in dirs {
         fs::create_dir_all(&dir).map_err(|error| blocked(&dir, &error))?;
@@ -472,7 +518,10 @@ pub fn set_backup_skip(paths: &WorkspacePaths, keys: &[String], skip: bool) -> R
     let mut places = Vec::new();
     for key in keys {
         let place = Place::new(key).map_err(|bad| {
-            Diagnostic::error(None, format!("`{}` is not a path inside the workspace: {:?}", bad.path, bad.problem))
+            Diagnostic::error(
+                None,
+                t!("workspaces.file.not-inside", path = bad.path.as_str(), why = outside(bad.problem)),
+            )
         })?;
         places.push(place.as_str().to_owned());
     }
@@ -514,7 +563,7 @@ fn read_workspace_at(paths: &WorkspacePaths) -> Result<WorkspaceFile, Diagnostic
     let text = fs::read_to_string(&paths.file).map_err(|error| blocked(&paths.file, &error))?;
     let read = WorkspaceFile::parse(WORKSPACE_FILE, &text);
     read.value.ok_or_else(|| {
-        let reason = read.diagnostics.first().map_or_else(|| "no usable workspace".to_owned(), ToString::to_string);
+        let reason = read.diagnostics.first().map_or_else(|| t!("workspaces.file.unusable"), ToString::to_string);
         Diagnostic::error(None, format!("{}: {reason}", paths.file.display()))
     })
 }
@@ -697,6 +746,55 @@ mod tests {
         fs::write(&paths.file, "id = \"baska\"\nname = \"Proje\"\n").expect("writable");
         let listed = store.workspaces();
         assert!(listed.value[0].is_broken());
+        fs::remove_dir_all(&root).expect("cleaned up");
+    }
+
+    #[test]
+    fn a_broken_workspace_is_explained_in_the_active_language() {
+        let root = scratch("turkish");
+        let store = Store::new(&root);
+        store.prepare().expect("writable");
+        // A folder whose name no workspace could ever have.
+        fs::create_dir_all(store.workspaces_dir().join("Büyük Harf")).expect("writable");
+        // A workspace whose file names another one.
+        let other = store.create_workspace("Proje", today()).expect("a free name");
+        fs::write(&store.workspace_paths(&other.id).file, "id = \"baska\"\nname = \"Proje\"\n").expect("writable");
+        // A workspace that lost its Assets, and one whose own folder, where it works, is gone.
+        let lost = store.create_workspace("Kayip", today()).expect("a free name");
+        fs::remove_dir_all(store.workspace_paths(&lost.id).assets).expect("removable");
+        let gone = root.join("gitti");
+        store.create_workspace_in("Yerinde", today(), Some(gone.clone())).expect("a free name");
+
+        let listed = crate::ui::in_language("tr", || store.workspaces());
+        let said: Vec<String> = listed
+            .value
+            .iter()
+            .flat_map(|entry| entry.problems.iter().map(|problem| problem.message.clone()))
+            .collect();
+        for expected in [
+            "Büyük Harf: bu klasör adı bir çalışma alanı kimliği değil: `B` klasör adında olamaz; adın 1. karakteri.",
+            "proje: çalışma alanı dosyası bu çalışma alanına `baska` diyor",
+            "Assets: çalışma alanının bu klasörü eksik",
+            "gitti: bu çalışma alanının çalıştığı klasör yerinde yok; QCode onu oluşturmaz",
+        ] {
+            assert!(said.iter().any(|message| message.ends_with(expected)), "`{expected}` in {said:#?}");
+        }
+        fs::remove_dir_all(&root).expect("cleaned up");
+    }
+
+    #[test]
+    fn a_path_left_out_of_the_backup_that_is_not_inside_is_refused_in_the_active_language() {
+        let root = scratch("turkish-skip");
+        let store = Store::new(&root);
+        store.prepare().expect("writable");
+        let file = store.create_workspace("Proje", today()).expect("a free name");
+        let keys = ["../disari".to_owned()];
+        let refused = crate::ui::in_language("tr", || set_backup_skip(&store.workspace_paths(&file.id), &keys, true))
+            .expect_err("a path that leaves the workspace");
+        assert_eq!(
+            refused.message,
+            "`../disari` çalışma alanının içinde bir yol değil: bir `.` ya da `..` parçası çalışma alanının dışına çıkıyor"
+        );
         fs::remove_dir_all(&root).expect("cleaned up");
     }
 

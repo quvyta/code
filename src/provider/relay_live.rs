@@ -306,6 +306,7 @@ impl Road {
                 .into_iter()
                 .map(std::ffi::OsString::from)
                 .collect(),
+            deadline: Some(crate::engine::ANSWER_WITHIN),
         };
         capture(&command).map(|size| size.trim().to_owned()).unwrap_or_default()
     }

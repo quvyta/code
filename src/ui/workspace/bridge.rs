@@ -8,12 +8,16 @@
 //! exchange that goes on too long is ended. An ended exchange is not ended silently: both tabs
 //! say so under their terminal, and the person is told once wherever they are looking.
 //!
-//! A taken message is typed into the receiving harness itself, as soon as that tab is quiet:
-//! the person is not typing in it and its program has stopped writing. Until then, and whenever
-//! the harness is not running to be typed into, the message waits in the tab, where the person
+//! A taken message is typed into the receiving harness itself, as soon as that tab is quiet: the
+//! person has no line started and not sent in it, and its program has stopped writing. Until then, and
+//! whenever the harness is not running to be typed into, the message waits in the tab, where the person
 //! sees who sent it and can read it. A message is never dropped on the way: the sending agent is
 //! told whether its message went in or still waits, and a later list says so again, so an agent
 //! cannot believe it handed work over when it did not.
+//!
+//! A window's tab has no prompt to type into. A message to it waits in the tab until the agent
+//! inside the window asks for its inbox, which hands over every waiting message at once; the
+//! sender is told that it waits for that, not that it went in.
 
 use std::time::{Duration, Instant};
 
@@ -22,7 +26,7 @@ use qframe::runtime::{Confirm, Task};
 use qframe::widgets::{ScrollView, Toast};
 
 use crate::bridge::config::Unregistered;
-use crate::bridge::protocol::{Answer, Listed, MOST_TEXT, Question, Request};
+use crate::bridge::protocol::{Answer, Listed, MOST_TEXT, Question, Received, Request};
 use crate::bridge::rules::{Decision, End, Refusal};
 use crate::bridge::socket::{Call, Inbox, Listener};
 use crate::profile::{HarnessKind, NetworkMode, Profile};
@@ -33,9 +37,9 @@ use super::{Msg, OpenWorkspace, Tab, TabKey, TabKind, WorkspaceScreen};
 /// Well inside the minute some harnesses give a tool before they give up on it.
 pub(super) const ASK_WAIT: Duration = Duration::from_secs(45);
 
-/// How long the person's typing and the harness's own output must both have been quiet before a
-/// message is typed into a tab. Generous on purpose: a shorter wait buys no correctness and cuts
-/// a person's half-written line in half on a loaded machine.
+/// How long the harness's own output must have been quiet before a message is typed into its
+/// tab. Generous on purpose: a shorter wait buys no correctness and types into a tool that is still
+/// drawing on a loaded machine.
 pub(super) const QUIET: Duration = Duration::from_secs(2);
 
 /// How often a tab that still holds messages is looked at again. Nothing is timed while no tab
@@ -82,6 +86,9 @@ pub enum Undelivered {
     /// it has not started yet. The tab's own restart brings it back and delivery goes on by
     /// itself.
     NotRunning,
+    /// The tab is a window, with no prompt to type into: the messages wait until its agent asks
+    /// for its inbox.
+    Inbox,
 }
 
 /// A question to the person about one pair of tabs, and the messages waiting on the answer.
@@ -184,7 +191,48 @@ pub(super) fn answer(screen: &mut WorkspaceScreen, id: &str, call: Call, now: In
             Command::none()
         }
         Request::Send { tab, text } => send(screen, id, sender, &tab, text, call, now),
+        Request::Inbox => {
+            call.answer(inbox(screen, sender));
+            Command::none()
+        }
+        Request::Peek => {
+            call.answer(peek(workspace, sender));
+            Command::none()
+        }
     }
+}
+
+/// The messages waiting in the tab `key`, left where they are: a window's watcher asks this to
+/// know when to tell its agent to take them.
+fn peek(workspace: &OpenWorkspace, key: TabKey) -> Answer {
+    let Some(tab) = workspace.tabs.iter().find(|tab| tab.key() == key) else {
+        return Answer::refused(t!("bridge.answer.stranger"));
+    };
+    let messages: Vec<Received> =
+        tab.letters().iter().map(|letter| Received { from: letter.from.clone(), text: letter.text.clone() }).collect();
+    if messages.is_empty() {
+        return Answer::received(t!("bridge.answer.inbox-empty"), messages);
+    }
+    Answer::received(t!("bridge.answer.peek", n = messages.len()), messages)
+}
+
+/// Hands the tab `key` every message waiting in it, taking them out of the tab: the answer to its
+/// agent asking for its inbox.
+fn inbox(screen: &mut WorkspaceScreen, key: TabKey) -> Answer {
+    let Some((_, tab)) = screen.owner_mut(key).and_then(|workspace| workspace.find(key)) else {
+        return Answer::refused(t!("bridge.answer.stranger"));
+    };
+    let taken = tab.take_letters();
+    if taken.is_empty() {
+        return Answer::received(t!("bridge.answer.inbox-empty"), Vec::new());
+    }
+    let mut text = t!("bridge.answer.inbox", n = taken.len());
+    for letter in &taken {
+        text.push_str("\n\n");
+        text.push_str(&t!("bridge.handed", from = letter.from.as_str(), text = letter.text.as_str()));
+    }
+    let messages = taken.into_iter().map(|letter| Received { from: letter.from, text: letter.text }).collect();
+    Answer::received(text, messages)
 }
 
 /// The tab of `workspace` whose token the question carries.
@@ -214,17 +262,14 @@ fn named(workspace: &OpenWorkspace, key: TabKey) -> String {
     }
 }
 
-/// The other harness tabs of `workspace`, the ones `sender` can send to.
-///
-/// A window is not among them, and must not be: it draws no terminal, so there is no prompt a
-/// message could be typed into, and an agent that could leave one there would believe it had
-/// handed work over when nothing had been said to anyone.
+/// The other harness tabs of `workspace`, the ones `sender` can send to: the terminals, which
+/// take a message into their prompt, and the windows, whose agent takes it from its inbox.
 fn others(workspace: &OpenWorkspace, sender: TabKey) -> Vec<(usize, &Tab, &Profile)> {
     workspace
         .tabs
         .iter()
         .enumerate()
-        .filter(|(_, tab)| tab.key() != sender && matches!(tab.kind(), TabKind::Profile(_)))
+        .filter(|(_, tab)| tab.key() != sender && matches!(tab.kind(), TabKind::Profile(_) | TabKind::Desktop(_)))
         .filter_map(|(index, tab)| profile_of(workspace, tab.key()).map(|profile| (index, tab, profile)))
         .collect()
 }
@@ -239,6 +284,7 @@ fn list(workspace: &OpenWorkspace, sender: TabKey) -> Answer {
             harness: profile.harness.record().display_name.to_owned(),
             profile: profile.name.as_str().to_owned(),
             network: profile.network == NetworkMode::Full,
+            inbox: by_inbox(tab),
             waiting: tab.letters().len(),
             trouble: tab.undelivered().filter(|_| !tab.letters().is_empty()).map(trouble),
         })
@@ -275,14 +321,24 @@ fn list(workspace: &OpenWorkspace, sender: TabKey) -> Answer {
             )
         };
         text.push_str(&line);
+        // An agent that only reads the words still learns that this one reads no prompt.
+        if tab.inbox {
+            text.push_str(&t!("bridge.answer.by-inbox"));
+        }
     }
     Answer::listed(text, tabs)
+}
+
+/// Whether `tab` takes its messages only through its agent's inbox: a window, which has no prompt.
+fn by_inbox(tab: &Tab) -> bool {
+    matches!(tab.kind(), TabKind::Desktop(_))
 }
 
 /// The words that tell an agent why the messages waiting in a tab have not been typed in.
 fn trouble(why: Undelivered) -> String {
     match why {
         Undelivered::NotRunning => t!("bridge.answer.not-running"),
+        Undelivered::Inbox => t!("bridge.answer.not-read"),
     }
 }
 
@@ -334,11 +390,18 @@ fn send(
         call.answer(Answer::refused(t!("bridge.answer.no-tab", tab = wanted)));
         return Command::none();
     };
+    // The person gave the sending tab something since it was last handed a message: what it sends
+    // now is their task, not its answer to another agent, and starts an exchange of its own. Without
+    // this, a tab the person keeps giving work runs into the loop limit of answers it sent long ago.
+    let fresh = workspace.tabs.iter().any(|tab| tab.key() == from && tab.person_typed());
     let ends = (
         End { tab: from.0, network: from_profile.network == NetworkMode::Full },
         End { tab: to.0, network: to_profile.network == NetworkMode::Full },
     );
     let (sender_name, receiver_name) = (named(workspace, from), named(workspace, to));
+    if fresh {
+        screen.rules.new_chain(from.0);
+    }
     let hop = match screen.rules.check(ends.0, ends.1, now) {
         Ok(hop) => hop,
         Err(refusal) => {
@@ -489,6 +552,7 @@ fn taken(screen: &WorkspaceScreen, to: TabKey, name: &str) -> Answer {
         return Answer::done(t!("bridge.answer.delivered", tab = name));
     }
     match tab.undelivered() {
+        Some(Undelivered::Inbox) => Answer::done(t!("bridge.answer.queued-inbox", tab = name)),
         Some(why) => Answer::done(t!("bridge.answer.queued-stuck", tab = name, trouble = trouble(why))),
         None => Answer::done(t!("bridge.answer.queued", tab = name)),
     }
@@ -502,7 +566,9 @@ pub(super) fn deliver(screen: &mut WorkspaceScreen, now: Instant) -> Command<Msg
     for workspace in &mut screen.workspaces {
         for tab in &mut workspace.tabs {
             hand_over(tab, now);
-            waiting |= !tab.letters().is_empty();
+            // A window's messages wait for its agent, not for a moment of quiet, so nothing is
+            // timed for them.
+            waiting |= !tab.letters().is_empty() && !by_inbox(tab);
         }
     }
     if !waiting || screen.delivering {
@@ -520,11 +586,20 @@ pub(super) fn deliver(screen: &mut WorkspaceScreen, now: Instant) -> Command<Msg
 /// sent it believing its work had been handed over.
 fn hand_over(tab: &mut Tab, now: Instant) {
     let Some(letter) = tab.letters().first().cloned() else { return };
+    if by_inbox(tab) {
+        tab.not_delivered(Undelivered::Inbox);
+        return;
+    }
     let Some(session) = tab.session().cloned() else {
         tab.not_delivered(Undelivered::NotRunning);
         return;
     };
-    if now.saturating_duration_since(session.last_input()) < QUIET
+    // A line the person started and has not sent holds every message back, however long they
+    // pause over it: a message typed in then joins their line and goes out with their Return
+    // (seen in the endurance trial, 2026-09-24). Once they send or clear it, the usual quiet is
+    // enough.
+    if session.line_pending()
+        || now.saturating_duration_since(session.last_input()) < QUIET
         || now.saturating_duration_since(session.last_output()) < QUIET
     {
         return;
@@ -557,6 +632,18 @@ fn queue(screen: &mut WorkspaceScreen, to: TabKey, from: String, text: String, h
     if let Some((_, tab)) = screen.owner_mut(to).and_then(|workspace| workspace.find(to)) {
         tab.receive(Letter { from, text });
     }
+}
+
+/// Asks the person before the tab `key`, named `name` on the strip, is closed with `waiting`
+/// messages from other tabs still in it. They would go with the tab, and the agents that sent them
+/// were told their work was taken, so nothing about it would reach anyone again.
+pub(super) fn ask_close(key: TabKey, name: &str, waiting: usize) -> Command<Msg> {
+    Command::confirm(
+        Confirm::new(t!("bridge.close.title", tab = name), Msg::CloseTabAnyway(key))
+            .message(t!("bridge.close.message", n = waiting))
+            .confirm_label(t!("bridge.close.confirm"))
+            .cancel_label(t!("bridge.close.cancel")),
+    )
 }
 
 /// Forgets the tabs of `keys`, which were closed: the rules drop them, and a message waiting on
@@ -663,6 +750,7 @@ fn waiting(tab: &Tab, ui: &mut View<'_, Msg>) {
                 Some(Undelivered::NotRunning) => {
                     t!("bridge.waiting-stuck", n = letters.len(), from = last.from.as_str())
                 }
+                Some(Undelivered::Inbox) => t!("bridge.waiting-inbox", n = letters.len(), from = last.from.as_str()),
                 None => t!("bridge.waiting", n = letters.len(), from = last.from.as_str()),
             };
             ui.add(Text::new(line).role("secondary").no_wrap()).fill_width();

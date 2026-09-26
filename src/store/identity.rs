@@ -8,6 +8,8 @@
 
 use std::fmt;
 
+use qframe::t;
+
 /// Why a display name or a stored identifier cannot be used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceIdError {
@@ -27,6 +29,29 @@ pub enum WorkspaceIdError {
     },
     /// A name Windows reserves for a device and never gives to a file.
     Reserved,
+}
+
+impl WorkspaceIdError {
+    /// The sentence for this reason a name cannot become an identifier, in the active language.
+    /// The position is counted from one, because that is how a person counts the letters of a
+    /// name.
+    #[must_use]
+    pub fn said(self) -> String {
+        match self {
+            Self::Empty => t!("workspaces.name-empty"),
+            Self::Illegal { position, character } => t!(
+                "workspaces.name-illegal",
+                character = character.to_string(),
+                position = i64::try_from(position.saturating_add(1)).unwrap_or(i64::MAX),
+            ),
+            Self::TooLong { length } => t!(
+                "workspaces.name-too-long",
+                length = i64::try_from(length).unwrap_or(i64::MAX),
+                max = i64::try_from(WorkspaceId::MAX_LEN).unwrap_or(i64::MAX),
+            ),
+            Self::Reserved => t!("workspaces.name-reserved"),
+        }
+    }
 }
 
 /// The name a workspace has on disk: lower-case ASCII letters and digits, separated by `-`.

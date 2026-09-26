@@ -5,10 +5,11 @@
 //! everything else follows from what the person does. Opening a workspace is the one thing it
 //! cannot do itself, so [`update`] hands that workspace's identifier back to the application.
 //!
-//! Three things it never does quietly. A name that is already taken is told to the person and
+//! Four things it never does quietly. A name that is already taken is told to the person and
 //! not turned into `name-2`. A folder chosen to start from is copied, never moved, so their own
-//! copy stays where it is. A copy or a clone that fails or is stopped takes the workspace folder
-//! it was filling with it, so a half-made workspace is never left on the list.
+//! copy stays where it is — or, when the person chooses so in plain words, used where it stands,
+//! and then never deleted with the workspace. A copy or a clone that fails or is stopped takes the
+//! workspace folder it was filling with it, so a half-made workspace is never left on the list.
 
 mod draft;
 mod fill;
@@ -31,7 +32,7 @@ use qframe::widgets::{
 use crate::engine::Engine;
 use crate::store::{Store, WorkspaceEntry, WorkspaceId};
 
-pub use draft::Source;
+pub use draft::{Place, Source};
 
 use draft::{Draft, FOLDER_FIELD, NAME_FIELD, Problem, URL_FIELD};
 use fill::{Fill, Job};
@@ -80,6 +81,8 @@ pub enum Msg {
     Name(String),
     /// Another source was chosen.
     Source(usize),
+    /// The folder is to be copied, or used where it stands: the place in [`Place::ALL`].
+    Place(usize),
     /// The git address is being written.
     Url(String),
     /// Something happened in the folder browser.
@@ -237,6 +240,7 @@ pub fn update(workspaces: &mut Workspaces, message: Msg) -> (Command<Msg>, Optio
         }
         Msg::Name(text) => edit(workspaces, |draft| draft.name = text),
         Msg::Source(index) => edit(workspaces, |draft| draft.source = Source::from_index(index)),
+        Msg::Place(index) => edit(workspaces, |draft| draft.place = Place::from_index(index)),
         Msg::Url(text) => edit(workspaces, |draft| draft.url = text),
         Msg::Picker(FilePickerMsg::Chosen(path)) => edit(workspaces, |draft| draft.folder = Some(path)),
         Msg::Picker(message) => match workspaces.overlay {
@@ -303,18 +307,21 @@ const DELETE_LIST: &str = "workspace-delete-list";
 /// store that cannot be made is the same problem as one that cannot be read.
 fn list(store: &Store) -> Command<Msg> {
     let store = store.clone();
+    let code = qframe::i18n::active_code();
     Command::perform(move || {
-        if let Err(problem) = store.prepare() {
-            return Msg::Listed { entries: Vec::new(), trouble: Some(problem.to_string()) };
-        }
-        let loaded = store.workspaces();
-        // A store that cannot be read at all answers with no workspaces and one diagnostic;
-        // anything else belongs to a workspace and is shown on its row.
-        let trouble = match (loaded.value.is_empty(), loaded.diagnostics.first()) {
-            (true, Some(problem)) => Some(problem.to_string()),
-            _ => None,
-        };
-        Msg::Listed { entries: loaded.value, trouble }
+        crate::ui::in_language(&code, || {
+            if let Err(problem) = store.prepare() {
+                return Msg::Listed { entries: Vec::new(), trouble: Some(problem.to_string()) };
+            }
+            let loaded = store.workspaces();
+            // A store that cannot be read at all answers with no workspaces and one diagnostic;
+            // anything else belongs to a workspace and is shown on its row.
+            let trouble = match (loaded.value.is_empty(), loaded.diagnostics.first()) {
+                (true, Some(problem)) => Some(problem.to_string()),
+                _ => None,
+            };
+            Msg::Listed { entries: loaded.value, trouble }
+        })
     })
 }
 
@@ -356,13 +363,36 @@ fn submit(workspaces: &mut Workspaces) -> Command<Msg> {
     if draft.busy {
         return Command::none();
     }
-    if let Some(problem) = draft.check(workspaces.store.root(), workspaces.engine.is_some()) {
+    // A folder used where it stands is named in the workspace file by the path the file system
+    // itself gives it: absolute, and with no link on the way that could later point elsewhere.
+    // Both sides are compared that way, so a store reached through a link is still found inside it.
+    let in_place = draft.source == Source::Folder && draft.place == Place::InPlace;
+    let store = if in_place {
+        if let Some(folder) = draft.folder.as_mut() {
+            match std::fs::canonicalize(&*folder) {
+                Ok(real) if real.is_dir() => *folder = real,
+                Ok(real) => {
+                    draft.problem = Some(Problem::PlaceGone(real.display().to_string()));
+                    return Command::focus(field_input(FOLDER_FIELD));
+                }
+                Err(error) => {
+                    draft.problem = Some(Problem::PlaceGone(format!("{}: {error}", folder.display())));
+                    return Command::focus(field_input(FOLDER_FIELD));
+                }
+            }
+        }
+        std::fs::canonicalize(workspaces.store.root()).unwrap_or_else(|_| workspaces.store.root().to_path_buf())
+    } else {
+        workspaces.store.root().to_path_buf()
+    };
+    if let Some(problem) = draft.check(&store, workspaces.engine.is_some()) {
         let field = problem.field();
         draft.problem = Some(problem);
         return Command::focus(field_input(field));
     }
 
-    let file = match workspaces.store.create_workspace(&draft.name, Date::today_utc()) {
+    let folder = if in_place { draft.folder.clone() } else { None };
+    let file = match workspaces.store.create_workspace_in(&draft.name, Date::today_utc(), folder) {
         Ok(file) => file,
         Err(error) => {
             let problem = Problem::from(error);
@@ -374,6 +404,14 @@ fn submit(workspaces: &mut Workspaces) -> Command<Msg> {
 
     let paths = workspaces.store.workspace_paths(&file.id);
     let fill = match (draft.source, draft.folder.clone(), workspaces.engine.clone()) {
+        // Nothing to fill: the workspace works in the person's folder, which is whole already.
+        (Source::Folder, Some(_), _) if in_place => {
+            workspaces.overlay = None;
+            return Command::batch([
+                Command::toast(Toast::success(t!("workspaces.created-toast", name = file.name))),
+                list(&workspaces.store),
+            ]);
+        }
         (Source::Folder, Some(from), _) => Fill::Copy { from },
         (Source::Git, _, Some(engine)) => Fill::Clone { engine, url: draft.url.trim().to_owned() },
         // An empty workspace is whole the moment its folders are there.
@@ -396,7 +434,9 @@ fn submit(workspaces: &mut Workspaces) -> Command<Msg> {
     draft.problem = None;
     workspaces.log.clear();
     workspaces.tasks.clear_finished();
-    let task = Task::new(label, move |cx| fill::run(&job, cx)).on_event(Msg::Progress);
+    let code = qframe::i18n::active_code();
+    let task =
+        Task::new(label, move |cx| crate::ui::in_language(&code, || fill::run(&job, cx))).on_event(Msg::Progress);
     workspaces.job = Some(task.id());
     Command::task(task)
 }
@@ -468,12 +508,19 @@ fn surveyed(workspaces: &mut Workspaces, survey: Box<Survey>) -> Command<Msg> {
         workspaces.deleting = false;
         return Command::toast(running_toast(&survey.name, running));
     }
-    let message = format!(
+    let folder =
+        if survey.in_place.is_some() { "workspaces.removal.folder-in-place" } else { "workspaces.removal.folder" };
+    let mut message = format!(
         "{} {} {}",
-        t!("workspaces.removal.folder", path = survey.dir.display().to_string()),
+        t!(folder, path = survey.dir.display().to_string()),
         engine_words(&survey.engine),
         t!("workspaces.removal.kept")
     );
+    // The folder the agents worked in is the person's; the question says so in so many words,
+    // because "the workspace is deleted" is exactly where someone fears for it.
+    if let Some(folder) = &survey.in_place {
+        message = format!("{message} {}", t!("workspaces.removal.in-place", path = folder.display().to_string()));
+    }
     let question = Confirm::new(t!("workspaces.removal.title", name = survey.name.as_str()), Msg::DeleteConfirmed)
         .message(message)
         .confirm_label(t!("workspaces.removal.confirm"))
@@ -509,8 +556,9 @@ fn delete(workspaces: &mut Workspaces) -> Command<Msg> {
     let Some(survey) = workspaces.doomed.take() else { return Command::none() };
     let store = workspaces.store.clone();
     let engine = workspaces.engine.clone();
+    let code = qframe::i18n::active_code();
     Command::perform(move || {
-        let outcome = remove::remove(&store, engine.as_ref(), &survey);
+        let outcome = crate::ui::in_language(&code, || remove::remove(&store, engine.as_ref(), &survey));
         Msg::Deleted(survey, outcome)
     })
 }
@@ -550,6 +598,9 @@ const URL_INPUT: &str = "workspace-url";
 
 /// The name the choice of where a new workspace starts from is focused by.
 const SOURCE_GROUP: &str = "workspace-source";
+
+/// The name of the choice between copying a folder and using it where it stands.
+const PLACE_GROUP: &str = "workspace-place";
 
 /// Where the folder browser starts: the person's home folder, or the store when there is no
 /// home folder to be had.
@@ -758,12 +809,26 @@ fn form(workspaces: &Workspaces, draft: &Draft, ui: &mut View<'_, Msg>) {
                     Some(folder) => folder.display().to_string(),
                     None => t!("workspaces.folder-none"),
                 };
-                let field = Field::new(t!("workspaces.folder-label"))
-                    .hint(t!("workspaces.folder-hint"))
-                    .error(errors.get(FOLDER_FIELD));
+                // Said where the folder is chosen: under "use it where it is", the agents change the
+                // person's real files, and that is the one thing they must not learn later.
+                let (label, hint) = match draft.place {
+                    Place::Copy => (t!("workspaces.folder-label"), t!("workspaces.folder-hint")),
+                    Place::InPlace => (t!("workspaces.place-folder-label"), t!("workspaces.place-in-place-hint")),
+                };
+                let field = Field::new(label).hint(hint).error(errors.get(FOLDER_FIELD));
                 fields.field(field, |ui| {
                     ui.add(Text::new(chosen).role(if draft.folder.is_some() { "body" } else { "secondary" }))
                         .fill_width();
+                });
+                fields.field(Field::new(t!("workspaces.place-label")), |ui| {
+                    ui.add(
+                        RadioGroup::new(Place::ALL.map(Place::label))
+                            .horizontal(true)
+                            .selected(Some(draft.place.index()))
+                            .on_select(Msg::Place),
+                    )
+                    .id(PLACE_GROUP)
+                    .fill_width();
                 });
                 FilePicker::new(&draft.browser, Msg::Picker)
                     .show(fields.ui())

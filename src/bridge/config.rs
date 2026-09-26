@@ -91,6 +91,7 @@ pub(crate) fn words(error: &EngineError) -> String {
         EngineError::NotRunnable { error, .. } => error.to_string(),
         EngineError::Failed(failure) => failure.output.clone(),
         EngineError::Cancelled { .. } => String::new(),
+        EngineError::TimedOut { command, after } => crate::engine::run::timed_out(command, *after),
     }
 }
 

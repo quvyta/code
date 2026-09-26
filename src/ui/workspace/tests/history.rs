@@ -256,6 +256,8 @@ fn choosing_a_conversation_resumes_it_inside_the_container() {
             "qcode-firefly-claude-sub",
             "claude",
             "--dangerously-skip-permissions",
+            "--settings",
+            "{\"skipDangerousModePermissionPrompt\":true}",
             "--resume",
             id
         ],
@@ -284,13 +286,18 @@ fn a_codex_conversation_is_resumed_with_its_subcommand() {
             "codex",
             "resume",
             "--dangerously-bypass-approvals-and-sandbox",
+            "--dangerously-bypass-hook-trust",
             id
         ]
     );
     apply(&mut screen, Msg::NewTab);
     let fresh = key(&screen, 1);
     apply(&mut screen, Msg::Choose(fresh, Choice::NewChat("codex".to_owned())));
-    assert_eq!(words(&screen, fresh)[4..], ["codex", "--dangerously-bypass-approvals-and-sandbox"], "a new chat");
+    assert_eq!(
+        words(&screen, fresh)[4..],
+        ["codex", "--dangerously-bypass-approvals-and-sandbox", "--dangerously-bypass-hook-trust"],
+        "a new chat"
+    );
 }
 
 /// A session of `firefly` with two new-chat tabs of `claude-sub`, opened at 1000 and 2000
@@ -376,7 +383,17 @@ fn a_tab_that_resumes_a_conversation_already_is_not_given_another() {
     let tab = key(&screen, 2);
     apply(&mut screen, Msg::Woken(tab, 0, Ok(()), Some(vec![conversation("c-new", None, 9_000_000)])));
     assert_eq!(conversation_of(&screen, 2).as_deref(), Some("c-taken"));
-    assert_eq!(words(&screen, tab)[4..], ["claude", "--dangerously-skip-permissions", "--resume", "c-taken"]);
+    assert_eq!(
+        words(&screen, tab)[4..],
+        [
+            "claude",
+            "--dangerously-skip-permissions",
+            "--settings",
+            "{\"skipDangerousModePermissionPrompt\":true}",
+            "--resume",
+            "c-taken"
+        ]
+    );
 }
 
 #[test]

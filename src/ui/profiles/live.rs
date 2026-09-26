@@ -98,6 +98,26 @@ fn stand_in_image(engine: &Engine, folder: &Path) -> String {
     image
 }
 
+/// Builds the smallest image that can stand in for the profile's when what is under test is the
+/// login going in and out of a container: a shell, and a home directory anyone may write, which
+/// is all a login needs. The profile's own recipe installs from the network on Debian, which
+/// [`stand_in_image`] cannot do on alpine.
+fn login_image(engine: &Engine, folder: &Path) -> String {
+    let home = "/tmp/qcode-home";
+    let containerfile = format!("FROM {ALPINE}\nENV HOME={home}\nRUN mkdir -p {home} && chmod 0777 {home}\n");
+    std::fs::write(folder.join("Containerfile"), containerfile).expect("a Containerfile");
+    let image = profile().image();
+    let _ = capture(&engine.remove_image(&image));
+    build_image(
+        engine,
+        &ImageBuild { image: &image, containerfile: &folder.join("Containerfile"), context: folder },
+        &|| false,
+        &mut |_| {},
+    )
+    .expect("the stand-in login image builds");
+    image
+}
+
 /// Runs a shell script in a container without a terminal and answers whether it succeeded.
 fn in_container(engine: &Engine, container: &str, script: &str) -> bool {
     capture(&engine.exec_without_terminal(&Exec { container, command: &["sh", "-c", script] })).is_ok()
@@ -123,7 +143,7 @@ fn clear(engine: &Engine, image: &str) {
 fn a_login_that_really_happened_leaves_the_container_and_reaches_the_volume() {
     for engine in engines() {
         let folder = scratch("stored");
-        let image = stand_in_image(&engine, &folder);
+        let image = login_image(&engine, &folder);
         let profile = profile();
         let volume = names::credential_volume(profile.name.as_str());
         let _ = capture(&engine.remove_volume(&volume));
@@ -162,7 +182,7 @@ fn a_login_that_really_happened_leaves_the_container_and_reaches_the_volume() {
 fn a_login_that_never_happened_stores_nothing_and_makes_no_volume() {
     for engine in engines() {
         let folder = scratch("missing");
-        let image = stand_in_image(&engine, &folder);
+        let image = login_image(&engine, &folder);
         let profile = profile();
         let volume = names::credential_volume(profile.name.as_str());
         let _ = capture(&engine.remove_volume(&volume));
@@ -206,7 +226,7 @@ fn a_template_lands_in_the_home_directory_of_the_image_it_is_built_into() {
 fn a_login_container_is_removed_even_when_the_login_is_interrupted() {
     for engine in engines() {
         let folder = scratch("interrupted");
-        let image = stand_in_image(&engine, &folder);
+        let image = login_image(&engine, &folder);
         let profile = profile();
         let container = work::open_login(&engine, &profile).expect("the login container opens");
         let name = container.name.clone();
@@ -253,24 +273,24 @@ fn a_rebuild_runs_every_step_again_takes_a_changed_recipe_and_keeps_the_image_wh
         let label = || capture(&engine.image_label(IMAGE, recipe::REVISION_LABEL)).expect("asked").trim().to_owned();
 
         let one = recipe("one");
-        work::rebuild_from(&engine, IMAGE, &one, &|| false, &mut |_| {}).expect("the first build");
+        work::rebuild_from(&engine, IMAGE, &one, None, &|| false, &mut |_| {}).expect("the first build");
         let (first, stamp) = (id(), read("/stamp"));
         assert_eq!(label(), one.revision(), "{kind:?}: the recipe is written on the image");
 
-        work::rebuild_from(&engine, IMAGE, &one, &|| false, &mut |_| {}).expect("the same recipe again");
+        work::rebuild_from(&engine, IMAGE, &one, None, &|| false, &mut |_| {}).expect("the same recipe again");
         assert_ne!(read("/stamp"), stamp, "{kind:?}: every step ran again, none was taken from before");
         let second = id();
         assert_ne!(second, first, "{kind:?}");
         assert!(capture(&engine.image_exists(&first)).is_err(), "{kind:?}: the replaced image is gone");
 
         let two = recipe("two");
-        work::rebuild_from(&engine, IMAGE, &two, &|| false, &mut |_| {}).expect("a changed recipe");
+        work::rebuild_from(&engine, IMAGE, &two, None, &|| false, &mut |_| {}).expect("a changed recipe");
         assert_eq!(read("/marker"), "two", "{kind:?}: the change is in the image");
         assert_eq!(label(), two.revision(), "{kind:?}");
         let third = id();
 
         let broken = recipe::Recipe { containerfile: format!("FROM {ALPINE}\nRUN false\n"), files: Vec::new() };
-        let failed = work::rebuild_from(&engine, IMAGE, &broken, &|| false, &mut |_| {});
+        let failed = work::rebuild_from(&engine, IMAGE, &broken, None, &|| false, &mut |_| {});
         assert!(matches!(failed, Err(Problem::Refused(_))), "{kind:?}: {failed:?}");
         let kept = capture(&engine.image_exists(IMAGE)).map(|id| id.trim().to_owned());
         let marker = kept.is_ok().then(|| read("/marker"));

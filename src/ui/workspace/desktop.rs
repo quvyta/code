@@ -95,6 +95,10 @@ pub(super) fn open(screen: &WorkspaceScreen, key: TabKey, run: u64) -> Command<M
         }
     };
     Command::perform(move || {
+        // The login first, for the same reason: the application reads it once, as it starts.
+        if let Err(failure) = plan::give_window_login(&engine, &plan, user) {
+            return Msg::WindowOpened(key, run, Err(failure));
+        }
         // Made ready before the window is opened, because the application reads its settings and
         // its instructions as it starts and its container cannot be written to once it is running.
         let prepared = plan::prepare_window(&engine, &plan, user, &token);
@@ -510,12 +514,11 @@ fn words(tab: &Tab, profile: &str, offline: bool) -> (&'static str, String, Opti
         }
         TabState::Running => {
             let mut detail = t!("workspace.window.open-detail", profile = profile);
-            // The application has nothing to work with until the person signs in, and the first
-            // sign-in asks for their password and second step in a window whose cookie jar starts
-            // empty. Said before it happens, so the window that comes up is expected, and so is
-            // the one time it asks.
+            // The application has nothing to work with until it is signed in. A profile signed in
+            // on the Profiles page gave this workspace its login before the window opened; one
+            // that was not has the window ask, once, and that is said before it happens.
             detail.push(' ');
-            detail.push_str(&t!("workspace.window.sign-in"));
+            detail.push_str(&t!("workspace.window-login.tab"));
             if offline {
                 detail.push(' ');
                 detail.push_str(&t!("workspace.window.offline"));

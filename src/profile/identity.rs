@@ -11,12 +11,13 @@
 //! commands, so that a machine with no engine can read them back in tests.
 
 use crate::base::paths::{HOME_DIR, KEEP_ALIVE};
+use crate::desktop::login::{self, Fill};
 use crate::engine::names;
 use crate::engine::run::{EngineError, capture};
 use crate::engine::{
     Access, ContainerCreate, ContainerState, Engine, EngineCommand, Exec, HostUser, Mount, MountSource, Network,
 };
-use crate::profile::SafeName;
+use crate::profile::{SafeName, account};
 use crate::store::WorkspaceId;
 
 /// Where a profile's credentials volume is mounted in every container that reads or writes it:
@@ -103,7 +104,11 @@ impl Home {
 /// The courier container mounts the credentials volume read-only and the home volume writable,
 /// reaches no network, and runs as the same user the harness container runs as, so the copies
 /// belong to whoever will read them there. The copy is the whole content of the store: the
-/// store holds nothing but the login, put there by the capture that made it.
+/// store holds nothing but the login, put there by the capture that made it. The keys of a login
+/// that live in a harness's shared settings file are then merged into the home's file rather
+/// than copied over it ([`crate::profile::account`]). A window's login is
+/// two rows of the application's database rather than files, and is put into the home's database
+/// instead of copied over it (see [`crate::desktop::login`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rewrite {
     /// Makes the courier.
@@ -112,13 +117,19 @@ pub struct Rewrite {
     pub start: EngineCommand,
     /// Copies the store into the home.
     pub copy: EngineCommand,
+    /// Merges the keys of the login a harness keeps among its other settings into the home's
+    /// files, which the copy cannot do without losing the rest of them (see
+    /// [`crate::profile::account`]).
+    pub merge: EngineCommand,
     /// Removes the courier, whether or not the copy succeeded.
     pub remove: EngineCommand,
 }
 
-/// Spells out the commands that give `home` its profile's stored login.
+/// Spells out the commands that give `home` its profile's stored login, `fill` saying whether a
+/// window's login may replace one the home already has (a harness's files are copied over either
+/// way; see [`login::give`]).
 #[must_use]
-pub fn rewrite(engine: &Engine, home: &Home, user: HostUser) -> Rewrite {
+pub fn rewrite(engine: &Engine, home: &Home, user: HostUser, fill: Fill) -> Rewrite {
     let courier = home.courier();
     let store = names::credential_volume(home.profile.as_str());
     let volume = home.volume();
@@ -137,9 +148,13 @@ pub fn rewrite(engine: &Engine, home: &Home, user: HostUser) -> Rewrite {
         workdir: None,
         command: KEEP_ALIVE,
     });
-    let script = format!("cp -R {STORE_DIR}/. {HOME_DIR}/");
-    let copy = engine.exec_without_terminal(&Exec { container: &courier, command: &["sh", "-c", &script] });
-    Rewrite { create, start: engine.start_container(&courier), copy, remove: engine.remove_container(&courier) }
+    let give = login::give(fill);
+    let words: Vec<&str> = give.iter().map(String::as_str).collect();
+    let copy = engine.exec_without_terminal(&Exec { container: &courier, command: &words });
+    let merge = account::merge();
+    let words: Vec<&str> = merge.iter().map(String::as_str).collect();
+    let merge = engine.exec_without_terminal(&Exec { container: &courier, command: &words });
+    Rewrite { create, start: engine.start_container(&courier), copy, merge, remove: engine.remove_container(&courier) }
 }
 
 /// Runs a [`Rewrite`] to the end, taking the courier away again whatever happened.
@@ -148,8 +163,11 @@ pub fn rewrite(engine: &Engine, home: &Home, user: HostUser) -> Rewrite {
 /// keep the next copy from being made under the same name.
 fn run(rewrite: &Rewrite) -> Result<(), EngineError> {
     let _ = capture(&rewrite.remove);
-    let copied =
-        capture(&rewrite.create).and_then(|_| capture(&rewrite.start)).and_then(|_| capture(&rewrite.copy)).map(|_| ());
+    let copied = capture(&rewrite.create)
+        .and_then(|_| capture(&rewrite.start))
+        .and_then(|_| capture(&rewrite.copy))
+        .and_then(|_| capture(&rewrite.merge))
+        .map(|_| ());
     let _ = capture(&rewrite.remove);
     copied
 }
@@ -164,7 +182,12 @@ pub fn home_exists(engine: &Engine, home: &Home) -> Result<bool, EngineError> {
     Ok(listed(&capture(&engine.list_volumes())?, &home.volume()))
 }
 
-/// Gives a home that was just made its profile's stored login.
+/// Gives a home its profile's stored login when it has none of its own.
+///
+/// A terminal harness's home is given it once, when the home was just made. A window's home is
+/// given it every time the window opens, because a window's login lives in a database the home
+/// has whether or not anyone signed in there: the copy looks for a login in it and leaves one it
+/// finds alone ([`Fill::Keep`]), so a workspace that was signed in to by hand keeps what it has.
 ///
 /// A profile with no stored login gives nothing, and that is not a failure: the harness asks
 /// for its login the first time it runs, as it would on any machine. Nothing is made for it
@@ -178,7 +201,7 @@ pub fn first_fill(engine: &Engine, home: &Home, user: HostUser) -> Result<(), En
     if !is_stored(&capture(&engine.list_volumes())?, &home.profile) {
         return Ok(());
     }
-    run(&rewrite(engine, home, user))
+    run(&rewrite(engine, home, user, Fill::Keep))
 }
 
 /// What refreshing a profile's login across its workspaces came to.
@@ -208,6 +231,7 @@ impl From<EngineError> for RefreshError {
             EngineError::Cancelled { command } => {
                 format!("{} {}", command.program.display(), command.args.join(" ".as_ref()).to_string_lossy())
             }
+            EngineError::TimedOut { command, after } => crate::engine::run::timed_out(&command, after),
         })
     }
 }
@@ -248,7 +272,8 @@ pub fn refresh_all(
             done.running.push(workspace.clone());
             continue;
         }
-        run(&rewrite(engine, &home, user))?;
+        // Asked for by the person, so a window's copy replaces what the home had, as files do.
+        run(&rewrite(engine, &home, user, Fill::Replace))?;
         done.written.push(workspace.clone());
     }
     Ok(done)
@@ -297,7 +322,7 @@ mod tests {
     #[test]
     fn the_courier_mounts_the_store_read_only_and_the_home_writable_off_the_network() {
         let engine = Engine::new(EngineKind::Podman, "/usr/bin/podman");
-        let rewrite = rewrite(&engine, &home(), HostUser::Ids { uid: 1000, gid: 1000 });
+        let rewrite = rewrite(&engine, &home(), HostUser::Ids { uid: 1000, gid: 1000 }, Fill::Keep);
         assert_eq!(
             args(&rewrite.create),
             [
@@ -320,17 +345,21 @@ mod tests {
             ]
         );
         assert_eq!(args(&rewrite.start), ["start", "qcode-refresh-my-app-claude-sub"]);
-        assert_eq!(
-            args(&rewrite.copy),
-            ["exec", "qcode-refresh-my-app-claude-sub", "sh", "-c", "cp -R /qcode-credentials/. /home/qcode/"]
-        );
+        let copy = args(&rewrite.copy);
+        assert_eq!(&copy[..4], ["exec", "qcode-refresh-my-app-claude-sub", "sh", "-c"]);
+        // A harness's files are copied over whole; a window's rows are put into its database.
+        assert!(copy[4].ends_with("else cp -R /qcode-credentials/. /home/qcode/; fi"), "{copy:?}");
+        assert_eq!(copy.last().map(String::as_str), Some("keep"), "a first fill never replaces a login");
+        let merge = args(&rewrite.merge);
+        assert_eq!(&merge[..3], ["exec", "qcode-refresh-my-app-claude-sub", "node"]);
+        assert_eq!(&merge[merge.len() - 3..], [STORE_DIR, HOME_DIR, account::MERGE_DIR], "{merge:?}");
         assert_eq!(args(&rewrite.remove), ["rm", "--force", "qcode-refresh-my-app-claude-sub"]);
     }
 
     #[test]
     fn docker_spells_the_same_courier_with_its_own_user_flag() {
         let engine = Engine::new(EngineKind::Docker, "/usr/bin/docker");
-        let rewrite = rewrite(&engine, &home(), HostUser::Ids { uid: 1000, gid: 100 });
+        let rewrite = rewrite(&engine, &home(), HostUser::Ids { uid: 1000, gid: 100 }, Fill::Replace);
         let create = args(&rewrite.create);
         assert_eq!(
             &create[..7],
@@ -352,7 +381,7 @@ mod tests {
     #[test]
     fn the_copy_runs_without_a_terminal_so_docker_takes_it_from_a_pipe() {
         let engine = Engine::new(EngineKind::Docker, "/usr/bin/docker");
-        let rewrite = rewrite(&engine, &home(), HostUser::ImageDefault);
+        let rewrite = rewrite(&engine, &home(), HostUser::ImageDefault, Fill::Keep);
         let copy = args(&rewrite.copy);
         assert!(!copy.contains(&"--tty".to_owned()), "{copy:?}");
         assert!(!copy.contains(&"--interactive".to_owned()), "{copy:?}");

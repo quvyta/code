@@ -1,9 +1,10 @@
 //! Deleting a workspace: finding everything it owns, and taking exactly that away.
 //!
-//! A workspace owns its folder under `Workspaces/`, the containers named after it and the home
-//! volumes its profiles keep there. Nothing else is touched: the profiles, their images and their
-//! logins belong to every workspace that uses them, and a folder the workspace was copied from was
-//! never moved into it.
+//! A workspace owns its folder under `Workspaces/`, the containers named after it, the home
+//! volumes its profiles keep there and the images it keeps what its administrator installed in.
+//! Nothing else is touched: the profiles, their images and their logins belong to every
+//! workspace that uses them, a folder the workspace was copied from was never moved into it, and
+//! a folder the workspace worked in where it stands is the person's own.
 //!
 //! Container and volume names join the workspace's identifier and a profile's name with a dash,
 //! and both may hold dashes of their own, so `qcode-a-b-c` could be the workspace `a` with the
@@ -14,6 +15,8 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use qframe::t;
 
 use crate::engine::names;
 use crate::engine::run::{EngineError, capture};
@@ -32,6 +35,9 @@ pub struct Survey {
     pub id: Option<WorkspaceId>,
     /// What the engine answered.
     pub engine: Reach,
+    /// The person's own folder, when the workspace worked in it where it stands. It is never
+    /// removed, and the question says so.
+    pub in_place: Option<PathBuf>,
 }
 
 /// What the engine answered about a workspace.
@@ -87,7 +93,8 @@ pub fn survey(store: &Store, engine: Option<&Engine>, entry: &WorkspaceEntry, na
         (Some(_), None) => Reach::Listed { containers: Vec::new(), running: Vec::new(), volumes: Vec::new() },
         (Some(engine), Some(id)) => listed(store, engine, id),
     };
-    Survey { name, dir: entry.dir.clone(), id, engine }
+    let in_place = entry.file.as_ref().and_then(|file| file.folder.clone());
+    Survey { name, dir: entry.dir.clone(), id, engine, in_place }
 }
 
 /// Removes everything `survey` found, containers first, so no volume is still in use when its
@@ -119,11 +126,43 @@ pub fn remove(store: &Store, engine: Option<&Engine>, survey: &Survey) -> Outcom
                 left.push(format!("{volume}: {}", said(&error)));
             }
         }
+        // What the workspace's administrator installed was kept in an image of the workspace's
+        // own for each profile; it is nobody else's, so it goes with the workspace. A profile
+        // that has none answers that it has none, which is not something left behind.
+        let carried = store.read_workspace(id).value.map(|file| file.profiles).unwrap_or_default();
+        for profile in carried {
+            let image = crate::ui::workspace::workspace_image(id.as_str(), &profile.name);
+            if capture(&engine.image_exists(&image)).is_ok()
+                && let Err(error) = capture(&engine.remove_image(&image))
+            {
+                left.push(format!("{image}: {}", said(&error)));
+            }
+        }
     }
-    if let Err(reason) = remove_folder(store, &survey.dir) {
+    // The person's folder can only be inside the workspace's own when the workspace file was
+    // written by hand to say so; the dialog refuses such a folder. Removing the workspace folder
+    // would take theirs with it, so the workspace folder stays, and the toast says why.
+    if let Some(folder) = survey.in_place.as_ref().filter(|folder| inside(folder, &survey.dir)) {
+        let why = t!("workspaces.left.theirs-inside", folder = folder.display().to_string());
+        left.push(format!("{}: {why}", survey.dir.display()));
+    } else if let Err(reason) = remove_folder(store, &survey.dir) {
         left.push(format!("{}: {reason}", survey.dir.display()));
     }
     if left.is_empty() { Outcome::Deleted } else { Outcome::Partly(left) }
+}
+
+/// Whether the person's folder `folder` is `dir` or somewhere under it, compared as the folders
+/// really are: a link or a `..` in either path can make a folder inside look like one outside, and
+/// removing `dir` would then take the person's folder with it. A folder whose real place cannot be
+/// found is inside when its path says so, and a `dir` that is not there takes nothing with it.
+fn inside(folder: &Path, dir: &Path) -> bool {
+    if folder.starts_with(dir) {
+        return true;
+    }
+    match (fs::canonicalize(folder), fs::canonicalize(dir)) {
+        (Ok(folder), Ok(dir)) => folder.starts_with(dir),
+        _ => false,
+    }
 }
 
 /// Removes the workspace folder `dir`, and only when it is a folder of the store's `Workspaces/`.
@@ -131,7 +170,7 @@ pub fn remove(store: &Store, engine: Option<&Engine>, survey: &Survey) -> Outcom
 /// A link standing there is removed as a link: what it points at is not the store's.
 fn remove_folder(store: &Store, dir: &Path) -> Result<(), String> {
     if dir.parent() != Some(store.workspaces_dir().as_path()) {
-        return Err("not a folder of the QCode folder's Workspaces".to_owned());
+        return Err(t!("workspaces.left.not-in-store"));
     }
     let kind = match fs::symlink_metadata(dir) {
         Ok(meta) => meta.file_type(),
@@ -271,12 +310,13 @@ fn said(error: &EngineError) -> String {
         EngineError::NotRunnable { error, .. } => error.to_string(),
         EngineError::Failed(failure) => failure.output.trim().to_owned(),
         EngineError::Cancelled { .. } => String::new(),
+        EngineError::TimedOut { command, after } => crate::engine::run::timed_out(command, *after),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Names;
+    use super::{Names, Store, remove_folder};
     use crate::store::WorkspaceId;
 
     fn names(workspaces: &[&str], profiles: &[&str]) -> Names {
@@ -337,5 +377,13 @@ mod tests {
         let alone = names(&["a"], &["b-c", "c"]);
         assert!(alone.owns_container(&id("a"), "qcode-a-b-c"));
         assert!(alone.owns_volume(&id("a"), "qcode-home-a-b-c"));
+    }
+
+    #[test]
+    fn a_folder_outside_the_store_is_refused_in_the_active_language() {
+        let root = std::env::temp_dir().join(format!("qcode-remove-outside-{}", std::process::id()));
+        let store = Store::new(&root);
+        let refused = crate::ui::in_language("tr", || remove_folder(&store, &root.join("elsewhere")));
+        assert_eq!(refused, Err("QCode klasörünün Workspaces klasöründe değil".to_owned()));
     }
 }

@@ -1,5 +1,6 @@
-//! `workspace.qcode`: what a workspace is called, when it was made, which profiles it carries, what
-//! its backup leaves out and whether it takes the assets too.
+//! `workspace.qcode`: what a workspace is called, when it was made, which folder it works in when
+//! that is not its own `Work/`, which profiles it carries, what its backup leaves out and whether it
+//! takes the assets too.
 //!
 //! The file is a [`Document`](qframe::document::Document): the framework checks the shape and
 //! reports every problem with its line and column, and what only qcode can judge — whether the
@@ -7,10 +8,12 @@
 //! entry is skipped, and everything that is readable is still used.
 
 use std::fmt::Write as _;
+use std::path::PathBuf;
 
 use qframe::date::Date;
 use qframe::diagnostics::Diagnostic;
 use qframe::document::{Document, Shape, Table, ValueKind};
+use qframe::t;
 
 use super::{Loaded, WorkspaceId};
 use crate::backup::{Place, PlaceProblem};
@@ -33,6 +36,11 @@ pub struct WorkspaceFile {
     pub name: String,
     /// The day the workspace was made, when the file records a readable one.
     pub created: Option<Date>,
+    /// The person's own folder the workspace works in where it stands, when it was made that way:
+    /// an absolute path on this machine, mounted as the containers' work folder in place of the
+    /// workspace's own `Work/`. `None` is a workspace with a `Work/` of its own, which every file
+    /// written before the choice existed is.
+    pub folder: Option<PathBuf>,
     /// The profiles the workspace carries, in the order the file lists them.
     pub profiles: Vec<WorkspaceProfile>,
     /// The folders and files inside `Work/` its backup leaves out, each a path inside the
@@ -51,6 +59,7 @@ impl WorkspaceFile {
             id,
             name: name.into(),
             created: Some(created),
+            folder: None,
             profiles: Vec::new(),
             backup_skip: Vec::new(),
             backup_assets: false,
@@ -74,7 +83,7 @@ impl WorkspaceFile {
             Some((_, Ok(id))) => Some(id),
             Some((_, Err(problem))) => {
                 let at = root.value_location("id").cloned();
-                diagnostics.push(Diagnostic::error(at, format!("`id` is not a workspace id: {problem:?}")));
+                diagnostics.push(Diagnostic::error(at, t!("workspaces.file.not-an-id", problem = problem.said())));
                 None
             }
             None => None,
@@ -84,12 +93,13 @@ impl WorkspaceFile {
         };
         let name = root.text("name").map_or_else(
             || {
-                diagnostics.push(Diagnostic::warning(None, "no readable `name`; the id is shown instead"));
+                diagnostics.push(Diagnostic::warning(None, t!("workspaces.file.no-name")));
                 id.as_str().to_owned()
             },
             str::to_owned,
         );
         let created = date(root, "created", &mut diagnostics);
+        let folder = folder(root, &mut diagnostics);
         // An entry without a name was reported by the document as missing its required key;
         // skipping it here is what that report means.
         let profiles = root
@@ -102,7 +112,7 @@ impl WorkspaceFile {
             .collect();
         let backup_skip = skip_list(root, &mut diagnostics);
         let backup_assets = root.table("backup").and_then(|backup| backup.flag("assets")).unwrap_or(false);
-        Loaded { value: Some(Self { id, name, created, profiles, backup_skip, backup_assets }), diagnostics }
+        Loaded { value: Some(Self { id, name, created, folder, profiles, backup_skip, backup_assets }), diagnostics }
     }
 
     /// The file as it is written to disk.
@@ -113,6 +123,11 @@ impl WorkspaceFile {
         let _ = writeln!(out, "name = {}", quoted(&self.name));
         if let Some(created) = self.created {
             let _ = writeln!(out, "created = {}", quoted(&created.to_string()));
+        }
+        // Written only for a workspace that has one, so a file of a workspace with its own `Work/`
+        // reads the same byte for byte as it did before the choice existed.
+        if let Some(folder) = &self.folder {
+            let _ = writeln!(out, "folder = {}", quoted(&folder.to_string_lossy()));
         }
         for profile in &self.profiles {
             let _ = write!(out, "\n[[profile]]\nname = {}\n", quoted(&profile.name));
@@ -148,6 +163,7 @@ fn shape() -> Shape {
         .required("id", ValueKind::text())
         .optional("name", ValueKind::text())
         .optional("created", ValueKind::text())
+        .optional("folder", ValueKind::text())
         .entries("profile", profile)
         .table("backup", backup)
 }
@@ -163,20 +179,28 @@ fn skip_list(root: &Table, diagnostics: &mut Vec<Diagnostic>) -> Vec<String> {
             Ok(place) if skip.iter().any(|known| known == place.as_str()) => {}
             Ok(place) => skip.push(place.as_str().to_owned()),
             Err(bad) => {
-                let why = match bad.problem {
-                    PlaceProblem::Empty => "it names nothing",
-                    PlaceProblem::Absolute => "it starts outside the workspace",
-                    PlaceProblem::Outside => "a `.` or `..` part leaves the workspace",
-                    PlaceProblem::LineBreak => "it holds a line break",
-                };
                 let at = entry.value_location("path").cloned();
-                let message =
-                    format!("`backup.skip` path {} is not inside the workspace: {why}; it is ignored", quoted(path));
+                let message = t!("workspaces.file.skip", path = quoted(path), why = outside(bad.problem));
                 diagnostics.push(Diagnostic::warning(at, message));
             }
         }
     }
     skip
+}
+
+/// The folder the workspace works in where it stands, when the file names one. A path that is not
+/// absolute is reported and not used: relative to what, would be a guess, and a guess here decides
+/// which of the person's folders the agents change.
+fn folder(root: &Table, diagnostics: &mut Vec<Diagnostic>) -> Option<PathBuf> {
+    let text = root.text("folder")?;
+    let path = PathBuf::from(text);
+    if path.is_absolute() {
+        return Some(path);
+    }
+    let at = root.value_location("folder").cloned();
+    let message = t!("workspaces.file.folder", path = quoted(text));
+    diagnostics.push(Diagnostic::warning(at, message));
+    None
 }
 
 /// Reads the day under `key`, reporting a value that is not one and answering `None`.
@@ -185,9 +209,20 @@ fn date(table: &Table, key: &str, diagnostics: &mut Vec<Diagnostic>) -> Option<D
         Ok(date) => Some(date),
         Err(problem) => {
             let at = table.value_location(key).cloned();
-            diagnostics.push(Diagnostic::warning(at, format!("`{key}` is not a day: {problem}; it is ignored")));
+            let message = t!("workspaces.file.day", key = key, problem = problem.to_string());
+            diagnostics.push(Diagnostic::warning(at, message));
             None
         }
+    }
+}
+
+/// Why a path is not one inside the workspace, in the active language.
+pub(super) fn outside(problem: PlaceProblem) -> String {
+    match problem {
+        PlaceProblem::Empty => t!("workspaces.file.names-nothing"),
+        PlaceProblem::Absolute => t!("workspaces.file.absolute"),
+        PlaceProblem::Outside => t!("workspaces.file.climbs"),
+        PlaceProblem::LineBreak => t!("workspaces.file.line-break"),
     }
 }
 
@@ -278,7 +313,7 @@ mod tests {
     #[test]
     fn a_broken_date_is_a_warning_and_leaves_the_workspace_usable() {
         let text = "id = \"proje\"\nname = \"Proje\"\ncreated = \"2026-13-40\"\n";
-        let read = WorkspaceFile::parse(FILE, text);
+        let read = crate::ui::in_language("en", || WorkspaceFile::parse(FILE, text));
         assert_eq!(read.value.expect("usable").created, None);
         assert_eq!(read.diagnostics.len(), 1);
         assert_eq!(located(&read.diagnostics[0]), "workspace.qcode:3:11", "the key that holds the bad day");
@@ -364,7 +399,7 @@ mod tests {
                     [[backup.skip]]\npath = \"data\"\n\n\
                     [[backup.skip]]\npath = \"/etc\"\n\n\
                     [[backup.skip]]\n";
-        let read = WorkspaceFile::parse(FILE, text);
+        let read = crate::ui::in_language("en", || WorkspaceFile::parse(FILE, text));
         assert_eq!(read.value.expect("usable").backup_skip, ["data"], "written as the backup names it, once");
         let mut places: Vec<String> = read.diagnostics.iter().map(located).collect();
         places.sort();
@@ -376,6 +411,71 @@ mod tests {
         );
         let climbing = read.diagnostics.iter().find(|d| located(d) == "workspace.qcode:5:8").expect("reported");
         assert!(climbing.message.contains("leaves the workspace"), "{}", climbing.message);
+    }
+
+    #[test]
+    fn a_folder_used_in_place_reads_back_the_same_and_a_file_without_one_reads_as_before() {
+        let mut file = WorkspaceFile::new(
+            WorkspaceId::parse("proje").expect("an id"),
+            "Proje",
+            Date::new(2026, 9, 25).expect("a day"),
+        );
+        let before = file.to_toml();
+        assert_eq!(before, "id = \"proje\"\nname = \"Proje\"\ncreated = \"2026-09-25\"\n");
+        let read = WorkspaceFile::parse(FILE, &before);
+        assert!(read.is_clean(), "{:?}", read.diagnostics);
+        assert_eq!(read.value.as_ref().and_then(|file| file.folder.clone()), None, "an older file is a copy");
+        assert_eq!(read.value.expect("usable").to_toml(), before, "and is written back byte for byte");
+
+        file.folder = Some(PathBuf::from("/home/kişi/kod \"proje\""));
+        file.profiles.push(WorkspaceProfile { name: "claude".to_owned(), added: None });
+        let text = file.to_toml();
+        assert!(text.contains("\nfolder = \"/home/kişi/kod \\\"proje\\\"\"\n\n[[profile]]"), "{text}");
+        let read = WorkspaceFile::parse(FILE, &text);
+        assert!(read.is_clean(), "{:?}", read.diagnostics);
+        assert_eq!(read.value, Some(file));
+    }
+
+    #[test]
+    fn a_folder_that_is_not_absolute_is_reported_and_not_guessed_at() {
+        let read =
+            crate::ui::in_language("en", || WorkspaceFile::parse(FILE, "id = \"proje\"\nfolder = \"kod/proje\"\n"));
+        assert_eq!(read.value.expect("usable").folder, None);
+        let said = read.diagnostics.iter().find(|d| d.message.contains("`folder`")).expect("the folder is reported");
+        assert_eq!(located(said), "workspace.qcode:2:10");
+    }
+
+    #[test]
+    fn what_is_wrong_with_a_workspace_file_is_said_in_the_active_language() {
+        let text = "id = \"proje\"\nfolder = \"kod/proje\"\ncreated = \"2026-13-40\"\n\n\
+                    [[backup.skip]]\npath = \"\"\n\n\
+                    [[backup.skip]]\npath = \"/etc\"\n\n\
+                    [[backup.skip]]\npath = \"../ev\"\n\n\
+                    [[backup.skip]]\npath = \"a\\nb\"\n";
+        let read = crate::ui::in_language("tr", || WorkspaceFile::parse(FILE, text));
+        let said: Vec<&str> = read.diagnostics.iter().map(|problem| problem.message.as_str()).collect();
+        for expected in [
+            "okunabilen bir `name` yok; onun yerine kimlik gösteriliyor",
+            "`folder` \"kod/proje\" mutlak bir yol değil; yok sayılıyor",
+            "`backup.skip` yolu \"\" çalışma alanının içinde değil: hiçbir şeyi adlandırmıyor; yok sayılıyor",
+            "`backup.skip` yolu \"/etc\" çalışma alanının içinde değil: çalışma alanının dışında başlıyor; yok sayılıyor",
+            "`backup.skip` yolu \"../ev\" çalışma alanının içinde değil: bir `.` ya da `..` parçası çalışma alanının \
+             dışına çıkıyor; yok sayılıyor",
+            "`backup.skip` yolu \"a\\nb\" çalışma alanının içinde değil: içinde bir satır sonu var; yok sayılıyor",
+        ] {
+            assert!(said.contains(&expected), "`{expected}` in {said:#?}");
+        }
+        assert!(
+            said.iter().any(|message| message.starts_with("`created` bir gün değil: ") && message.ends_with("; yok sayılıyor")),
+            "{said:#?}"
+        );
+
+        let read = crate::ui::in_language("tr", || WorkspaceFile::parse(FILE, "id = \"con\"\n"));
+        let said: Vec<&str> = read.diagnostics.iter().map(|problem| problem.message.as_str()).collect();
+        assert_eq!(
+            said,
+            ["`id` bir çalışma alanı kimliği değil: Bu ad Windows'ta bir aygıtın adı. Yanına bir kelime ekle."]
+        );
     }
 
     #[test]

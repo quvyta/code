@@ -5,6 +5,36 @@ Every release of quvyta-code, newest first. The format follows
 [Semantic Versioning](https://semver.org/); while the version starts with 0, a minor release may
 change files qcode writes, and the notes say so when it does.
 
+## 0.1.18 - 2026-09-27
+
+### Added
+
+- **A new template for opencode: oh my opencode slim.** It sets opencode up the way every QCode template does and adds graphify and [oh-my-opencode-slim](https://github.com/alvinunreal/oh-my-opencode-slim), a lighter team of seven agents (about 220 MB, against oh-my-openagent's 470 MB), which runs on whatever model the profile signs in with. oh-my-openagent is not installed with it. It asks for no key, sends no telemetry and never updates itself.
+- **A shell in a profile's container.** **Open shell** on a profile, and on the last page of the profile wizard, opens a container of the profile's image with the network and none of your files, as you and as administrator. When you close it, qcode says what changed and asks whether to add it to the profile. What you add reaches every workspace made afterwards and is put back by every **Rebuild image**; the commands run as administrator are listed on the profile and can be removed. A sign-in made in the shell is never added. A shell left open when qcode closed is never thrown away without asking.
+- **What you install stays.** Tools installed for your user with `npm -g`, `pipx` or `uv tool` go into the workspace's home, so they survive a changed setting, a rebuild or a new qcode. **As administrator** on a running container in the side panel opens a root shell; what you install there stays in that workspace when its container is made again, is installed again when the profile's image is rebuilt, and never reaches the profile or another workspace.
+- **Sign in once, in the profile wizard.** A login made there signs Claude Code in in every new workspace, and Antigravity IDE's window opens already signed in in every workspace, with the agent's approvals set under a QCode template.
+- **Use a folder where it is.** A workspace made from a folder can use that folder itself instead of a copy: every container works in your real folder, and deleting the workspace leaves it as it is. A folder that is copied now keeps its links.
+- **Quvyta development**, a template with Rust's toolchain, the build tools, uv and, if you want it, Chromium in the image.
+- **Edit a profile** from the Profiles table: everything but its name. The image is built again only when what it holds changes, and you sign in again only when the account changes.
+- **Antigravity takes part in messages between tabs.** Its window is listed among the agent tabs; messages sent to it wait in its inbox, its agent is told in its own panel when one arrives, and told again if it lets them wait.
+- **Nine languages, whole.** Every screen is now in English, Turkish, German, Spanish, French, Japanese, Brazilian Portuguese, Russian and Simplified Chinese, including the messages about a broken workspace or a deletion that left something behind.
+
+### Changed
+
+- **Templates have plain names.** QCode basic is **QCode recommended** and QCode high is **QCode extra**. QCode recommended now gives every harness graphify, Claude Code its makers' starter plugins and opencode oh-my-openagent; QCode extra adds every plugin qcode's author uses.
+- **Closing a tab never ends a working agent without asking.** Closing a harness tab or an Antigravity window whose agent is still running, with its `×` or `ctrl+w`, asks first, as quitting already did. A tab that still holds messages from other tabs asks before they are thrown away.
+- **No harness stops to ask before it acts**, under any template: the container is what keeps the work apart from your machine.
+- **An engine that stops answering is named.** When Podman or Docker does not answer a short question within a minute, qcode stops waiting and says it may be stuck on a lock of its own. Builds, copies, backups and installs are still waited for however long they take.
+- **Messages between tabs never join a line you started**, and text that arrives in a tab all at once keeps its spaces and Returns.
+- Built against quvyta-framework 0.1.29.
+
+### Fixed
+
+- **Antigravity's Google sign-in is stored.** Antigravity writes a new sign-in down only when it closes, so taking it while the window was open found nothing and lost it. qcode now closes the window first, then stores the sign-in. Press **I have signed in** once the window shows you are signed in.
+- **Sign-ins pass through a folder that is yours alone.** The folders a sign-in uses on your machine are made fresh under a name nobody can guess, readable only by you, and removed when the sign-in ends; Antigravity's token file is readable only by you.
+- **Deleting a workspace that uses a folder where it is** compares real paths, so a folder of yours reached through a link or `..` is never deleted with it.
+- **The README no longer shows a moving picture.** The old one staged a tab's answer instead of recording a real harness; it will come back as a recording of real harnesses.
+
 ## 0.1.17 - 2026-09-24
 
 ### Added
@@ -246,7 +276,7 @@ change files qcode writes, and the notes say so when it does.
 
 ### Changed
 
-- Settings move to the Quvyta family's file, `~/.config/quvyta/code.conf` on Linux. Settings
+- Settings move to the Quvyta ecosystem's shared file, `~/.config/quvyta/code.conf` on Linux. Settings
   from `~/.config/quvyta/code/settings.toml` are brought over once, at start.
 - A new workspace defaults to `Quvyta/Code` in your Documents folder. A workspace chosen before
   stays where it is.

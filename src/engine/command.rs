@@ -10,6 +10,14 @@ use super::dialect::{Relabel, Sandboxing, TmpfsOwner, UserMapping};
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+/// How long an engine is given to answer a question: whether an image is there, what a container
+/// is doing, to remove a volume. Each of those takes a moment; one that has taken this long is not
+/// going to answer, usually because the engine is stuck waiting on a lock of its own, and the
+/// person is better told so than left looking at a task that never ends. Generous, because a busy
+/// machine can make a moment long.
+pub const ANSWER_WITHIN: Duration = Duration::from_secs(60);
 
 /// A command to run: the engine binary and its arguments, ready for
 /// [`std::process::Command`] or for `qframe`'s `TerminalSession::spawn`.
@@ -19,6 +27,25 @@ pub struct EngineCommand {
     pub program: PathBuf,
     /// Its arguments, in order.
     pub args: Vec<OsString>,
+    /// How long running it to the end ([`capture`](super::run::capture),
+    /// [`feed`](super::run::feed)) waits before it is stopped and said to be stuck: `None` for
+    /// work that takes as long as it takes, such as a build, a copy or a backup.
+    pub deadline: Option<Duration>,
+}
+
+impl EngineCommand {
+    /// The same command, waited for however long it takes: for work inside a container whose
+    /// length depends on what it works on, such as installing packages again or archiving a home.
+    #[must_use]
+    pub fn unbounded(self) -> Self {
+        Self { deadline: None, ..self }
+    }
+
+    /// The same command, waited for `deadline` at the most.
+    #[must_use]
+    pub fn within(self, deadline: Duration) -> Self {
+        Self { deadline: Some(deadline), ..self }
+    }
 }
 
 /// Collects the arguments of one command.
@@ -39,8 +66,14 @@ impl Args {
 }
 
 impl Engine {
+    /// A question, answered within [`ANSWER_WITHIN`].
     fn command(&self, args: Args) -> EngineCommand {
-        EngineCommand { program: self.bin.clone(), args: args.0 }
+        EngineCommand { program: self.bin.clone(), args: args.0, deadline: Some(self.answer_within) }
+    }
+
+    /// Work whose length depends on what it works on, so no wait is too long for it.
+    fn long(&self, args: Args) -> EngineCommand {
+        EngineCommand { program: self.bin.clone(), args: args.0, deadline: None }
     }
 
     /// Builds the image `image` from `containerfile`.
@@ -56,7 +89,7 @@ impl Engine {
         args.push("--file");
         args.push(request.containerfile);
         args.push(request.context);
-        self.command(args)
+        self.long(args)
     }
 
     /// Builds the image `image` from `containerfile` again from its first step, reusing no layer
@@ -77,7 +110,7 @@ impl Engine {
         args.push("--file");
         args.push(request.containerfile);
         args.push(request.context);
-        self.command(args)
+        self.long(args)
     }
 
     /// Removes the image `image`, running containers and all.
@@ -197,7 +230,7 @@ impl Engine {
                 command: request.command,
             },
         );
-        self.command(args)
+        self.long(args)
     }
 
     /// [`Engine::run_once`] with the command's standard input handed to the program, for a
@@ -220,7 +253,7 @@ impl Engine {
                 command: request.command,
             },
         );
-        self.command(args)
+        self.long(args)
     }
 
     /// Runs a program in a container of its own, attached to a terminal and removed as soon as
@@ -259,7 +292,7 @@ impl Engine {
                 command: once.command,
             },
         );
-        self.command(args)
+        self.long(args)
     }
 
     /// Runs a program in a container of its own that draws a window on the person's desktop, in
@@ -343,7 +376,7 @@ impl Engine {
         let mut args = Args::new();
         args.push("wait");
         args.push(name);
-        self.command(args)
+        self.long(args)
     }
 
     /// Stops a running container, giving its program `seconds` to close by itself before it is
@@ -359,7 +392,8 @@ impl Engine {
         args.push("--time");
         args.push(seconds.to_string());
         args.push(name);
-        self.command(args)
+        // The engine itself waits those seconds before it answers, so they come on top.
+        EngineCommand { deadline: Some(self.answer_within + Duration::from_secs(seconds.into())), ..self.command(args) }
     }
 
     /// The part of `create` and `run` both engines take the same way: who the container runs
@@ -453,7 +487,56 @@ impl Engine {
         }
         args.push(request.container);
         args.extend(request.command);
-        self.command(args)
+        self.long(args)
+    }
+
+    /// [`Engine::exec_with_env`] as root rather than as whoever the container runs as.
+    ///
+    /// No image carries `sudo`: root is the engine's to give, and only for the one command a
+    /// person asked to run as the administrator.
+    #[must_use]
+    pub fn exec_as_root(&self, request: &Exec<'_>, env: &[(&str, &str)]) -> EngineCommand {
+        let mut command = self.exec_with_env(request, env);
+        command.args.splice(1..1, [OsString::from("--user"), OsString::from("0")]);
+        command
+    }
+
+    /// [`Engine::exec_without_terminal`] as root.
+    #[must_use]
+    pub fn exec_as_root_without_terminal(&self, request: &Exec<'_>) -> EngineCommand {
+        let mut command = self.exec_without_terminal(request);
+        command.args.splice(1..1, [OsString::from("--user"), OsString::from("0")]);
+        command
+    }
+
+    /// Lists what a container changed above its image, one `A`, `C` or `D` and a path a line,
+    /// spelled the same by both engines.
+    #[must_use]
+    pub fn container_diff(&self, name: &str) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("diff");
+        args.push(name);
+        // As long as the container has changed things: a home full of installed packages is
+        // many thousands of lines.
+        self.long(args)
+    }
+
+    /// Makes an image named `image` of a container as it stands, running as `user`, which is
+    /// what the image said before a container ran it as somebody else, and carrying `labels`.
+    #[must_use]
+    pub fn commit_container(&self, name: &str, image: &str, user: &str, labels: &[(&str, &str)]) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("commit");
+        args.push("--change");
+        args.push(format!("USER {user}"));
+        for (key, value) in labels {
+            args.push("--change");
+            args.push(format!("LABEL {key}={value}"));
+        }
+        args.push(name);
+        args.push(image);
+        // A commit writes every changed file into a new layer, however many there are.
+        self.long(args)
     }
 
     /// Runs a command inside a running container without a terminal but with its standard input
@@ -611,7 +694,7 @@ impl Engine {
         args.push("cp");
         args.push(request.host);
         args.push(at(request.container, request.target));
-        self.command(args)
+        self.long(args)
     }
 
     /// Copies out of a container onto the host, the other direction of [`Engine::copy_in`].
@@ -621,7 +704,7 @@ impl Engine {
         args.push("cp");
         args.push(at(request.container, request.source));
         args.push(request.host);
-        self.command(args)
+        self.long(args)
     }
 }
 
@@ -949,6 +1032,56 @@ mod tests {
     }
 
     #[test]
+    fn a_question_has_a_deadline_and_work_that_takes_its_own_time_has_none() {
+        use std::time::Duration;
+        let engine = podman().answering_within(Duration::from_secs(7));
+        let asked = Some(Duration::from_secs(7));
+        for question in [
+            engine.list_volumes(),
+            engine.list_containers(),
+            engine.remove_volume("qcode-home-a-b"),
+            engine.remove_container("qcode-a-b"),
+            engine.container_state("qcode-a-b"),
+            engine.image_exists("qcode/base"),
+            engine.start_container("qcode-a-b"),
+            engine.stop_container("qcode-a-b"),
+            engine.exec_without_terminal(&Exec { container: "qcode-a-b", command: &["true"] }),
+            engine.info(),
+        ] {
+            assert_eq!(question.deadline, asked, "{:?}", args(&question));
+        }
+        // The engine itself waits the seconds it is given before it answers.
+        assert_eq!(engine.stop_container_within("qcode-a-b", 30).deadline, Some(Duration::from_secs(37)));
+        let run = RunOnce {
+            image: "qcode/base",
+            mounts: &[],
+            network: Network::None,
+            user: HostUser::ImageDefault,
+            workdir: None,
+            command: &["true"],
+        };
+        let build = ImageBuild { image: "qcode/base", containerfile: Path::new("/c"), context: Path::new("/") };
+        let copy = CopyIn { host: Path::new("/h"), container: "qcode-a-b", target: Path::new("/t") };
+        let out = CopyOut { container: "qcode-a-b", source: Path::new("/t"), host: Path::new("/h") };
+        for work in [
+            engine.build_image(&build),
+            engine.rebuild_image(&build),
+            engine.run_once(&run),
+            engine.run_fed(&run),
+            engine.wait_container("qcode-a-b"),
+            engine.exec(&Exec { container: "qcode-a-b", command: &["bash"] }),
+            engine.copy_in(&copy),
+            engine.copy_out(&out),
+            engine.commit_container("qcode-a-b", "qcode/a", "qcode", &[]),
+            engine.container_diff("qcode-a-b"),
+            engine.exec_without_terminal(&Exec { container: "qcode-a-b", command: &["true"] }).unbounded(),
+        ] {
+            assert_eq!(work.deadline, None, "{:?}", args(&work));
+        }
+        assert_eq!(podman().list_volumes().deadline, Some(crate::engine::ANSWER_WITHIN));
+    }
+
+    #[test]
     fn builds_an_image_from_a_containerfile() {
         let request = ImageBuild {
             image: "qcode/profile/claude-sub",
@@ -1018,6 +1151,38 @@ mod tests {
         let spelled = ["image", "inspect", "--format", "{{.Size}}", "qcode/profile/anti"];
         assert_eq!(args(&docker().image_size("qcode/profile/anti")), spelled);
         assert_eq!(args(&podman().image_size("qcode/profile/anti")), spelled);
+    }
+
+    #[test]
+    fn root_is_asked_of_the_engine_for_one_command_and_a_container_is_diffed_and_committed_the_same_on_both() {
+        for engine in [podman(), docker()] {
+            let request = Exec { container: "qcode-shell.p", command: &["bash"] };
+            assert_eq!(
+                args(&engine.exec_as_root(&request, &[("HISTFILE", "/tmp/h")])),
+                ["exec", "--user", "0", "--interactive", "--tty", "--env", "HISTFILE=/tmp/h", "qcode-shell.p", "bash"]
+            );
+            assert_eq!(
+                args(&engine.exec_as_root_without_terminal(&request)),
+                ["exec", "--user", "0", "qcode-shell.p", "bash"]
+            );
+            assert_eq!(args(&engine.container_diff("qcode-shell.p")), ["diff", "qcode-shell.p"]);
+            assert_eq!(
+                args(&engine.commit_container("qcode-shell.p", "qcode/profile/p", "qcode", &[])),
+                ["commit", "--change", "USER qcode", "qcode-shell.p", "qcode/profile/p"]
+            );
+            assert_eq!(
+                args(&engine.commit_container("qcode-w-p", "qcode/workspace/w/p", "qcode", &[("qcode.base", "sha")])),
+                [
+                    "commit",
+                    "--change",
+                    "USER qcode",
+                    "--change",
+                    "LABEL qcode.base=sha",
+                    "qcode-w-p",
+                    "qcode/workspace/w/p"
+                ]
+            );
+        }
     }
 
     #[test]

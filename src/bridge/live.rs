@@ -23,7 +23,7 @@ use std::sync::mpsc;
 use serde_json::Value;
 
 use super::config;
-use super::protocol::{Answer, Listed, Question, Request};
+use super::protocol::{Answer, Listed, Question, Received, Request};
 use super::socket::Listener;
 use crate::engine::run::capture;
 use crate::engine::{Engine, EngineKind, Exec, HostUser, detect};
@@ -41,8 +41,14 @@ fn engines() -> Vec<Engine> {
     if std::env::var("QCODE_CONTAINER_TESTS").as_deref() != Ok("1") {
         return Vec::new();
     }
-    let found: Vec<Engine> =
-        [EngineKind::Podman, EngineKind::Docker].into_iter().filter_map(|kind| detect(kind).ok()).collect();
+    // `QCODE_CONTAINER_ENGINE` keeps one engine, the way the relay's live tests do, so a run on a
+    // machine short of memory builds each image once.
+    let only = std::env::var("QCODE_CONTAINER_ENGINE").ok();
+    let found: Vec<Engine> = [EngineKind::Podman, EngineKind::Docker]
+        .into_iter()
+        .filter(|kind| only.as_deref().is_none_or(|only| format!("{kind:?}").eq_ignore_ascii_case(only)))
+        .filter_map(|kind| detect(kind).ok())
+        .collect();
     assert!(!found.is_empty(), "these tests were asked for and no engine answered");
     found
 }
@@ -130,6 +136,7 @@ fn questions() -> Vec<String> {
         format!(r#"{{"jsonrpc":"2.0","id":6,"method":"tools/list","params":{{{modern}}}}}"#),
         r#"{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"1900-01-01"}}}"#.to_owned(),
         r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"delete_everything","arguments":{}}}"#.to_owned(),
+        r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"check_inbox","arguments":{}}}"#.to_owned(),
     ]
 }
 
@@ -152,11 +159,16 @@ fn answer_as_qcode(listener: &Listener, seen: mpsc::Sender<Question>) -> std::th
                         harness: "Codex".to_owned(),
                         profile: "codex-main".to_owned(),
                         network: false,
+                        inbox: false,
                         waiting: 1,
                         trouble: Some("the coding tool in that tab is not running".to_owned()),
                     }],
                 ),
                 Request::Send { tab, text } => Answer::done(format!("queued for {tab}: {text}")),
+                Request::Inbox | Request::Peek => Answer::received(
+                    "one message".to_owned(),
+                    vec![Received { from: "Codex · codex-main".to_owned(), text: "the tests pass".to_owned() }],
+                ),
             };
             call.answer(answer);
             let _ = seen.send(question);
@@ -185,7 +197,7 @@ fn converse(engine: &Engine, container: &str, wrap: &str) -> std::collections::H
 
 /// Checks the answers of [`converse`] against the protocol, both revisions.
 fn check_answers(kind: EngineKind, answers: &std::collections::HashMap<u64, Value>) {
-    assert_eq!(answers.len(), 8, "{kind:?}: every request answered, the notification not: {answers:?}");
+    assert_eq!(answers.len(), 9, "{kind:?}: every request answered, the notification not: {answers:?}");
     assert_eq!(answers[&1]["result"]["protocolVersion"], "2025-06-18", "{kind:?}: the version asked for is spoken");
     assert!(answers[&1]["result"]["capabilities"]["tools"].is_object());
     assert_eq!(answers[&1]["result"]["serverInfo"]["name"], "qcode");
@@ -195,7 +207,7 @@ fn check_answers(kind: EngineKind, answers: &std::collections::HashMap<u64, Valu
         .iter()
         .filter_map(|tool| tool["name"].as_str())
         .collect();
-    assert_eq!(names, ["list_tabs", "send_message"]);
+    assert_eq!(names, ["list_tabs", "send_message", "check_inbox"]);
     assert_eq!(answers[&3]["result"]["isError"], false);
     assert_eq!(answers[&3]["result"]["structuredContent"]["tabs"][0]["tab"], "7", "{kind:?}: {}", answers[&3]);
     assert_eq!(answers[&4]["result"]["content"][0]["text"], "queued for 7: run the tests", "{kind:?}");
@@ -204,6 +216,9 @@ fn check_answers(kind: EngineKind, answers: &std::collections::HashMap<u64, Valu
     assert_eq!(answers[&6]["result"]["resultType"], "complete");
     assert_eq!(answers[&7]["error"]["code"], -32022, "{kind:?}: an unknown revision is refused with the modern error");
     assert_eq!(answers[&8]["error"]["code"], -32602, "{kind:?}: an unknown tool is a protocol error");
+    let inbox = &answers[&9]["result"]["structuredContent"]["messages"][0];
+    assert_eq!(inbox["from"], "Codex · codex-main", "{kind:?}: {}", answers[&9]);
+    assert_eq!(inbox["text"], "the tests pass", "{kind:?}: the inbox reaches the agent whole");
 }
 
 /// The token the tab whose settings are written would have. Nothing but a running QCode hands
@@ -275,7 +290,11 @@ fn verify(harness: HarnessKind) {
         drop(listener);
         answering.join().expect("the answering thread ends");
         let tokens: Vec<String> = questions.try_iter().map(|question| question.token).collect();
-        assert_eq!(tokens, ["tok-direct", "tok-direct", "tok-parent", "tok-parent"], "{kind:?} {harness:?}");
+        assert_eq!(
+            tokens,
+            ["tok-direct", "tok-direct", "tok-direct", "tok-parent", "tok-parent", "tok-parent"],
+            "{kind:?} {harness:?}"
+        );
 
         capture(&engine.remove_container(&plan.name)).expect("the container is removed");
         capture(&engine.remove_volume(&home.volume())).expect("the home is removed");
@@ -631,13 +650,13 @@ fn claude_code_opens_on_its_prompt(template: Template) {
 
 #[test]
 #[ignore = "needs a container engine, the network once for the image, and a model service; run with QCODE_CONTAINER_TESTS=1, QCODE_PROVIDER_URL and QCODE_PROVIDER_MODEL"]
-fn claude_code_opens_on_its_prompt_under_qcode_basic_without_a_key_pressed() {
+fn claude_code_opens_on_its_prompt_under_qcode_recommended_without_a_key_pressed() {
     claude_code_opens_on_its_prompt(Template::Recommended);
 }
 
 #[test]
 #[ignore = "needs a container engine, the network once for the image, and a model service; run with QCODE_CONTAINER_TESTS=1, QCODE_PROVIDER_URL and QCODE_PROVIDER_MODEL"]
-fn claude_code_opens_on_its_prompt_under_qcode_high_without_a_key_pressed() {
+fn claude_code_opens_on_its_prompt_under_qcode_extra_without_a_key_pressed() {
     claude_code_opens_on_its_prompt(Template::High);
 }
 
@@ -779,4 +798,93 @@ fn a_message_delivered_into_qwen_code_on_a_provider_reaches_its_own_prompt() {
 #[ignore = "needs a container engine, the network, and the owner's MiMo key; run with QCODE_CONTAINER_TESTS=1"]
 fn a_message_delivered_into_codex_on_a_provider_reaches_its_own_prompt() {
     delivered_on_a_provider(HarnessKind::Codex);
+}
+
+/// The pull a window's agent makes, made by a real agent: Claude Code on Xiaomi MiMo, in a
+/// container with no network, is asked to check its inbox, calls `check_inbox` of the real bridge
+/// server, and says what the message in it was. QCode's side here answers the inbox the way
+/// [`answer_as_qcode`] does, with one message from a Codex tab; which messages a tab's inbox really
+/// holds, and that taking them empties it, is the screen's own tests' to show. What only a real
+/// agent can show is that the tool is found, called and read.
+#[test]
+#[ignore = "needs a container engine, the network, and the owner's MiMo key; run with QCODE_CONTAINER_TESTS=1"]
+fn an_agent_takes_a_message_from_its_inbox_through_the_real_server() {
+    use crate::provider::relay::{self, Listener as Relay, Upstream};
+    use crate::provider::{Key, ProviderEntry, ProviderKind, Tag};
+
+    let Some(key) = std::env::var_os("HOME")
+        .and_then(|home| std::fs::read_to_string(PathBuf::from(home).join(".config/quvyta/mimo-key")).ok())
+        .and_then(|text| Key::new(&text))
+    else {
+        println!("skipped: there is no key at ~/.config/quvyta/mimo-key");
+        return;
+    };
+    let harness = HarnessKind::ClaudeCode;
+    let model = std::env::var("QCODE_MIMO_MODEL").unwrap_or_else(|_| "mimo-v2.6-flash".to_owned());
+    let profile = Profile {
+        name: SafeName::parse("bridgetest-inbox").expect("the name is safe"),
+        account: AccountKind::Provider,
+        provider: Some(crate::profile::ProviderChoice { tag: PROVIDER_TAG.to_owned(), model }),
+        ..self::profile(harness)
+    };
+    let choice = profile.provider.clone().expect("the profile names a provider");
+    let kind_of = ProviderKind::MimoTokenPlan;
+    let mut entry = ProviderEntry::new(Tag::parse(PROVIDER_TAG).expect("a tag"), kind_of, kind_of.suggested_base());
+    entry.key = Some(key);
+
+    for engine in engines() {
+        let kind = engine.kind();
+        let scratch = Scratch::new("inbox");
+        let paths = scratch.paths();
+        let workspace = WorkspaceId::parse(WORKSPACE).expect("a workspace id");
+        let plan = ContainerPlan::profile(&workspace, &paths, &profile);
+        let home = Home::new(profile.name.clone(), workspace.clone());
+        let _ = capture(&engine.remove_container(&plan.name));
+        let _ = capture(&engine.remove_volume(&home.volume()));
+        build(&engine, &profile);
+
+        let bridge = Listener::open(&paths.mcp()).expect("the workspace's socket opens");
+        let (seen, questions) = mpsc::channel();
+        let answering = answer_as_qcode(&bridge, seen);
+        let token = super::token();
+        let mine = token.clone();
+        let carried = entry.clone();
+        let relay = Relay::open(
+            &paths.mcp(),
+            move |asked| (asked == mine).then(|| carried.clone()),
+            Upstream::network(),
+            |_| (),
+        )
+        .expect("the workspace's relay socket opens");
+        let user = HostUser::current().expect("the current user");
+        ensure_running(&engine, &plan, user).unwrap_or_else(|failure| panic!("{kind:?}: {failure:?}"));
+        config::register(&engine, &plan.name, harness, &token)
+            .unwrap_or_else(|trouble| panic!("{kind:?}: {trouble:?}"));
+
+        let mut line = harness.command_line(None);
+        line.extend([
+            "-p".to_owned(),
+            "Call the check_inbox tool of the qcode MCP server once. Then reply with only the text of the \
+             message it returned, word for word."
+                .to_owned(),
+        ]);
+        let mut words = vec!["env".to_owned(), format!("{}={token}", super::TOKEN_VARIABLE)];
+        for (name, value) in choice.environment(harness, &token, None) {
+            words.push(format!("{name}='{}'", value.replace('\'', "'\\''")));
+        }
+        words.extend(relay::wrapping(&line).into_iter().map(|word| format!("'{}'", word.replace('\'', "'\\''"))));
+        let said = run(&engine, &plan.name, &words.join(" ")).unwrap_or_else(|trouble| trouble);
+        println!("{kind:?}: the agent said: {said}");
+
+        drop(relay);
+        drop(bridge);
+        answering.join().expect("the answering thread ends");
+        let asked: Vec<Request> = questions.try_iter().map(|question| question.request).collect();
+        assert!(asked.contains(&Request::Inbox), "{kind:?}: the agent called check_inbox: {asked:?}");
+        assert!(said.to_lowercase().contains("the tests pass"), "{kind:?}: it read what the inbox held: {said}");
+
+        capture(&engine.remove_container(&plan.name)).expect("the container is removed");
+        capture(&engine.remove_volume(&home.volume())).expect("the home is removed");
+        clear(&engine, &profile, &plan.name);
+    }
 }

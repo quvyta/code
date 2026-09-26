@@ -123,9 +123,22 @@ const server = createServer((req, res) => {
 // provider that does not work. The relay then lives exactly as long as the harness does.
 const harness = process.argv.slice(2);
 
-server.listen(PORT, "127.0.0.1", () => {
+// The address every harness is told of, written into its environment and its arguments by QCode.
+// A second tab of the same profile shares this container, and its relay finds the port taken by the
+// first; it then listens on a free port of its own and tells its harness that one instead, in the
+// very places QCode wrote the usual one.
+const ADDRESS = `127.0.0.1:${PORT}`;
+function moved(text, port) {
+  return text.split(ADDRESS).join(`127.0.0.1:${port}`);
+}
+
+function start() {
   if (harness.length === 0) return;
-  const child = spawn(harness[0], harness.slice(1), { stdio: "inherit" });
+  const port = server.address().port;
+  const env = {};
+  for (const [name, value] of Object.entries(process.env)) env[name] = moved(value, port);
+  const args = harness.map((word) => moved(word, port));
+  const child = spawn(args[0], args.slice(1), { stdio: "inherit", env });
   child.on("exit", (code, signal) => {
     server.close();
     process.exit(signal ? 128 : (code ?? 0));
@@ -135,4 +148,11 @@ server.listen(PORT, "127.0.0.1", () => {
     server.close();
     process.exit(127);
   });
+}
+
+server.once("listening", start);
+server.once("error", (error) => {
+  if (error.code !== "EADDRINUSE") throw error;
+  server.listen(0, "127.0.0.1");
 });
+server.listen(PORT, "127.0.0.1");

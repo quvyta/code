@@ -63,6 +63,9 @@ pub fn detect(kind: EngineKind) -> Result<Engine, Unavailable> {
         }
         // `capture` never cancels: nothing was given to it to cancel with.
         Err(EngineError::Cancelled { .. }) => Err(Unavailable::InfoFailed { code: None, output: String::new() }),
+        Err(EngineError::TimedOut { command, after }) => {
+            Err(Unavailable::InfoFailed { code: None, output: super::run::timed_out(&command, after) })
+        }
     }
 }
 
@@ -71,7 +74,7 @@ impl Engine {
     /// what makes it the question [`detect`] asks.
     #[must_use]
     pub fn info(&self) -> EngineCommand {
-        EngineCommand { program: self.bin.clone(), args: vec!["info".into()] }
+        EngineCommand { program: self.bin.clone(), args: vec!["info".into()], deadline: Some(self.answer_within) }
     }
 }
 

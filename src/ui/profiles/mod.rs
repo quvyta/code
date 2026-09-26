@@ -12,13 +12,22 @@
 //! in a test with no container runtime.
 
 #[cfg(test)]
+mod inbox_tests;
+#[cfg(test)]
 mod live;
 pub(crate) mod recipe;
 mod remove;
+pub(crate) mod shell;
+mod shell_page;
+#[cfg(test)]
+mod shell_tests;
 mod status;
+#[cfg(test)]
+mod window_tests;
 mod wizard;
 pub(crate) mod work;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -32,7 +41,10 @@ use qframe::widgets::{
 };
 
 use crate::base::{Gap, Os, Refusal};
+use crate::desktop::login::{self, Seen, SignIn};
+use crate::desktop::{Display, NoDisplay, callback, signin};
 use crate::engine::Engine;
+use crate::profile::own::Own;
 use crate::profile::{
     ASSUMED_CONTEXT_TOKENS, AccountKind, Extra, HarnessKind, MountAccess, NetworkMode, Profile, SafeName, Template,
 };
@@ -40,8 +52,9 @@ use crate::provider::{ProviderEntry, Providers};
 use crate::store::Store;
 use crate::ui::settings::engine::help;
 
+pub use shell_page::{ShellMsg, ShellPage, Side as ShellSide, Stage as ShellStage};
 pub use status::{Readiness, Revision, Row, Status};
-pub use wizard::{Blocked, Build, Draft, Login, Stage, Unfinished};
+pub use wizard::{Blocked, Build, Draft, Login, Page, Stage, Unfinished, WindowBack, WindowLogin};
 pub use work::Problem;
 
 /// Width of the wizard's pages: wide enough for every step to keep its name in the row of
@@ -60,7 +73,7 @@ const VIEWPORT_ROWS: u16 = 16;
 /// Rows the tallest page of the wizard takes at [`PAGE_WIDTH`], with the steps above it and the
 /// buttons under it: the image page of a machine without an engine. The wizard is placed as if
 /// every page were this tall, so the steps stay on the same row from page to page.
-const WIZARD_ROWS: u16 = 25;
+const WIZARD_ROWS: u16 = 28;
 
 /// Rows the application's own foot takes under this screen — the way back and the list of keys —
 /// which the screen's view cannot see but which shares the terminal with it.
@@ -106,6 +119,8 @@ pub enum Msg {
     RebuildAsked,
     /// The question was answered with yes: the image page opens on its own and the build starts.
     RebuildConfirmed,
+    /// Changing the chosen profile was asked for: the wizard opens on it.
+    EditAsked,
     /// Open the wizard.
     New,
     /// Open the wizard as soon as the store has been read, for a person who asked for a new
@@ -130,7 +145,7 @@ pub enum Msg {
     PickOs(usize),
     /// A template was chosen.
     PickTemplate(usize),
-    /// A part of QCode high's additions was switched on (`true`) or off.
+    /// A part of a QCode template's additions was switched on (`true`) or off.
     SwitchExtra(Extra, bool),
     /// An account type was chosen.
     PickAccount(usize),
@@ -176,6 +191,17 @@ pub enum Msg {
     LoginFailed(Problem),
     /// A container a login used has been cleared away.
     LoginDiscarded,
+    /// The window a login is made in is open on the person's screen; the number tells this opening
+    /// apart from an earlier one.
+    WindowOpened(u64, Arc<SignIn>),
+    /// The look for the window's login found it, or found the window gone.
+    WindowSeen(u64, Seen),
+    /// The window asked for these web addresses to be opened, the newest last.
+    WindowAsked(u64, Vec<String>),
+    /// The page the window asked for was shown, or could not be.
+    WindowPage(u64, String, Page),
+    /// The listening for a window sign-in's way back ended; the second number is which listening.
+    WindowBack(u64, u64, callback::Ending),
     /// Deleting the chosen profile was asked for: the engine is asked what it holds of it first.
     DeleteAsked,
     /// The engine answered what it holds of the profile to be deleted.
@@ -186,6 +212,8 @@ pub enum Msg {
     DeleteKept,
     /// The deletion is over.
     Deleted(Box<remove::Survey>, remove::Outcome),
+    /// Something about a profile's shell, or its own steps.
+    Shell(ShellMsg),
 }
 
 /// The profiles screen.
@@ -217,6 +245,12 @@ pub struct Profiles {
     doomed: Option<Box<remove::Survey>>,
     /// Whether the selection is on the row that makes a new profile rather than on a profile.
     on_new: bool,
+    /// What this machine offers a window, for the sign-in of a harness that opens one.
+    display: Result<Display, NoDisplay>,
+    /// A profile's shell, while it is open; it covers the list or the wizard it was opened from.
+    shell: Option<ShellPage>,
+    /// What each profile had added in its shell, by the profile's name, as last read.
+    own: HashMap<String, Own>,
 }
 
 impl Profiles {
@@ -244,7 +278,18 @@ impl Profiles {
             deleting: false,
             doomed: None,
             on_new: false,
+            display: crate::desktop::current(),
+            shell: None,
+            own: HashMap::new(),
         }
+    }
+
+    /// The same screen, opening a sign-in window on `display` rather than on the session this
+    /// process was started in: a test's own stand-in, never the person's screen.
+    #[must_use]
+    pub fn showing_on(mut self, display: Result<Display, NoDisplay>) -> Self {
+        self.display = display;
+        self
     }
 
     /// The same screen reading the providers from `path` rather than from this machine's data
@@ -294,6 +339,12 @@ impl Profiles {
         &self.problems
     }
 
+    /// A profile's shell, while it is open.
+    #[must_use]
+    pub fn shell(&self) -> Option<&ShellPage> {
+        self.shell.as_ref()
+    }
+
     /// The store, when there is one.
     fn store(&self) -> Option<Store> {
         self.root.as_ref().map(Store::new)
@@ -318,7 +369,9 @@ pub fn update(state: &mut Profiles, message: Msg) -> Command<Msg> {
                 state.selected = index;
                 state.choose_when_read = None;
             }
-            let probing = probe(state, listing.profiles);
+            state.own.clear();
+            let own = shell_page::load(state.store(), &listing.profiles);
+            let probing = Command::batch([probe(state, listing.profiles), own]);
             if std::mem::take(&mut state.new_wanted) {
                 return Command::batch([probing, update(state, Msg::New)]);
             }
@@ -371,6 +424,11 @@ pub fn update(state: &mut Profiles, message: Msg) -> Command<Msg> {
             state.draft = Some(Draft::for_rebuild(&row.profile));
             start_build(state)
         }
+        Msg::EditAsked => {
+            let Some(row) = state.selected() else { return Command::none() };
+            state.draft = Some(Draft::for_edit(&row.profile, state.providers.clone()));
+            Command::focus("profile-harness")
+        }
         Msg::SignOutConfirmed => sign_out(state),
         Msg::SignedOut(result) => {
             state.signing_out = false;
@@ -398,9 +456,15 @@ pub fn update(state: &mut Profiles, message: Msg) -> Command<Msg> {
                 return next(state);
             }
             // Finish is only offered once there is a profile; Cancel is the other way out and
-            // leaves nothing behind, so only this one is a profile having been made.
-            state.made = state.draft.as_ref().and_then(Draft::profile).map(|profile| profile.name);
-            state.choose_when_read.clone_from(&state.made);
+            // leaves nothing behind, so only this one is a profile having been made. A profile
+            // that was only changed was not made: nobody waiting for a new one is handed it.
+            let finished = state.draft.as_ref().and_then(Draft::profile).map(|profile| profile.name);
+            if state.draft.as_ref().is_some_and(Draft::is_editing) {
+                state.choose_when_read = finished;
+            } else {
+                state.made = finished;
+                state.choose_when_read.clone_from(&state.made);
+            }
             leave(state)
         }
         Msg::Back => {
@@ -436,7 +500,9 @@ pub fn update(state: &mut Profiles, message: Msg) -> Command<Msg> {
             Command::none()
         }
         Msg::PickTemplate(index) => {
-            if let (Some(draft), Some(template)) = (&mut state.draft, Template::ALL.get(index)) {
+            if let Some(draft) = &mut state.draft
+                && let Some(template) = Template::offered(draft.harness).get(index)
+            {
                 draft.template = *template;
             }
             Command::none()
@@ -560,6 +626,28 @@ pub fn update(state: &mut Profiles, message: Msg) -> Command<Msg> {
             Command::none()
         }
         Msg::LoginDiscarded => Command::none(),
+        Msg::WindowOpened(run, sign_in) => window_opened(state, run, sign_in),
+        Msg::WindowSeen(run, seen) => {
+            let current = state
+                .draft
+                .as_ref()
+                .is_some_and(|draft| matches!(&draft.login, Login::Window(window) if window.run == run));
+            // A window that is signed in, or gone, is done with: what its home holds is taken now.
+            if current && seen != Seen::NotYet { store_login(state) } else { Command::none() }
+        }
+        Msg::WindowAsked(run, addresses) => window_asked(state, run, &addresses),
+        Msg::WindowPage(run, address, page) => {
+            if let Some(window) = current_window(state, run) {
+                window.page = Some((address, page));
+            }
+            Command::none()
+        }
+        Msg::WindowBack(run, id, ending) => {
+            if let Some(window) = current_window(state, run) {
+                window.came_back(id, ending);
+            }
+            Command::none()
+        }
         Msg::DeleteAsked => ask_delete(state),
         Msg::DeleteSurveyed(survey) => delete_question(state, survey),
         Msg::DeleteConfirmed(homes) => delete(state, homes),
@@ -569,6 +657,7 @@ pub fn update(state: &mut Profiles, message: Msg) -> Command<Msg> {
             Command::none()
         }
         Msg::Deleted(survey, outcome) => deleted(state, &survey, outcome),
+        Msg::Shell(message) => shell_page::update(state, message),
     }
 }
 
@@ -715,9 +804,16 @@ fn ask_rebuild(state: &Profiles) -> Command<Msg> {
         return Command::none();
     }
     let name = row.profile.name.to_string();
+    let mut message = t!("profiles.rebuild.message");
+    // What the person added in the profile's shell is put back, and they are told how much.
+    let steps = state.own.get(name.as_str()).map_or(0, |own| own.steps.len());
+    if steps > 0 {
+        message.push(' ');
+        message.push_str(&t!("profiles.own.rebuild", n = i64::try_from(steps).unwrap_or(i64::MAX)));
+    }
     Command::confirm(
         Confirm::new(t!("profiles.rebuild.title", name = name.as_str()), Msg::RebuildConfirmed)
-            .message(t!("profiles.rebuild.message"))
+            .message(message)
             .confirm_label(t!("profiles.rebuild.confirm")),
     )
 }
@@ -738,6 +834,7 @@ fn next(state: &mut Profiles) -> Command<Msg> {
         Some(Blocked::NoImage) => Command::focus("build-start"),
         Some(Blocked::NoProvider) => Command::focus("profile-provider"),
         Some(Blocked::Unsupported(_)) => Command::focus("profile-system"),
+        Some(Blocked::NoChromium) => Command::focus("profile-extras"),
         None if draft.stage == Stage::Image && draft.build == Build::Waiting => start_build(state),
         None => Command::none(),
     }
@@ -754,7 +851,13 @@ fn leave(state: &mut Profiles) -> Command<Msg> {
         }
         if let Login::Running { session, container } = &draft.login {
             session.kill();
-            commands.push(discard(engine, Arc::clone(container)));
+            commands.push(discard(engine.clone(), Arc::clone(container)));
+        }
+        if let Login::Window(window) = &draft.login {
+            if let Some(id) = window.looking {
+                commands.push(Command::cancel_task(id));
+            }
+            commands.push(close_window(engine, Arc::clone(&window.sign_in)));
         }
     }
     state.draft = None;
@@ -766,6 +869,9 @@ fn leave(state: &mut Profiles) -> Command<Msg> {
 
 /// Starts the image build.
 fn start_build(state: &mut Profiles) -> Command<Msg> {
+    if state.draft.as_ref().is_some_and(Draft::is_editing) {
+        return save_edit(state);
+    }
     let (Some(engine), Some(store)) = (state.engine.clone(), state.store()) else {
         return Command::none();
     };
@@ -775,13 +881,15 @@ fn start_build(state: &mut Profiles) -> Command<Msg> {
         return Command::none();
     }
     draft.log.clear();
+    let profiles = store.profiles_dir();
     if draft.is_only_rebuild() {
         let task = Task::new(t!("profiles.rebuild.button"), move |cx| {
             let cancel = || cx.is_cancelled();
             let mut line = |text: &str| cx.send(Msg::BuildLine(text.to_owned()));
             // The definition file is already there and nothing of it changes, so only the image
-            // is made.
-            let built = work::rebuild(&engine, &profile, &cancel, &mut || cx.send(Msg::BaseImageStarted), &mut line);
+            // is made, with what the person added in the profile's shell after the recipe.
+            let started = &mut || cx.send(Msg::BaseImageStarted);
+            let built = work::rebuild(&engine, &profile, &profiles, &cancel, started, &mut line);
             Ok(Msg::BuildEnded(built))
         });
         draft.build = Build::Running(task.id());
@@ -792,12 +900,53 @@ fn start_build(state: &mut Profiles) -> Command<Msg> {
         let mut line = |text: &str| cx.send(Msg::BuildLine(text.to_owned()));
         // The base image of the profile's own system comes first: a profile on Arch is built on
         // Arch's, and the log is told when that one starts building.
-        let built = work::build_whole(&engine, &profile, &cancel, &mut || cx.send(Msg::BaseImageStarted), &mut line);
+        let started = &mut || cx.send(Msg::BaseImageStarted);
+        let built = work::build_whole_in(&engine, &profile, &profiles, &cancel, started, &mut line);
         // The definition file is written only once there is an image behind it, so a store
         // never holds a profile that cannot be opened.
         let result =
             built.and_then(|()| store.write_profile(&profile).map_err(|problem| Problem::Machine(problem.message)));
         Ok(Msg::BuildEnded(result))
+    });
+    draft.build = Build::Running(task.id());
+    Command::task(task)
+}
+
+/// Saves the changes to a profile: its definition file, after building its image again when the
+/// changes reach the image.
+///
+/// The rebuild is the one the list's button starts, so the image that was there stays until the
+/// new one is built, and a rebuild that fails or is stopped saves nothing: the definition would
+/// otherwise describe an image that was never made. Changes that do not reach the image are
+/// saved at once and need no engine; the containers of the workspaces take them the next time
+/// each is started, because a container made from another plan is made again then
+/// (`ensure_running`).
+fn save_edit(state: &mut Profiles) -> Command<Msg> {
+    let Some(store) = state.store() else { return Command::none() };
+    let engine = state.engine.clone();
+    let Some(draft) = &mut state.draft else { return Command::none() };
+    let Some(profile) = draft.profile() else { return Command::none() };
+    if matches!(draft.build, Build::Running(_)) {
+        return Command::none();
+    }
+    let rebuild = draft.rebuilds();
+    if rebuild && engine.is_none() {
+        return Command::none();
+    }
+    draft.log.clear();
+    let task = Task::new(t!("profiles.edit.saving"), move |cx| {
+        let built = match (&engine, rebuild) {
+            (Some(engine), true) => {
+                let cancel = || cx.is_cancelled();
+                let mut line = |text: &str| cx.send(Msg::BuildLine(text.to_owned()));
+                let started = &mut || cx.send(Msg::BaseImageStarted);
+                work::rebuild(engine, &profile, &store.profiles_dir(), &cancel, started, &mut line)
+            }
+            _ => Ok(()),
+        };
+        let saved =
+            built.and_then(|()| store.write_profile(&profile).map_err(|problem| Problem::Machine(problem.message)));
+        Ok(Msg::BuildEnded(saved))
     });
     draft.build = Build::Running(task.id());
     Command::task(task)
@@ -810,6 +959,9 @@ fn start_login(state: &mut Profiles) -> Command<Msg> {
     let Some(profile) = draft.profile() else { return Command::none() };
     if draft.login.is_busy() {
         return Command::none();
+    }
+    if profile.harness.desktop().is_some() {
+        return start_window_login(state, engine, profile);
     }
     draft.login = Login::Opening;
     Command::task(Task::new(t!("profiles.wizard.step-login"), move |_| {
@@ -845,6 +997,19 @@ fn login_event(state: &mut Profiles, event: TerminalEvent) -> Command<Msg> {
 fn store_login(state: &mut Profiles) -> Command<Msg> {
     let Some(engine) = state.engine.clone() else { return Command::none() };
     let Some(draft) = &mut state.draft else { return Command::none() };
+    if let Login::Window(window) = &draft.login {
+        let Some(profile) = draft.profile() else { return Command::none() };
+        let stop = window.looking.map_or_else(Command::none, Command::cancel_task);
+        let sign_in = Arc::clone(&window.sign_in);
+        // Dropping the window's state gives up any port still listened on for its way back.
+        draft.login = Login::Storing;
+        let task = Task::new(t!("profiles.wizard.storing"), move |_| {
+            let stored = login::take(&engine, &profile, &sign_in);
+            login::close(&engine, &sign_in);
+            Ok(Msg::LoginStored(stored))
+        });
+        return Command::batch([stop, Command::task(task)]);
+    }
     let Login::Running { session, container } = &draft.login else { return Command::none() };
     let Some(profile) = draft.profile() else { return Command::none() };
     session.kill();
@@ -861,6 +1026,12 @@ fn store_login(state: &mut Profiles) -> Command<Msg> {
 fn cancel_login(state: &mut Profiles) -> Command<Msg> {
     let engine = state.engine.clone();
     let Some(draft) = &mut state.draft else { return Command::none() };
+    if let Login::Window(window) = &draft.login {
+        let stop = window.looking.map_or_else(Command::none, Command::cancel_task);
+        let close = close_window(engine, Arc::clone(&window.sign_in));
+        draft.login = Login::Unfinished(Unfinished::Stopped);
+        return Command::batch([stop, close]);
+    }
     let Login::Running { session, container } = &draft.login else { return Command::none() };
     session.kill();
     let command = discard(engine, Arc::clone(container));
@@ -873,6 +1044,143 @@ fn discard(engine: Option<Engine>, container: Arc<work::LoginContainer>) -> Comm
     let Some(engine) = engine else { return Command::none() };
     Command::perform(move || {
         work::close_login(&engine, &container);
+        Msg::LoginDiscarded
+    })
+}
+
+/// Tells one opening of a sign-in window from the next.
+static WINDOW_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Opens the window a harness that draws in one is signed in from, on this machine's screen.
+///
+/// A machine with no screen to open it on is said to have none, in the words the workspace uses
+/// for the same thing, rather than failing at the engine.
+fn start_window_login(state: &mut Profiles, engine: Engine, profile: Profile) -> Command<Msg> {
+    let display = match &state.display {
+        Ok(display) => display.clone(),
+        Err(reason) => {
+            let words = match reason {
+                NoDisplay::NoWayland => t!("workspace.window.no-wayland"),
+                NoDisplay::NoSocket(path) => t!("workspace.window.no-socket", socket = path.display().to_string()),
+            };
+            if let Some(draft) = &mut state.draft {
+                draft.login = Login::Failed(Problem::Machine(words));
+            }
+            return Command::none();
+        }
+    };
+    let Some(draft) = &mut state.draft else { return Command::none() };
+    draft.login = Login::Opening;
+    let run = WINDOW_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Command::task(Task::new(t!("profiles.wizard.step-login"), move |_| {
+        Ok(match login::open(&engine, &profile, &display) {
+            Ok(sign_in) => Msg::WindowOpened(run, Arc::new(sign_in)),
+            Err(problem) => Msg::LoginFailed(problem),
+        })
+    }))
+}
+
+/// Takes the window that is open for a login. From then on one task stays with it for as long as
+/// it is open: it passes on every page the window asks to have opened, the moment it is asked for,
+/// and looks inside every few seconds for the login.
+///
+/// One task rather than a watch of the folder beside it: both only wait, so the waiting is counted
+/// in the task's own pauses, which a test's clock decides; and the task ends with the window.
+fn window_opened(state: &mut Profiles, run: u64, sign_in: Arc<SignIn>) -> Command<Msg> {
+    let engine = state.engine.clone();
+    let Some(draft) = state.draft.as_mut().filter(|draft| matches!(draft.login, Login::Opening)) else {
+        // The wizard was closed, or the sign-in stopped, while the window was coming up.
+        return close_window(engine, sign_in);
+    };
+    let Some(engine) = engine else { return Command::none() };
+    let looked = Arc::clone(&sign_in);
+    let task = Task::new(t!("profiles.window.looking"), move |cx| {
+        let every = login::LOOK_EVERY.as_millis() / login::ASK_EVERY.as_millis().max(1);
+        let mut pauses: u128 = 0;
+        loop {
+            let asked = signin::taken(&looked.browser);
+            if !asked.is_empty() {
+                cx.send(Msg::WindowAsked(run, asked));
+            }
+            if pauses.is_multiple_of(every.max(1)) {
+                match login::seen(&engine, &looked) {
+                    Seen::NotYet => {}
+                    seen => return Ok(Msg::WindowSeen(run, seen)),
+                }
+            }
+            pauses += 1;
+            if !cx.sleep(login::ASK_EVERY) {
+                return Ok(Msg::LoginDiscarded);
+            }
+        }
+    });
+    let mut window = WindowLogin::new(run, Arc::clone(&sign_in));
+    window.looking = Some(task.id());
+    draft.login = Login::Window(window);
+    Command::task(task)
+}
+
+/// The window being signed in from, when `run` is its opening.
+fn current_window(state: &mut Profiles, run: u64) -> Option<&mut WindowLogin> {
+    match &mut state.draft.as_mut()?.login {
+        Login::Window(window) if window.run == run => Some(window),
+        _ => None,
+    }
+}
+
+/// Takes the addresses the sign-in window asked to have opened: the newest is opened in the
+/// person's own browser, after its way back to the application's `localhost` is listened for on
+/// this machine and carried into the window's container, exactly as a workspace's window does
+/// ([`callback`]). A page whose way back cannot be listened for is not opened: its sign-in would go
+/// to whoever holds the port.
+fn window_asked(state: &mut Profiles, run: u64, addresses: &[String]) -> Command<Msg> {
+    let engine = state.engine.clone();
+    let Some(window) = current_window(state, run) else { return Command::none() };
+    let Some(address) = addresses.last().cloned() else { return Command::none() };
+    if !signin::is_web(&address) {
+        window.page = Some((address, Page::Nowhere));
+        return Command::none();
+    }
+    let listening = match (callback::return_to(&address), engine) {
+        (Some(back), _) if window.listens_on(back.port) => Command::none(),
+        (Some(back), Some(engine)) => match callback::Listener::bind(&back) {
+            Ok(listener) => {
+                let carrier = callback::carrier(&engine, &window.sign_in.window, &back);
+                let (stop, stopped) = callback::Stop::new();
+                let id = stop.id();
+                window.back = Some((back.port, WindowBack::Listening(stop)));
+                Command::task(Task::new(t!("workspace.window.signin-task"), move |cx| {
+                    let ending = listener
+                        .serve(&carrier, |pause| cx.sleep(pause) && !stopped.load(std::sync::atomic::Ordering::SeqCst));
+                    Ok(Msg::WindowBack(run, id, ending))
+                }))
+            }
+            Err(refusal) => {
+                let why = match refusal {
+                    callback::NotListening::Taken => WindowBack::Taken,
+                    callback::NotListening::Refused(words) => WindowBack::Refused(words),
+                };
+                window.back = Some((back.port, why));
+                window.page = Some((address, Page::Held));
+                return Command::none();
+            }
+        },
+        _ => Command::none(),
+    };
+    window.page = Some((address.clone(), Page::Asked));
+    let answer = address.clone();
+    let open = Command::open_with(qframe::runtime::Open::new(address).answer(move |outcome| {
+        let page = if outcome == qframe::runtime::OpenOutcome::Opened { Page::InBrowser } else { Page::Nowhere };
+        Msg::WindowPage(run, answer, page)
+    }));
+    Command::batch([listening, open])
+}
+
+/// Clears away the window a login was made in, and everything made for it.
+fn close_window(engine: Option<Engine>, sign_in: Arc<SignIn>) -> Command<Msg> {
+    let Some(engine) = engine else { return Command::none() };
+    Command::perform(move || {
+        login::close(&engine, &sign_in);
         Msg::LoginDiscarded
     })
 }
@@ -906,6 +1214,16 @@ fn recognised(state: &Profiles, problem: &Problem, ui: &mut View<'_, Msg>) {
 
 /// Draws the screen: the list of profiles, or the wizard while one is being made.
 pub fn view(state: &Profiles, ui: &mut View<'_, Msg>) {
+    if let Some(page) = &state.shell {
+        let top = ui.size().height.saturating_sub(WIZARD_ROWS + CHROME_ROWS) / 2;
+        ui.column(|ui| {
+            ui.spacer().height(Length::Cells(top));
+            shell_page::draw(page, ui);
+        })
+        .fill()
+        .align(Align::Center);
+        return;
+    }
     match state.draft() {
         Some(draft) => draw_wizard(state, draft, ui),
         None => draw_list(state, ui),
@@ -1012,6 +1330,9 @@ fn draw_list(state: &Profiles, ui: &mut View<'_, Msg>) {
                     }
                     ui.add(out.variant("danger").disabled(engineless || !signed_in)).id("profile-sign-out");
                 }
+                // Everything but the name can be changed, whatever the engine says.
+                ui.add(Button::new(t!("profiles.edit.button")).on_press(Msg::EditAsked)).id("profile-edit");
+
                 // Only an image that is there can be built again; one that is not is built from
                 // the tab that needs it, with the words for that.
                 let rebuildable = !engineless && row.image == Readiness::Present;
@@ -1036,6 +1357,21 @@ fn draw_list(state: &Profiles, ui: &mut View<'_, Msg>) {
             }
             if row.image == Readiness::Present && row.revision == Revision::Earlier {
                 ui.add(Text::new(t!("profiles.rebuild.earlier")).color("warning")).fill_width();
+            }
+            // On a row of its own beside what was added in it, so the actions above keep their
+            // room on a narrow screen. Only an image that is there has a container to open.
+            let shell = !engineless && row.image == Readiness::Present;
+            ui.row(|ui| {
+                let mut open = Button::new(t!("profiles.shell.button"));
+                if shell {
+                    open = open.on_press(Msg::Shell(ShellMsg::Asked));
+                }
+                ui.add(open.disabled(!shell)).id("profile-shell");
+                ui.spacer();
+            })
+            .fill_width();
+            if let Some(own) = state.own.get(row.profile.name.as_str()) {
+                shell_page::draw_own(own, ui);
             }
         }
     })
@@ -1081,9 +1417,11 @@ fn state_cell(readiness: Readiness, key: &str) -> TableCell {
 /// wizard gives it: that is advice for choosing, and this profile has chosen already.
 fn summary(profile: &Profile) -> String {
     let template = t!(match profile.template {
-        Template::Base => "profiles.summary-base",
-        Template::Recommended => "profiles.summary-recommended",
-        Template::High => "profiles.summary-high",
+        Template::Base => "profiles.template.summary-base",
+        Template::Recommended => "profiles.template.name-recommended",
+        Template::Slim => "profiles.template.name-slim",
+        Template::High => "profiles.template.name-extra",
+        Template::QuvytaDev => "profiles.summary-quvyta-dev",
     });
     let account = match &profile.provider {
         Some(provider) => {
@@ -1137,9 +1475,11 @@ pub fn closed_sign_in(profile: &Profile) -> Option<String> {
 /// The word for a template.
 fn template_word(template: Template) -> String {
     t!(match template {
-        Template::Base => "profiles.template-base",
-        Template::Recommended => "profiles.template-recommended",
-        Template::High => "profiles.template-high",
+        Template::Base => "profiles.template.name-base",
+        Template::Recommended => "profiles.template.name-recommended",
+        Template::Slim => "profiles.template.name-slim",
+        Template::High => "profiles.template.name-extra",
+        Template::QuvytaDev => "profiles.template-quvyta-dev",
     })
 }
 
@@ -1154,13 +1494,12 @@ fn account_word(account: AccountKind) -> String {
     })
 }
 
-/// Why a profile has no sign-in step, for the two accounts that have none: the harness needs no
-/// account at all, or the person signs in inside its own window and QCode never sees it.
+/// Why a profile has no sign-in step, for the one account that has none: the harness needs no
+/// account at all.
 fn no_login_detail(account: AccountKind, harness: &str) -> Option<String> {
     match account {
         AccountKind::Free => Some(t!("profiles.wizard.account-free-detail", harness = harness)),
-        AccountKind::InApp => Some(t!("profiles.wizard.account-in-app-detail", harness = harness)),
-        AccountKind::Subscription | AccountKind::ApiKey | AccountKind::Provider => None,
+        AccountKind::Subscription | AccountKind::ApiKey | AccountKind::InApp | AccountKind::Provider => None,
     }
 }
 
@@ -1247,14 +1586,23 @@ fn draw_steps(state: &Profiles, draft: &Draft, ui: &mut View<'_, Msg>) {
         .on_finish(Msg::Finish)
         .on_step(Msg::Step);
     wizard
-        .show(ui, |ui| match draft.stage {
-            Stage::Harness => draw_harness(draft, ui),
-            Stage::System => draw_system(draft, ui),
-            Stage::Template => draw_template(draft, ui),
-            Stage::Account => draw_account(draft, ui),
-            Stage::Permissions => draw_permissions(draft, ui),
-            Stage::Image => draw_image(state, draft, ui),
-            Stage::Login => draw_login(state, draft, ui),
+        .show(ui, |ui| {
+            match draft.stage {
+                Stage::Harness => draw_harness(draft, ui),
+                Stage::System => draw_system(draft, ui),
+                Stage::Template => draw_template(draft, ui),
+                Stage::Account => draw_account(draft, ui),
+                Stage::Permissions => draw_permissions(draft, ui),
+                Stage::Image => draw_image(state, draft, ui),
+                Stage::Login => draw_login(state, draft, ui),
+            }
+            // On the last page, once there is an image: the profile is made, and this is where
+            // the person may still change it by hand before any workspace copies it.
+            let last = draft.stages().last() == Some(&draft.stage);
+            let signing = draft.login.is_busy() || matches!(draft.login, Login::Running { .. } | Login::Window(_));
+            if last && draft.build == Build::Done && !signing {
+                shell_page::offer(state, ui);
+            }
         })
         .width(Length::Cells(PAGE_WIDTH));
 }
@@ -1291,6 +1639,14 @@ fn draw_harness(draft: &Draft, ui: &mut View<'_, Msg>) {
     // system they chose there cannot run this one, not only when they reach it again.
     if let Some(refusal) = draft.os.refuses(draft.harness) {
         ui.add(Text::new(refusal_line(refusal, draft)).color("warning")).fill_width();
+    }
+    // A profile being changed keeps its name, and the page says why in one quiet line rather than
+    // offering a field that would not take.
+    if draft.is_editing() {
+        ui.add(Text::new(t!("profiles.wizard.name")).bold());
+        ui.add(Text::new(draft.name.clone()));
+        ui.add(Text::new(t!("profiles.edit.name-fixed")).role("secondary")).fill_width();
+        return;
     }
     ui.add_with(
         Field::new(t!("profiles.wizard.name"))
@@ -1367,38 +1723,99 @@ fn refusal_line(refusal: Refusal, draft: &Draft) -> String {
 
 /// The harness as it comes, or set up the way QCode runs it.
 fn draw_template(draft: &Draft, ui: &mut View<'_, Msg>) {
-    let chosen = Template::ALL.iter().position(|template| *template == draft.template);
+    let offered = Template::offered(draft.harness);
+    let chosen = offered.iter().position(|template| *template == draft.template);
     ui.add(Text::new(t!("profiles.wizard.template-lead")).role("secondary")).fill_width();
-    ui.add(RadioGroup::new(Template::ALL.map(template_word)).selected(chosen).on_select(Msg::PickTemplate))
-        .id("profile-template");
+    ui.add(
+        RadioGroup::new(offered.into_iter().map(template_word).collect::<Vec<_>>())
+            .selected(chosen)
+            .on_select(Msg::PickTemplate),
+    )
+    .id("profile-template");
     let detail = match draft.template {
         Template::Base => t!("profiles.wizard.template-base-detail"),
-        Template::Recommended => t!("profiles.wizard.template-recommended-detail"),
-        Template::High => t!("profiles.wizard.template-high-detail"),
+        Template::Recommended => t!("profiles.template.recommended-detail"),
+        Template::Slim => t!("profiles.template.slim-detail"),
+        Template::High => t!("profiles.template.extra-detail"),
+        Template::QuvytaDev => t!("profiles.template.dev-detail"),
     };
     ui.add(Text::new(detail).role("secondary")).fill_width();
     let extras = draft.template.extras(draft.harness);
     if extras.is_empty() {
-        ui.add(Text::new(t!("profiles.wizard.unattended")).role("secondary")).fill_width();
+        ui.add(Text::new(t!("profiles.template.unattended")).role("secondary")).fill_width();
         return;
     }
-    // What QCode high installs is said where it is chosen, item by item, in the page's own text
-    // rather than in a footnote under it: the person is agreeing to a download of hundreds of
+    // What a QCode template installs is said where it is chosen, item by item, in the page's own
+    // text rather than in a footnote under it: the person is agreeing to a download of hundreds of
     // megabytes and to tools of other makers in their image. Each is on unless switched off here,
     // as the owner approved them: visible, and each one the person's to refuse.
-    ui.add(Text::new(t!("profiles.wizard.high-adds")).bold());
-    ui.add(Text::new(t!("profiles.wizard.high-choose")).role("secondary")).fill_width();
-    SettingsList::show(ui, |list| {
-        let mut headed = false;
-        for extra in extras {
-            // The plugins stand together under one heading, which also gives their size.
-            if matches!(extra, Extra::Plugin(_)) && !headed {
-                list.heading(t!("profiles.wizard.high-claude-plugins"));
-                headed = true;
+    ui.add(Text::new(t!("profiles.template.adds")).bold());
+    ui.add(Text::new(t!("profiles.template.adds-choose")).role("secondary")).fill_width();
+    // The parts that are not plugins, each with a line of what it is and how large.
+    let (plugins, parts): (Vec<Extra>, Vec<Extra>) =
+        extras.into_iter().partition(|extra| matches!(extra, Extra::Plugin(_)));
+    extra_switches(draft, &parts, ui).id("profile-extras").fill_width();
+    if plugins.is_empty() {
+        draw_blocked_and_download(draft, ui);
+        return;
+    }
+    // The plugins stand together under one heading, which also gives their size: QCode
+    // recommended's five in one column, the sixteen of QCode extra in columns side by side, so the
+    // page still fits the wizard's height and every one keeps a switch of its own.
+    let heading = if draft.template.carries_high() {
+        t!("profiles.template.extra-plugins")
+    } else {
+        t!("profiles.wizard.high-claude-plugins")
+    };
+    ui.add(Text::new(heading).bold());
+    // As many columns as fit the page with the longest name whole, at most three, each measured
+    // and painted at the same width. The page is as wide as the screen lets it be, up to its own.
+    let page = ui.size().width.min(PAGE_WIDTH);
+    let longest = plugins.iter().map(|plugin| plugin.id().chars().count()).max().unwrap_or_default();
+    let needed = u16::try_from(longest).unwrap_or(u16::MAX).saturating_add(PLUGIN_ROW_ROOM);
+    let fit = usize::from((page + PLUGIN_GAP) / (needed + PLUGIN_GAP)).clamp(1, PLUGIN_COLUMNS);
+    let columns = if plugins.len() > PLUGINS_IN_ONE_COLUMN { fit } else { 1 };
+    let per_column = plugins.len().div_ceil(columns);
+    let spread = u16::try_from(columns).unwrap_or(1);
+    let width = page.saturating_sub(PLUGIN_GAP * (spread - 1)) / spread;
+    ui.row(|ui| {
+        for (index, column) in plugins.chunks(per_column).enumerate() {
+            let list = extra_switches(draft, column, ui).id(format!("profile-plugins-{index}"));
+            if columns == 1 {
+                list.fill_width();
+            } else {
+                list.width(Length::Cells(width));
             }
+        }
+    })
+    .gap(PLUGIN_GAP)
+    .fill_width();
+    draw_blocked_and_download(draft, ui);
+}
+
+/// Plugins up to this many stand in one column; more are spread over [`PLUGIN_COLUMNS`].
+const PLUGINS_IN_ONE_COLUMN: usize = 6;
+
+/// How many columns the plugins of QCode extra are spread over.
+const PLUGIN_COLUMNS: usize = 3;
+
+/// Cells between two columns of plugins.
+const PLUGIN_GAP: u16 = 2;
+
+/// Cells a plugin's row needs beside its name: the pillar before it, the gap, the switch with its
+/// word in any language, and the gap after it.
+const PLUGIN_ROW_ROOM: u16 = 18;
+
+/// One list of switches, one row for each of `extras`: graphify, oh-my-openagent and Chromium
+/// with a line saying what they are, a plugin by its name alone.
+fn extra_switches<'v>(draft: &Draft, extras: &[Extra], ui: &'v mut View<'_, Msg>) -> qframe::widget::NodeMut<'v, Msg> {
+    SettingsList::show(ui, |list| {
+        for extra in extras.iter().copied() {
             let row = match extra {
                 Extra::Graphify => SettingRow::new(extra.id()).description(t!("profiles.wizard.high-graphify")),
                 Extra::OhMyOpenAgent => SettingRow::new(extra.id()).description(t!("profiles.wizard.high-omo")),
+                Extra::OhMyOpenCodeSlim => SettingRow::new(extra.id()).description(t!("profiles.template.slim-omo")),
+                Extra::Chromium => SettingRow::new(extra.id()).description(t!("profiles.template.dev-chromium")),
                 Extra::Plugin(_) => SettingRow::new(extra.id()),
             };
             list.row(row, |ui| {
@@ -1406,27 +1823,42 @@ fn draw_template(draft: &Draft, ui: &mut View<'_, Msg>) {
             });
         }
     })
-    .id("profile-extras")
-    .fill_width();
+}
+
+/// Under the parts: why the chosen system cannot have Chromium, when it cannot, and what the build
+/// downloads.
+fn draw_blocked_and_download(draft: &Draft, ui: &mut View<'_, Msg>) {
+    if draft.blocked() == Some(Blocked::NoChromium) {
+        ui.add(Text::new(t!("profiles.template.dev-no-chromium", system = draft.os.display_name())).color("danger"))
+            .fill_width();
+    }
     draw_download(draft, ui);
 }
 
 /// What the build downloads and what the network means, in the colour of a warning; or, when every
-/// part of QCode high is switched off, that nothing more is downloaded.
+/// part of a QCode template is switched off, that nothing more is downloaded.
 fn draw_download(draft: &Draft, ui: &mut View<'_, Msg>) {
     if !draft.adds_anything() {
-        ui.add(Text::new(t!("profiles.wizard.high-none")).role("secondary")).fill_width();
+        ui.add(Text::new(t!("profiles.template.adds-none")).role("secondary")).fill_width();
         return;
     }
-    // The system's own repositories are named, since the packages come from there.
-    let download = t!("profiles.wizard.high-download", system = draft.os.display_name());
+    // The system's own repositories are named, since the packages come from there. graphify alone
+    // comes from them and PyPI; the plugins add npm and GitHub, and Quvyta development its own.
+    let graphify_alone =
+        draft.template.extras(draft.harness).into_iter().all(|extra| extra == Extra::Graphify || !draft.has(extra));
+    let system = draft.os.display_name();
+    let download = match draft.template {
+        Template::QuvytaDev => t!("profiles.template.dev-download", system = system),
+        _ if graphify_alone => t!("profiles.template.download-graphify", system = system),
+        _ => t!("profiles.template.download", template = template_word(draft.template).as_str(), system = system),
+    };
     ui.add(Text::new(download).color("warning")).fill_width();
     if let Some(offline) = offline_line(draft) {
         ui.add(Text::new(offline).color("warning")).fill_width();
     }
 }
 
-/// What will not work at run time in a QCode high profile whose containers have no network, when
+/// What will not work at run time in a profile of a QCode template whose containers have no network, when
 /// that is the profile being made; `None` otherwise.
 ///
 /// Measured in containers without one: context7 of the Claude Code plugins is a server on
@@ -1442,7 +1874,15 @@ fn offline_line(draft: &Draft) -> Option<String> {
     let context7 = Extra::parse("context7").is_some_and(|context7| draft.has(context7));
     match draft.harness {
         HarnessKind::ClaudeCode if context7 => Some(t!("profiles.wizard.high-offline-claude")),
-        HarnessKind::OpenCode if draft.has(Extra::OhMyOpenAgent) => Some(t!("profiles.wizard.high-offline-opencode")),
+        HarnessKind::OpenCode if draft.template == Template::Slim && draft.has(Extra::OhMyOpenCodeSlim) => {
+            Some(t!("profiles.template.slim-offline"))
+        }
+        HarnessKind::OpenCode
+            if draft.template.extras(draft.harness).contains(&Extra::OhMyOpenAgent)
+                && draft.has(Extra::OhMyOpenAgent) =>
+        {
+            Some(t!("profiles.wizard.high-offline-opencode"))
+        }
         _ if draft.has(Extra::Graphify) => Some(t!("profiles.wizard.high-offline")),
         _ => None,
     }
@@ -1547,7 +1987,7 @@ fn draw_permissions(draft: &Draft, ui: &mut View<'_, Msg>) {
     )
     .id("profile-network");
     // Chosen here, after the template: this is where the person turns the network off, so this
-    // is where they learn what of QCode high that costs.
+    // is where they learn what of a QCode template that costs.
     if let Some(offline) = offline_line(draft) {
         ui.add(Text::new(offline).color("warning")).fill_width();
     }
@@ -1556,8 +1996,14 @@ fn draw_permissions(draft: &Draft, ui: &mut View<'_, Msg>) {
 /// Building the image, with everything the engine says as it says it.
 fn draw_image(state: &Profiles, draft: &Draft, ui: &mut View<'_, Msg>) {
     let engineless = state.engine.is_none();
-    let rebuild = draft.is_only_rebuild();
+    let rebuild = draft.is_only_rebuild() || (draft.is_editing() && draft.rebuilds());
+    let kept = draft.is_editing() && !draft.rebuilds();
     let lead = match &draft.build {
+        // A change that does not reach the image saves the file and builds nothing.
+        Build::Waiting | Build::Running(_) if kept => t!("profiles.edit.saving"),
+        Build::Done if kept => t!("profiles.edit.kept"),
+        Build::Done if draft.is_editing() => t!("profiles.edit.rebuilt", name = draft.name.as_str()),
+        Build::Failed(_) if kept => t!("profiles.edit.unsaved"),
         // A rebuild keeps the image that was there until the new one is finished, so its words
         // for a build under way, stopped or failed are not the wizard's.
         Build::Running(_) if rebuild => t!("profiles.rebuild.running"),
@@ -1568,7 +2014,16 @@ fn draw_image(state: &Profiles, draft: &Draft, ui: &mut View<'_, Msg>) {
         Build::Running(_) => t!("profiles.wizard.build-running"),
         Build::Done => t!("profiles.wizard.build-done"),
         Build::Stopped => t!("profiles.wizard.build-stopped"),
-        Build::Failed(_) if draft.high_download_failed() => t!("profiles.wizard.high-build-failed"),
+        Build::Failed(_) if draft.dev_download_failed() => t!("profiles.template.dev-build-failed"),
+        Build::Failed(_) if draft.extra_download_failed() => {
+            t!("profiles.template.build-failed", template = template_word(Template::High).as_str())
+        }
+        Build::Failed(_) if draft.slim_download_failed() => {
+            t!("profiles.template.build-failed", template = template_word(Template::Slim).as_str())
+        }
+        Build::Failed(_) if draft.recommended_download_failed() => {
+            t!("profiles.template.build-failed", template = template_word(Template::Recommended).as_str())
+        }
         Build::Failed(_) => t!("profiles.wizard.build-failed"),
     };
     // While the build runs its words shine, the one thing on the page that moves besides the log:
@@ -1583,18 +2038,27 @@ fn draw_image(state: &Profiles, draft: &Draft, ui: &mut View<'_, Msg>) {
     if let Build::Failed(problem) = &draft.build {
         recognised(state, problem, ui);
     }
-    if draft.build == Build::Done && !draft.account.needs_login() && !rebuild {
+    if draft.is_editing() {
+        match draft.build {
+            // What happens to the containers already made from the profile.
+            Build::Done => {
+                ui.add(Text::new(t!("profiles.edit.runtime")).role("secondary")).fill_width();
+            }
+            Build::Failed(_) | Build::Stopped if rebuild => {
+                ui.add(Text::new(t!("profiles.edit.unsaved")).color("warning")).fill_width();
+            }
+            _ => {}
+        }
+    }
+    if draft.build == Build::Done && !draft.account.needs_login() && !rebuild && !draft.is_editing() {
         let harness = draft.harness.record().display_name;
-        let ready = match draft.account {
-            AccountKind::InApp => t!("profiles.wizard.in-app-ready", harness = harness),
-            _ => t!("profiles.wizard.free-ready", harness = harness),
-        };
-        ui.add(Text::new(ready).color("success")).fill_width();
+        ui.add(Text::new(t!("profiles.wizard.free-ready", harness = harness)).color("success")).fill_width();
     }
     // A window's image carries a whole desktop application, which is an order of magnitude more
     // than a command-line harness; the person is told before the build rather than after.
     if let Some(desktop) = draft.harness.desktop()
         && matches!(draft.build, Build::Waiting | Build::Running(_))
+        && !kept
     {
         let size = t!(
             "profiles.wizard.desktop-size",
@@ -1605,9 +2069,11 @@ fn draw_image(state: &Profiles, draft: &Draft, ui: &mut View<'_, Msg>) {
         ui.add(Text::new(size).role("secondary")).fill_width();
     }
     // Said again right before the build starts, which is when the download happens.
-    if draft.adds_anything() && matches!(draft.build, Build::Waiting | Build::Running(_)) {
+    if draft.adds_anything() && matches!(draft.build, Build::Waiting | Build::Running(_)) && !kept {
         draw_download(draft, ui);
     }
+    // Saving a change the image does not see needs no engine.
+    let engineless = engineless && !kept;
     if engineless {
         ui.add(Text::new(t!("profiles.no-engine-detail")).color("warning")).fill_width();
     }
@@ -1648,15 +2114,20 @@ fn draw_login(state: &Profiles, draft: &Draft, ui: &mut View<'_, Msg>) {
         Login::Waiting => {
             // Gemini CLI's own dialog is kept to the key in the image, so the page says where the
             // key comes from and what the dialog will ask, rather than speak of a sign-in flow.
-            let (why, what) = if draft.harness == HarnessKind::GeminiCli && draft.account == AccountKind::ApiKey {
-                ("profiles.gemini.login-why", "profiles.gemini.login-what")
+            // A window is signed in to in a window, so its page says so, and what QCode reads to be
+            // sure of it is the application's own record rather than a file.
+            let window = draft.harness.desktop().is_some();
+            let (why, what, proof) = if window {
+                ("profiles.window.why", "profiles.window.what", "profiles.window.proof")
+            } else if draft.harness == HarnessKind::GeminiCli && draft.account == AccountKind::ApiKey {
+                ("profiles.gemini.login-why", "profiles.gemini.login-what", "profiles.wizard.login-proof")
             } else {
-                ("profiles.wizard.login-why", "profiles.wizard.login-what")
+                ("profiles.wizard.login-why", "profiles.wizard.login-what", "profiles.wizard.login-proof")
             };
             ui.add(Text::new(t!("profiles.signing.kept")).bold()).fill_width();
             ui.add(Text::new(t!(why, harness = harness)).role("secondary")).fill_width();
-            ui.add(Text::new(t!(what)).role("secondary")).fill_width();
-            ui.add(Text::new(t!("profiles.wizard.login-proof")).role("secondary")).fill_width();
+            ui.add(Text::new(t!(what, harness = harness)).role("secondary")).fill_width();
+            ui.add(Text::new(t!(proof)).role("secondary")).fill_width();
             // A profile being made can be finished from here without signing in; what that costs
             // is said before the person decides, not after.
             if !draft.is_only_login() {
@@ -1665,7 +2136,8 @@ fn draw_login(state: &Profiles, draft: &Draft, ui: &mut View<'_, Msg>) {
             if engineless {
                 ui.add(Text::new(t!("profiles.no-engine-detail")).color("warning")).fill_width();
             }
-            let mut button = Button::new(t!("profiles.wizard.login-open")).variant("primary").disabled(engineless);
+            let open = if window { t!("profiles.window.open") } else { t!("profiles.wizard.login-open") };
+            let mut button = Button::new(open).variant("primary").disabled(engineless);
             if !engineless {
                 button = button.on_press(Msg::LoginStart);
             }
@@ -1686,8 +2158,13 @@ fn draw_login(state: &Profiles, draft: &Draft, ui: &mut View<'_, Msg>) {
             .gap(2)
             .fill_width();
         }
+        Login::Window(window) => draw_window(window, harness, ui),
         Login::Storing => {
             ui.add(ShimmerText::new(t!("profiles.wizard.login-storing"))).id("login-working");
+        }
+        Login::Stored(_) if draft.harness.desktop().is_some() => {
+            ui.add(Text::new(t!("profiles.window.stored", harness = harness)).color("success")).fill_width();
+            ui.add(Text::new(t!("profiles.signing.stored")).role("secondary")).fill_width();
         }
         Login::Stored(files) => {
             ui.add(
@@ -1700,6 +2177,9 @@ fn draw_login(state: &Profiles, draft: &Draft, ui: &mut View<'_, Msg>) {
         Login::Unfinished(why) => {
             let text = match why {
                 Unfinished::Stopped => t!("profiles.wizard.login-interrupted"),
+                Unfinished::Missing if draft.harness.desktop().is_some() => {
+                    t!("profiles.window.not-found", harness = harness)
+                }
                 Unfinished::Missing => t!("profiles.wizard.login-not-found"),
             };
             ui.add(Text::new(text).color("warning")).fill_width();
@@ -1716,6 +2196,55 @@ fn draw_login(state: &Profiles, draft: &Draft, ui: &mut View<'_, Msg>) {
             ui.add(Button::new(t!("profiles.wizard.login-again")).on_press(Msg::LoginStart)).id("login-again");
         }
     }
+}
+
+/// The sign-in window's page: where the window is, what to do in it, where the sign-in page went,
+/// and the two things that can be done from here.
+fn draw_window(window: &WindowLogin, harness: &str, ui: &mut View<'_, Msg>) {
+    ui.add(Text::new(t!("profiles.window.running", harness = harness))).fill_width();
+    ui.add(Text::new(t!("profiles.window.noticed", harness = harness)).role("secondary")).fill_width();
+    let minutes = (callback::WAIT.as_secs() / 60).to_string();
+    match &window.page {
+        None => {}
+        Some((address, Page::Asked | Page::InBrowser)) => {
+            ui.add(Text::new(t!("workspace.window.signin-in-browser")).role("secondary")).fill_width();
+            ui.add(Text::new(address.clone()).role("secondary")).fill_width();
+        }
+        Some((address, Page::Nowhere | Page::Held)) => {
+            ui.add(Text::new(t!("workspace.window.signin-open-yourself")).color("warning")).fill_width();
+            ui.add(Text::new(address.clone())).fill_width();
+        }
+    }
+    match &window.back {
+        None => {}
+        Some((port, WindowBack::Listening(_))) => {
+            let text = t!("workspace.window.signin-listening", port = port.to_string(), minutes = minutes.clone());
+            ui.add(Text::new(text).role("secondary")).fill_width();
+        }
+        Some((port, WindowBack::Returned)) => {
+            let text = t!("workspace.window.signin-returned", port = port.to_string());
+            ui.add(Text::new(text).color("success")).fill_width();
+        }
+        Some((port, WindowBack::TimedOut)) => {
+            let text = t!("workspace.window.signin-timed-out", port = port.to_string(), minutes = minutes);
+            ui.add(Text::new(text).color("warning")).fill_width();
+        }
+        Some((port, WindowBack::Taken)) => {
+            ui.add(Text::new(t!("profiles.window.port-taken", port = port.to_string())).color("warning")).fill_width();
+        }
+        Some((port, WindowBack::Refused(reason))) => {
+            let text = t!("profiles.window.no-listen", port = port.to_string(), reason = reason.clone());
+            ui.add(Text::new(text).color("warning")).fill_width();
+        }
+    }
+    ui.row(|ui| {
+        ui.add(Button::new(t!("profiles.wizard.login-done")).variant("primary").on_press(Msg::LoginDone))
+            .id("login-done");
+        ui.add(Button::new(t!("profiles.wizard.login-stop")).on_press(Msg::LoginCancel)).id("login-stop");
+        ui.spacer();
+    })
+    .gap(2)
+    .fill_width();
 }
 
 #[cfg(test)]
@@ -1769,7 +2298,7 @@ mod tests {
     /// A store path that is never read: the tests deliver what the disk would have given,
     /// so nothing here touches a file system or an engine.
     fn root() -> PathBuf {
-        std::env::temp_dir().join("qcode-profiles-screen")
+        std::env::temp_dir().join(format!("qcode-profiles-screen-{}", std::process::id()))
     }
 
     /// A screen with a store and no engine, on a terminal of `width` by `height`.
@@ -1831,7 +2360,7 @@ mod tests {
 
     #[test]
     fn a_store_being_read_says_so_instead_of_looking_empty() {
-        let root = std::env::temp_dir().join("qcode-profiles-loading");
+        let root = std::env::temp_dir().join(format!("qcode-profiles-loading-{}", std::process::id()));
         let state = Profiles::new(Some(root), None);
         assert!(state.is_loading());
         let mut harness = Harness::with_env(Host { state }, env(), SIZE.0, SIZE.1);
@@ -1881,7 +2410,7 @@ mod tests {
         let arch = Profile { os: Os::Arch, ..profile("claude-arch", HarnessKind::ClaudeCode) };
         let harness = loaded(vec![arch, profile("claude-sub", HarnessKind::ClaudeCode)]);
         let screen = harness.screen();
-        assert!(screen.contains("Claude Code, QCode basic, subscription, on Arch Linux"), "{screen}");
+        assert!(screen.contains("Claude Code, QCode recommended, subscription, on Arch Linux"), "{screen}");
         assert!(!screen.contains("Debian"), "a profile on Debian reads as it did before:\n{screen}");
     }
 
@@ -1890,7 +2419,7 @@ mod tests {
         let harness = loaded(vec![profile("claude-sub", HarnessKind::ClaudeCode)]);
         let screen = harness.screen();
         assert!(screen.contains("Claude Code"), "{screen}");
-        assert!(screen.contains("Claude Code, QCode basic, subscription"), "{screen}");
+        assert!(screen.contains("Claude Code, QCode recommended, subscription"), "{screen}");
         assert!(screen.contains("subscription"), "{screen}");
         assert!(screen.contains("assets read-only"), "{screen}");
         assert!(screen.contains("network full"), "{screen}");
@@ -2428,7 +2957,7 @@ mod tests {
         let mut harness = loaded(vec![profile("claude-sub", HarnessKind::ClaudeCode)]);
         harness.set_locale("tr").render();
         let screen = harness.screen();
-        for text in ["Profiller", "QCode basic", "Giriş yap", "Çıkış yap", "abonelik"] {
+        for text in ["Profiller", "QCode önerilen", "Giriş yap", "Çıkış yap", "abonelik"] {
             assert!(screen.contains(text), "`{text}` is missing:\n{screen}");
         }
         harness.send(Msg::New).render();
@@ -2520,7 +3049,8 @@ mod tests {
         let harness = wizard_on(1);
         assert_eq!(harness.screen().matches(square.as_str()).count(), Os::ALL.len(), "{}", harness.screen());
         let harness = wizard_on(2);
-        assert_eq!(harness.screen().matches(square.as_str()).count(), Template::ALL.len(), "{}", harness.screen());
+        let offered = Template::offered(HarnessKind::ClaudeCode).len();
+        assert_eq!(harness.screen().matches(square.as_str()).count(), offered, "{}", harness.screen());
         let harness = wizard_on(4);
         let options = MountAccess::ALL.len() + NetworkMode::ALL.len();
         assert_eq!(harness.screen().matches(square.as_str()).count(), options, "{}", harness.screen());
@@ -2539,15 +3069,37 @@ mod tests {
     }
 
     #[test]
-    fn the_qcode_templates_carry_the_names_the_owner_chose() {
+    fn the_templates_carry_the_names_the_owner_chose_in_each_language() {
         let harness = wizard_on(2);
-        assert!(harness.screen().contains("QCode basic (recommended)"), "{}", harness.screen());
-        assert!(harness.screen().contains("QCode high"), "{}", harness.screen());
-        assert_eq!(harness.app().state.draft().expect("open").template, Template::Recommended, "basic is chosen");
+        let screen = harness.screen();
+        for name in ["As it comes", "QCode recommended", "QCode extra", "Quvyta development"] {
+            assert!(screen.contains(name), "`{name}`:\n{screen}");
+        }
+        assert_eq!(harness.app().state.draft().expect("open").template, Template::Recommended, "recommended is chosen");
         let mut harness = wizard_on(2);
         harness.set_locale("tr").render();
-        assert!(harness.screen().contains("QCode basic (önerilen)"), "{}", harness.screen());
-        assert!(harness.screen().contains("QCode high"), "{}", harness.screen());
+        let screen = harness.screen();
+        for name in ["Olduğu gibi", "QCode önerilen", "QCode ekstra", "Quvyta geliştirme"] {
+            assert!(screen.contains(name), "`{name}`:\n{screen}");
+        }
+        // The old names are gone from every screen, in every template's page.
+        let names = [
+            ("en", ["As it comes", "QCode recommended", "QCode extra", "Quvyta development"]),
+            ("tr", ["Olduğu gibi", "QCode önerilen", "QCode ekstra", "Quvyta geliştirme"]),
+        ];
+        for (language, rows) in names {
+            for row in rows {
+                let mut harness = wizard_on(2);
+                harness.set_locale(language).render();
+                harness.click_text(row).render();
+                let screen = harness.screen();
+                for word in ["basic", "high", "yüksek"] {
+                    let found =
+                        screen.split(|c: char| !c.is_alphanumeric()).any(|each| each.eq_ignore_ascii_case(word));
+                    assert!(!found, "{language} {row}: `{word}`:\n{screen}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -2622,7 +3174,7 @@ mod tests {
         assert!(screen.contains("No sign-in needed"), "{screen}");
         assert!(!screen.contains("Not signed in"), "{screen}");
         assert!(!screen.contains("Sign in") && !screen.contains("Sign out"), "{screen}");
-        assert!(screen.contains("opencode, QCode basic, free, no account"), "{screen}");
+        assert!(screen.contains("opencode, QCode recommended, free, no account"), "{screen}");
         assert!(harness.app().state.selected().expect("chosen").is_runnable());
         harness.send(Msg::SignInAsked).render();
         assert!(harness.app().state.draft().is_none(), "there is nothing to sign in to");
@@ -2632,7 +3184,7 @@ mod tests {
     }
 
     #[test]
-    fn choosing_qcode_high_says_what_it_installs_and_what_the_network_means_and_saves_it() {
+    fn choosing_qcode_extra_says_what_it_installs_and_what_the_network_means_and_saves_it() {
         // Every step is taken where the person takes it: the button that opens the wizard, the
         // button that moves on, the row that names the template and the one that names the
         // network, never the message sent by hand.
@@ -2644,16 +3196,29 @@ mod tests {
         harness.click_text("New profile").render();
         harness.click_text("Next").render();
         harness.click_text("Next").render();
-        assert!(harness.screen().contains("How much of the harness"), "{}", harness.screen());
-        assert!(!harness.screen().contains("graphify"), "basic installs nothing more:\n{}", harness.screen());
-
-        harness.click_text("QCode high").render();
         let screen = harness.screen();
-        assert_eq!(harness.app().state.draft().expect("open").template, Template::High, "{screen}");
+        assert!(screen.contains("How much of the harness"), "{screen}");
+        // QCode recommended installs graphify and Claude Code's starter plugins, and says where
+        // they come from.
         for installed in ["graphify", "superpowers", "context7", "code-review", "security-guidance", "block-no-verify"]
         {
-            assert!(screen.contains(installed), "`{installed}` is not listed:\n{screen}");
+            assert!(screen.contains(installed), "recommended lists `{installed}`:\n{screen}");
         }
+        assert!(!screen.contains("hookify"), "the rest are extra's:\n{screen}");
+        assert!(screen.contains("about 30 MB together"), "{screen}");
+        assert!(
+            screen.contains("What QCode recommended adds is downloaded from Debian 13, PyPI, npm and GitHub"),
+            "recommended's download is said:\n{screen}"
+        );
+
+        harness.click_text("QCode extra").render();
+        let screen = harness.screen();
+        assert_eq!(harness.app().state.draft().expect("open").template, Template::High, "{screen}");
+        for extra in Template::High.extras(HarnessKind::ClaudeCode) {
+            assert!(screen.contains(extra.id()), "`{}` is not listed:\n{screen}", extra.id());
+        }
+        assert!(screen.contains("about 60 MB together"), "{screen}");
+        assert!(screen.contains("What QCode extra adds is downloaded"), "{screen}");
         assert!(!screen.contains("oh-my-openagent"), "that is opencode's, not Claude Code's:\n{screen}");
         assert!(screen.contains("so the build needs the network"), "the download is said:\n{screen}");
         let at = |text: &str| {
@@ -2688,6 +3253,83 @@ mod tests {
         let _ = std::fs::remove_dir_all(&folder);
     }
 
+    #[test]
+    fn opencode_offers_oh_my_opencode_slim_whose_image_carries_graphify_and_the_slim_team_and_not_oh_my_openagent() {
+        // Chosen where the person chooses it: the button that opens the wizard, the harness's
+        // row, the button that moves on and the template's own row.
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let folder = std::env::temp_dir().join(format!("qcode-profiles-slim-{stamp}"));
+        let mut harness = Harness::with_env(Host { state: Profiles::new(Some(folder.clone()), None) }, env(), 96, 60);
+        harness.set_locale("en").set_glyph_mode(GlyphMode::Unicode).set_reduced_motion(true);
+        harness.send(Msg::Loaded(Listing { profiles: Vec::new(), diagnostics: Vec::new() })).render();
+        harness.click_text("New profile").render();
+        harness.click_text("opencode").render();
+        harness.click_text("Next").render();
+        harness.click_text("Next").render();
+        assert!(harness.screen().contains("How much of the harness"), "{}", harness.screen());
+        harness.click_text("oh my opencode slim").render();
+        let screen = harness.screen();
+        assert_eq!(harness.app().state.draft().expect("open").template, Template::Slim, "{screen}");
+        assert!(screen.contains("oh-my-opencode-slim"), "what it installs is named:\n{screen}");
+        // Never both in one profile: oh-my-openagent is not among what the page installs.
+        assert!(!screen.contains("About 470 MB"), "{screen}");
+        let extras = Template::Slim.extras(HarnessKind::OpenCode);
+        assert!(extras.contains(&Extra::OhMyOpenCodeSlim) && !extras.contains(&Extra::OhMyOpenAgent), "{extras:?}");
+
+        let profile = harness.app().state.draft().and_then(Draft::profile).expect("a profile");
+        let files = profile.files();
+        let settings = files
+            .iter()
+            .find(|file| file.path == ".config/opencode/opencode.json")
+            .expect("opencode's settings are written");
+        assert!(
+            settings.contents.contains("file:///usr/local/npm/lib/node_modules/oh-my-opencode-slim"),
+            "opencode loads the slim plugin from the image: {}",
+            settings.contents
+        );
+        assert!(!settings.contents.contains("oh-my-openagent"), "{}", settings.contents);
+        let own = files
+            .iter()
+            .find(|file| file.path == ".config/opencode/oh-my-opencode-slim.json")
+            .expect("the plugin's own settings are written");
+        assert!(own.contents.contains("\"autoUpdate\": false"), "{}", own.contents);
+        let recipe = super::recipe::image(&profile);
+        assert!(
+            recipe.containerfile.contains("npm install -g --cache /tmp/qcode-npm-cache oh-my-opencode-slim"),
+            "{}",
+            recipe.containerfile
+        );
+        assert!(!recipe.containerfile.contains("oh-my-openagent"), "{}", recipe.containerfile);
+        assert!(recipe.containerfile.contains("graphifyy"), "graphify is installed too: {}", recipe.containerfile);
+        assert!(screen.contains("graphify"), "and listed where the template is chosen:\n{screen}");
+
+        // Written and read back as the slim template.
+        harness.app().state.store().expect("a store").write_profile(&profile).expect("the file is written");
+        let name = format!("{}.toml", profile.name);
+        let text = std::fs::read_to_string(folder.join("Profiles").join(&name)).expect("the file is there");
+        assert!(text.contains("template = \"slim\""), "{text}");
+        let read = crate::profile::Profile::parse(&name, &text);
+        assert_eq!(read.profile.map(|profile| profile.template), Some(Template::Slim), "{:?}", read.diagnostics);
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn oh_my_opencode_slim_is_offered_to_opencode_alone() {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let folder = std::env::temp_dir().join(format!("qcode-profiles-slim-claude-{stamp}"));
+        let mut harness = Harness::with_env(Host { state: Profiles::new(Some(folder.clone()), None) }, env(), 96, 60);
+        harness.set_locale("en").set_glyph_mode(GlyphMode::Unicode).set_reduced_motion(true);
+        harness.send(Msg::Loaded(Listing { profiles: Vec::new(), diagnostics: Vec::new() })).render();
+        harness.click_text("New profile").render();
+        harness.click_text("Next").render();
+        harness.click_text("Next").render();
+        let screen = harness.screen();
+        assert!(screen.contains("How much of the harness"), "{screen}");
+        assert!(screen.contains("QCode extra"), "{screen}");
+        assert!(!screen.contains("oh my opencode slim"), "slim is opencode's:\n{screen}");
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
     /// Where the switch of the row labelled `label` is drawn: the rightmost cell of that row whose
     /// ground is not the row's own, a cell inside the switch's track.
     fn switch_of(harness: &Harness<Host>, label: &str) -> (i32, i32) {
@@ -2702,13 +3344,13 @@ mod tests {
         let after = u16::try_from(start + label.chars().count() + 1).expect("on screen");
         let ground = harness.bg(after, y);
         // The whole width, not the line's: a switch is drawn in coloured blanks, which the text of
-        // the screen trims away.
+        // the screen trims away. The first such cell after the label is its own switch, also when
+        // rows stand in columns side by side; one cell further in is inside the track.
         let width = harness.buffer().area.width;
         let cell = (after..width)
-            .rev()
             .find(|x| harness.bg(*x, y) != ground)
             .unwrap_or_else(|| panic!("`{label}` has a switch on its row:\n{screen}"));
-        (i32::from(cell) - 1, i32::from(y))
+        (i32::from(cell) + 1, i32::from(y))
     }
 
     /// A profiles screen on a store in a scratch folder of its own, with an engine that is a script
@@ -2867,6 +3509,158 @@ echo 'COMMIT qcode/profile/claude-sub'
         let screen = harness.screen();
         assert!(screen.contains("Image ready"), "{screen}");
         assert!(!screen.contains("built by an earlier QCode"), "{screen}");
+    }
+
+    /// The definition file of `name` in the store of `engine`, as the disk has it.
+    fn definition(engine: &Rebuilt, name: &str) -> String {
+        std::fs::read_to_string(engine.folder.join("Profiles").join(format!("{name}.toml"))).unwrap_or_default()
+    }
+
+    /// Opens the wizard on the chosen profile the way the person does, from its button under the
+    /// rows, and walks `pages` pages on with the wizard's own Next.
+    fn edit(harness: &mut Harness<Host>, pages: usize) {
+        harness.click_text("Edit").render();
+        assert!(harness.app().state.draft().is_some_and(Draft::is_editing), "{}", harness.screen());
+        for _ in 0..pages {
+            harness.click_text("Next").render();
+        }
+    }
+
+    #[test]
+    fn editing_a_profile_opens_the_wizard_on_it_with_its_name_kept() {
+        let engine = Rebuilt::new("edit-open");
+        let mut chosen = profile("claude-sub", HarnessKind::ClaudeCode);
+        chosen.network = NetworkMode::None;
+        let mut harness = engine.screen(chosen);
+        edit(&mut harness, 0);
+        let screen = harness.screen();
+        assert!(screen.contains("The name stays as it is"), "{screen}");
+        assert!(screen.contains("claude-sub"), "{screen}");
+        assert!(!screen.contains("The name of the definition file"), "no field that would not take: {screen}");
+        // Where the name stands, a click and typing change nothing: there is no field to take it.
+        let (x, y) = harness.find("claude-sub").expect("the name is shown");
+        harness.click(x + 2, y).render();
+        harness.type_text("-new").render();
+        assert_eq!(harness.app().state.draft().expect("open").name, "claude-sub", "{}", harness.screen());
+        let draft = harness.app().state.draft().expect("open");
+        assert_eq!(draft.network, NetworkMode::None, "everything else comes as the profile has it");
+        // Leaving before the image page writes nothing.
+        harness.click_text("Cancel").render();
+        assert_eq!(definition(&engine, "claude-sub"), "", "nothing was saved");
+        assert!(engine.builds().is_empty(), "{:#?}", engine.calls());
+    }
+
+    #[test]
+    fn a_change_the_image_is_built_from_is_saved_through_a_rebuild() {
+        let engine = Rebuilt::new("edit-image");
+        let chosen = profile("claude-sub", HarnessKind::ClaudeCode);
+        let mut harness = engine.screen(chosen.clone());
+        edit(&mut harness, 2);
+        harness.click_text("QCode extra").render();
+        // Account, permissions, then the image page, which saves by building again.
+        edit_on(&mut harness, 3);
+        let builds = engine.builds();
+        assert_eq!(builds.len(), 1, "one rebuild: {:#?}", engine.calls());
+        assert!(builds[0].starts_with("build --no-cache --tag qcode/profile/claude-sub "), "{builds:#?}");
+        let changed = Profile { template: Template::High, ..chosen };
+        let built = std::fs::read_to_string(engine.folder.join("built")).expect("a Containerfile was built");
+        assert_eq!(built, recipe::image(&changed).labelled(), "the changed profile's recipe");
+        let text = definition(&engine, "claude-sub");
+        assert!(text.contains("template = \"high\""), "{text}");
+        let read = Profile::parse("claude-sub.toml", &text).profile.expect("the file reads");
+        assert_eq!(read, changed);
+        let screen = harness.screen();
+        assert!(screen.contains("is built again with the changes"), "{screen}");
+        // The login it has stays: the account and the harness did not change.
+        assert_eq!(harness.app().state.draft().expect("open").stages(), Stage::WITHOUT_LOGIN);
+        harness.click_text("Finish").render();
+        assert!(harness.app().state.draft().is_none(), "{}", harness.screen());
+        assert_eq!(harness.app().state.made, None, "a changed profile is not a new one");
+    }
+
+    #[test]
+    fn a_change_of_account_brings_the_sign_in_back_and_builds_nothing() {
+        let engine = Rebuilt::new("edit-account");
+        let chosen = profile("claude-sub", HarnessKind::ClaudeCode);
+        let mut harness = engine.screen(chosen.clone());
+        edit(&mut harness, 3);
+        let (x, y) = radio_mark(&harness, "API key");
+        harness.click(i32::from(x) + 1, i32::from(y)).render();
+        assert_eq!(harness.app().state.draft().expect("open").account, AccountKind::ApiKey, "{}", harness.screen());
+        edit_on(&mut harness, 2);
+        assert!(engine.builds().is_empty(), "nothing the image is built from changed: {:#?}", engine.calls());
+        let read = Profile::parse("claude-sub.toml", &definition(&engine, "claude-sub")).profile.expect("saved");
+        assert_eq!(read, Profile { account: AccountKind::ApiKey, ..chosen });
+        // The login it has was made for a subscription; the sign-in page is the next one.
+        harness.click_text("Next").render();
+        let draft = harness.app().state.draft().expect("open");
+        assert_eq!(draft.stage, Stage::Login, "{}", harness.screen());
+        assert!(harness.screen().contains("Open the sign-in"), "{}", harness.screen());
+    }
+
+    #[test]
+    fn a_change_of_the_network_is_saved_without_a_rebuild_and_remakes_a_stopped_container() {
+        let engine = Rebuilt::new("edit-network");
+        let chosen = profile("claude-sub", HarnessKind::ClaudeCode);
+        let mut harness = engine.screen(chosen.clone());
+        edit(&mut harness, 4);
+        let (x, y) = radio_mark(&harness, "none");
+        harness.click(i32::from(x) + 1, i32::from(y)).render();
+        edit_on(&mut harness, 1);
+        assert!(engine.builds().is_empty(), "the network is the containers', not the image's: {:#?}", engine.calls());
+        let screen = harness.screen();
+        assert!(screen.contains("the image is kept as it is"), "{screen}");
+        assert!(screen.contains("made again with the changes the next time it starts"), "{screen}");
+        let read = Profile::parse("claude-sub.toml", &definition(&engine, "claude-sub")).profile.expect("saved");
+        assert_eq!(read, Profile { network: NetworkMode::None, ..chosen.clone() });
+
+        // A workspace's stopped container of the profile, made from the plan as it was, is made
+        // again from the one the saved profile gives, with the same home volume.
+        let workspace = crate::store::WorkspaceId::parse("firefly").expect("an id");
+        let paths = crate::store::WorkspacePaths {
+            root: engine.folder.join("w"),
+            file: engine.folder.join("w").join("workspace.qcode"),
+            code: engine.folder.join("w").join("Work"),
+            assets: engine.folder.join("w").join("Assets"),
+            harness: engine.folder.join("w").join("Containers").join("Harness"),
+        };
+        let user = crate::engine::HostUser::Ids { uid: 1000, gid: 1000 };
+        let stand_in = engine.folder.join("containers");
+        let before = crate::ui::workspace::ContainerPlan::profile(&workspace, &paths, &chosen);
+        let after = crate::ui::workspace::ContainerPlan::profile(&workspace, &paths, &read);
+        let podman = Engine::new(crate::engine::EngineKind::Podman, &stand_in);
+        assert_ne!(before.digest(&podman, user), after.digest(&podman, user));
+        let script = r#"#!/bin/sh
+printf '%s\n' "$*" >> FOLDER/container-calls
+case "$1 $2 $4" in
+'container inspect {{.State.Status}}') echo exited; exit 0 ;;
+'container inspect {{.Image}}') echo sha-same; exit 0 ;;
+'container inspect '*) echo DIGEST; exit 0 ;;
+'image inspect {{.Id}}') case "$5" in qcode/workspace/*) exit 1 ;; esac; echo sha-same; exit 0 ;;
+esac
+exit 0
+"#
+        .replace("FOLDER", &engine.folder.display().to_string())
+        .replace("DIGEST", &before.digest(&podman, user));
+        std::fs::write(&stand_in, script).expect("the stand-in engine");
+        std::fs::set_permissions(&stand_in, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("runnable");
+        crate::ui::workspace::ensure_running(&podman, &after, user).expect("it comes up");
+        let calls = std::fs::read_to_string(engine.folder.join("container-calls")).expect("calls");
+        let calls: Vec<&str> = calls.lines().collect();
+        let removed =
+            calls.iter().position(|call| call.starts_with("rm ") && call.contains("qcode-firefly-claude-sub"));
+        let created = calls.iter().position(|call| call.starts_with("create ") && call.contains("--network=none"));
+        assert!(removed.is_some() && created.is_some() && removed < created, "made again: {calls:#?}");
+        let label = format!("qcode.plan={}", after.digest(&podman, user));
+        assert!(calls.iter().any(|call| call.contains(&label)), "with the new plan's label: {calls:#?}");
+        assert!(!calls.iter().any(|call| call.starts_with("volume rm")), "the home stays: {calls:#?}");
+    }
+
+    /// Walks `pages` more pages on with the wizard's own Next.
+    fn edit_on(harness: &mut Harness<Host>, pages: usize) {
+        for _ in 0..pages {
+            harness.click_text("Next").render();
+        }
     }
 
     #[test]
@@ -3073,7 +3867,7 @@ echo 'COMMIT qcode/profile/claude-sub'
             harness.screen()
         );
         harness.click_text("Next").render();
-        harness.click_text("QCode high").render();
+        harness.click_text("QCode extra").render();
         assert!(harness.screen().contains("downloaded from Arch Linux, PyPI"), "{}", harness.screen());
         harness.click_text("Next").render();
         harness.click_text("Next").render();
@@ -3144,22 +3938,23 @@ echo 'COMMIT qcode/profile/claude-sub'
         harness.click_text("New profile").render();
         harness.click_text("Next").render();
         harness.click_text("Next").render();
-        harness.click_text("QCode high").render();
+        harness.click_text("QCode extra").render();
 
-        let context7 = Extra::parse("context7").expect("a part of QCode high");
+        // A plugin QCode extra alone installs.
+        let hookify = Extra::parse("hookify").expect("a part of QCode extra");
         let has = |harness: &Harness<Host>, extra| harness.app().state.draft().expect("open").has(extra);
         for extra in Template::High.extras(HarnessKind::ClaudeCode) {
             assert!(has(&harness, extra), "{extra:?} is on until switched off:\n{}", harness.screen());
         }
-        let (x, y) = switch_of(&harness, "context7");
+        let (x, y) = switch_of(&harness, "hookify");
         harness.click(x, y).render();
-        assert!(!has(&harness, context7), "a click switches it off:\n{}", harness.screen());
+        assert!(!has(&harness, hookify), "a click switches it off:\n{}", harness.screen());
         // The keys reach the same switch: the list has the row the click was on.
         harness.press("space").render();
-        assert!(has(&harness, context7), "space switches it back on:\n{}", harness.screen());
+        assert!(has(&harness, hookify), "space switches it back on:\n{}", harness.screen());
         harness.press("space").render();
-        assert!(!has(&harness, context7), "and off again:\n{}", harness.screen());
-        for extra in Template::High.extras(HarnessKind::ClaudeCode).into_iter().filter(|extra| *extra != context7) {
+        assert!(!has(&harness, hookify), "and off again:\n{}", harness.screen());
+        for extra in Template::High.extras(HarnessKind::ClaudeCode).into_iter().filter(|extra| *extra != hookify) {
             assert!(has(&harness, extra), "{extra:?} stays on");
         }
 
@@ -3172,14 +3967,15 @@ echo 'COMMIT qcode/profile/claude-sub'
 
         let text =
             std::fs::read_to_string(folder.join("Profiles").join("claude-code.toml")).expect("the profile is saved");
-        assert!(text.contains("[additions]\ncontext7 = false\n"), "{text}");
+        assert!(text.contains("template = \"high\""), "{text}");
+        assert!(text.contains("[additions]\nhookify = false\n"), "{text}");
         let saved = crate::profile::Profile::parse("claude-code.toml", &text).profile.expect("it reads back");
-        assert_eq!(saved.without, [context7], "{text}");
+        assert_eq!(saved.without, [hookify], "{text}");
 
         let image = std::fs::read_to_string(folder.join("built-qcode-profile-claude-code"))
             .expect("the profile's image was built from a Containerfile");
-        assert!(!image.contains("context7"), "{image}");
-        for plugin in crate::profile::CLAUDE_PLUGINS.iter().filter(|plugin| !plugin.starts_with("context7@")) {
+        assert!(!image.contains("hookify"), "{image}");
+        for plugin in crate::profile::CLAUDE_PLUGINS.iter().filter(|plugin| !plugin.starts_with("hookify@")) {
             assert!(image.contains(&format!("claude plugin install {plugin}")), "{plugin}: {image}");
         }
         assert!(image.contains("pipx install --global graphifyy"), "graphify stays: {image}");
@@ -3187,35 +3983,129 @@ echo 'COMMIT qcode/profile/claude-sub'
     }
 
     #[test]
-    fn opencode_under_qcode_high_lists_oh_my_openagent_and_not_the_plugins() {
-        let mut harness = wizard_on(0);
-        harness.click_text("opencode").render();
+    fn quvyta_development_is_offered_and_saved_with_chromium_switched_off_and_built_with_rust() {
+        // From where the person's hand is: the buttons, the template's row, the switch.
+        let (folder, mut harness) = recording("quvyta-dev");
+        harness.click_text("New profile").render();
         harness.click_text("Next").render();
         harness.click_text("Next").render();
-        harness.click_text("QCode high").render();
+        harness.click_text("Quvyta development").render();
         let screen = harness.screen();
-        assert!(screen.contains("oh-my-openagent"), "{screen}");
-        assert!(screen.contains("graphify"), "{screen}");
-        assert!(!screen.contains("superpowers"), "{screen}");
+        assert_eq!(harness.app().state.draft().expect("open").template, Template::QuvytaDev, "{screen}");
+        assert!(screen.contains("Rust's stable toolchain"), "what it adds is said:\n{screen}");
+        assert!(screen.contains("GitHub, rustup.rs and"), "and where it comes from:\n{screen}");
+        for part in ["graphify", "superpowers", "chromium"] {
+            assert!(screen.contains(part), "`{part}` is listed:\n{screen}");
+        }
+        let has = |harness: &Harness<Host>| harness.app().state.draft().expect("open").has(Extra::Chromium);
+        assert!(has(&harness), "on until switched off");
+        let (x, y) = switch_of(&harness, "chromium");
+        harness.click(x, y).render();
+        assert!(!has(&harness), "a click switches it off:\n{}", harness.screen());
+
+        harness.click_text("Next").render();
+        harness.click_text("Next").render();
+        harness.click_text("Next").render();
+        let build = &harness.app().state.draft().expect("open").build;
+        assert!(matches!(build, Build::Done), "the build ended well: {build:?}\n{}", harness.screen());
+
+        let text =
+            std::fs::read_to_string(folder.join("Profiles").join("claude-code.toml")).expect("the profile is saved");
+        assert!(text.contains("template = \"quvyta-dev\""), "{text}");
+        assert!(text.contains("[additions]\nchromium = false\n"), "{text}");
+        let saved = crate::profile::Profile::parse("claude-code.toml", &text).profile.expect("it reads back");
+        assert_eq!((saved.template, saved.without), (Template::QuvytaDev, vec![Extra::Chromium]), "{text}");
+        let image = std::fs::read_to_string(folder.join("built-qcode-profile-claude-code"))
+            .expect("the profile's image was built from a Containerfile");
+        assert!(image.contains("https://sh.rustup.rs"), "{image}");
+        assert!(!image.contains("chromium"), "{image}");
+        let _ = std::fs::remove_dir_all(&folder);
     }
 
     #[test]
-    fn a_build_of_qcode_high_that_could_not_download_says_so() {
-        let mut harness = wizard_on(2);
-        harness.click_text("QCode high").render();
-        for _ in 0..3 {
-            harness.send(Msg::Next);
-        }
-        let said = format!(
-            "{} could not install graphify. What QCode high adds is downloaded while the image is built, so the build needs the network.",
-            recipe::HIGH_FAILED
-        );
-        harness
-            .send(Msg::BuildLine(said))
-            .send(Msg::BuildEnded(Err(Problem::Refused("exit status 1".to_owned()))))
-            .render();
+    fn on_ubuntu_quvyta_development_waits_on_its_page_until_chromium_is_switched_off() {
+        let (folder, mut harness) = recording("quvyta-dev-ubuntu");
+        harness.click_text("New profile").render();
+        harness.click_text("Next").render();
+        harness.click_text("Ubuntu 24.04 LTS").render();
+        harness.click_text("Next").render();
+        harness.click_text("Quvyta development").render();
+        harness.click_text("Next").render();
+        let stage = |harness: &Harness<Host>| harness.app().state.draft().expect("open").stage;
+        assert_eq!(stage(&harness), Stage::Template, "{}", harness.screen());
         let screen = harness.screen();
-        assert!(screen.contains("could not download what it adds"), "{screen}");
+        assert!(screen.contains("Ubuntu 24.04 LTS packages Chromium only as a snap"), "{screen}");
+        let (x, y) = switch_of(&harness, "chromium");
+        harness.click(x, y).render();
+        assert!(!harness.screen().contains("only as a snap"), "{}", harness.screen());
+        harness.click_text("Next").render();
+        assert_eq!(stage(&harness), Stage::Account, "{}", harness.screen());
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn the_sixteen_plugins_of_qcode_extra_fit_a_screen_of_forty_rows_each_with_its_switch() {
+        let mut harness = wizard_on(2);
+        harness.resize(100, 40).render();
+        harness.click_text("QCode extra").render();
+        let screen = harness.screen();
+        for extra in Template::High.extras(HarnessKind::ClaudeCode) {
+            assert!(screen.contains(extra.id()), "`{}` is not listed:\n{screen}", extra.id());
+            if matches!(extra, Extra::Plugin(_)) {
+                // Every plugin keeps a switch of its own, reached by a click on it.
+                let (x, y) = switch_of(&harness, extra.id());
+                harness.click(x, y).render();
+                assert!(
+                    !harness.app().state.draft().expect("open").has(extra),
+                    "{}:\n{}",
+                    extra.id(),
+                    harness.screen()
+                );
+                harness.click(x, y).render();
+                assert!(harness.app().state.draft().expect("open").has(extra), "{}", extra.id());
+            }
+        }
+        assert!(screen.contains("needs the network"), "{screen}");
+        assert!(screen.contains("Next"), "the buttons are still on screen:\n{screen}");
+    }
+
+    #[test]
+    fn opencode_under_every_qcode_template_lists_oh_my_openagent_and_not_the_plugins() {
+        for row in ["QCode recommended", "QCode extra"] {
+            let mut harness = wizard_on(0);
+            harness.click_text("opencode").render();
+            harness.click_text("Next").render();
+            harness.click_text("Next").render();
+            harness.click_text(row).render();
+            let screen = harness.screen();
+            assert!(screen.contains("oh-my-openagent"), "{row}: {screen}");
+            assert!(screen.contains("graphify"), "{row}: {screen}");
+            assert!(!screen.contains("superpowers"), "{row}: {screen}");
+            assert!(screen.contains("npm and GitHub"), "{row}: the download is said: {screen}");
+        }
+    }
+
+    #[test]
+    fn a_build_of_a_qcode_template_that_could_not_download_says_whose_it_was() {
+        for (row, failed, name) in [
+            ("QCode extra", recipe::EXTRA_FAILED, "QCode extra"),
+            ("QCode recommended", recipe::RECOMMENDED_FAILED, "QCode recommended"),
+        ] {
+            let mut harness = wizard_on(2);
+            harness.click_text(row).render();
+            for _ in 0..3 {
+                harness.send(Msg::Next);
+            }
+            let said = format!(
+                "{failed} could not install graphify. What {name} adds is downloaded while the image is built, so the build needs the network."
+            );
+            harness
+                .send(Msg::BuildLine(said))
+                .send(Msg::BuildEnded(Err(Problem::Refused("exit status 1".to_owned()))))
+                .render();
+            let screen = harness.screen();
+            assert!(screen.contains(&format!("{name} could not download what it adds")), "{screen}");
+        }
         // Any other failure keeps the plain words.
         let mut harness = wizard_on(5);
         harness.send(Msg::BuildEnded(Err(Problem::Refused("no space left".to_owned())))).render();
@@ -3306,24 +4196,17 @@ echo 'COMMIT qcode/profile/claude-sub'
     }
 
     #[test]
-    fn the_lines_of_qcode_high_are_really_in_every_language() {
+    fn the_lines_of_the_template_parts_are_really_in_every_language() {
         // A file whose values are English still has every key. What each language is checked for
         // is its own words: with the names of the tools taken out, most of what is left must not
         // be words of the English line.
         let keys = [
-            "profiles.wizard.template-high-detail",
-            "profiles.wizard.high-adds",
-            "profiles.wizard.high-choose",
-            "profiles.wizard.high-none",
             "profiles.wizard.high-graphify",
             "profiles.wizard.high-claude-plugins",
             "profiles.wizard.high-omo",
-            "profiles.wizard.high-download",
             "profiles.wizard.high-offline-claude",
             "profiles.wizard.high-offline-opencode",
             "profiles.wizard.high-offline",
-            "profiles.wizard.high-build-failed",
-            "profiles.template-recommended",
         ];
         let names = [
             "QCode",

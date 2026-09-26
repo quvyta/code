@@ -1,5 +1,6 @@
 // The QCode bridge: a Model Context Protocol server that lets the agent of one QCode tab
-// list the other tabs of its project and send a message to one of them.
+// list the other tabs of its project, send a message to one of them, and take the messages
+// waiting for its own tab.
 //
 // A harness starts this file with `node` over stdio. It has no dependencies, because it runs in
 // every profile image and nothing but Node is promised there. It decides nothing itself: every
@@ -31,7 +32,9 @@ const INSTRUCTIONS =
   "tabs, and QCode may refuse a message; the answer always says what happened and why. A " +
   "message is written into the other tab's prompt once that tab is quiet, so it may still be " +
   "waiting after send_message answers: list_tabs says how many messages each tab still holds " +
-  "and what is stopping them.";
+  "and what is stopping them. A window tab has no prompt: messages to it wait until its agent " +
+  "calls check_inbox, and an agent in a window calls check_inbox at the start and the end of " +
+  "every task.";
 
 const TOOLS = [
   {
@@ -64,6 +67,17 @@ const TOOLS = [
       required: ["tab", "text"],
       additionalProperties: false,
     },
+  },
+  {
+    name: "check_inbox",
+    title: "Take the messages waiting for this tab",
+    description:
+      "Returns every message other tabs of this QCode project sent to this tab that has not " +
+      "reached you yet, each with the tab that sent it, and takes them out of QCode: they are " +
+      "yours now. A tab in a window (Antigravity IDE) has no prompt, so this is the only way its " +
+      "messages reach it: call it at the start of every task and when you finish one. Answer a " +
+      "message with send_message to the tab that sent it.",
+    inputSchema: { type: "object", additionalProperties: false },
   },
 ];
 
@@ -143,6 +157,13 @@ async function call(params) {
     const answer = await ask({ op: "send", tab: args.tab, text: args.text });
     if (!answer) return text(UNREACHABLE, true);
     return text(answer.text, !answer.ok);
+  }
+  if (name === "check_inbox") {
+    const answer = await ask({ op: "inbox" });
+    if (!answer) return text(UNREACHABLE, true);
+    const result = text(answer.text, !answer.ok);
+    if (answer.ok) result.structuredContent = { messages: answer.messages ?? [] };
+    return result;
   }
   return null;
 }

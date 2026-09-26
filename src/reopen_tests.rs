@@ -711,3 +711,47 @@ fn rail(harness: &Harness<QCode>) -> Vec<String> {
     let screen = harness.app().workspace.as_ref().expect("a workspace screen");
     screen.workspaces().iter().map(|workspace| workspace.name().to_owned()).collect()
 }
+
+/// Leaves QCode the way [`crate::run`] does once its screen is given back, as the last QCode open
+/// on `machine`, with one container of it recorded as running. Answers the engine calls made.
+fn leave_last(machine: &Machine) -> Vec<String> {
+    use crate::engine::run::EngineError;
+    use crate::engine::{Engine, EngineCommand};
+    use crate::service::{Engines, Open, Places};
+
+    let places = Places::beside(machine.root.join("data").join("containers.toml"));
+    let open = Open::hold(places.clone()).expect("this QCode is held open");
+    crate::store::Registry::record(&places.registry, "qcode-firefly-base", EngineKind::Podman)
+        .expect("the container is recorded");
+    let engine_for = |kind: EngineKind| Some(Engine::new(kind, "/nonexistent/qcode-test-engine"));
+    let mut calls = Vec::new();
+    let mut run = |command: &EngineCommand| -> Result<String, EngineError> {
+        let words: Vec<String> = command.args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
+        let answer = if words[0] == "ps" { "qcode-firefly-base\trunning\n".to_owned() } else { String::new() };
+        calls.push(words.join(" "));
+        Ok(answer)
+    };
+    let mut engines = Engines { engine_for: &engine_for, run: &mut run };
+    let text = || std::sync::Arc::new(crate::service::translator(Some("en")));
+    let mut out = Vec::new();
+    crate::leave(&mut out, None, Some(open), &|| machine.config(), &mut engines, &text).expect("QCode leaves");
+    calls
+}
+
+#[test]
+fn the_choice_of_what_containers_do_when_qcode_closes_is_the_one_qcode_obeys_on_its_way_out() {
+    let machine = Machine::set_up("on-close");
+    let mut harness = machine.reopen();
+    to_settings(&mut harness);
+    choose(&mut harness, "When QCode closes", "Keep running");
+    drop(harness);
+    let calls = leave_last(&machine);
+    assert!(!calls.iter().any(|call| call.starts_with("stop")), "kept running, nothing is stopped: {calls:?}");
+
+    let mut harness = machine.reopen();
+    to_settings(&mut harness);
+    choose(&mut harness, "When QCode closes", "Stop");
+    drop(harness);
+    let calls = leave_last(&machine);
+    assert!(calls.contains(&"stop qcode-firefly-base".to_owned()), "stopped, the container stops: {calls:?}");
+}

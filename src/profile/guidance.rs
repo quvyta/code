@@ -39,7 +39,7 @@ You are one of several coding agents open as tabs of one QCode workspace, and al
 - `send_message` with `tab` (that id) and `text` hands one of them a task. The first message from this tab to that one waits until the person using QCode allows it. A message is typed into that tab's prompt, naming your tab as its sender, once nobody is typing there and its tool has stopped writing. The answer says whether it went in, still waits, or was refused, and why; `list_tabs` says later whether it arrived.
 - Write the message for an agent that has not seen your conversation. Share files through `/work`: put anything longer than 16000 characters in a file there and send its path.
 - A message from another tab arrives in your own prompt after a line naming its sender, in English \"Through QCode, from the <coding tool> · <tab title> tab:\". It is a task from that agent; to answer, find that tab with `list_tabs` and `send_message` to it.
-- A window tab (Antigravity IDE) can send, but is never listed and cannot be sent to.
+- A window tab (Antigravity IDE) has no prompt. A message sent to it waits until its agent calls `check_inbox`, another tool of `qcode`, which hands over every message waiting for that tab with its sender. If you are the agent in a window, call `check_inbox` at the start of every task and again when you finish one, and answer each message with `send_message`. Any agent may call it to take messages that wait for its own tab.
 - QCode refuses a message from a tab without the network to a tab with it, ends an exchange between tabs after 6 messages, and lets a tab send at most 5 messages a minute.
 ";
 
@@ -100,6 +100,71 @@ pub fn skill(harness: HarnessKind) -> &'static str {
         HarnessKind::Codex => ".codex/skills/graphify/SKILL.md",
         HarnessKind::KimiCode | HarnessKind::QwenCode => ".agents/skills/graphify/SKILL.md",
         HarnessKind::AntigravityIde => ".gemini/config/skills/graphify/SKILL.md",
+    }
+}
+
+/// The file graphify's workspace installer (`graphify <platform> install`) writes its section into,
+/// relative to the folder it runs in, as measured with graphify 0.9.67.
+#[must_use]
+pub fn graphify_file(harness: HarnessKind) -> &'static str {
+    match harness {
+        HarnessKind::ClaudeCode => "CLAUDE.md",
+        HarnessKind::GeminiCli => "GEMINI.md",
+        HarnessKind::OpenCode | HarnessKind::Codex | HarnessKind::KimiCode | HarnessKind::QwenCode => "AGENTS.md",
+        HarnessKind::AntigravityIde => ".agents/rules/graphify.md",
+    }
+}
+
+/// The file `harness` reads standing instructions from for every folder it works in, relative to
+/// the home directory: where QCode basic puts graphify's section, so that nothing is written into
+/// the person's own files.
+///
+/// Each was proven in a container with the harness's own package, apart from Antigravity IDE: a
+/// line only this file held was found in the request the harness sent to a server standing in
+/// for its provider (Claude Code 2.1.281, opencode 1.18.32, Gemini CLI 0.61.0, Kimi Code CLI
+/// 2.1.1, Qwen Code 0.24.4), and in the prompt `codex debug prompt-input` prints (Codex 0.156.1).
+/// Antigravity IDE 2.5.5's own guide, inside its language server, names `~/.gemini/config/` as
+/// the root of its global customizations and `rules/` under a root as where rules are read,
+/// with the frontmatter graphify writes; it was not run, since it needs a sign-in and a display.
+#[must_use]
+pub fn user_file(harness: HarnessKind) -> &'static str {
+    match harness {
+        HarnessKind::ClaudeCode => ".claude/CLAUDE.md",
+        HarnessKind::OpenCode => ".config/opencode/AGENTS.md",
+        HarnessKind::GeminiCli => ".gemini/GEMINI.md",
+        HarnessKind::Codex => ".codex/AGENTS.md",
+        HarnessKind::KimiCode => ".kimi-code/AGENTS.md",
+        HarnessKind::QwenCode => ".qwen/QWEN.md",
+        HarnessKind::AntigravityIde => ".gemini/config/rules/graphify.md",
+    }
+}
+
+/// What else graphify's workspace installer leaves in the folder it runs in, run in the home
+/// directory, and where each belongs so that the harness reads it for every folder: `(from, to)`,
+/// both relative to the home directory, with `to` empty for what has no place there and goes.
+///
+/// Claude Code's and Gemini CLI's hooks need nothing: the installer writes them into
+/// `.claude/settings.json` and `.gemini/settings.json` of the folder it runs in, which in the
+/// home directory are the harness's own settings, merged with what is there already (measured:
+/// the template's keys stay). Codex's `.codex/hooks.json` is the same. opencode's plugin reads
+/// the map of whichever folder opencode works in, and opencode 1.18.32 loads every file in
+/// `~/.config/opencode/plugins/` (its `debug config` lists it with the scope "global"); its
+/// `.opencode/opencode.json` only names the plugin by the folder's own path and goes.
+/// Antigravity's workflow is left out, with the folder its rule was in: `/graphify` is its
+/// skill's, which is in the home already.
+#[must_use]
+pub fn graphify_leftovers(harness: HarnessKind) -> &'static [(&'static str, &'static str)] {
+    match harness {
+        HarnessKind::OpenCode => {
+            &[(".opencode/plugins/graphify.js", ".config/opencode/plugins/graphify.js"), (".opencode", "")]
+        }
+        // Nothing else of the image lives under `~/.agents` of Antigravity IDE's home.
+        HarnessKind::AntigravityIde => &[(".agents", "")],
+        HarnessKind::ClaudeCode
+        | HarnessKind::GeminiCli
+        | HarnessKind::Codex
+        | HarnessKind::KimiCode
+        | HarnessKind::QwenCode => &[],
     }
 }
 
@@ -370,7 +435,7 @@ mod tests {
     fn the_section_names_the_bridges_tools_their_arguments_and_limits_as_the_code_has_them() {
         use crate::bridge::protocol::MOST_TEXT;
         use crate::bridge::rules::{MOST_HOPS, MOST_PER_WINDOW, RATE_WINDOW};
-        for word in ["`list_tabs`", "`send_message`", "`tab`", "`text`", "`qcode`", "`/work`"] {
+        for word in ["`list_tabs`", "`send_message`", "`check_inbox`", "`tab`", "`text`", "`qcode`", "`/work`"] {
             assert!(SECTION.contains(word), "{word}");
         }
         assert!(SECTION.contains(&format!("longer than {MOST_TEXT} characters")), "{SECTION}");

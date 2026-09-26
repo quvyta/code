@@ -286,7 +286,7 @@ pub struct Profile {
     pub assets: MountAccess,
     /// What the container may reach.
     pub network: NetworkMode,
-    /// The parts of QCode high's additions the person switched off for this profile. Empty means
+    /// The parts of a QCode template's additions the person switched off for this profile. Empty means
     /// everything its template adds, which is what a file without the choice reads as.
     pub without: Vec<Extra>,
     /// The system the profile's image is built on. Debian, which every profile was built on before
@@ -430,6 +430,21 @@ impl Profile {
             diagnostics.push(Diagnostic::error(root.value_location(OS).cloned(), message));
             return Loaded { profile: None, diagnostics };
         }
+        // Chromium where the system has none that runs in a container was never offered either:
+        // the wizard stops on it. Built without it, the profile would not be what the file says.
+        if template.extras(harness).contains(&Extra::Chromium)
+            && !without.contains(&Extra::Chromium)
+            && os.chromium().is_none()
+        {
+            let message = format!(
+                "`{OS}` is `{}`, which has no Chromium that runs in a container; set `{ADDITIONS}.{}` \
+                 to false or choose another system",
+                os.id(),
+                Extra::Chromium.id()
+            );
+            diagnostics.push(Diagnostic::error(root.value_location(OS).cloned(), message));
+            return Loaded { profile: None, diagnostics };
+        }
         if harness.withdrawn(account) {
             let message = format!(
                 "`{ACCOUNT}` is `{}`: {} stopped this sign-in for personal accounts on 2026-06-18; \
@@ -522,17 +537,25 @@ impl Profile {
                 Addition::Graphify => self.has(Extra::Graphify),
                 Addition::ClaudePlugins => !self.claude_plugins().is_empty(),
                 Addition::OhMyOpenAgent => self.has(Extra::OhMyOpenAgent),
+                Addition::OhMyOpenCodeSlim => self.has(Extra::OhMyOpenCodeSlim),
+                Addition::Rust => true,
+                // A system with no Chromium that runs in a container gets none; the wizard and the
+                // file both refuse the pair, so this only keeps a recipe from naming no package.
+                Addition::Chromium => self.has(Extra::Chromium) && self.os.chromium().is_some(),
             })
             .collect()
     }
 
     /// The configuration files this profile's image build writes, in the order they are written:
-    /// its template's, except that opencode without oh-my-openagent gets QCode basic's settings,
-    /// because QCode high's name the plugin by a path that would then lead nowhere.
+    /// its template's, except that opencode without oh-my-openagent gets the settings of its
+    /// record, because the template's name the plugin by a path that would then lead nowhere.
     #[must_use]
     pub fn files(&self) -> Vec<ConfigFile> {
-        if self.template == Template::High && self.harness == HarnessKind::OpenCode && !self.has(Extra::OhMyOpenAgent) {
-            return Template::Recommended.files(self.harness);
+        if self.template.extras(self.harness).contains(&Extra::OhMyOpenAgent) && !self.has(Extra::OhMyOpenAgent) {
+            return Template::plain_files(self.harness);
+        }
+        if self.template.extras(self.harness).contains(&Extra::OhMyOpenCodeSlim) && !self.has(Extra::OhMyOpenCodeSlim) {
+            return Template::plain_files(self.harness);
         }
         self.template.files(self.harness)
     }
@@ -565,7 +588,7 @@ const ASSETS: &str = "assets";
 const NETWORK: &str = "network";
 /// The key, below `[network]`, of the network mode.
 const MODE: &str = "mode";
-/// The table of QCode high's additions: each part by its id, `false` where the person switched it
+/// The table of a QCode template's additions: each part by its id, `false` where the person switched it
 /// off. A part not named is on.
 const ADDITIONS: &str = "additions";
 /// The table naming the provider and model a profile of [`AccountKind::Provider`] runs on.
@@ -725,6 +748,18 @@ mode = \"full\"
     }
 
     #[test]
+    fn an_antigravity_profile_made_before_its_login_was_stored_loads_as_one_that_needs_it() {
+        // Written by a QCode that left the sign-in to each workspace's window.
+        let text = "name = \"anti\"\nharness = \"antigravity-ide\"\naccount = \"in-app\"\n";
+        let loaded = Profile::parse("anti.toml", text);
+        assert_eq!(loaded.diagnostics, []);
+        let profile = loaded.profile.expect("the profile still loads");
+        assert_eq!(profile.account, AccountKind::InApp);
+        assert!(profile.account.needs_login(), "the Profiles page offers the sign-in for it");
+        assert!(profile.to_toml().contains("account = \"in-app\"\n"), "{}", profile.to_toml());
+    }
+
+    #[test]
     fn free_use_loads_for_opencode_and_is_refused_where_it_is_not_offered() {
         let text = "name = \"oc\"\nharness = \"opencode\"\naccount = \"free\"\n";
         let loaded = Profile::parse("oc.toml", text);
@@ -803,6 +838,35 @@ mode = \"full\"
     }
 
     #[test]
+    fn a_quvyta_development_file_reads_back_as_itself_with_chromium_switched_off() {
+        let text = COMPLETE.replace("template = \"recommended\"", "template = \"quvyta-dev\"")
+            + "\n[additions]\nchromium = false\n";
+        let loaded = parse(&text);
+        assert_eq!(loaded.diagnostics, []);
+        let profile = loaded.profile.expect("complete");
+        assert_eq!(profile.template, Template::QuvytaDev);
+        assert_eq!(profile.without, [Extra::Chromium]);
+        assert_eq!(profile.additions(), [Addition::Graphify, Addition::ClaudePlugins, Addition::Rust]);
+        assert_eq!(profile.to_toml(), text, "written back as it was read");
+        let on = parse(&COMPLETE.replace("template = \"recommended\"", "template = \"quvyta-dev\""));
+        let on = on.profile.expect("complete");
+        assert_eq!(on.additions(), [Addition::Graphify, Addition::ClaudePlugins, Addition::Rust, Addition::Chromium]);
+    }
+
+    #[test]
+    fn quvyta_development_with_chromium_on_ubuntu_is_refused_and_without_it_is_not() {
+        let ubuntu = COMPLETE
+            .replace("template = \"recommended\"", "template = \"quvyta-dev\"")
+            .replace("harness = \"claude-code\"\n", "harness = \"claude-code\"\nos = \"ubuntu\"\n");
+        let loaded = parse(&ubuntu);
+        assert_eq!(loaded.profile, None, "Chromium cannot be had there: {:?}", loaded.diagnostics);
+        assert!(loaded.diagnostics[0].message.contains("no Chromium"), "{:?}", loaded.diagnostics);
+        let without = parse(&format!("{ubuntu}\n[additions]\nchromium = false\n"));
+        assert_eq!(without.diagnostics, []);
+        assert_eq!(without.profile.expect("complete").os, Os::Ubuntu);
+    }
+
+    #[test]
     fn a_profile_on_another_system_says_so_and_reads_back_as_the_same_profile() {
         let text = COMPLETE.replace("harness = \"claude-code\"\n", "harness = \"claude-code\"\nos = \"arch\"\n");
         let loaded = parse(&text);
@@ -838,7 +902,7 @@ mode = \"full\"
         assert_eq!(Profile::parse("c.toml", &fine).profile.map(|profile| profile.os), Some(Os::Alpine));
     }
 
-    /// A profile written before QCode high's parts could be switched off holds no choice, and
+    /// A profile written before a QCode template's parts could be switched off holds no choice, and
     /// reads as having every one of them: the same file, the same profile, the same image.
     #[test]
     fn a_qcode_high_file_without_the_choice_has_everything_and_is_written_back_unchanged() {
@@ -865,23 +929,48 @@ mode = \"full\"
         assert!(!read.has(Extra::Graphify) && !read.has(Extra::Plugin("context7@claude-plugins-official")));
         assert!(read.has(Extra::Plugin("superpowers@claude-plugins-official")));
         assert_eq!(read.additions(), [Addition::ClaudePlugins], "graphify is not installed");
-        assert_eq!(read.claude_plugins().len(), 4);
+        assert_eq!(read.claude_plugins().len(), crate::profile::CLAUDE_PLUGINS.len() - 1);
         // A part named `true`, or not named, is on.
         let on = written.replace("graphify = false", "graphify = true");
         assert!(parse(&on).profile.expect("complete").has(Extra::Graphify));
     }
 
     #[test]
-    fn opencode_without_oh_my_openagent_is_set_up_as_under_qcode_basic() {
-        let text = COMPLETE
-            .replace("template = \"recommended\"", "template = \"high\"")
-            .replace("claude-code", "opencode")
-            .replace("subscription", "api-key");
-        let mut profile = parse(&text).profile.expect("complete");
-        assert_ne!(profile.files(), Template::Recommended.files(HarnessKind::OpenCode), "with it, the plugin is named");
-        profile.without = vec![Extra::OhMyOpenAgent];
-        assert_eq!(profile.files(), Template::Recommended.files(HarnessKind::OpenCode));
-        assert_eq!(profile.additions(), [Addition::Graphify]);
+    fn opencode_without_oh_my_openagent_is_not_told_of_it_under_any_template() {
+        for template in ["recommended", "high"] {
+            let text = COMPLETE
+                .replace("template = \"recommended\"", &format!("template = \"{template}\""))
+                .replace("claude-code", "opencode")
+                .replace("subscription", "api-key");
+            let mut profile = parse(&text).profile.expect("complete");
+            assert_ne!(
+                profile.files(),
+                Template::plain_files(HarnessKind::OpenCode),
+                "{template}: the plugin is named"
+            );
+            assert_eq!(profile.additions(), [Addition::Graphify, Addition::OhMyOpenAgent], "{template}");
+            profile.without = vec![Extra::OhMyOpenAgent];
+            assert_eq!(profile.files(), Template::plain_files(HarnessKind::OpenCode), "{template}");
+            assert_eq!(profile.additions(), [Addition::Graphify], "{template}");
+        }
+    }
+
+    /// Profiles written before QCode recommended installed Claude Code's plugins read as they
+    /// were written, and now get the starter plugins; a `high` file gets every plugin of QCode
+    /// extra, and a plugin it switched off stays off.
+    #[test]
+    fn older_recommended_and_high_files_read_unchanged_and_get_what_their_template_gives_today() {
+        let recommended = parse(COMPLETE).profile.expect("complete");
+        assert_eq!(recommended.template, Template::Recommended);
+        assert_eq!(recommended.claude_plugins(), crate::profile::CLAUDE_STARTER_PLUGINS);
+        assert_eq!(recommended.to_toml(), COMPLETE, "written back byte for byte");
+        let text =
+            COMPLETE.replace("template = \"recommended\"", "template = \"high\"") + "\n[additions]\ncontext7 = false\n";
+        let high = parse(&text).profile.expect("complete");
+        assert_eq!(high.template, Template::High);
+        assert!(!high.claude_plugins().contains(&"context7@claude-plugins-official"));
+        assert!(high.claude_plugins().contains(&"hookify@claude-plugins-official"), "a plugin new to extra is on");
+        assert_eq!(high.claude_plugins().len(), crate::profile::CLAUDE_PLUGINS.len() - 1);
     }
 
     /// A profile that says it runs on a provider but names no tag or model cannot be pointed

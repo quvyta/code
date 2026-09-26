@@ -679,9 +679,10 @@ dependencies = [
 
 [[package]]
 name = "quvyta-code"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "quvyta-framework",
+ "rustix",
  "serde_json",
  "toml",
  "ureq",
@@ -689,9 +690,9 @@ dependencies = [
 
 [[package]]
 name = "quvyta-framework"
-version = "0.1.22"
+version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "100d2e3b7a7b0b446e016b0c5e6aaa7780a1ceee8706185370f28649e8bc5ffb"
+checksum = "4ed0f279bfa3680b86b2c3d4a8c40237f0dfe800f29b92935dac0f9ef65f43ce"
 dependencies = [
  "crossterm",
  "dirs",

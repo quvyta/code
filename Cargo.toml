@@ -23,7 +23,7 @@ repository = "https://github.com/quvyta/code"
 readme = "README.md"
 keywords = ["tui", "terminal", "agent", "podman", "docker"]
 categories = ["command-line-utilities", "development-tools"]
-version = "0.1.17"
+version = "0.1.18"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -53,8 +53,8 @@ path = "src/bin/quvyta-code.rs"
 
 [dependencies]
 # The terminal tabs and the sign-in flow run a harness in a pseudo-terminal; `updates` is the
-# family's notice that a newer version is out.
-quvyta-framework = { version = "0.1.22", features = ["pty", "updates"] }
+# ecosystem's notice that a newer version is out.
+quvyta-framework = { version = "0.1.29", features = ["pty", "updates"] }
 # The bridge between tabs reads JSON from containers, which is untrusted input, and merges the
 # harnesses' JSON settings, which the person also edits; `preserve_order` keeps their keys where
 # they wrote them.
@@ -63,4 +63,10 @@ serde_json = { version = "1.0.150", features = ["preserve_order"] }
 # bridge needs of it, so nothing but the parser is turned on.
 toml = { version = "1.1.6", default-features = false, features = ["std", "parse", "preserve_order"] }
 ureq = "3.4.2"
+
+[target.'cfg(unix)'.dependencies]
+# Ending an engine command that stopped answering: the signal is sent directly, never through a
+# `kill` program a machine may not have. The framework already brings this exact version in, so
+# naming it here adds no crate.
+rustix = { version = "1.1.4", default-features = false, features = ["std", "process"] }
 

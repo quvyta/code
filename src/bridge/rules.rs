@@ -8,7 +8,8 @@
 //!    the same kind, nothing leaves that could not leave already.
 //! 2. **The chain.** A message sent by a tab that was itself sent one a short while ago continues
 //!    that exchange, one step further; a chain longer than [`MOST_HOPS`] is cut, so two agents
-//!    answering each other stop on their own.
+//!    answering each other stop on their own. What the person types into a tab ends the chain that
+//!    tab was in: its next message is their new task, not an answer.
 //! 3. **The pace.** One tab sends at most [`MOST_PER_WINDOW`] messages in [`RATE_WINDOW`], so an
 //!    agent that sends in a loop is stopped even when every message starts a new chain.
 //! 4. **The person**, only when they turned asking on in the settings. Then the first message
@@ -149,6 +150,13 @@ impl Rules {
     /// `to` sends next continues the chain.
     pub fn received(&mut self, to: u64, hop: u32, now: Instant) {
         self.received.insert(to, (hop, now));
+    }
+
+    /// Ends the chain the tab `tab` was in: what it sends next starts a new one. Called when the
+    /// person gave that tab something of their own since it was last handed a message, so what it
+    /// sends is their new task rather than its answer to another agent.
+    pub fn new_chain(&mut self, tab: u64) {
+        self.received.remove(&tab);
     }
 
     /// Forgets everything about the tab `tab`, which was closed: its keys are never used again,

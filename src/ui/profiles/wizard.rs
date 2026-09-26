@@ -16,6 +16,9 @@ use crate::profile::{
 };
 use crate::provider::{Model, ProviderEntry};
 
+use crate::desktop::callback;
+use crate::desktop::login::SignIn;
+
 use super::recipe;
 use super::work::{LoginContainer, Problem};
 
@@ -106,6 +109,8 @@ pub enum Login {
         /// one holding it.
         container: Arc<LoginContainer>,
     },
+    /// The harness's window is open on the person's screen and they are signing in there.
+    Window(WindowLogin),
     /// The harness has stopped and the login is being looked for and stored.
     Storing,
     /// A login was found and stored; the number is how many files it took.
@@ -128,6 +133,80 @@ impl Login {
     #[must_use]
     pub fn is_busy(&self) -> bool {
         matches!(self, Self::Opening | Self::Storing)
+    }
+}
+
+/// A window opened for a login: what was made for it, what the wizard is waiting on, and what came
+/// of the sign-in page the window asked for.
+#[derive(Debug)]
+pub struct WindowLogin {
+    /// Which opening of the window this is, so an answer of an earlier one is told apart.
+    pub run: u64,
+    /// The window, its home and this machine's folders. Shared because whoever clears it away —
+    /// the page, or the wizard closing — may not be the one holding it.
+    pub sign_in: Arc<SignIn>,
+    /// The task that looks for the login while the window is open, so it can be stopped.
+    pub looking: Option<TaskId>,
+    /// The page the window asked to have opened last, and where it was shown.
+    pub page: Option<(String, Page)>,
+    /// The way back of that page's sign-in, by its port.
+    pub back: Option<(u16, WindowBack)>,
+}
+
+/// Where the page a sign-in window asked for was shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Page {
+    /// It is on its way to the person's browser.
+    Asked,
+    /// The person's browser opened it.
+    InBrowser,
+    /// Nothing could show it; the person is given the address instead.
+    Nowhere,
+    /// It was held back, because its sign-in could not come back to this machine.
+    Held,
+}
+
+/// What happened to the way back of a window's sign-in.
+#[derive(Debug)]
+pub enum WindowBack {
+    /// QCode listens for it; dropping the stop gives the port up.
+    Listening(callback::Stop),
+    /// It came back and reached the application.
+    Returned,
+    /// Nothing came back in time.
+    TimedOut,
+    /// Another program holds the port.
+    Taken,
+    /// The system would not listen there, in its own words.
+    Refused(String),
+}
+
+impl WindowLogin {
+    /// A window just opened, with nothing asked of it yet.
+    #[must_use]
+    pub fn new(run: u64, sign_in: Arc<SignIn>) -> Self {
+        Self { run, sign_in, looking: None, page: None, back: None }
+    }
+
+    /// Whether the way back on `port` is being listened for already.
+    #[must_use]
+    pub fn listens_on(&self, port: u16) -> bool {
+        matches!(&self.back, Some((listened, WindowBack::Listening(_))) if *listened == port)
+    }
+
+    /// Takes the end of a listening, when it is the one still held: `id` tells a listening that
+    /// was replaced by a later one apart.
+    pub fn came_back(&mut self, id: u64, ending: callback::Ending) {
+        let Some((port, WindowBack::Listening(stop))) = &self.back else { return };
+        if stop.id() != id {
+            return;
+        }
+        let port = *port;
+        self.back = match ending {
+            callback::Ending::Returned => Some((port, WindowBack::Returned)),
+            callback::Ending::TimedOut => Some((port, WindowBack::TimedOut)),
+            callback::Ending::Stopped => None,
+        };
     }
 }
 
@@ -157,7 +236,7 @@ pub struct Draft {
     pub assets: MountAccess,
     /// What the container may reach.
     pub network: NetworkMode,
-    /// The parts of QCode high's additions switched off. Kept while another template or harness
+    /// The parts of a QCode template's additions switched off. Kept while another template or harness
     /// is looked at, so going back finds them as they were left; only the ones the chosen
     /// template and harness add reach the profile.
     pub without: Vec<Extra>,
@@ -175,6 +254,9 @@ pub struct Draft {
     only_login: bool,
     /// Whether this draft exists only to build an existing profile's image again.
     only_rebuild: bool,
+    /// The profile as it stood when the person asked to change it, while the draft changes one
+    /// that exists: what tells a change of the image, or of the sign-in, from one that is not.
+    editing: Option<Profile>,
 }
 
 /// Why a step cannot be left yet.
@@ -190,6 +272,8 @@ pub enum Blocked {
     NoProvider,
     /// The chosen system does not run the chosen harness, for this reason.
     Unsupported(Refusal),
+    /// Chromium is on, and the chosen system has none that runs in a container.
+    NoChromium,
 }
 
 impl Draft {
@@ -220,6 +304,7 @@ impl Draft {
             taken: taken.into_iter().collect(),
             only_login: false,
             only_rebuild: false,
+            editing: None,
         };
         draft.name = draft.suggested_name();
         draft
@@ -249,6 +334,7 @@ impl Draft {
             taken: Vec::new(),
             only_login: true,
             only_rebuild: false,
+            editing: None,
         }
     }
 
@@ -265,11 +351,74 @@ impl Draft {
         }
     }
 
-    /// Whether the build failed because a step of QCode high could not download what it
-    /// installs, which the step says in words of its own (`recipe::HIGH_FAILED`) in the log.
+    /// A draft that changes `profile`: the whole wizard, from its first page, with everything the
+    /// profile says already chosen and `providers` offered on the account page. The name stays as
+    /// it is, because the profile's image, its login and every workspace's home of it are named
+    /// after it.
     #[must_use]
-    pub fn high_download_failed(&self) -> bool {
-        matches!(self.build, Build::Failed(_)) && self.log.iter().any(|line| line.text().contains(recipe::HIGH_FAILED))
+    pub fn for_edit(profile: &Profile, providers: Vec<ProviderEntry>) -> Self {
+        let mut draft = Self {
+            stage: Stage::Harness,
+            build: Build::Waiting,
+            only_login: false,
+            editing: Some(profile.clone()),
+            ..Self::for_login(profile)
+        };
+        draft.offer_providers(providers);
+        draft
+    }
+
+    /// Whether this draft changes a profile that exists.
+    #[must_use]
+    pub fn is_editing(&self) -> bool {
+        self.editing.is_some()
+    }
+
+    /// Whether saving the changes builds the image again: the recipe of the profile as it is now
+    /// is not the recipe it was built from. The harness, the template and its parts, the system,
+    /// and an account whose kind the image is kept to all change the recipe; the network, the
+    /// access to `Assets/` and the provider's model do not, since they belong to the containers.
+    #[must_use]
+    pub fn rebuilds(&self) -> bool {
+        let (Some(before), Some(after)) = (&self.editing, self.profile()) else { return false };
+        recipe::image(before).revision() != recipe::image(&after).revision()
+    }
+
+    /// Whether the changes need a new sign-in: the profile signs in, and either with another kind
+    /// of account or to another harness than the login it has was made for.
+    #[must_use]
+    pub fn signs_in_again(&self) -> bool {
+        let Some(before) = &self.editing else { return false };
+        self.account.needs_login() && (self.account != before.account || self.harness != before.harness)
+    }
+
+    /// Whether the build failed because a step of QCode extra could not download what it
+    /// installs, which the step says in words of its own (`recipe::EXTRA_FAILED`) in the log.
+    #[must_use]
+    pub fn extra_download_failed(&self) -> bool {
+        matches!(self.build, Build::Failed(_)) && self.log.iter().any(|line| line.text().contains(recipe::EXTRA_FAILED))
+    }
+
+    /// Whether the build failed because a step of Quvyta development could not download what it
+    /// installs, which the step says in words of its own (`recipe::DEV_FAILED`) in the log.
+    #[must_use]
+    pub fn dev_download_failed(&self) -> bool {
+        matches!(self.build, Build::Failed(_)) && self.log.iter().any(|line| line.text().contains(recipe::DEV_FAILED))
+    }
+
+    /// Whether the build failed because a step of QCode recommended could not download what it
+    /// installs, which the step says in words of its own (`recipe::RECOMMENDED_FAILED`) in the log.
+    #[must_use]
+    pub fn recommended_download_failed(&self) -> bool {
+        matches!(self.build, Build::Failed(_))
+            && self.log.iter().any(|line| line.text().contains(recipe::RECOMMENDED_FAILED))
+    }
+
+    /// Whether the build failed because a step of oh my opencode slim could not download what it
+    /// installs, which the step says in words of its own (`recipe::SLIM_FAILED`) in the log.
+    #[must_use]
+    pub fn slim_download_failed(&self) -> bool {
+        matches!(self.build, Build::Failed(_)) && self.log.iter().any(|line| line.text().contains(recipe::SLIM_FAILED))
     }
 
     /// Whether this draft is only a login for a profile that already exists.
@@ -300,6 +449,11 @@ impl Draft {
         }
         if changed || !harness.supports(self.account) {
             self.account = first_account(harness);
+        }
+        // A template this harness is not offered, chosen for the one before, would build an image
+        // the page never showed.
+        if !Template::offered(harness).contains(&self.template) {
+            self.template = Template::Recommended;
         }
     }
 
@@ -360,9 +514,13 @@ impl Draft {
 
     /// The pages this draft goes through. A profile that signs in to nothing has no sign-in
     /// page: a step that could only say "nothing to do" would still have to be walked through.
+    ///
+    /// A profile being changed has one only when the changes need a new sign-in: the login it
+    /// has is kept otherwise, and asking for it again would only make the person do it twice.
     #[must_use]
     pub fn stages(&self) -> &'static [Stage] {
-        if self.account.needs_login() { &Stage::ALL } else { &Stage::WITHOUT_LOGIN }
+        let signs_in = self.account.needs_login() && (self.editing.is_none() || self.signs_in_again());
+        if signs_in { &Stage::ALL } else { &Stage::WITHOUT_LOGIN }
     }
 
     /// The profile the draft describes, if the name is usable and, for a provider account, both
@@ -400,8 +558,8 @@ impl Draft {
         self.offers(extra) && !self.without.contains(&extra)
     }
 
-    /// Whether anything at all is added to the image beside what QCode basic writes: false for
-    /// QCode basic and base, and for QCode high with every part switched off.
+    /// Whether anything at all is added to the image beside the harness and its settings: false
+    /// for base, and for a QCode template with every part switched off.
     #[must_use]
     pub fn adds_anything(&self) -> bool {
         self.template.extras(self.harness).into_iter().any(|extra| self.has(extra))
@@ -433,6 +591,8 @@ impl Draft {
             // A harness the system cannot run is never built there: the page says why and stays
             // until the person picks another system or goes back for another harness.
             Stage::System => self.os.refuses(self.harness).map(Blocked::Unsupported),
+            // Said where the part is switched, which is where it can be switched off.
+            Stage::Template if self.has(Extra::Chromium) && self.os.chromium().is_none() => Some(Blocked::NoChromium),
             Stage::Account if self.account == AccountKind::Provider && self.profile_provider().is_none() => {
                 Some(Blocked::NoProvider)
             }

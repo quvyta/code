@@ -6,12 +6,15 @@
 //! ```text
 //! {"token":"…","op":"list"}
 //! {"token":"…","op":"send","tab":"3","text":"Please run the tests."}
+//! {"token":"…","op":"inbox"}
+//! {"token":"…","op":"peek"}
 //! ```
 //!
 //! An answer carries the words the agent is shown, whether it was done, and for a list the tabs:
 //!
 //! ```text
-//! {"ok":true,"text":"…","tabs":[{"tab":"3","title":"codex-main","harness":"Codex","profile":"codex-main","network":true,"waiting":0,"trouble":null}]}
+//! {"ok":true,"text":"…","tabs":[{"tab":"3","title":"codex-main","harness":"Codex","profile":"codex-main","network":true,"inbox":false,"waiting":0,"trouble":null}]}
+//! {"ok":true,"text":"…","messages":[{"from":"Codex · codex-main","text":"Please run the tests."}]}
 //! {"ok":false,"text":"…"}
 //! ```
 //!
@@ -51,6 +54,12 @@ pub enum Request {
         /// The message.
         text: String,
     },
+    /// Every message waiting for the asking tab, taken out of it: how the agent of a tab that has
+    /// no prompt to type into (a window) receives what was sent to it.
+    Inbox,
+    /// The messages waiting for the asking tab, left where they are: how a window's own watcher
+    /// learns that there is something for its agent to take, without taking it.
+    Peek,
 }
 
 /// A line that is not a question.
@@ -74,6 +83,8 @@ pub fn parse(line: &str) -> Result<Question, Malformed> {
     let request = match object.get("op").and_then(Value::as_str) {
         Some("list") => Request::List,
         Some("send") => Request::Send { tab: text("tab")?, text: text("text")? },
+        Some("inbox") => Request::Inbox,
+        Some("peek") => Request::Peek,
         _ => return Err(Malformed),
     };
     Ok(Question { token, request })
@@ -92,12 +103,25 @@ pub struct Listed {
     pub profile: String,
     /// Whether the tab's container reaches the network.
     pub network: bool,
+    /// Whether the tab takes messages only when its agent checks its inbox, because it has no
+    /// prompt they could be typed into: a window. A sender reads it to know that a message it
+    /// leaves there is not in front of that agent until then.
+    pub inbox: bool,
     /// How many messages are still waiting to be typed into the tab's harness. A sending agent
     /// reads it to see that what it sent has not arrived yet.
     pub waiting: usize,
     /// Why the waiting messages have not been typed in, when something is stopping them, in the
     /// words the agent is shown. `None` while nothing is.
     pub trouble: Option<String>,
+}
+
+/// A message taken out of a tab's inbox, as the inbox answers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Received {
+    /// Who sent it: the harness and the title of the sending tab.
+    pub from: String,
+    /// The message.
+    pub text: String,
 }
 
 /// QCode's answer to a question.
@@ -109,25 +133,33 @@ pub struct Answer {
     pub text: String,
     /// The tabs, for an answer to [`Request::List`].
     pub tabs: Option<Vec<Listed>>,
+    /// The messages, for an answer to [`Request::Inbox`].
+    pub messages: Option<Vec<Received>>,
 }
 
 impl Answer {
     /// A question answered: `text` says what was done.
     #[must_use]
     pub fn done(text: String) -> Self {
-        Self { ok: true, text, tabs: None }
+        Self { ok: true, text, tabs: None, messages: None }
     }
 
     /// A question refused: `text` says why.
     #[must_use]
     pub fn refused(text: String) -> Self {
-        Self { ok: false, text, tabs: None }
+        Self { ok: false, text, tabs: None, messages: None }
     }
 
     /// The list of `tabs`, told in `text` too.
     #[must_use]
     pub fn listed(text: String, tabs: Vec<Listed>) -> Self {
-        Self { ok: true, text, tabs: Some(tabs) }
+        Self { ok: true, text, tabs: Some(tabs), messages: None }
+    }
+
+    /// The `messages` taken out of the asking tab's inbox, told in `text` too.
+    #[must_use]
+    pub fn received(text: String, messages: Vec<Received>) -> Self {
+        Self { ok: true, text, tabs: None, messages: Some(messages) }
     }
 
     /// The answer as the line written back: JSON on one line, ending in a newline. JSON never
@@ -147,12 +179,18 @@ impl Answer {
                         "harness": tab.harness,
                         "profile": tab.profile,
                         "network": tab.network,
+                        "inbox": tab.inbox,
                         "waiting": tab.waiting,
                         "trouble": tab.trouble,
                     })
                 })
                 .collect();
             object.insert("tabs".to_owned(), Value::Array(tabs));
+        }
+        if let Some(messages) = &self.messages {
+            let messages =
+                messages.iter().map(|message| json!({ "from": message.from, "text": message.text })).collect();
+            object.insert("messages".to_owned(), Value::Array(messages));
         }
         let mut line = Value::Object(object).to_string();
         line.push('\n');
@@ -177,6 +215,28 @@ mod tests {
                 request: Request::Send { tab: "3".to_owned(), text: "run the tests\nplease".to_owned() }
             })
         );
+        assert_eq!(
+            parse(r#"{"token":"abc","op":"inbox"}"#),
+            Ok(Question { token: "abc".to_owned(), request: Request::Inbox })
+        );
+        assert_eq!(
+            parse(r#"{"token":"abc","op":"peek"}"#),
+            Ok(Question { token: "abc".to_owned(), request: Request::Peek })
+        );
+    }
+
+    #[test]
+    fn an_inbox_carries_each_message_with_its_sender() {
+        let messages = vec![
+            Received { from: "Codex · codex-main".to_owned(), text: "run the tests\nplease".to_owned() },
+            Received { from: "opencode · oc".to_owned(), text: "done".to_owned() },
+        ];
+        let line = Answer::received("two messages".to_owned(), messages).line();
+        let back: Value = serde_json::from_str(line.trim_end()).expect("the answer is JSON");
+        assert_eq!(back["messages"][0]["from"], "Codex · codex-main");
+        assert_eq!(back["messages"][0]["text"], "run the tests\nplease");
+        assert_eq!(back["messages"][1]["from"], "opencode · oc");
+        assert!(back.get("tabs").is_none());
     }
 
     #[test]
@@ -224,6 +284,7 @@ mod tests {
             harness: "Codex".to_owned(),
             profile: "codex-main".to_owned(),
             network: false,
+            inbox: true,
             waiting: 2,
             trouble: Some("the harness in that tab is not running".to_owned()),
         };
@@ -234,6 +295,7 @@ mod tests {
         assert_eq!(back["tabs"][0]["harness"], "Codex");
         assert_eq!(back["tabs"][0]["network"], Value::Bool(false));
         assert_eq!(back["tabs"][0]["waiting"], 2);
+        assert_eq!(back["tabs"][0]["inbox"], Value::Bool(true));
         assert_eq!(back["tabs"][0]["trouble"], "the harness in that tab is not running");
     }
 
@@ -245,6 +307,7 @@ mod tests {
             harness: "Codex".to_owned(),
             profile: "codex-main".to_owned(),
             network: true,
+            inbox: false,
             waiting: 0,
             trouble: None,
         };

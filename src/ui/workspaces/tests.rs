@@ -644,8 +644,17 @@ fn deleting_a_workspace_asks_once_naming_what_goes_and_takes_exactly_that() {
         ["rm --force qcode-firefly-base", "rm --force qcode-firefly-claude", "volume rm qcode-home-firefly-claude"],
         "exactly Firefly's containers and home, and nothing of Serenity's or of the profile's"
     );
+    let images: Vec<String> = asked(&log).into_iter().filter(|line| line.starts_with("image rm")).collect();
+    assert_eq!(
+        images,
+        ["image rm --force qcode/workspace/firefly/claude"],
+        "what its administrator installed goes too"
+    );
     assert!(!store.workspaces_dir().join("firefly").exists(), "the folder is gone");
     assert!(store.workspaces_dir().join("serenity").is_dir(), "the other workspace stays");
+    // The toast names Firefly too. Its life runs on the harness's clock, which moves only as fast
+    // as this machine draws, so it is let go here rather than waited out.
+    harness.advance(Duration::from_secs(10));
     settle(&mut harness, |harness| !harness.screen().contains("Firefly"));
     assert!(!harness.screen().contains("Firefly"), "and the list says so:\n{}", harness.screen());
     assert_eq!(harness.app().deleted, ["firefly"], "the application is told, once");
@@ -760,4 +769,364 @@ fn a_new_workspace_is_the_first_row_of_the_list_for_the_pointer_and_the_keyboard
     harness.press("enter").render();
     assert!(matches!(harness.app().state.overlay, Some(Overlay::New(_))), "Enter on it opens the dialog");
     assert!(harness.app().opened.is_empty(), "and no workspace was opened on the way");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_copied_folder_keeps_its_links_as_links_with_the_same_targets() {
+    use std::os::unix::fs::symlink;
+    // A project that keeps `LICENSE -> ../../LICENSE` loses it when the link is dropped, and gains
+    // a stranger's file when the link is followed; the copy holds the link itself.
+    let scratch = Scratch::new("links");
+    let source = scratch.path().join("source");
+    fs::create_dir_all(source.join("crates").join("app")).expect("a source tree");
+    fs::write(source.join("LICENSE"), "MIT").expect("a file");
+    let outside = scratch.path().join("elsewhere.txt");
+    fs::write(&outside, "not theirs to copy").expect("a file outside");
+    symlink("../../LICENSE", source.join("crates").join("app").join("LICENSE")).expect("a relative link");
+    symlink(&outside, source.join("absolute")).expect("an absolute link");
+    symlink("no/such/thing", source.join("dangling")).expect("a dangling link");
+    let store = scratch.path().join("store");
+
+    let mut harness = screen(&store, None);
+    harness.send(Msg::Start).render();
+    typed(&mut harness, "Firefly");
+    harness.click_text("A folder").render();
+    harness.send(Msg::Picker(qframe::widgets::FilePickerMsg::Open(source.clone()))).advance(Duration::from_millis(50));
+    harness.click_text("Choose folder").render();
+    harness.click_text("Create").render();
+    let work = store.join("Workspaces").join("firefly").join("Work");
+    settle(&mut harness, |_| work.join("dangling").symlink_metadata().is_ok());
+
+    for (link, target) in [
+        (work.join("crates").join("app").join("LICENSE"), PathBuf::from("../../LICENSE")),
+        (work.join("absolute"), outside.clone()),
+        (work.join("dangling"), PathBuf::from("no/such/thing")),
+    ] {
+        let kind =
+            link.symlink_metadata().unwrap_or_else(|_| panic!("{} is there:\n{}", link.display(), harness.screen()));
+        assert!(kind.file_type().is_symlink(), "{} is a link", link.display());
+        assert_eq!(fs::read_link(&link).expect("readable"), target, "{} points where it did", link.display());
+    }
+    assert_eq!(fs::read_to_string(work.join("crates").join("app").join("LICENSE")).expect("it reads"), "MIT");
+    assert!(source.join("absolute").symlink_metadata().is_ok(), "their own folder is untouched");
+}
+
+/// A folder of the person's own with a file and a folder in it, and what it holds, path by path
+/// with each file's contents, to compare before and after.
+fn own_folder(scratch: &Scratch) -> PathBuf {
+    let own = scratch.path().join("my project");
+    fs::create_dir_all(own.join("src")).expect("the person's folder");
+    fs::write(own.join("src").join("main.rs"), "fn main() {}").expect("their code");
+    fs::write(own.join("notes.md"), "mine").expect("their notes");
+    fs::canonicalize(own).expect("it is there")
+}
+
+/// Everything below `folder`, path by path, with each file's contents.
+fn holdings(folder: &Path) -> Vec<(PathBuf, Option<String>)> {
+    let mut found = Vec::new();
+    let mut todo = vec![folder.to_path_buf()];
+    while let Some(dir) = todo.pop() {
+        for entry in fs::read_dir(&dir).expect("readable").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                todo.push(path.clone());
+                found.push((path, None));
+            } else {
+                found.push((path.clone(), Some(fs::read_to_string(&path).expect("readable"))));
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Makes `Firefly` from `folder` the way a person does: the name, "A folder", the folder opened in
+/// the browser and chosen, "Use it where it is", then Create.
+fn make_in_place(harness: &mut Harness<Screen>, folder: &Path) {
+    harness.send(Msg::Start).render();
+    typed(harness, "Firefly");
+    harness.click_text("A folder").render();
+    harness
+        .send(Msg::Picker(qframe::widgets::FilePickerMsg::Open(folder.to_path_buf())))
+        .advance(Duration::from_millis(50));
+    harness.click_text("Choose folder").render();
+    harness.click_text("Use it where it is").render();
+}
+
+#[test]
+fn a_folder_used_where_it_is_is_not_copied_and_the_workspace_names_it() {
+    let scratch = Scratch::new("in-place");
+    let own = own_folder(&scratch);
+    let before = holdings(&own);
+    let store = scratch.path().join("store");
+
+    let mut harness = screen(&store, None);
+    make_in_place(&mut harness, &own);
+    let text = harness.screen();
+    assert!(text.contains("change your real files"), "the choice says what it means:\n{text}");
+    assert!(text.contains("Folder to work in"), "{text}");
+    harness.click_text("Create").render();
+    settle(&mut harness, |harness| harness.app().state.overlay.is_none());
+
+    let workspace = store.join("Workspaces").join("firefly");
+    assert!(workspace.join("workspace.qcode").is_file(), "the workspace is made:\n{}", harness.screen());
+    assert!(!workspace.join("Work").exists(), "nothing is copied, not even an empty Work");
+    let file = Store::new(&store).read_workspace(&crate::store::WorkspaceId::parse("firefly").expect("an id"));
+    let file = file.value.expect("readable");
+    assert_eq!(file.folder.as_deref(), Some(own.as_path()), "the workspace names the real folder");
+    assert_eq!(Store::new(&store).paths_of(&file).code, own, "and works in it");
+    assert_eq!(holdings(&own), before, "the person's folder is exactly as it was");
+    settle(&mut harness, |harness| harness.screen().contains("Firefly"));
+    assert!(!harness.screen().contains("Broken"), "a whole workspace:\n{}", harness.screen());
+}
+
+#[test]
+fn copying_stays_the_default_for_a_folder() {
+    let scratch = Scratch::new("in-place-default");
+    let own = own_folder(&scratch);
+    let store = scratch.path().join("store");
+    let mut harness = screen(&store, None);
+    harness.send(Msg::Start).render();
+    typed(&mut harness, "Firefly");
+    harness.click_text("A folder").render();
+    assert!(bold(&harness, "Copy it into QCode"), "{}", harness.screen());
+    assert!(!bold(&harness, "Use it where it is"), "{}", harness.screen());
+    harness.send(Msg::Picker(qframe::widgets::FilePickerMsg::Open(own.clone()))).advance(Duration::from_millis(50));
+    harness.click_text("Choose folder").render();
+    harness.click_text("Create").render();
+    let work = store.join("Workspaces").join("firefly").join("Work");
+    settle(&mut harness, |_| work.join("notes.md").is_file());
+    assert!(work.join("src").join("main.rs").is_file(), "copied:\n{}", harness.screen());
+}
+
+#[test]
+fn a_folder_inside_the_qcode_folder_is_not_used_where_it_is() {
+    // Another workspace's Work, used in place, would go when that workspace is deleted.
+    let scratch = Scratch::new("in-place-store");
+    let store = scratch.path().join("store");
+    let other = Store::new(&store).create_workspace("Serenity", qframe::date::Date::today_utc()).expect("made");
+    let inside = Store::new(&store).workspace_paths(&other.id).code;
+    let mut harness = screen(&store, None);
+    make_in_place(&mut harness, &inside);
+    harness.click_text("Create").render();
+    let text = harness.screen();
+    assert!(text.contains("inside one another"), "{text}");
+    assert!(!store.join("Workspaces").join("firefly").exists(), "nothing was made");
+}
+
+/// A store holding Firefly, which works in `folder` where it stands.
+fn in_place_workspace(scratch: &Scratch, folder: &Path) -> Store {
+    let store = Store::new(scratch.path());
+    store.create_workspace_in("Firefly", qframe::date::Date::today_utc(), Some(folder.to_path_buf())).expect("made");
+    store
+}
+
+#[cfg(unix)]
+#[test]
+fn deleting_a_workspace_used_in_place_says_the_folder_stays_and_leaves_every_file_of_it() {
+    let scratch = Scratch::new("in-place-delete");
+    let own_scratch = Scratch::new("in-place-delete-own");
+    let own = own_folder(&own_scratch);
+    let before = holdings(&own);
+    let store = in_place_workspace(&scratch, &own);
+    let (engine, log) = stand_in(&scratch, "qcode-firefly-base\texited\n", "");
+    let mut harness = screen(scratch.path(), Some(engine));
+
+    ask_about_firefly(&mut harness);
+    settle(&mut harness, |harness| harness.screen().contains("Delete Firefly?"));
+    let text = harness.screen().split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(text.contains("is yours and is not deleted"), "{text}");
+    assert!(!text.contains("the code in Work"), "no code of the workspace's own goes:\n{text}");
+    harness.press("tab").press("enter").render();
+    settle(&mut harness, |harness| harness.screen().contains("Firefly was deleted"));
+
+    assert!(harness.screen().contains("Firefly was deleted"), "{}", harness.screen());
+    assert_eq!(removals(&log), ["rm --force qcode-firefly-base"]);
+    assert!(!store.workspaces_dir().join("firefly").exists(), "the workspace goes");
+    assert_eq!(holdings(&own), before, "the folder it worked in is exactly as it was");
+}
+
+#[test]
+fn a_workspace_file_that_puts_its_folder_inside_the_workspace_keeps_both_when_deleted() {
+    // Only a file written by hand can say this; deleting the workspace folder would take the
+    // person's folder with it, so neither goes and the toast says why.
+    let scratch = Scratch::new("in-place-inside");
+    let store = Store::new(scratch.path());
+    let root = store.workspaces_dir().join("firefly");
+    let own = root.join("mine");
+    fs::create_dir_all(&own).expect("a folder inside the workspace");
+    fs::write(own.join("notes.md"), "mine").expect("their notes");
+    let own = fs::canonicalize(own).expect("there");
+    let mut file = crate::store::WorkspaceFile::new(
+        crate::store::WorkspaceId::parse("firefly").expect("an id"),
+        "Firefly",
+        qframe::date::Date::today_utc(),
+    );
+    file.folder = Some(own.clone());
+    store.write_workspace(&file).expect("written");
+
+    let mut harness = screen(scratch.path(), None);
+    ask_about_firefly(&mut harness);
+    settle(&mut harness, |harness| harness.screen().contains("Delete Firefly?"));
+    harness.press("tab").press("enter").render();
+    settle(&mut harness, |harness| harness.screen().contains("only partly deleted"));
+    assert!(own.join("notes.md").is_file(), "their file is there:\n{}", harness.screen());
+    assert!(harness.app().deleted.is_empty(), "and nothing claims it was deleted");
+}
+
+/// A store holding Firefly with a folder of the person's inside its own, which Firefly's file
+/// names as `named(store, the folder)`, and the person's folder.
+fn folder_inside_named(scratch: &Scratch, named: impl Fn(&Store, &Path) -> PathBuf) -> (Store, PathBuf) {
+    let store = Store::new(scratch.path());
+    let own = store.workspaces_dir().join("firefly").join("mine");
+    fs::create_dir_all(&own).expect("a folder inside the workspace");
+    fs::write(own.join("notes.md"), "mine").expect("their notes");
+    let mut file = crate::store::WorkspaceFile::new(
+        crate::store::WorkspaceId::parse("firefly").expect("an id"),
+        "Firefly",
+        qframe::date::Date::today_utc(),
+    );
+    file.folder = Some(named(&store, &own));
+    store.write_workspace(&file).expect("written");
+    (store, own)
+}
+
+/// Deletes Firefly from the screen, answering the question, and waits for the toast.
+fn delete_firefly(scratch: &Scratch) -> Harness<Screen> {
+    let mut harness = screen(scratch.path(), None);
+    ask_about_firefly(&mut harness);
+    settle(&mut harness, |harness| harness.screen().contains("Delete Firefly?"));
+    harness.press("tab").press("enter").render();
+    settle(&mut harness, |harness| harness.screen().contains("deleted"));
+    harness
+}
+
+#[cfg(unix)]
+#[test]
+fn a_workspace_file_that_reaches_its_folder_through_a_link_keeps_both_when_deleted() {
+    let scratch = Scratch::new("in-place-link");
+    let links = Scratch::new("in-place-link-outside");
+    let link = links.path().join("mine");
+    let (_store, own) = folder_inside_named(&scratch, |_, own| {
+        std::os::unix::fs::symlink(own, &link).expect("a link to it from elsewhere");
+        link.clone()
+    });
+    let harness = delete_firefly(&scratch);
+    assert!(own.join("notes.md").is_file(), "their file is there:\n{}", harness.screen());
+    assert!(harness.screen().contains("only partly deleted"), "{}", harness.screen());
+    assert!(harness.app().deleted.is_empty(), "and nothing claims it was deleted");
+}
+
+#[test]
+fn a_workspace_file_that_reaches_its_folder_through_dots_keeps_both_when_deleted() {
+    let scratch = Scratch::new("in-place-dots");
+    let (_store, own) = folder_inside_named(&scratch, |store, _| {
+        fs::create_dir_all(store.workspaces_dir().join("serenity")).expect("a folder beside it");
+        store.workspaces_dir().join("serenity").join("..").join("firefly").join("mine")
+    });
+    let harness = delete_firefly(&scratch);
+    assert!(own.join("notes.md").is_file(), "their file is there:\n{}", harness.screen());
+    assert!(harness.app().deleted.is_empty(), "and nothing claims it was deleted");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_engine_that_stops_answering_while_a_workspace_is_deleted_is_named_and_said_to_be_stuck() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = Scratch::new("delete-stuck");
+    two_workspaces(&scratch);
+    let (engine, log) = stand_in(&scratch, CONTAINERS, VOLUMES);
+    // The same engine, except that removing a volume never comes back, the way podman does when
+    // it waits on a lock another of its processes holds.
+    let stuck = scratch.path().join("engine").join("stuck");
+    fs::create_dir_all(&stuck).expect("a folder for the stuck engine");
+    let bin = stuck.join("podman");
+    let script = format!(
+        "#!/bin/sh\n[ \"$1 $2\" = 'volume rm' ] && {{ echo \"$*\" >> '{log}'; exec sleep 600; }}\nexec '{engine}' \"$@\"\n",
+        log = log.display(),
+        engine = engine.bin().display(),
+    );
+    fs::write(&bin, script).expect("the stuck engine");
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).expect("runnable");
+    let engine = Engine::new(EngineKind::Podman, bin).answering_within(Duration::from_secs(2));
+    let mut harness = screen(scratch.path(), Some(engine));
+    ask_about_firefly(&mut harness);
+    settle(&mut harness, |harness| harness.screen().contains("Delete Firefly?"));
+    harness.press("tab").press("enter").render();
+    let words = |harness: &Harness<Screen>| harness.screen().split_whitespace().collect::<Vec<_>>().join(" ");
+    let started = std::time::Instant::now();
+    while !words(&harness).contains("stuck on a lock") {
+        assert!(started.elapsed() < Duration::from_secs(30), "never said:\n{}", harness.screen());
+        harness.advance(Duration::from_millis(20)).render();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let said = words(&harness);
+    assert!(said.contains("Podman did not answer in 2 seconds, so QCode stopped waiting"), "{said}");
+    assert!(said.contains("qcode-home-firefly-claude"), "the volume it was removing is named: {said}");
+    assert!(said.contains("Firefly was only partly deleted"), "{said}");
+}
+
+/// A harness over the store at `root` speaking Turkish from the first listing on.
+fn turkish_screen(root: &Path, engine: Option<Engine>) -> Harness<Screen> {
+    let state = Workspaces::new(Store::new(root), engine, Vec::new());
+    let mut harness =
+        Harness::with_env(Screen { state, opened: Vec::new(), deleted: Vec::new() }, env(), SIZE.0, SIZE.1);
+    harness.set_locale("tr").set_glyph_mode(GlyphMode::Unicode).set_reduced_motion(true);
+    harness.send(Msg::Refresh).render();
+    harness
+}
+
+#[test]
+fn a_broken_workspace_says_what_is_wrong_in_the_language_on_screen() {
+    // The list is read on a background thread, where the runtime's translator does not reach; the
+    // reasons are still in the person's language.
+    let scratch = Scratch::new("broken-turkish");
+    let store = Store::new(scratch.path());
+    let file = store.create_workspace("Firefly", qframe::date::Date::today_utc()).expect("made");
+    fs::remove_dir_all(store.workspace_paths(&file.id).assets).expect("removable");
+    let mut harness = turkish_screen(scratch.path(), None);
+    settle(&mut harness, |harness| harness.screen().contains("Bozuk"));
+    harness.click_text("Firefly").render();
+    let text = harness.screen();
+    assert!(text.contains("eksik") && !text.contains('⟦') && !text.contains("missing"), "{text}");
+}
+
+#[test]
+fn a_workspace_kept_because_its_folder_is_inside_says_why_in_the_language_on_screen() {
+    let scratch = Scratch::new("in-place-inside-turkish");
+    folder_inside_named(&scratch, |_, own| fs::canonicalize(own).expect("there"));
+    let mut harness = screen(scratch.path(), None);
+    ask_about_firefly(&mut harness);
+    settle(&mut harness, |harness| harness.screen().contains("Delete Firefly?"));
+    harness.set_locale("tr");
+    harness.press("tab").press("enter").render();
+    settle(&mut harness, |harness| harness.screen().contains("kısmen silindi"));
+    let text = harness.screen();
+    assert!(text.contains("düşmez") && !text.contains('⟦') && !text.contains("QCode's"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn what_a_copy_leaves_behind_is_logged_in_the_language_on_screen() {
+    // A socket is neither a file nor a folder: the copy names it and goes on.
+    let scratch = Scratch::new("copy-turkish");
+    let source = scratch.path().join("source");
+    fs::create_dir_all(&source).expect("a source tree");
+    fs::write(source.join("notes.md"), "mine").expect("a file");
+    let _socket = std::os::unix::net::UnixListener::bind(source.join("socket")).expect("a socket");
+    let store = scratch.path().join("store");
+
+    let mut harness = screen(&store, None);
+    harness.send(Msg::Start).render();
+    typed(&mut harness, "Firefly");
+    harness.click_text("A folder").render();
+    harness.send(Msg::Picker(qframe::widgets::FilePickerMsg::Open(source.clone()))).advance(Duration::from_millis(50));
+    harness.click_text("Choose folder").render();
+    harness.set_locale("tr").render();
+    harness.click_text("Oluştur").render();
+    settle(&mut harness, |harness| harness.app().state.overlay.is_none());
+    let lines: Vec<String> = harness.app().state.log.iter().map(|line| line.text().to_owned()).collect();
+    let socket = format!("{}: ne dosya ne klasör, olduğu yerde bırakıldı", source.join("socket").display());
+    assert!(lines.contains(&socket), "{lines:#?}");
 }

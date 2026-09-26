@@ -13,6 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use qframe::runtime::TaskCx;
+use qframe::t;
 
 use crate::base::{self, paths::CODE_DIR, paths::KEEP_ALIVE};
 use crate::engine::run::{EngineError, capture, stream};
@@ -72,9 +73,13 @@ pub fn run(job: &Job, cx: &TaskCx<Msg>) -> Result<Msg, String> {
 
 /// Copies everything below `from` into `into`, one folder at a time.
 ///
-/// Symbolic links are named and skipped rather than followed: a link into a parent folder would
-/// make the copy endless, and a link out of the tree would copy something the person did not
-/// choose. Stopping is checked before every folder, so a stop is noticed even in a deep tree.
+/// A symbolic link is made again as a link with the same target, word for word, rather than
+/// followed: a link into a parent folder would make the copy endless, a link out of the tree would
+/// copy something the person did not choose, and a project that keeps `LICENSE -> ../../LICENSE`
+/// needs the link itself, not a copy of the file or a hole where it was. A relative target stays
+/// relative, so it points inside the copy as it pointed inside the original; one pointing nowhere
+/// is kept pointing nowhere. Stopping is checked before every folder, so a stop is noticed even in
+/// a deep tree.
 fn copy_tree(from: &Path, into: &Path, cx: &TaskCx<Msg>) -> Result<(), String> {
     let mut todo = vec![(from.to_path_buf(), into.to_path_buf())];
     while let Some((source, target)) = todo.pop() {
@@ -89,18 +94,38 @@ fn copy_tree(from: &Path, into: &Path, cx: &TaskCx<Msg>) -> Result<(), String> {
             let kind = entry.file_type().map_err(|error| at(&source, &error))?;
             let (source, target) = (entry.path(), target.join(entry.file_name()));
             if kind.is_symlink() {
-                cx.send(Msg::Line(format!("{}: a link, left where it is", source.display())));
+                link(&source, &target).map_err(|error| at(&source, &error))?;
+                cx.send(Msg::Line(target.display().to_string()));
             } else if kind.is_dir() {
                 todo.push((source, target));
             } else if kind.is_file() {
                 fs::copy(&source, &target).map_err(|error| at(&source, &error))?;
                 cx.send(Msg::Line(target.display().to_string()));
             } else {
-                cx.send(Msg::Line(format!("{}: neither a file nor a folder, left where it is", source.display())));
+                cx.send(Msg::Line(t!("workspaces.copy.skipped", path = source.display().to_string())));
             }
         }
     }
     Ok(())
+}
+
+/// Makes `target` a symbolic link to what the link `source` points at, in its own words.
+#[cfg(unix)]
+fn link(source: &Path, target: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(fs::read_link(source)?, target)
+}
+
+/// Makes `target` a symbolic link to what the link `source` points at, in its own words. A link
+/// to a folder and one to a file are two different things here; one pointing nowhere is taken for
+/// a file.
+#[cfg(windows)]
+fn link(source: &Path, target: &Path) -> std::io::Result<()> {
+    let points_at = fs::read_link(source)?;
+    if fs::metadata(source).is_ok_and(|meta| meta.is_dir()) {
+        std::os::windows::fs::symlink_dir(points_at, target)
+    } else {
+        std::os::windows::fs::symlink_file(points_at, target)
+    }
 }
 
 /// The two engine commands a clone is made of: the container the clone borrows, and the clone
@@ -186,6 +211,7 @@ fn reason(error: EngineError) -> String {
         },
         // A stopped run is not a failure; `run` has already seen that it was cancelled.
         EngineError::Cancelled { .. } => String::new(),
+        EngineError::TimedOut { command, after } => crate::engine::run::timed_out(&command, after),
     }
 }
 

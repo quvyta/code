@@ -13,11 +13,12 @@ pub mod known;
 mod live;
 pub mod names;
 pub mod run;
+pub mod scratch;
 mod state;
 
 pub use command::{
-    Access, ContainerCreate, CopyIn, CopyOut, EngineCommand, Exec, HostUser, ImageBuild, Mount, MountSource, Network,
-    RunAttached, RunOnce, RunWindow, Socket, Tmpfs,
+    ANSWER_WITHIN, Access, ContainerCreate, CopyIn, CopyOut, EngineCommand, Exec, HostUser, ImageBuild, Mount,
+    MountSource, Network, RunAttached, RunOnce, RunWindow, Socket, Tmpfs,
 };
 pub(crate) use detect::installed;
 pub use detect::{Unavailable, detect};
@@ -60,13 +61,22 @@ impl EngineKind {
 pub struct Engine {
     kind: EngineKind,
     bin: PathBuf,
+    /// How long a question to it is given: [`ANSWER_WITHIN`], unless said otherwise.
+    answer_within: std::time::Duration,
 }
 
 impl Engine {
     /// An engine of `kind` run through the binary at `bin`.
     #[must_use]
     pub fn new(kind: EngineKind, bin: impl Into<PathBuf>) -> Self {
-        Self { kind, bin: bin.into() }
+        Self { kind, bin: bin.into(), answer_within: ANSWER_WITHIN }
+    }
+
+    /// The same engine, given `wait` rather than [`ANSWER_WITHIN`] to answer a question; what a
+    /// test uses to see a stuck engine without waiting a minute for it.
+    #[must_use]
+    pub fn answering_within(self, wait: std::time::Duration) -> Self {
+        Self { answer_within: wait, ..self }
     }
 
     /// Which engine this is.

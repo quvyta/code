@@ -36,7 +36,7 @@ case "$1 $2 $4" in
 'container inspect {{.State.Status}}') [ -e FOLDER/started ] && echo running || echo exited; exit 0 ;;
 'container inspect {{.Image}}') echo sha-old; exit 0 ;;
 'container inspect '*) echo DIGEST; exit 0 ;;
-'image inspect {{.Id}}') echo IMAGE; exit 0 ;;
+'image inspect {{.Id}}') case "$5" in qcode/workspace/*) exit 1 ;; esac; echo IMAGE; exit 0 ;;
 esac
 [ "$1" = start ] && touch FOLDER/started
 exit 0

@@ -293,6 +293,9 @@ mod tests {
         match question {
             Ok(Question { request: Request::Send { text, .. }, .. }) => Answer::done(text.clone()),
             Ok(Question { request: Request::List, .. }) => Answer::listed("none".to_owned(), Vec::new()),
+            Ok(Question { request: Request::Inbox | Request::Peek, .. }) => {
+                Answer::received("empty".to_owned(), Vec::new())
+            }
             Err(Malformed) => Answer::refused("malformed".to_owned()),
         }
     }

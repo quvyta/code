@@ -195,6 +195,7 @@ fn said(error: &EngineError) -> String {
         EngineError::NotRunnable { error, .. } => error.to_string(),
         EngineError::Failed(failure) => failure.output.trim().to_owned(),
         EngineError::Cancelled { .. } => String::new(),
+        EngineError::TimedOut { command, after } => crate::engine::run::timed_out(command, *after),
     }
 }
 
@@ -377,6 +378,9 @@ mod tests {
         assert_eq!(carried(&store, "serenity"), [] as [String; 0]);
         let firefly = crate::store::WorkspaceId::parse("firefly").expect("an identifier");
         assert!(!store.workspace_paths(&firefly).harness_profile("claude").exists(), "with its empty folder");
+        // The toast names claude too. Its life runs on the harness's clock, which moves only as
+        // fast as this machine draws, so it is let go here rather than waited out.
+        harness.advance(Duration::from_secs(10));
         settle(&mut harness, |harness| !harness.screen().contains("claude"));
         assert!(!harness.screen().contains("claude"), "and the list says so:\n{}", harness.screen());
     }

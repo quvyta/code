@@ -21,6 +21,7 @@ mod desktop;
 mod file_ops;
 mod files;
 mod history;
+mod keep;
 mod panel;
 mod plan;
 mod relay;
@@ -42,10 +43,13 @@ pub use desktop::Opening;
 pub use file_ops::{Change, FileError, NameProblem};
 pub use files::{DocumentTrouble, FileEntry, FileMsg, FileTree, NameFor, Naming};
 pub use history::HistoryKey;
+pub use keep::{BASE_LABEL as WORKSPACE_BASE_LABEL, enter_admin, image as workspace_image};
 pub use panel::{Panel, PanelWidget};
+#[cfg(test)]
+pub(crate) use plan::open_window as plan_open_window;
 pub use plan::{
     ASSETS_DIR, Bridge, CODE_DIR, ContainerPlan, HOME_DIR, KEEP_ALIVE, LaunchFailure, MCP_DIR, PLAN_LABEL, SHELL,
-    ensure_running, open_page,
+    ensure_running, ensure_running_noting, give_window_login, open_page,
 };
 pub use tab::{Back, Pages, Shown, Tab, TabKey, TabKind, TabState};
 pub use viewer::{MOST_TEXT, Taken};
@@ -77,7 +81,7 @@ use crate::profile::guidance::Unguided;
 use crate::profile::history::Conversation;
 use crate::profile::{HarnessKind, Profile, ProviderChoice};
 use crate::store::{
-    Registry, Session, SessionTab, SessionTabKind, SessionWorkspace, WorkspaceFile, WorkspaceId, WorkspacePaths,
+    Registry, Session, SessionTab, SessionTabKind, SessionWorkspace, Store, WorkspaceFile, WorkspaceId, WorkspacePaths,
     add_profile,
 };
 use crate::ui::profiles::work::Problem;
@@ -113,6 +117,11 @@ pub enum Msg {
     OpenTab(usize),
     /// A tab was closed.
     CloseTab(usize),
+    /// The person confirmed closing the tab `TabKey`, which still held messages from other tabs
+    /// or an agent that was still running.
+    CloseTabAnyway(TabKey),
+    /// What a closed tab had started inside its container was ended.
+    TabEnded,
     /// A tab was dragged to another place.
     MoveTab {
         /// Where it was.
@@ -346,6 +355,13 @@ pub enum Msg {
     /// The instruction files of a QCode high profile whose container came up could not be brought
     /// up to date in the workspace; the message that came with the start follows.
     Unguided(HarnessKind, Unguided, Box<Msg>),
+    /// The profile's image was rebuilt under a workspace that installed things of its own as the
+    /// administrator, and running this command again on the new image failed: the workspace stays
+    /// on the image it had. The profile's name, the command, and the message that came with the
+    /// start.
+    Behind(String, String, Box<Msg>),
+    /// "As administrator" was asked for in the container of the profile of this name.
+    OpenAdmin(String),
     /// Bringing a backup back finished.
     Restored {
         /// The workspace's id.
@@ -530,7 +546,8 @@ impl OpenWorkspace {
                 Some(ContainerPlan::base(self.id.as_str(), &self.paths))
             }
             TabKind::Markdown(_) | TabKind::Sound(_) => None,
-            TabKind::Profile(name) => self
+            // The administrator works in the same container the profile's harness tabs do.
+            TabKind::Profile(name) | TabKind::Admin(name) => self
                 .profiles
                 .iter()
                 .find(|profile| profile.name.as_str() == name)
@@ -554,6 +571,9 @@ impl OpenWorkspace {
     pub fn program(&self, tab: &Tab, editor: Editor) -> Option<Vec<String>> {
         match tab.kind() {
             TabKind::Shell => Some(plan::SHELL.iter().map(|part| (*part).to_owned()).collect()),
+            // Root's `bash` is started by the engine as root, which the tab's command says, not
+            // its program.
+            TabKind::Admin(_) => Some(vec!["bash".to_owned()]),
             TabKind::Profile(name) => {
                 let profile = self.profiles.iter().find(|profile| profile.name.as_str() == name)?;
                 let mut command = profile.harness.command_line(tab.conversation());
@@ -590,6 +610,7 @@ impl OpenWorkspace {
         let Some(tab) = self.tabs.get(index) else { return String::new() };
         match tab.kind() {
             TabKind::Profile(name) => name.clone(),
+            TabKind::Admin(name) => t!("workspace.tab.admin", profile = name.clone()),
             // The window's tab is labelled by its profile like a harness tab, with the mark that
             // says it is a window rather than a terminal.
             TabKind::Desktop(name) => t!("workspace.tab.window", profile = name.clone()),
@@ -894,7 +915,9 @@ impl WorkspaceScreen {
                 | TabKind::Pdf(file)
                 | TabKind::Office(file)
                 | TabKind::Sound(file) => files::is_inside(file),
-                TabKind::Shell | TabKind::Profile(_) | TabKind::Desktop(_) => workspace.plan(&kind).is_some(),
+                TabKind::Shell | TabKind::Profile(_) | TabKind::Desktop(_) | TabKind::Admin(_) => {
+                    workspace.plan(&kind).is_some()
+                }
             };
             if !usable {
                 continue;
@@ -926,21 +949,26 @@ impl WorkspaceScreen {
                 tabs: workspace
                     .tabs
                     .iter()
-                    .map(|tab| SessionTab {
-                        kind: match tab.kind() {
-                            TabKind::Shell => SessionTabKind::Shell,
-                            TabKind::Profile(name) => SessionTabKind::Profile(name.clone()),
-                            TabKind::New => SessionTabKind::New,
-                            TabKind::Image(file) => SessionTabKind::Image(file.clone()),
-                            TabKind::Markdown(file) => SessionTabKind::Markdown(file.clone()),
-                            TabKind::Editor(file) => SessionTabKind::Editor(file.clone()),
-                            TabKind::Pdf(file) => SessionTabKind::Pdf(file.clone()),
-                            TabKind::Office(file) => SessionTabKind::Office(file.clone()),
-                            TabKind::Sound(file) => SessionTabKind::Sound(file.clone()),
-                            TabKind::Desktop(name) => SessionTabKind::Desktop(name.clone()),
-                        },
-                        conversation: tab.conversation().map(str::to_owned),
-                        opened: tab.opened(),
+                    .filter_map(|tab| {
+                        Some(SessionTab {
+                            kind: match tab.kind() {
+                                // Root is given for the moment it was asked for, never by opening
+                                // QCode again.
+                                TabKind::Admin(_) => return None,
+                                TabKind::Shell => SessionTabKind::Shell,
+                                TabKind::Profile(name) => SessionTabKind::Profile(name.clone()),
+                                TabKind::New => SessionTabKind::New,
+                                TabKind::Image(file) => SessionTabKind::Image(file.clone()),
+                                TabKind::Markdown(file) => SessionTabKind::Markdown(file.clone()),
+                                TabKind::Editor(file) => SessionTabKind::Editor(file.clone()),
+                                TabKind::Pdf(file) => SessionTabKind::Pdf(file.clone()),
+                                TabKind::Office(file) => SessionTabKind::Office(file.clone()),
+                                TabKind::Sound(file) => SessionTabKind::Sound(file.clone()),
+                                TabKind::Desktop(name) => SessionTabKind::Desktop(name.clone()),
+                            },
+                            conversation: tab.conversation().map(str::to_owned),
+                            opened: tab.opened(),
+                        })
                     })
                     .collect(),
             })
@@ -994,6 +1022,7 @@ impl WorkspaceScreen {
                 let env: Vec<(&str, &str)> = env.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
                 Some(plan.enter_with(engine, &parts, &env))
             }
+            TabKind::Admin(_) => Some(keep::enter_admin(engine, &plan)),
             _ => Some(plan.enter(engine, &parts)),
         }
     }
@@ -1009,7 +1038,8 @@ impl WorkspaceScreen {
         let plan = workspace.plan(tab.kind())?;
         let program = viewer::text_command(tab.kind())?;
         let parts: Vec<&str> = program.iter().map(String::as_str).collect();
-        Some(engine.exec_without_terminal(&Exec { container: &plan.name, command: &parts }))
+        // Taking the text out of a long PDF takes as long as the PDF is long.
+        Some(engine.exec_without_terminal(&Exec { container: &plan.name, command: &parts }).unbounded())
     }
 
     /// The workspace of `id`, when the screen has it open.
@@ -1157,30 +1187,28 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
             Command::none()
         }
         Msg::CloseTab(index) => {
-            let silenced = match screen.workspace() {
-                Some(workspace) => {
-                    let tabs: Vec<&Tab> = workspace.tabs.get(index).into_iter().collect();
-                    Command::batch([
-                        sound::silence(screen, workspace, &tabs),
-                        desktop::close_all(screen, workspace, &tabs),
-                    ])
-                }
+            // Messages other agents left in the tab would go with it, and those agents were told
+            // their work was taken: the person decides that knowingly.
+            if let Some(tab) = screen.workspace().and_then(|workspace| workspace.tabs.get(index))
+                && !tab.letters().is_empty()
+            {
+                let name = screen.workspace().map(|workspace| workspace.tab_label(index)).unwrap_or_default();
+                return bridge::ask_close(tab.key(), &name, tab.letters().len());
+            }
+            // Closing ends the agent inside the container, so one in the middle of a task is cut
+            // off: a stray `ctrl+w` or a click on the `×` costs a question, never that work.
+            if let Some((key, harness)) = screen.workspace().and_then(|workspace| agent_running(workspace, index)) {
+                return ask_end(key, &harness);
+            }
+            close_tab(screen, index)
+        }
+        Msg::TabEnded => Command::none(),
+        Msg::CloseTabAnyway(key) => {
+            let index = screen.workspace().and_then(|workspace| workspace.tabs.iter().position(|tab| tab.key() == key));
+            match index {
+                Some(index) => close_tab(screen, index),
                 None => Command::none(),
-            };
-            let Some(workspace) = screen.workspaces.get_mut(screen.active) else { return Command::none() };
-            let mut gone = Vec::new();
-            let mut token = None;
-            if let Some(tab) = workspace.tabs.get_mut(index) {
-                tab.close_session();
-                gone.push(tab.key());
-                token = Some(tab.token().to_owned());
             }
-            if let Some(token) = token {
-                relay::closed(workspace, &[token]);
-            }
-            TabEdit::Close(index).apply(&mut workspace.tabs, &mut workspace.active_tab);
-            bridge::closed(screen, &gone);
-            silenced
         }
         Msg::MoveTab { from, to } => {
             if let Some(workspace) = screen.workspaces.get_mut(screen.active) {
@@ -1503,6 +1531,12 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
         Msg::Unguided(harness, trouble, message) => {
             Command::batch([unguided(harness, &trouble), update(screen, *message)])
         }
+        Msg::Behind(profile, failed, message) => {
+            let told = Toast::warning(t!("workspace.admin.behind-title", profile = profile.as_str()))
+                .body(t!("workspace.admin.behind", command = failed.as_str()));
+            Command::batch([Command::toast(told), update(screen, *message)])
+        }
+        Msg::OpenAdmin(profile) => open_tab(screen, TabKind::Admin(profile)),
         Msg::ContainerActed(result) => {
             let refresh = list_containers(screen);
             match result {
@@ -1605,6 +1639,79 @@ impl WorkspaceScreen {
         let entry = providers.get(&provider.tag)?;
         entry.model(&provider.model)?.window(entry.kind)
     }
+}
+
+/// The tab at `index` and the name of its harness, when an agent is at work in it: a harness tab
+/// whose program still runs, or a window that is open. The same tabs Ctrl+Q asks about, less the
+/// ones still starting: nothing runs in those yet, so closing one cuts no work off.
+///
+/// A profile no longer on the list still ran its harness, so the tab is named by the profile then.
+fn agent_running(workspace: &OpenWorkspace, index: usize) -> Option<(TabKey, String)> {
+    let tab = workspace.tabs.get(index)?;
+    if !tab.kind().runs_agent() || !matches!(tab.state(), TabState::Running) {
+        return None;
+    }
+    let name = tab.kind().profile()?;
+    let harness = workspace.profiles.iter().find(|profile| profile.name.as_str() == name);
+    Some((
+        tab.key(),
+        harness.map_or_else(|| name.to_owned(), |profile| profile.harness.record().display_name.to_owned()),
+    ))
+}
+
+/// Asks the person before the tab `key` is closed while `harness` is still running in it.
+fn ask_end(key: TabKey, harness: &str) -> Command<Msg> {
+    Command::confirm(
+        qframe::runtime::Confirm::new(t!("workspace.close-agent.title", harness = harness), Msg::CloseTabAnyway(key))
+            .message(t!("workspace.close-agent.message"))
+            .confirm_label(t!("workspace.close-agent.confirm"))
+            .cancel_label(t!("workspace.close-agent.cancel"))
+            .danger(),
+    )
+}
+
+/// Closes the tab at `index` of the open workspace: its program, its sound and its window stop,
+/// its relay and its place in the bridge's rules are let go.
+fn close_tab(screen: &mut WorkspaceScreen, index: usize) -> Command<Msg> {
+    // A harness tab's processes inside its container outlive the engine's command that started
+    // them, so they are ended by the tab's token.
+    let ending = screen
+        .workspace()
+        .and_then(|workspace| {
+            let tab = workspace.tabs.get(index)?;
+            if !matches!(tab.kind(), TabKind::Profile(_)) {
+                return None;
+            }
+            let plan = workspace.plan(tab.kind())?;
+            Some(plan.end_tab(screen.engine.as_ref()?, tab.token()))
+        })
+        .map_or_else(Command::none, |command| {
+            Command::perform(move || {
+                let _ = crate::engine::run::capture(&command);
+                Msg::TabEnded
+            })
+        });
+    let silenced = match screen.workspace() {
+        Some(workspace) => {
+            let tabs: Vec<&Tab> = workspace.tabs.get(index).into_iter().collect();
+            Command::batch([sound::silence(screen, workspace, &tabs), desktop::close_all(screen, workspace, &tabs)])
+        }
+        None => Command::none(),
+    };
+    let Some(workspace) = screen.workspaces.get_mut(screen.active) else { return Command::none() };
+    let mut gone = Vec::new();
+    let mut token = None;
+    if let Some(tab) = workspace.tabs.get_mut(index) {
+        tab.close_session();
+        gone.push(tab.key());
+        token = Some(tab.token().to_owned());
+    }
+    if let Some(token) = token {
+        relay::closed(workspace, &[token]);
+    }
+    TabEdit::Close(index).apply(&mut workspace.tabs, &mut workspace.active_tab);
+    bridge::closed(screen, &gone);
+    Command::batch([silenced, ending])
 }
 
 /// The provider and model a profile of `kind` runs on, when `kind` is a harness tab of a profile
@@ -1763,15 +1870,20 @@ fn show_page(screen: &mut WorkspaceScreen, again: bool) -> Command<Msg> {
         let plan = ContainerPlan::profile(&workspace.id, &workspace.paths, profile);
         let (engine, harness, answer, registry) = (engine.clone(), profile.harness, key.clone(), registry.clone());
         commands.push(Command::perform(move || {
-            // A container made from an image that has been built again since is made anew before
-            // it is read, since reading starts it and the tab would then take it as it is.
-            let renewed = plan::renew_rebuilt(&engine, &plan, user);
+            // A container made from an image that has been built again since, or from an earlier
+            // plan, is made anew before it is read, since reading starts it and the tab would
+            // then take it as it is.
+            let (renewed, behind) = plan::renew_stale(&engine, &plan, user);
             // Reading a stopped container starts it and leaves it running for the tab that opens
             // a conversation from it, so it is noted like any container QCode starts.
             let mut started = renewed;
             let container = plan.name;
             let read = history::read(&engine, &container, harness, &mut || started = true);
-            let message = Msg::HistoryRead(answer, generation, read);
+            let mut message = Msg::HistoryRead(answer.clone(), generation, read);
+            // The tab that opens next finds the container running and would never say it.
+            if let Some(failed) = behind {
+                message = Msg::Behind(answer.profile, failed, Box::new(message));
+            }
             if started { noted(registry.as_deref(), engine.kind(), &container, message) } else { message }
         }));
         commands.push(after(history::SHOW_AFTER, Msg::HistorySlow(key, generation)));
@@ -1943,7 +2055,9 @@ fn start(
             return answer(Err(LaunchFailure { command: String::new(), output: message, image_missing: false }));
         }
     }
-    let result = plan::ensure_running(engine, plan, user);
+    let noted_start = plan::ensure_running_noting(engine, plan, user);
+    let behind = noted_start.as_ref().ok().cloned().flatten();
+    let result = noted_start.map(|_| ());
     let up = result.is_ok();
     // Registered before the harness starts, so it finds the bridge's server at its first start.
     let unregistered = match &plan.bridge {
@@ -1956,22 +2070,25 @@ fn start(
     // meant to be from its first turn.
     let unguided = match plan.guidance {
         Some(harness) if up => {
-            let trouble = plan::guide(engine, &plan.name, &plan.code, harness, plan.graphify).err();
-            // After graphify's installer, which is what points the agent at the map; started and
-            // not waited for, so the harness starts at once.
-            if plan.graphify {
-                plan::build_map(engine, &plan.name, &plan.code);
-            }
-            trouble.map(|trouble| (harness, trouble))
+            plan::guide(engine, &plan.name, &plan.code, harness, plan.graphify).err().map(|trouble| (harness, trouble))
         }
         _ => None,
     };
+    // After graphify's installer under QCode high, which is what points the agent at the map;
+    // under QCode basic the image points it there already. Started and not waited for, so the
+    // harness starts at once.
+    if up && plan.graphify {
+        plan::build_map(engine, &plan.name, &plan.code);
+    }
     let mut message = answer(result);
     if let Some((harness, trouble)) = unregistered {
         message = Msg::Unbridged(harness, trouble, Box::new(message));
     }
     if let Some((harness, trouble)) = unguided {
         message = Msg::Unguided(harness, trouble, Box::new(message));
+    }
+    if let (Some(failed), Some(home)) = (behind, &plan.home) {
+        message = Msg::Behind(home.profile().to_string(), failed, Box::new(message));
     }
     if up { noted(registry, engine.kind(), &plan.name, message) } else { message }
 }
@@ -2142,10 +2259,18 @@ fn build_image(screen: &mut WorkspaceScreen, key: TabKey) -> Command<Msg> {
     let Some(profile) = workspace.profiles.iter().find(|profile| profile.name.as_str() == name).cloned() else {
         return Command::none();
     };
+    // The store's `Profiles/` holds what the person added in the profile's shell, which the
+    // image this engine lacks is built with too; a workspace is always `Workspaces/<id>/` in it.
+    let profiles = workspace.paths.root.parent().and_then(Path::parent).map(|store| Store::new(store).profiles_dir());
     let task = Task::new(t!("workspace.image.building", profile = name), move |cx| {
         let cancel = || cx.is_cancelled();
         let mut line = |text: &str| cx.send(Msg::ImageLine(key, text.to_owned()));
-        let built = crate::ui::profiles::work::build_whole(&engine, &profile, &cancel, &mut || {}, &mut line);
+        let built = match &profiles {
+            Some(profiles) => {
+                crate::ui::profiles::work::build_whole_in(&engine, &profile, profiles, &cancel, &mut || {}, &mut line)
+            }
+            None => crate::ui::profiles::work::build_whole(&engine, &profile, &cancel, &mut || {}, &mut line),
+        };
         Ok(Msg::ImageBuilt(
             key,
             built.map_err(|problem| match problem {
@@ -2389,16 +2514,16 @@ fn center(screen: &WorkspaceScreen, ui: &mut View<'_, Msg>) {
         .workspace()
         .and_then(OpenWorkspace::active_tab)
         .filter(|tab| !tab.letters().is_empty() || tab.stopped().is_some());
-    match waiting {
-        Some(tab) => {
-            ui.column(|ui| {
-                ui.column(|ui| tab_body(screen, ui)).fill();
-                bridge::view(tab, ui);
-            })
-            .fill();
+    // The same shape whether or not anything waits: a line appearing under the tab must not
+    // rebuild the tab's terminal as another widget, or the keyboard the person is typing with is
+    // taken from it the moment a message arrives.
+    ui.column(|ui| {
+        ui.column(|ui| tab_body(screen, ui)).fill();
+        if let Some(tab) = waiting {
+            bridge::view(tab, ui);
         }
-        None => tab_body(screen, ui),
-    }
+    })
+    .fill();
 }
 
 /// The open tab, or why there is nothing to show.
@@ -2680,7 +2805,7 @@ pub fn agents_at_work(screen: &WorkspaceScreen) -> usize {
         .workspaces
         .iter()
         .flat_map(|workspace| workspace.tabs.iter())
-        .filter(|tab| matches!(tab.kind(), TabKind::Profile(_) | TabKind::Desktop(_)))
+        .filter(|tab| tab.kind().runs_agent())
         .filter(|tab| matches!(tab.state(), TabState::Running | TabState::Starting))
         .count()
 }

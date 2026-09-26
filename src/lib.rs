@@ -24,6 +24,9 @@ pub mod ui;
 #[cfg(test)]
 mod reopen_tests;
 
+#[cfg(test)]
+mod endurance_live;
+
 use std::io::{self, Write as _};
 use std::path::PathBuf;
 
@@ -76,9 +79,14 @@ pub fn run() -> io::Result<()> {
     let Loaded { value: config, diagnostics: left_behind } = Config::load();
     let places = service::Places::detect();
     let text = || std::sync::Arc::new(service::translator(config.settings().language().as_deref()));
+    // An engine found stuck is said so from background work, in the language chosen by then.
+    engine::run::speak_with(|| {
+        std::sync::Arc::new(service::translator(Config::load().value.settings().language().as_deref()))
+    });
     // The setting as it is on disk when the containers are about to be stopped, which may be long
     // after this QCode started and after another one changed it.
-    let on_close = || Config::load().value.on_close();
+    let settings_now = || Config::load().value;
+    let on_close = || settings_now().on_close();
     let engine_for = |kind: EngineKind| detect(kind).ok();
     // The background service starts the same binary with one word, and it has no screen: it
     // waits for the last QCode to close, answers in the language the person chose and exits.
@@ -105,28 +113,47 @@ pub fn run() -> io::Result<()> {
         runtime = runtime.locale_source(file, text);
     }
     let ran = runtime.run();
+    let mut engines = service::Engines { engine_for: &engine_for, run: &mut capture };
+    let left = leave(&mut io::stdout(), farewell.take().as_ref(), open, &settings_now, &mut engines, &text);
+    ran.and(left)
+}
+
+/// What QCode does on the way out, once its screen is given back: the workspaces it leaves are
+/// backed up, the containers are stopped or kept as `settings` say when this is the last QCode
+/// open, and the harnesses that keep their conversations in a database are backed up once their
+/// containers stopped. What is worth saying about it is written to `out`, in the words `text`
+/// gives.
+///
+/// `settings` reads the settings file as it is at that moment, which may be long after this
+/// QCode started and after another one changed it.
+fn leave(
+    out: &mut dyn io::Write,
+    leaving: Option<&ui::workspace::Leaving>,
+    open: Option<service::Open>,
+    settings: &dyn Fn() -> Config,
+    engines: &mut service::Engines<'_>,
+    text: &dyn Fn() -> std::sync::Arc<qframe::i18n::I18n>,
+) -> io::Result<()> {
+    let on_close = || settings().on_close();
+    let mut say = |lines: Vec<String>| lines.iter().try_for_each(|line| writeln!(out, "{line}"));
     // The workspaces are backed up before their containers may be stopped, and a backup that
     // failed is the one thing said about it: one that worked needs no word on the way out.
-    let leaving = farewell.take();
-    let say = |lines: Vec<String>| lines.iter().try_for_each(|line| writeln!(io::stdout(), "{line}"));
-    let backed = leaving.as_ref().map_or(Ok(()), |leaving| qframe::i18n::scope(text(), || say(leaving.back_up())));
+    let backed = leaving.map_or(Ok(()), |leaving| qframe::i18n::scope(text(), || say(leaving.back_up())));
     // The screen is given back by now, so what the last QCode stopped is said on the terminal
     // the person started it from.
     let closed = open.map_or(Ok(()), |open| {
-        let mut engines = service::Engines { engine_for: &engine_for, run: &mut capture };
-        let reaped = open.close(&on_close, &mut engines)?;
+        let reaped = open.close(&on_close, engines)?;
         qframe::i18n::scope(text(), || match reaped {
             Some(reaped @ (service::stop::Reaped::Done(_) | service::stop::Reaped::Broken(_))) => {
-                service::report(&reaped).iter().try_for_each(|line| writeln!(io::stdout(), "{line}"))
+                say(service::report(&reaped))
             }
             Some(service::stop::Reaped::Kept) | None => Ok(()),
         })
     });
     // A harness that keeps its conversations in a database is backed up only once its container
     // has stopped, which is now when this QCode stopped it.
-    let stopped =
-        leaving.as_ref().map_or(Ok(()), |leaving| qframe::i18n::scope(text(), || say(leaving.back_up_stopped())));
-    ran.and(backed).and(closed).and(stopped)
+    let stopped = leaving.map_or(Ok(()), |leaving| qframe::i18n::scope(text(), || say(leaving.back_up_stopped())));
+    backed.and(closed).and(stopped)
 }
 
 /// The application's own locale files, compiled in so an installed program carries its text with
@@ -207,6 +234,10 @@ pub struct WorkspaceContents {
     /// Every profile of the store: a new tab offers them all, and one the workspace does not
     /// carry yet is added to it when it is opened.
     pub profiles: Vec<Profile>,
+    /// The workspace works in the person's own folder where it stands, and that folder was not
+    /// there when it was read. Such a workspace is not opened: its containers would be given a
+    /// folder that is not there, and an engine may make an empty one in its place.
+    pub folder_gone: bool,
 }
 
 /// What the workspaces that were read are for.
@@ -771,8 +802,9 @@ impl QCode {
                 .iter()
                 .filter_map(|id| {
                     let file = files.remove(files.iter().position(|file| file.id == *id)?);
-                    let paths = store.workspace_paths(&file.id);
-                    Some(WorkspaceContents { file, paths, profiles: known.clone() })
+                    let paths = store.paths_of(&file);
+                    let folder_gone = file.folder.is_some() && !paths.code.is_dir();
+                    Some(WorkspaceContents { file, paths, profiles: known.clone(), folder_gone })
                 })
                 .collect();
             Msg::Read(contents, opening)
@@ -780,11 +812,30 @@ impl QCode {
     }
 
     /// Opens what was read for `opening`.
+    ///
+    /// A workspace whose own folder of the person's is gone is said, by name and path, and left
+    /// closed; nothing makes the folder again. It stays on the list and in the recent ones, since a
+    /// disk plugged in again brings it back.
     fn read(&mut self, contents: Vec<WorkspaceContents>, opening: Opening) -> Command<Msg> {
+        let (gone, contents): (Vec<_>, Vec<_>) = contents.into_iter().partition(|one| one.folder_gone);
+        let mut told: Vec<Command<Msg>> = gone
+            .iter()
+            .map(|one| {
+                let toast = Toast::warning(t!("app.folder-gone", name = one.file.name.as_str()))
+                    .body(t!("app.folder-gone-body", path = one.paths.code.display().to_string()));
+                Command::toast(toast)
+            })
+            .collect();
         match opening {
-            Opening::One(id) => self.show_workspace(contents, &id),
-            Opening::Session(session) => self.restore(contents, &session),
+            Opening::One(id) if gone.iter().any(|one| one.file.id == id) => told.push(self.show_workspaces(false)),
+            Opening::One(id) => told.push(self.show_workspace(contents, &id)),
+            Opening::Session(mut session) => {
+                // Said once, above, in its own words: not among the ones the store no longer has.
+                session.workspaces.retain(|record| !gone.iter().any(|one| one.file.id == record.id));
+                told.push(self.restore(contents, &session));
+            }
         }
+        Command::batch(told)
     }
 
     /// Opens the workspace `id`: into the workspace screen that is open, beside the workspaces it
@@ -1285,6 +1336,7 @@ fn said(error: &engine::run::EngineError) -> String {
         engine::run::EngineError::NotRunnable { error, .. } => error.to_string(),
         engine::run::EngineError::Failed(failure) => failure.output.clone(),
         engine::run::EngineError::Cancelled { .. } => t!("app.stopped"),
+        engine::run::EngineError::TimedOut { command, after } => engine::run::timed_out(command, *after),
     }
 }
 
@@ -2025,6 +2077,98 @@ mod tests {
         harness.click_text("Firefly").advance(MOMENT);
         assert_eq!(harness.app().page(), Page::Workspace, "{}", harness.screen());
         harness
+    }
+
+    /// A stand-in engine at `dir` that writes every call it is given into `dir/calls` and answers
+    /// each with success and nothing else.
+    #[cfg(unix)]
+    fn recording_engine(dir: &std::path::Path) -> (crate::engine::Engine, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let (binary, calls) = (dir.join("engine"), dir.join("calls"));
+        std::fs::write(&binary, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n", calls.display()))
+            .expect("the stand-in is written");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).expect("it can be run");
+        (crate::engine::Engine::new(crate::engine::EngineKind::Podman, binary), calls)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_workspace_used_in_place_opens_on_the_real_folder_and_its_containers_mount_it_as_work() {
+        let root = scratch("in-place-open");
+        let _ = std::fs::remove_dir_all(&root);
+        let own = root.join("my project");
+        std::fs::create_dir_all(&own).expect("the person's folder");
+        std::fs::write(own.join("notes.md"), "mine").expect("their notes");
+        let store = crate::store::Store::new(root.join("store"));
+        store
+            .create_workspace_in("Firefly", qframe::date::Date::today_utc(), Some(own.clone()))
+            .expect("the store takes a workspace");
+        let (engine, calls) = recording_engine(&root);
+        let app = super::QCode::new(
+            config(store.root(), &[]),
+            super::testing::dirs(),
+            super::testing::host(),
+            &settled(),
+            Some(engine),
+            None,
+            None,
+        )
+        .with_providers(Some(super::testing::providers_file()), super::testing::no_web());
+        let mut harness = harness(app, SIZE.0, SIZE.1);
+        harness.click_text("Workspaces").advance(MOMENT);
+        harness.click_text("Firefly").advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Workspace, "{}", harness.screen());
+        let screen = harness.app().workspace.as_ref().expect("the workspace screen is open");
+        assert_eq!(
+            screen.workspaces()[0].paths().code,
+            own,
+            "the file tree, the shell and the backup see the real folder"
+        );
+
+        // The shell is the first container a person reaches; its mounts are the ones every
+        // container of the workspace gets for its work folder.
+        harness.click_text("New tab").render();
+        harness.click_text("Shell").advance(Duration::from_millis(400)).render();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mounted = format!("{}:{}:rw", own.display(), crate::base::paths::CODE_DIR);
+        let created = || {
+            std::fs::read_to_string(&calls)
+                .unwrap_or_default()
+                .lines()
+                .find(|call| call.starts_with("create "))
+                .map(str::to_owned)
+        };
+        while created().is_none() && std::time::Instant::now() < deadline {
+            harness.advance(Duration::from_millis(20)).render();
+        }
+        let create = created().unwrap_or_else(|| panic!("a container was made:\n{}", harness.screen()));
+        assert!(create.contains(&mounted), "{create}");
+        assert!(!create.contains("/Work:"), "no Work of the workspace's own is mounted: {create}");
+        assert_eq!(std::fs::read_to_string(own.join("notes.md")).ok().as_deref(), Some("mine"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_workspace_whose_own_folder_is_gone_says_so_and_is_neither_opened_nor_given_a_new_folder() {
+        let root = scratch("in-place-gone");
+        let _ = std::fs::remove_dir_all(&root);
+        let own = root.join("unplugged disk").join("project");
+        std::fs::create_dir_all(&own).expect("the person's folder");
+        let store = crate::store::Store::new(root.join("store"));
+        store
+            .create_workspace_in("Firefly", qframe::date::Date::today_utc(), Some(own.clone()))
+            .expect("the store takes a workspace");
+        std::fs::remove_dir_all(root.join("unplugged disk")).expect("the disk is gone");
+
+        let mut harness = harness(app(config(store.root(), &["firefly"]), &settled(), None), SIZE.0, SIZE.1);
+        harness.click_text("Continue").advance(MOMENT);
+        let screen = harness.screen();
+        assert_ne!(harness.app().page(), Page::Workspace, "{screen}");
+        assert!(screen.contains("Firefly works in a folder that is not there"), "{screen}");
+        assert!(!own.exists(), "nothing made the folder again");
+        assert!(!root.join("unplugged disk").exists());
+        assert_eq!(harness.app().config.recent_workspaces().first().map(WorkspaceId::as_str), Some("firefly"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2911,6 +3055,37 @@ mod tests {
         assert_eq!(farewell.take(), None, "no workspace was open");
     }
 
+    /// Chooses `option` on the settings row `row`, the way a person does it: the list is scrolled
+    /// with the wheel until the row is on screen, and a row whose choices all stand on it is
+    /// chosen by clicking the choice. A row that keeps them in a drop-down is opened by the arrow
+    /// that ends it first, and the option is then clicked in the list that falls open.
+    fn choose_setting(harness: &mut qframe::runtime::Harness<super::QCode>, row: &str, option: &str) {
+        use qframe::event::MouseKind;
+        let middle = (i32::from(SIZE.0) / 2, i32::from(SIZE.1) / 2);
+        for _ in 0..40 {
+            if harness.find(row).is_some() {
+                break;
+            }
+            harness.mouse(MouseKind::ScrollDown, middle.0, middle.1).render();
+        }
+        let at =
+            harness.find(row).unwrap_or_else(|| panic!("`{row}` is on the settings screen:\n{}", harness.screen()));
+        if let Some(spot) = harness.find(option)
+            && spot.1 == at.1
+        {
+            harness.click(spot.0, spot.1).advance(MOMENT);
+            return;
+        }
+        let line =
+            harness.screen().lines().nth(usize::try_from(at.1).expect("on screen")).unwrap_or_default().to_owned();
+        let arrow = i32::try_from(line.trim_end().chars().count() - 1).expect("on screen");
+        harness.click(arrow, at.1).advance(MOMENT);
+        let spot = harness
+            .find(option)
+            .unwrap_or_else(|| panic!("`{option}` is offered under `{row}`:\n{}", harness.screen()));
+        harness.click(spot.0, spot.1).advance(MOMENT);
+    }
+
     #[test]
     fn a_new_interval_reaches_the_open_workspaces_at_once() {
         use crate::backup::BackupEvery;
@@ -2923,7 +3098,11 @@ mod tests {
             harness.app().workspace.as_ref().map(WorkspaceScreen::backup_every)
         };
         assert_eq!(every(&harness), Some(BackupEvery::Fifteen));
-        harness.send(Msg::Settings(crate::ui::settings::Msg::BackupEvery(BackupEvery::Hour))).advance(MOMENT);
+        rail_settings(&mut harness);
+        choose_setting(&mut harness, "Back up open workspaces", "1 hour");
+        click_back(&mut harness);
+        harness.advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Workspace, "{}", harness.screen());
         assert_eq!(every(&harness), Some(BackupEvery::Hour));
         assert_eq!(harness.app().config.backup_every(), BackupEvery::Hour, "and it is stored");
         let _ = std::fs::remove_dir_all(&root);
@@ -2936,15 +3115,21 @@ mod tests {
         let root = scratch("sound-choice");
         store_of(&root, &["Alpha"]);
         let mut harness = harness(app_with_absent_engine(config(&root, &[])), SIZE.0, SIZE.1);
-        let settings = |sound| Msg::Settings(crate::ui::settings::Msg::Sound(sound));
         let sound = |harness: &qframe::runtime::Harness<super::QCode>| {
             harness.app().workspace.as_ref().map(WorkspaceScreen::sound)
         };
-        harness.send(settings(Sound::Details)).advance(MOMENT);
+        harness.click_text("Settings").advance(MOMENT);
+        choose_setting(&mut harness, "Sounds", "Details only");
         assert!(harness.app().config.to_toml().contains("[apps]\nsound = \"details\""), "it is stored");
+        click_back(&mut harness);
+        harness.advance(MOMENT);
         open_from_the_list(&mut harness, "Alpha");
         assert_eq!(sound(&harness), Some(Sound::Details), "a screen made after the choice starts with it");
-        harness.send(settings(Sound::Play)).advance(MOMENT);
+        rail_settings(&mut harness);
+        choose_setting(&mut harness, "Sounds", "Play");
+        click_back(&mut harness);
+        harness.advance(MOMENT);
+        assert_eq!(harness.app().page(), Page::Workspace, "{}", harness.screen());
         assert_eq!(sound(&harness), Some(Sound::Play), "and the open screen takes the next one at once");
         assert!(!harness.app().config.to_toml().contains("[apps]"), "{}", harness.app().config.to_toml());
         let _ = std::fs::remove_dir_all(&root);

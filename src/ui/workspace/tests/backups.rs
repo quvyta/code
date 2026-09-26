@@ -340,6 +340,20 @@ fn a_workspace_file_that_cannot_be_written_says_so_and_nothing_changes() {
 }
 
 #[test]
+fn a_workspace_file_that_names_no_workspace_says_why_in_the_language_on_screen() {
+    // The file is read again and written on a background thread, where the runtime's translator
+    // does not reach; what is wrong with it is still in the person's language.
+    let scratch = Scratch::new("skip-no-id");
+    fs::write(scratch.paths().file, "id = \"con\"\nname = \"Firefly\"\n").expect("a workspace file");
+    let mut harness = backing_up(&scratch, BackupEvery::Fifteen);
+    harness.set_locale("tr").render();
+    right_click(&mut harness, "src");
+    harness.click_text("Yedeğe alma").advance(MOMENT);
+    let text = harness.screen();
+    assert!(text.contains("yazılamadı") && text.contains("kimliği") && !text.contains('⟦'), "{text}");
+}
+
+#[test]
 fn what_the_file_leaves_out_is_what_the_workspace_opens_with_and_it_speaks_turkish() {
     let scratch = Scratch::new("skip-open");
     let mut carried = file("firefly", "Firefly", &[]);

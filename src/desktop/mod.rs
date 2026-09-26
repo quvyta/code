@@ -14,6 +14,7 @@
 //! way back, and the tab says so.
 
 pub mod callback;
+pub mod login;
 pub mod seccomp;
 pub mod signin;
 
@@ -21,8 +22,12 @@ pub mod signin;
 mod callback_live;
 #[cfg(test)]
 mod live;
+#[cfg(test)]
+mod login_live;
 
 use std::path::{Path, PathBuf};
+
+use crate::engine::{Engine, EngineCommand, RunOnce, RunWindow, Socket, Tmpfs};
 
 /// Where a window's runtime folder is inside its container.
 ///
@@ -124,6 +129,45 @@ pub fn display(runtime: Option<&Path>, wayland: Option<&str>, device: &Path) -> 
     // trial found no visible difference in the editor either way.
     let device = device.exists().then(|| device.to_path_buf());
     Ok(Display { socket: path, name, device })
+}
+
+/// The command that opens a window: `once` run as the container `name`, given the one socket of
+/// `display`, a runtime folder of its own, the graphics device when there is one, the shared
+/// memory a browser engine needs, and the program QCode's own opener as its browser; and, for the
+/// engine that needs one, the seccomp profile at `seccomp`.
+///
+/// Both windows QCode opens are started here — a workspace's and the profile wizard's sign-in —
+/// so that neither can be given one option less than the other: a window that misses the socket
+/// or the variables naming it never comes up, and one that misses `BROWSER` cannot sign in.
+#[must_use]
+pub fn run_command(
+    engine: &Engine,
+    name: &str,
+    once: RunOnce<'_>,
+    display: &Display,
+    seccomp: Option<&Path>,
+) -> EngineCommand {
+    // The one file of the machine's runtime folder the window needs, inside a folder of the
+    // container's own, so that nothing else living beside it comes along.
+    let target = display.target();
+    let sockets = [Socket { host: &display.socket, target: &target }];
+    let tmpfs = [Tmpfs { target: Path::new(RUNTIME_DIR), mode: RUNTIME_MODE }];
+    let devices: Vec<&Path> = display.device.iter().map(PathBuf::as_path).collect();
+    let mut environment = display.environment();
+    // What the application runs when it wants a web address opened. Without it the call goes
+    // to `xdg-open`, which inside a container finds no browser and quietly does nothing.
+    environment.push(("BROWSER".to_owned(), signin::OPEN_PROGRAM.to_owned()));
+    let env: Vec<(&str, &str)> = environment.iter().map(|(key, value)| (key.as_str(), value.as_str())).collect();
+    engine.run_window(&RunWindow {
+        name,
+        once,
+        env: &env,
+        sockets: &sockets,
+        tmpfs: &tmpfs,
+        devices: &devices,
+        shm: SHM_SIZE,
+        seccomp,
+    })
 }
 
 /// What this machine offers a window, read from the variables of this process.

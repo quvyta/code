@@ -192,17 +192,47 @@ fn opening_a_qcode_high_opencode_tab_writes_agents_md() {
 }
 
 #[test]
-fn a_profile_on_qcode_basic_leaves_the_workspaces_files_alone() {
-    for template in [Template::Recommended, Template::Base] {
-        let engine = Recording::new("unguided-basic");
-        let mut harness = harness(engine.screen(on(HarnessKind::ClaudeCode, "claude-basic", template)), SIZE.0, SIZE.1);
+fn a_profile_on_qcode_basic_builds_the_map_out_of_git_and_writes_none_of_the_workspaces_files() {
+    let engine = Recording::new("unguided-basic");
+    // The workspace is a git repository, as a person's code usually is.
+    let git = engine.scratch.paths().code.join(".git");
+    fs::create_dir_all(git.join("info")).expect("a repository");
+    fs::write(git.join("info").join("exclude"), "# the person's own line\n*.log\n").expect("its exclude file");
+    let basic = on(HarnessKind::ClaudeCode, "claude-basic", Template::Recommended);
+    let mut harness = harness(engine.screen(basic), SIZE.0, SIZE.1);
+    open_a_chat(&mut harness);
+    let calls = engine.calls();
+    assert!(calls.iter().any(|call| call.starts_with("start ")), "the container came up: {calls:?}");
+    // graphify is told of from the image's home; nothing of it is installed into the workspace.
+    assert!(graphify_calls(&calls).is_empty(), "{calls:?}");
+    assert_eq!(map_calls(&calls).len(), 1, "the map is built for the section in the home to point at: {calls:?}");
+    assert_eq!(engine.work("CLAUDE.md"), None);
+    assert_eq!(engine.work("AGENTS.md"), None);
+    assert_eq!(engine.work(".claude/settings.json"), None);
+    let exclude = fs::read_to_string(git.join("info").join("exclude")).expect("the exclude file");
+    assert_eq!(exclude, "# the person's own line\n*.log\n/graphify-out/\n", "kept out of git, not in a .gitignore");
+    assert_eq!(engine.work(".gitignore"), None);
+}
+
+#[test]
+fn a_profile_on_base_or_without_graphify_builds_no_map_and_writes_nothing() {
+    let without = Profile {
+        without: vec![Extra::Graphify],
+        ..on(HarnessKind::ClaudeCode, "claude-plain", Template::Recommended)
+    };
+    for profile in [on(HarnessKind::ClaudeCode, "claude-base", Template::Base), without] {
+        let engine = Recording::new("unguided-base");
+        let git = engine.scratch.paths().code.join(".git");
+        fs::create_dir_all(&git).expect("a repository");
+        let template = profile.template;
+        let mut harness = harness(engine.screen(profile), SIZE.0, SIZE.1);
         open_a_chat(&mut harness);
         let calls = engine.calls();
         assert!(calls.iter().any(|call| call.starts_with("start ")), "the container came up: {calls:?}");
         assert!(graphify_calls(&calls).is_empty(), "{template:?}: {calls:?}");
         assert!(map_calls(&calls).is_empty(), "{template:?}: {calls:?}");
         assert_eq!(engine.work("CLAUDE.md"), None, "{template:?}");
-        assert_eq!(engine.work("AGENTS.md"), None, "{template:?}");
+        assert!(!git.join("info").join("exclude").exists(), "{template:?}: nothing to keep out");
     }
 }
 
@@ -316,4 +346,45 @@ fn qframe_display(engine: &Recording) -> crate::desktop::Display {
     let socket = runtime.join("wayland-1");
     fs::write(&socket, "").expect("a stand-in compositor socket");
     crate::desktop::Display { socket, name: "wayland-1".to_owned(), device: None }
+}
+
+#[test]
+fn the_map_is_kept_out_of_git_once_in_any_spelling_and_only_in_a_repository() {
+    let root = std::env::temp_dir().join(format!("qcode-exclude-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    // No repository: nothing is written anywhere.
+    let plain = root.join("plain");
+    fs::create_dir_all(&plain).expect("a folder");
+    assert!(!plan::exclude_map(&plain).expect("nothing to do"));
+    assert!(!plain.join(".git").exists());
+
+    // A repository without an exclude file gets one, with the line; a second time adds nothing.
+    let repo = root.join("repo");
+    fs::create_dir_all(repo.join(".git")).expect("a repository");
+    assert!(plan::exclude_map(&repo).expect("written"));
+    let exclude = repo.join(".git").join("info").join("exclude");
+    assert_eq!(fs::read_to_string(&exclude).expect("made"), format!("{}\n", plan::MAP_EXCLUDED));
+    assert!(!plan::exclude_map(&repo).expect("there already"));
+    assert_eq!(fs::read_to_string(&exclude).expect("kept"), format!("{}\n", plan::MAP_EXCLUDED));
+
+    // A line the person wrote their own way counts, and a file without a last newline gets one.
+    for (spelling, wanted) in [("graphify-out", false), ("  graphify-out/  ", false), ("*.log", true)] {
+        fs::write(&exclude, spelling).expect("the person's file");
+        assert_eq!(plan::exclude_map(&repo).expect("read"), wanted, "{spelling}");
+    }
+    assert_eq!(fs::read_to_string(&exclude).expect("kept"), format!("*.log\n{}\n", plan::MAP_EXCLUDED));
+
+    // A worktree names its folder in a `.git` file, and reads the exclude file of the repository
+    // it was made from.
+    let main = root.join("main");
+    let own = main.join(".git").join("worktrees").join("tree");
+    fs::create_dir_all(&own).expect("the worktree's folder");
+    fs::write(own.join("commondir"), "../..\n").expect("its common folder");
+    let tree = root.join("tree");
+    fs::create_dir_all(&tree).expect("the worktree");
+    fs::write(tree.join(".git"), format!("gitdir: {}\n", own.display())).expect("its .git file");
+    assert!(plan::exclude_map(&tree).expect("written"));
+    let shared = main.join(".git").join("info").join("exclude");
+    assert_eq!(fs::read_to_string(shared).expect("in the main repository"), format!("{}\n", plan::MAP_EXCLUDED));
+    let _ = fs::remove_dir_all(&root);
 }

@@ -1,10 +1,9 @@
 //! The base image: what it is made of, how QCode knows whether the one on the machine is still
 //! the one described here, and how it is built when it is not.
 
-use std::path::PathBuf;
-
 use super::Os;
 use crate::engine::run::{EngineError, build_image, capture};
+use crate::engine::scratch::Scratch;
 use crate::engine::{Engine, EngineCommand, ImageBuild};
 
 /// The Containerfile the base image is built from, carried inside the binary so an installed
@@ -150,28 +149,23 @@ pub fn ensure_os(
     if presence_of(engine, os) == Presence::Current {
         return Ok(Outcome::AlreadyThere);
     }
-    let context = context_dir();
-    let _ = std::fs::remove_dir_all(&context);
-    std::fs::create_dir_all(&context).map_err(Failure::Host)?;
+    // A folder of QCode's own under a name nobody can guess: a folder someone else made where
+    // the description is about to be written could have it swapped before the engine reads it.
+    let folder = Scratch::new("base").map_err(Failure::Host)?;
+    let context = folder.path();
     let written = context.join("Containerfile");
     let result = match std::fs::write(&written, containerfile_of(os)) {
         // Nothing is copied into the image from the context, so the context is the one file and
         // the directory that holds it. (Ubuntu's copies Node in from another image, which is
         // not the context.)
         Ok(()) => {
-            let request = ImageBuild { image: os.image(), containerfile: &written, context: &context };
+            let request = ImageBuild { image: os.image(), containerfile: &written, context };
             build_image(engine, &request, cancel, line).map(|()| Outcome::Built).map_err(Failure::Engine)
         }
         Err(error) => Err(Failure::Host(error)),
     };
-    let _ = std::fs::remove_dir_all(&context);
+    drop(folder);
     result
-}
-
-/// The directory the build context is written into: this machine's temporary directory, named
-/// after this process so two QCodes never write over each other.
-fn context_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("qcode-base-{}", std::process::id()))
 }
 
 /// The command that asks the image which description it was built from.

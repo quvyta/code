@@ -636,6 +636,18 @@ fn containers_widget(screen: &WorkspaceScreen, workspace: &OpenWorkspace, ui: &m
     } else {
         ui.column(buttons).fill_width();
     }
+    // Root in a profile's container, for what its system lacks; what it installs stays in this
+    // workspace. Offered for a profile's own container only, and only while it runs.
+    let profile = workspace.profiles.iter().find(|profile| {
+        name.as_deref() == Some(crate::engine::names::profile_container(workspace.id(), profile.name.as_str()).as_str())
+    });
+    if let Some(profile) = profile {
+        let mut admin = Button::new(t!("workspace.admin.open")).disabled(!running);
+        if running {
+            admin = admin.on_press(Msg::OpenAdmin(profile.name.to_string()));
+        }
+        ui.add(admin).id("workspace-container-admin");
+    }
 }
 
 /// Cells a row of these buttons asks for: each label in its own button, which the theme pads by

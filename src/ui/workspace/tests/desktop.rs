@@ -507,11 +507,12 @@ fn the_open_window_is_said_plainly_with_the_two_things_that_can_be_done_to_it() 
     let shown = harness.screen();
     assert!(shown.contains("Window open"), "{shown}");
     assert!(shown.contains("Bring to front") && shown.contains("Close the window"), "{shown}");
-    // The one sign-in the window asks for is said before it comes: in the person's own browser,
-    // carried back, and remembered after that.
-    assert!(shown.contains("The page opens in your"), "{shown}");
+    // A profile signed in on the Profiles page opens signed in; otherwise the one sign-in the
+    // window asks for is said before it comes: in the person's own browser, carried back, kept.
+    assert!(shown.contains("signed in on the Profiles page, the window opens already"), "{shown}");
+    assert!(shown.contains("the page opens in your own browser"), "{shown}");
     assert!(shown.contains("QCode carries Google's answer back"), "{shown}");
-    assert!(shown.contains("profile remembers you"), "{shown}");
+    assert!(shown.contains("this workspace keeps that"), "{shown}");
     // No box, no bracket: the state is said in words and colour.
     assert!(!shown.contains('[') && !shown.contains('\u{250c}'), "{shown}");
 }
@@ -740,6 +741,35 @@ fn choosing_the_window_writes_this_tabs_token_into_the_settings_before_the_windo
     assert!(removed < run, "the settings are finished with before the window starts: {calls:?}");
 }
 
+#[test]
+fn a_window_is_given_the_profiles_stored_login_before_it_opens_and_never_over_its_own() {
+    // An engine that holds a stored login for the profile, as the Profiles page leaves one.
+    let engine = Recording::answering(
+        "window-login-given",
+        "[ \"$1 $2\" = 'volume ls' ] && { echo qcode-cred-anti; exit 0; }\n",
+    );
+    let mut harness = harness(engine.screen(), SIZE.0, SIZE.1);
+    open_in(&mut harness, window());
+    harness.render();
+
+    let calls = engine.calls();
+    let courier = calls
+        .iter()
+        .position(|call| call.starts_with("create --name qcode-refresh-firefly-anti "))
+        .unwrap_or_else(|| panic!("the login is carried into the window's home: {calls:?}"));
+    assert!(calls[courier].contains("qcode-cred-anti:/qcode-credentials:ro"), "{}", calls[courier]);
+    assert!(calls[courier].contains("qcode-home-firefly-anti:/home/qcode:rw"), "{}", calls[courier]);
+    let removed = calls
+        .iter()
+        .rposition(|call| call == "rm --force qcode-refresh-firefly-anti")
+        .expect("the courier is taken away again");
+    let run = calls.iter().position(|call| call.starts_with("run ")).expect("the window is run");
+    assert!(removed < run, "the login is in the home before the application starts: {calls:?}");
+    // Only a home with no login of its own is given one.
+    let written = fs::read_to_string(&engine.calls).expect("the calls were written down");
+    assert!(written.contains("process.exit(2);\n keep\n"), "{written}");
+}
+
 /// QCode itself on the workspace screen `screen`, in a harness, so a key reaches the application's
 /// own quit rather than the screen's.
 fn qcode_on(screen: WorkspaceScreen) -> Harness<crate::QCode> {
@@ -797,4 +827,40 @@ fn ctrl_q_leaves_without_a_question_when_the_agents_window_has_closed() {
     let mut harness = qcode_on(screen);
     harness.press("ctrl+q").render();
     assert!(harness.quit_requested(), "nothing is at work, so nothing is asked:\n{}", harness.screen());
+}
+
+#[test]
+fn the_close_mark_of_an_open_window_asks_before_the_window_and_its_agent_are_ended() {
+    // Closing the tab closes the window and removes its container, so an agent at work in the
+    // window would be cut off; Ctrl+Q already asks about it, and so does the tab's own `×`.
+    let engine = Recording::new("window-close-ask");
+    let (mut harness, key) = open_window_on(&engine);
+    let label = format!("{WINDOW} window");
+    let container = crate::engine::names::desktop_container("firefly", WINDOW);
+    let removed =
+        |engine: &Recording| engine.calls().iter().any(|call| call.starts_with("rm") && call.contains(&container));
+    let click_close = |harness: &mut Harness<Screen>| {
+        let line: Vec<char> = harness.screen().lines().next().unwrap_or_default().chars().collect();
+        let title: Vec<char> = label.chars().collect();
+        let at =
+            line.windows(title.len()).position(|cells| cells == title.as_slice()).expect("the tab is on the strip");
+        let mark = (at + title.len()..line.len()).find(|&x| line[x] == '×').expect("the tab has a close mark");
+        harness.click(i32::try_from(mark).expect("a column"), 0).render();
+    };
+
+    click_close(&mut harness);
+    harness.advance(Duration::from_secs(2)).render();
+    let said = harness.screen().split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(said.contains("End Antigravity IDE in this tab?"), "{said}");
+    assert_eq!(tab(&harness.app().0, key).state(), &TabState::Running, "nothing is closed while the question stands");
+    assert!(!removed(&engine), "{:?}", engine.calls());
+
+    harness.click_text("Keep it running").advance(Duration::from_secs(2)).render();
+    assert_eq!(tab(&harness.app().0, key).state(), &TabState::Running, "kept, the window stays open");
+    assert!(!removed(&engine), "{:?}", engine.calls());
+
+    click_close(&mut harness);
+    harness.click_text("End and close").advance(Duration::from_secs(2)).render();
+    assert!(kinds(&harness.app().0).is_empty(), "ended, the tab is gone:\n{}", harness.screen());
+    assert!(removed(&engine), "and the window's container with it: {:?}", engine.calls());
 }

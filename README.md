@@ -5,7 +5,7 @@
 **quvyta-code** runs coding harnesses inside containers, from the terminal. You set up a
 profile once, sign it in, and from then on open that harness in any of your workspaces in a few
 seconds, moving between harnesses and shells the way you move between tabs. Nothing the harness
-runs ever runs on your machine itself. qcode is part of the Quvyta family of terminal
+runs ever runs on your machine itself. qcode is part of the Quvyta ecosystem of terminal
 applications, is built on [quvyta-framework](https://github.com/quvyta/framework) and is open
 source under the MIT licence.
 
@@ -20,11 +20,29 @@ source under the MIT licence.
   folder and the network. Because the container is what keeps the work apart from your machine,
   the harness is set up to work without stopping to ask for permission.
 - **Profiles.** A profile is one harness with its settings: which harness, which template (the
-  bare harness, **QCode basic** or **QCode high**), what it signs in with and what its containers
-  may reach. Building a profile builds its image; the build can be stopped at any time and a
-  half-made image is removed.
+  harness **as it comes**, **QCode recommended**, **QCode extra**, **Quvyta development** or, for
+  opencode, **oh my opencode slim**), what it signs in with and what its containers may reach. Building a profile builds its image; the build can be stopped at any time and a
+  half-made image is removed. **Edit** changes everything but the name later: a change to what the
+  image holds builds it again (the old image stays until the new one is ready), a change of account
+  asks you to sign in again, and a change to what the containers may reach needs no build at all.
+  **QCode recommended** sets the harness up the way its makers and qcode recommend: update checks
+  and usage reports off, its first questions answered, graphify (a map of the code the agent asks
+  before it reads files) and the plugins recommended for that harness (Claude Code's starter
+  plugins, oh-my-openagent for opencode); none of your workspace's files is changed. **QCode
+  extra** adds, for Claude Code, every other plugin qcode's author works with, and writes graphify's
+  and qcode's own instructions into the workspace's instruction file. **Quvyta development** is
+  QCode extra plus what building the Quvyta apps needs, in the image: Rust's stable toolchain with
+  clippy and rustfmt, a C compiler, pkg-config, OpenSSL's headers, git, ssh, curl, jq, uv and, as a
+  part you can switch off, Chromium for tests that drive a browser. **oh my opencode slim** is
+  opencode's alone: graphify and the same settings every QCode template writes, with
+  [oh-my-opencode-slim](https://github.com/alvinunreal/oh-my-opencode-slim) (about 220 MB) in
+  place of oh-my-openagent (about 470 MB), which it does not install. Its seven agents
+  (orchestrator, explorer, oracle, council, librarian, designer, fixer) all run on the model the
+  profile signs in with; it asks for no key, sends no telemetry and never updates itself. What a
+  template adds is listed when you pick it, and each part can be switched off.
 - **Signing in once.** A profile signs in through the harness's own sign-in flow, run in a
-  terminal inside a container. qcode then checks that the login file is really there before it
+  terminal inside a container (Antigravity IDE: in its own window, with the page in your own
+  browser). qcode then checks that the login is really there before it
   keeps it. Each workspace that uses the profile gets its own copy of the login, so chat history,
   memory and settings never leak from one workspace into another. A copy can be refreshed from the
   profile later, and the profile can be signed out. A profile that runs on one of your own
@@ -32,8 +50,11 @@ source under the MIT licence.
 - **Providers of your own.** An ollama server on your network, an OpenRouter account, or a Xiaomi
   MiMo or Kimi Code subscription can stand in for a harness's own account, for every harness but
   Gemini CLI. The provider's key stays on your machine and never enters a container. See [Providers of your own](#providers-of-your-own).
-- **Workspaces.** A workspace starts empty, from a copy of a folder, or from a git address (the clone
-  runs inside a container, so git does not have to be installed on your machine). The workspace
+- **Workspaces.** A workspace starts empty, from a folder, or from a git address (the clone
+  runs inside a container, so git does not have to be installed on your machine). A folder is
+  either copied into the QCode folder, links included, or used where it is: then nothing is
+  copied, every container works in your real folder, and deleting the workspace leaves that
+  folder as it is. The workspace
   screen has tabs for shells, harnesses and files, and a side panel with the workspace's files, its
   details and its containers, which can be stopped and restarted from there.
 - **Built-in apps.** A file opened from the file tree opens in a tab of its own, in the workspace's
@@ -57,6 +78,7 @@ The harnesses qcode knows today:
 | Codex CLI | subscription, API key, a provider of your own |
 | Kimi Code CLI | subscription (Kimi Code), a provider of your own |
 | Qwen Code | a provider of your own |
+| Antigravity IDE | Google account (a desktop window; see [Desktop harnesses](#desktop-harnesses)) |
 
 Google closed Gemini CLI's "Login with Google" to personal accounts (Code Assist for
 individuals, Google AI Pro and Ultra) on 18 June 2026, so a new Gemini CLI profile signs in with
@@ -71,8 +93,9 @@ CLI's sign-in is Kimi Code's own (mainland `kimi.com`, the default); a sign-in t
 region is not carried yet, and a Kimi Code key goes through the **Providers** page instead.
 
 Each harness is installed from its own published package when a profile's image is built; qcode
-does not ship or change any of them. The interface follows your system language (English and
-Turkish are included) and uses the family's themes, icons, keys and mouse behaviour.
+does not ship or change any of them. The interface follows your system language, in English,
+Turkish, German, Spanish, French, Japanese, Brazilian Portuguese, Russian or Simplified Chinese,
+and uses the ecosystem's themes, icons, keys and mouse behaviour.
 
 ## Why qcode, and what else there is
 
@@ -101,8 +124,8 @@ container is what keeps them away from your machine. It helps to know exactly wh
 The container keeps the harness away from:
 
 - your home folder, your other workspaces and every file qcode did not mount: a container sees
-  only its workspace's `Work/` folder, its `Assets/` folder (read-only unless the profile allows
-  writing) and its own home;
+  only its workspace's `Work/` folder (or, for a workspace that uses a folder where it is, that
+  folder), its `Assets/` folder (read-only unless the profile allows writing) and its own home;
 - other workspaces' logins and conversations: each workspace has its own copy of a profile's home;
 - the container engine itself: its socket is never mounted, containers are not privileged, and
   processes inside run as your own user id, never as root on your machine.
@@ -110,7 +133,8 @@ The container keeps the harness away from:
 It does not protect:
 
 - **the workspace folder.** The harness can change or delete anything in `Work/`, and it is
-  mounted straight from your disk. Keep your work in git and push it somewhere.
+  mounted straight from your disk. For a workspace that uses a folder where it is, that is your
+  real folder, not a copy. Keep your work in git and push it somewhere.
 - **your data from leaving over the network.** A profile with network access (the default) can
   send anything it can read, the workspace included, anywhere. A profile can be set to have no
   network, but most harnesses need it to reach their model. A profile that runs on one of your
@@ -143,7 +167,7 @@ day asks again. Nothing is asked while the first-run setup is open. The time of 
 kept in `~/.local/state/quvyta/code/update-check` on Linux.
 
 To turn it off, switch off **Say when an update is out** in **Settings**. The switch belongs to the
-whole Quvyta family: it is `update-notice = false` in `~/.config/quvyta/quvyta.conf`, and turning it
+whole Quvyta ecosystem: it is `update-notice = false` in `~/.config/quvyta/quvyta.conf`, and turning it
 off stops the question in every Quvyta application. While it is off, qcode asks nothing at all.
 
 Apart from that question, qcode connects to the network itself only after you have added a
@@ -170,17 +194,18 @@ A version of qcode before 0.1.13 said here that it had no network code at all. T
 true in 0.1.12, which added providers, and the sentence was not changed with it.
 
 All other traffic comes from programs you can see qcode start: your container engine, when it
-builds an image (the base image, the harness packages and, for QCode high, what that template
-adds) or clones a workspace from a git address; the command that installs a container engine,
+builds an image (the base image, the harness packages and, for the QCode templates, what they
+add) or clones a workspace from a git address; the command that installs a container engine,
 when you let qcode run it in the setup; and your own browser, when a sign-in page is handed to
 it. That hand-over is the one time qcode listens for a connection itself: on your machine's own
 loopback, on the port the sign-in comes back to, until it has (see Desktop harnesses). Inside the
 containers, the harnesses keep their own behaviour, including any telemetry of their own; their
-documentation says what that is. Some are switched off by qcode's templates: QCode basic turns off
-Antigravity's telemetry and Qwen Code's usage statistics (which Qwen Code otherwise sends to Alibaba
-Cloud), and QCode high turns off that of oh-my-openagent, which it adds. Kimi Code CLI sends
-anonymous telemetry to Moonshot unless `telemetry = false` is in its `~/.kimi-code/config.toml`;
-qcode leaves that file alone, because it is where Kimi Code CLI keeps its sign-in. A profile without
+documentation says what that is. Some are switched off by qcode's templates: QCode recommended turns off
+Claude Code's telemetry, error reports and updater, opencode's updater, Kimi Code CLI's telemetry
+and updater, Gemini CLI's usage statistics and update checks, Codex's update check and analytics,
+Qwen Code's usage statistics (which Qwen Code otherwise sends to Alibaba Cloud) and updater, and
+Antigravity's telemetry and updater, and turns off that of oh-my-openagent, which it adds. The
+**As it comes** template leaves all of them as their makers ship them. A profile without
 the network sends none of this anywhere.
 
 ## Screens
@@ -241,9 +266,11 @@ The program is installed as `qcode` and also as `quvyta-code`.
    again every time it starts.
 2. **A profile.** Open **Profiles** and make a new profile: pick the harness, the template, the
    account type and the permissions, then build the image. When it is built, sign in in the
-   terminal that opens and press **I have signed in**.
+   terminal that opens and press **I have signed in** (for Antigravity IDE, sign in in the window
+   that opens, then press **I have signed in**: the application writes its sign-in down only when
+   it closes, so qcode closes the window first and then stores it).
 3. **A workspace.** Open **Workspaces** and make a new workspace, empty, from a folder or from a git
-   address.
+   address. For a folder, choose **Copy it into QCode** or **Use it where it is**.
 4. **Tabs.** In the workspace, the `+` after the last tab (or `ctrl+t`) opens a new tab at once.
    It lists the shell of the workspace's own container and, for every profile, **New chat** and
    the profile's latest conversations in this workspace, newest first, with when each was last
@@ -361,7 +388,10 @@ from:
   where the application waits inside its container; qcode listens on that port on your machine's
   `127.0.0.1` (and `[::1]`) and carries what arrives to the application, through the engine, so
   the container needs no network for it. The tab says which port and for how long. You sign in
-  once per profile and it is remembered in that workspace. If another program already uses the
+  once, in the profile's sign-in step, and qcode keeps that login with the profile: every
+  workspace's window opens with it, and a workspace whose window already has a login of its own
+  keeps that one. A profile made before qcode 0.1.18 shows **Sign in** on the Profiles screen for
+  the same step. If another program already uses the
   port, the page is not opened and the tab says so: the sign-in has to come back to exactly that
   port. The page can also be shown in a small sign-in window inside the container (**Use the
   sign-in window here** on the tab), but Google refuses its own sign-in there with "This browser
@@ -412,7 +442,8 @@ link, never what it points to.
 ## Backups
 
 qcode keeps copies of every open workspace's `Work/` folder in `Backup/`, next to it in the
-workspace's own folder, so the backup moves and is copied with the workspace.
+workspace's own folder, so the backup moves and is copied with the workspace. For a workspace
+that uses a folder where it is, that folder is what is backed up, into the same `Backup/`.
 
 - **How often.** Every 15 minutes while the workspace is open, once more when you close it from the
   rail, and once more when qcode quits. **Settings**, **Back up open workspaces** chooses **Off**,
@@ -453,8 +484,8 @@ The **Workspace** part of the side panel also shows when the last backup was mad
 ## Tabs talking to each other
 
 The agents in a workspace's harness tabs can hand each other work: the one in a Claude Code tab can
-ask the one in a Codex tab to write a test, and hear back. qcode gives every harness two tools for
-this, `list_tabs` and `send_message`, through a small MCP server it registers in each harness's
+ask the one in a Codex tab to write a test, and hear back. qcode gives every harness three tools for
+this, `list_tabs`, `send_message` and `check_inbox`, through a small MCP server it registers in each harness's
 own settings, next to anything you added there. The server runs inside the container and talks
 to qcode through a socket in the workspace's `Containers/MCP/` folder, so it works in a profile
 without the network too.
@@ -470,7 +501,8 @@ turns them off:
   messages a minute, so two agents cannot keep each other busy, and spend your balance, forever.
   The sending agent is told why its message was refused. When an exchange is ended, both tabs say
   so in a line under their terminal until you press **Got it**, and a notice tells you once,
-  whichever tab you are looking at.
+  whichever tab you are looking at. What you type into a tab yourself starts a new exchange for it:
+  the agents you keep giving work are counted from your latest task, not from the first one.
 
 If you would rather approve the first message between two tabs, turn on **Ask before the first
 message** under **Messages between tabs** in **Settings**. The first message from one tab to
@@ -479,11 +511,16 @@ direction, until qcode closes, and is never written to disk. Esc denies. A pair 
 denied until qcode closes, even if you turn asking off again.
 
 A message that is taken is typed into the receiving harness's own prompt, on a line that says
-which tab sent it, as soon as that tab is quiet: you are not typing in it and its program has
-stopped writing. Until then, or while the harness is not running, it waits in the tab, where
+which tab sent it, as soon as that tab is quiet: its program has stopped writing and you have no
+line in it that you started and have not sent, so a line you paused over, however long, is never
+sent off with the message joined to it. Until then, or while the harness is not running, it waits in the tab, where
 **Read** shows it and **Discard** throws it away. The sending agent is told whether its message
-went in or still waits. A desktop window (Antigravity) can send messages but never receives any,
-because it has no prompt to type into.
+went in or still waits. A desktop window (Antigravity) has no prompt to type into, so a message to
+it waits in its tab until the agent inside the window calls `check_inbox`, which hands over every
+message waiting for it. A small extension qcode puts inside the window's application tells the
+agent when one arrives, with a prompt in its agent panel, and qcode's instructions tell it to check
+at the start and the end of every task too. The line under the window's tab says how many are
+waiting.
 
 ## Providers of your own
 
@@ -540,7 +577,7 @@ so the containers keep running; Settings says so.
 | Background service | `~/.config/systemd/user/qcode-reaper.service` and `qcode-reaper.path` on Linux, `~/Library/LaunchAgents/io.quvyta.code.reaper.plist` on macOS, while it is installed |
 | QCode folder | `Quvyta/Code` in your Documents folder by default (`~/Documents/Quvyta/Code`, or `~/Belgeler/Quvyta/Code` where the desktop names it so), or the folder you chose; a folder chosen before stays where it is |
 | Profiles | `Profiles/<profile>.toml` in the QCode folder |
-| Workspaces | `Workspaces/<workspace>/` in the QCode folder: `workspace.qcode`, the code in `Work/`, your material in `Assets/` |
+| Workspaces | `Workspaces/<workspace>/` in the QCode folder: `workspace.qcode`, the code in `Work/` (or the path of the folder it uses where it is), your material in `Assets/` |
 | Tabs talking to each other | `Workspaces/<workspace>/Containers/MCP/` in the QCode folder: the server the harnesses start and, while the workspace is open, the socket qcode listens on; each harness's own settings in `qcode-home-<workspace>-<profile>` hold the entry `qcode` |
 | Providers | `providers.toml` in the data folder, `~/.local/share/quvyta/code` on Linux, readable only by you in a folder only you can open. It holds the keys in plain text; they are never written to the settings file, the QCode folder or a container |
 | The relay to a provider | `relay.sock` and `qcode-relay.mjs` in `Workspaces/<workspace>/Containers/MCP/`, beside the bridge's socket and server |

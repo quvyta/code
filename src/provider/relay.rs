@@ -869,17 +869,19 @@ mod tests {
     fn the_script_starts_what_it_is_given_only_once_it_is_listening_and_ends_with_it() {
         let Some(node) = node() else { return };
         let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/provider/qcode-relay.mjs");
-        let reach = format!(
-            "const s=require('node:net').connect({PORT},'127.0.0.1');\
-             s.on('connect',()=>{{s.end();process.exit(23)}});s.on('error',()=>process.exit(1));"
-        );
+        // The stand-in reaches the address it was told of, as a harness does; the relay moves it
+        // to another port when the usual one is taken (by another test, say).
+        let reach = "const u=new URL(process.env.QCODE_TEST_BASE);\
+             const s=require('node:net').connect(Number(u.port),'127.0.0.1');\
+             s.on('connect',()=>{s.end();process.exit(23)});s.on('error',()=>process.exit(1));";
         let ran = std::process::Command::new(&node)
             .args([
                 script.as_os_str(),
                 std::ffi::OsStr::new(&node),
                 std::ffi::OsStr::new("-e"),
-                std::ffi::OsStr::new(&reach),
+                std::ffi::OsStr::new(reach),
             ])
+            .env("QCODE_TEST_BASE", format!("http://127.0.0.1:{PORT}"))
             .output()
             .expect("the script runs");
         assert_eq!(
@@ -888,6 +890,45 @@ mod tests {
             "the harness reached the relay and its own code came back: {}",
             String::from_utf8_lossy(&ran.stderr)
         );
+    }
+
+    /// A second tab of the same profile shares its container, and so the relay's usual port. The
+    /// second relay listens on a free port instead and tells its harness that one, in the
+    /// environment and on the command line where QCode wrote the usual address; before, it died on
+    /// the taken port and the tab never started (seen in the endurance trial, 2026-09-24).
+    #[test]
+    fn a_relay_whose_port_is_taken_listens_on_another_and_tells_its_harness_so() {
+        let Some(node) = node() else { return };
+        // Held for the whole test; if something else on this machine holds it, it is taken all the same.
+        let _held = std::net::TcpListener::bind(("127.0.0.1", PORT));
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/provider/qcode-relay.mjs");
+        let address = format!("http://127.0.0.1:{PORT}/v1");
+        let reach = "const u=new URL(process.env.QCODE_TEST_BASE),a=new URL(process.argv[1]);\
+             console.log(u.port+' '+a.port);\
+             const s=require('node:net').connect(Number(u.port),'127.0.0.1');\
+             s.on('connect',()=>{s.end();process.exit(23)});s.on('error',()=>process.exit(1));";
+        let ran = std::process::Command::new(&node)
+            .args([
+                script.as_os_str(),
+                std::ffi::OsStr::new(&node),
+                std::ffi::OsStr::new("-e"),
+                std::ffi::OsStr::new(reach),
+                std::ffi::OsStr::new(&address),
+            ])
+            .env("QCODE_TEST_BASE", &address)
+            .output()
+            .expect("the script runs");
+        assert_eq!(
+            ran.status.code(),
+            Some(23),
+            "the harness reached its relay: {}",
+            String::from_utf8_lossy(&ran.stderr)
+        );
+        let printed = String::from_utf8_lossy(&ran.stdout);
+        let ports: Vec<&str> = printed.split_whitespace().collect();
+        assert_eq!(ports.len(), 2, "{printed}");
+        assert_eq!(ports[0], ports[1], "the environment and the arguments name the same port: {printed}");
+        assert_ne!(ports[0], PORT.to_string(), "not the taken one: {printed}");
     }
 
     /// Node, when this machine has one. The script is run in a profile image, which always has

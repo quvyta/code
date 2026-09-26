@@ -312,6 +312,7 @@ fn engine_command(engine: &Engine, args: &[&str]) -> crate::engine::EngineComman
     crate::engine::EngineCommand {
         program: engine.bin().to_path_buf(),
         args: args.iter().map(std::ffi::OsString::from).collect(),
+        deadline: Some(crate::engine::ANSWER_WITHIN),
     }
 }
 

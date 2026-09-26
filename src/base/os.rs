@@ -217,6 +217,43 @@ impl Os {
         }
     }
 
+    /// The packages building the Quvyta apps needs from the system, under Quvyta development: a C
+    /// compiler and the tools around it, pkg-config, OpenSSL's headers, git, ssh, curl, jq, the
+    /// process tools (`ps`, `pgrep`) and bash, under each system's own names. Arch's `base-devel`
+    /// carries pkg-config (`pkgconf`) itself.
+    #[must_use]
+    pub fn build_tools(self) -> &'static [&'static str] {
+        match self {
+            Self::Debian | Self::Ubuntu => &[
+                "build-essential",
+                "pkg-config",
+                "libssl-dev",
+                "git",
+                "openssh-client",
+                "curl",
+                "ca-certificates",
+                "jq",
+                "procps",
+                "bash",
+            ],
+            Self::Arch => &["base-devel", "openssl", "git", "openssh", "curl", "jq", "procps-ng", "bash"],
+            Self::Alpine => {
+                &["build-base", "pkgconf", "openssl-dev", "git", "openssh-client", "curl", "jq", "procps-ng", "bash"]
+            }
+        }
+    }
+
+    /// Chromium's package on this system, or `None` where the system has none that runs in a
+    /// container: Ubuntu 24.04's `chromium-browser` is only a way to the snap, and snaps do not
+    /// run inside a container.
+    #[must_use]
+    pub fn chromium(self) -> Option<&'static [&'static str]> {
+        match self {
+            Self::Debian | Self::Arch | Self::Alpine => Some(&["chromium"]),
+            Self::Ubuntu => None,
+        }
+    }
+
     /// How pipx is told to install `package` outside the home directory, into `home`, with its
     /// commands in `/usr/local/bin`.
     ///
@@ -240,6 +277,39 @@ mod tests {
     use crate::base::apps::PROGRAMS;
     use crate::engine::names::BASE_IMAGE;
     use crate::profile::HarnessKind;
+
+    #[test]
+    fn every_system_names_the_build_tools_under_its_own_names_and_ubuntu_has_no_chromium() {
+        // Written out, so a tool dropped from a list is a failing test rather than a smaller image.
+        assert_eq!(
+            Os::Debian.build_tools(),
+            [
+                "build-essential",
+                "pkg-config",
+                "libssl-dev",
+                "git",
+                "openssh-client",
+                "curl",
+                "ca-certificates",
+                "jq",
+                "procps",
+                "bash"
+            ]
+        );
+        assert_eq!(Os::Ubuntu.build_tools(), Os::Debian.build_tools());
+        assert_eq!(
+            Os::Arch.build_tools(),
+            ["base-devel", "openssl", "git", "openssh", "curl", "jq", "procps-ng", "bash"]
+        );
+        assert_eq!(
+            Os::Alpine.build_tools(),
+            ["build-base", "pkgconf", "openssl-dev", "git", "openssh-client", "curl", "jq", "procps-ng", "bash"]
+        );
+        for os in [Os::Debian, Os::Arch, Os::Alpine] {
+            assert_eq!(os.chromium(), Some(["chromium"].as_slice()), "{os:?}");
+        }
+        assert_eq!(Os::Ubuntu.chromium(), None, "a snap does not run in a container");
+    }
 
     #[test]
     fn every_system_reads_back_as_itself_and_debian_is_the_default() {

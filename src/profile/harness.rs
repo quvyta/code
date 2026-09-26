@@ -48,9 +48,12 @@ pub enum AccountKind {
     Subscription,
     /// A key the user pastes in.
     ApiKey,
-    /// A login the person makes inside the harness's own window, with nothing for QCode to
-    /// make, store or carry: the harness writes it into the workspace's home volume itself and
-    /// finds it there again. QCode's sign-in container and credential volume have no part in it.
+    /// A login the person makes inside the harness's own window, once, in the profile wizard:
+    /// QCode opens the window in a sign-in container, the person signs in there through their own
+    /// browser, and QCode takes the login out into the profile's credentials volume, from where
+    /// every workspace's home is given it before its window opens. Written `in-app` in definition
+    /// files, as it always was, so a profile made before QCode stored this login loads as one that
+    /// is not signed in yet.
     InApp,
     /// A provider the person added on the Providers page, named in the profile by its tag and a
     /// model of its own. Nothing for QCode's sign-in container to make either: the key already
@@ -101,13 +104,11 @@ pub enum Surface {
 pub struct Desktop {
     /// The version this record was read from and checked against.
     pub version: &'static str,
-    /// Where the archive is downloaded from while the image is built.
-    pub archive: &'static str,
-    /// How many bytes that archive is, as the server reports its length.
-    pub bytes: u64,
-    /// The SHA-256 of the archive, so an image is never built from something else that answered
-    /// at the same address.
-    pub sha256: &'static str,
+    /// The maker's archives of that version, one for each processor the image may be built on.
+    ///
+    /// The image picks one while it is built, by the machine it is built on, and not QCode by the
+    /// machine it was compiled for: the engine may build for another processor than QCode's own.
+    pub archives: &'static [Archive],
     /// Where the archive unpacks to in the image, the one directory inside it stripped away.
     pub install_dir: &'static str,
     /// The program that opens the window, by its name under [`Desktop::install_dir`].
@@ -131,6 +132,20 @@ pub struct Desktop {
     /// `the_image_builds_from_the_makers_archive_and_carries_the_application_and_its_settings`
     /// prints the built size, so a re-measure is one run away.
     pub image_mib: u64,
+}
+
+/// One of a desktop application's archives: the build of one version for one processor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Archive {
+    /// The processor, as `uname -m` names it inside the image being built.
+    pub machine: &'static str,
+    /// Where the archive is downloaded from while the image is built.
+    pub address: &'static str,
+    /// How many bytes that archive is, as the server reports its length.
+    pub bytes: u64,
+    /// The SHA-256 of the archive, so an image is never built from something else that answered
+    /// at the same address.
+    pub sha256: &'static str,
 }
 
 impl Desktop {
@@ -212,9 +227,9 @@ pub struct Harness {
     /// The files the login lives in, relative to the home directory. Each one is a file, not a
     /// directory, so a copy never drags settings along with the login.
     ///
-    /// Empty for a harness whose login QCode does not carry: one signed in to inside its own
-    /// window ([`AccountKind::InApp`]) writes its login into the workspace's home volume itself,
-    /// and there is no sign-in container it could be taken out of.
+    /// A harness that opens a window names the database its login is kept in, which holds far more
+    /// than the login: what is taken out of it and given to a workspace is the login's rows alone
+    /// ([`crate::desktop::login`]), never the file.
     pub identity: &'static [&'static str],
     /// The configuration the `recommended` template writes, when the harness reads one.
     pub settings: Option<ConfigFile>,
@@ -274,11 +289,11 @@ impl Harness {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resume {
     /// An option that takes the id, written after the unattended-mode arguments:
-    /// `claude --dangerously-skip-permissions --resume <id>`.
+    /// `claude --dangerously-skip-permissions --settings <settings> --resume <id>`.
     Option(&'static str),
     /// A subcommand that takes the id, written straight after the program so that the
     /// unattended-mode arguments are read as the subcommand's own:
-    /// `codex resume --dangerously-bypass-approvals-and-sandbox <id>`.
+    /// `codex resume --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust <id>`.
     Subcommand(&'static str),
 }
 
@@ -396,17 +411,16 @@ impl AccountKind {
     /// Whether QCode has a login to make for a profile with this account. One that has none is
     /// ready as soon as its image is, and nothing about it waits for a credentials volume.
     ///
-    /// An in-app login is none of QCode's: the person makes it inside the harness's own window,
-    /// where it lands in the workspace's home volume. There is nothing for the sign-in container to
-    /// capture and nothing to carry from workspace to workspace, so the profile is ready the moment
-    /// its image is, exactly like one that signs in to nothing.
+    /// An in-app login is made in the harness's own window, but once and in the wizard, so that no
+    /// workspace has to ask for it again: it is a login QCode makes and stores like a
+    /// subscription's.
     ///
     /// A provider is the same: its key already lives in `providers.toml`, added on the Providers
     /// page long before this profile existed, so there is nothing for a sign-in container to
     /// capture either.
     #[must_use]
     pub fn needs_login(self) -> bool {
-        matches!(self, Self::Subscription | Self::ApiKey)
+        matches!(self, Self::Subscription | Self::ApiKey | Self::InApp)
     }
 }
 
@@ -455,7 +469,7 @@ static CLAUDE_CODE: Harness = Harness {
     withdrawn: &[],
     install: &["npm install -g @anthropic-ai/claude-code"],
     command: "claude",
-    auto_run: &["--dangerously-skip-permissions"],
+    auto_run: &["--dangerously-skip-permissions", "--settings", CLAUDE_NO_MODE_WARNING],
     environment: &[],
     identity: &[".claude/.credentials.json"],
     settings: Some(ConfigFile {
@@ -468,6 +482,18 @@ static CLAUDE_CODE: Harness = Harness {
     mcp: Some(McpSettings { path: ".claude.json", shape: McpShape::Claude }),
     key_only: None,
 };
+
+/// The settings Claude Code is started with beside every other source of settings, so that the
+/// argument that starts it without asking for permission never opens on a warning about itself.
+///
+/// The warning is a question of QCode's making: it asks whether the mode the argument chose is
+/// accepted, with "No, exit" highlighted, so a person who presses Return leaves. The templates
+/// answer it in `~/.claude/settings.json`, but `base` writes nothing, and no template may decide
+/// whether a harness asks for permission. Given with `--settings`, the key comes with the argument
+/// under every template. Checked against 2.1.281 on a terminal at `/work` in a home with no files:
+/// without it the warning came up after the folder question; with it the prompt came up instead,
+/// and `~/.claude/settings.json` still held nothing but the text style the person chose.
+const CLAUDE_NO_MODE_WARNING: &str = "{\"skipDangerousModePermissionPrompt\":true}";
 
 /// Claude Code's answers to its first-start questions, for the workspace mounted at
 /// [`CODE_DIR`](crate::base::paths::CODE_DIR). The same file is where the bridge registers its
@@ -616,9 +642,12 @@ static GEMINI_CLI: Harness = Harness {
     auto_run: &["--approval-mode=yolo"],
     environment: &[("GEMINI_FORCE_FILE_STORAGE", "true")],
     identity: &[".gemini/gemini-credentials.json", ".gemini/google_accounts.json"],
+    // The update check and usage statistics off: keys of 0.61.0's own settings schema
+    // (`general.enableAutoUpdate`, `general.enableAutoUpdateNotification`,
+    // `privacy.usageStatisticsEnabled`, each on by default). A rebuild is how an update arrives.
     settings: Some(ConfigFile {
         path: ".gemini/settings.json",
-        contents: "{\n  \"security\": {\n    \"folderTrust\": {\n      \"enabled\": false\n    }\n  }\n}\n",
+        contents: "{\n  \"general\": {\n    \"enableAutoUpdate\": false,\n    \"enableAutoUpdateNotification\": false\n  },\n  \"privacy\": {\n    \"usageStatisticsEnabled\": false\n  },\n  \"security\": {\n    \"folderTrust\": {\n      \"enabled\": false\n    }\n  }\n}\n",
     }),
     first_start: None,
     resume: Some(Resume::Option("--resume")),
@@ -680,6 +709,16 @@ static GEMINI_CLI: Harness = Harness {
 /// prompt it asks "Trust this folder?", and the answer lands in the same `config.toml` as
 /// `[projects."/work"] trust_level = "trusted"`. So the template's settings carry that answer;
 /// with them the prompt comes up with no key pressed.
+///
+/// Hooks, checked against 0.156.1 on a terminal at `/work` under QCode basic, whose image carries
+/// graphify's `PreToolUse` hook in `~/.codex/hooks.json`: the harness runs no hook until someone has
+/// trusted it, keeps that trust as `hooks.state."<hook>".trusted_hash` in `config.toml`, and opens
+/// saying "1 hook needs review before it can run". Given a task, it never ran the hook and the
+/// person's next keys went to the review list instead ("t trust all · enter review"). `codex
+/// --help` lists `--dangerously-bypass-hook-trust`, "Run enabled hooks without requiring persisted
+/// hook trust for this invocation", on the command, on `resume` and on `exec`; with it the notice
+/// is gone and the hook runs. The only hooks in an image are the ones its template installed, so
+/// there is nothing for the person to review.
 static CODEX: Harness = Harness {
     id: "codex",
     display_name: "Codex",
@@ -687,12 +726,14 @@ static CODEX: Harness = Harness {
     withdrawn: &[],
     install: &["npm install -g @openai/codex"],
     command: "codex",
-    auto_run: &["--dangerously-bypass-approvals-and-sandbox"],
+    auto_run: &["--dangerously-bypass-approvals-and-sandbox", "--dangerously-bypass-hook-trust"],
     environment: &[],
     identity: &[".codex/auth.json"],
+    // `check_for_update_on_startup` and `[analytics] enabled` are keys of 0.156.1's configuration,
+    // read in its binary, which documents the second as `[analytics] enabled = false`.
     settings: Some(ConfigFile {
         path: ".codex/config.toml",
-        contents: "approval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\n\n[projects.\"/work\"]\ntrust_level = \"trusted\"\n",
+        contents: "approval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\ncheck_for_update_on_startup = false\n\n[analytics]\nenabled = false\n\n[projects.\"/work\"]\ntrust_level = \"trusted\"\n",
     }),
     first_start: None,
     resume: Some(Resume::Subcommand("resume")),
@@ -823,9 +864,10 @@ static QWEN_CODE: Harness = Harness {
     auto_run: &["--approval-mode=yolo"],
     environment: &[],
     identity: &[],
+    // `general.enableAutoUpdate`, on by default in 0.24.4's settings schema, off like Gemini CLI's.
     settings: Some(ConfigFile {
         path: ".qwen/settings.json",
-        contents: "{\n  \"security\": {\n    \"folderTrust\": {\n      \"enabled\": false\n    }\n  },\n  \"privacy\": {\n    \"usageStatisticsEnabled\": false\n  }\n}\n",
+        contents: "{\n  \"general\": {\n    \"enableAutoUpdate\": false\n  },\n  \"security\": {\n    \"folderTrust\": {\n      \"enabled\": false\n    }\n  },\n  \"privacy\": {\n    \"usageStatisticsEnabled\": false\n  }\n}\n",
     }),
     first_start: None,
     resume: Some(Resume::Option("--resume")),
@@ -865,18 +907,39 @@ static QWEN_CODE: Harness = Harness {
 /// the base image does not carry and the install step downloads with. Recommended packages stay
 /// out, as everywhere in these images.
 ///
-/// The login: the application offers nothing but "Continue with Google" on its first screen, and
-/// that sign-in is not built yet — it opens a browser inside the container, which has none, and
-/// waits on a port of the container's own network. So the account type says the login is the
-/// person's to make inside the window, and the tab says plainly that the window is waiting for
-/// one. Closing that gap means carrying the browser call out to this machine and the port it
-/// answers on back in, and that is a slice of its own.
+/// The login: the application offers nothing but "Continue with Google" on its first screen. The
+/// person signs in once, in the profile wizard, in a window opened for that alone: the page goes
+/// to their own browser and the way back is carried into the container (`crate::desktop::callback`).
+/// The login is two rows of the application's database, read in its own code (where, and why no
+/// keyring or `--password-store` flag is involved, is written in `crate::desktop::login`); QCode
+/// takes those rows into the profile's credentials volume and puts them into each workspace's
+/// database before its window opens, where the workspace has no login of its own.
 ///
-/// The settings: the `recommended` template turns the maker's telemetry and the application's own
-/// updater off, and nothing else. It is written into the image's home directory like every
-/// template's file, which means the workspace's home volume gets it when the volume is first filled
-/// and never again, so an edit the person makes afterwards stays. The store trust question is
-/// deliberately left alone: refusing it on someone's behalf is not QCode's to do.
+/// The settings: both QCode templates turn the maker's telemetry and the application's own updater
+/// off, and turn workspace trust off, so the window never opens on "Do you trust the authors of the
+/// files in this folder?" nor keeps the workspace in restricted mode, where the application's own
+/// agent extension runs with less. The container is what keeps the work apart from the machine, as
+/// it is for every harness. `security.workspace.trust.enabled` is read in 2.5.5's
+/// `out/vs/workbench/workbench.desktop.main.js`: declared `{type:"boolean",default:!0}` in the
+/// configuration registry, and `isWorkspaceTrustEnabled(){return
+/// this.environmentService.disableWorkspaceTrust?!1:!!this.configurationService.getValue(…)}` reads
+/// it. The file is written into the image's home directory like every template's file, which means
+/// the workspace's home volume gets it when the volume is first filled and never again, so an edit
+/// the person makes afterwards stays. Workspace trust was left alone at first, as a question that
+/// was not QCode's to answer; the owner's rule since 2026-09-24 is that no harness asks under a
+/// QCode template, and under `base` the question is still the application's own.
+///
+/// What the settings file cannot hold: whether the agent runs a terminal command, proceeds past a
+/// plan without a review and runs JavaScript in its browser without asking. In 2.5.5 none of the
+/// three is a setting; each is a row of the application's own state database
+/// (`~/.config/Antigravity IDE/User/globalStorage/state.vscdb`, key
+/// `antigravityUnifiedStateSync.agentPreferences` with `terminalAutoExecutionPolicySentinelKey` and
+/// `artifactReviewPolicySentinelKey`, and `antigravityUnifiedStateSync.browserPreferences` with
+/// `browser_js_execution_config_sentinel_key`), and the onboarding of its first start writes all
+/// three from the mode the person picks there, "Agent-driven development" being the one that asks
+/// nothing. Its last page writes them over whatever an image put there, and it is skipped only once
+/// the database says the onboarding is done, so they are not written here: seeding them would take
+/// a build step that writes that database and passes over the page the sign-in starts from.
 ///
 /// The servers: the application reads user-level MCP servers from `~/.gemini/config/mcp_config.json`,
 /// which is where its own code joins that path, and its schema takes no field it does not name.
@@ -893,10 +956,10 @@ static ANTIGRAVITY_IDE: Harness = Harness {
     command: "/opt/antigravity-ide/antigravity-ide",
     auto_run: &[],
     environment: &[],
-    identity: &[],
+    identity: &[".config/Antigravity IDE/User/globalStorage/state.vscdb"],
     settings: Some(ConfigFile {
         path: ".config/Antigravity IDE/User/settings.json",
-        contents: "{\n  \"telemetry.telemetryLevel\": \"off\",\n  \"update.mode\": \"none\"\n}\n",
+        contents: "{\n  \"telemetry.telemetryLevel\": \"off\",\n  \"update.mode\": \"none\",\n  \"security.workspace.trust.enabled\": false\n}\n",
     }),
     first_start: None,
     resume: None,
@@ -908,10 +971,24 @@ static ANTIGRAVITY_IDE: Harness = Harness {
 /// The window Antigravity IDE opens, as the trial measured it.
 static ANTIGRAVITY: Desktop = Desktop {
     version: "2.5.5",
-    archive: "https://edgedl.me.gvt1.com/edgedl/release2/j0qc3/antigravity/stable/\
-              2.5.5-4923483625488384/linux-x64/Antigravity%20IDE.tar.gz",
-    bytes: 240_837_095,
-    sha256: "0c5233b297d2b3aebb61af49f8944012c2953d361a5ebb16978490636917f831",
+    archives: &[
+        Archive {
+            machine: "x86_64",
+            address: "https://edgedl.me.gvt1.com/edgedl/release2/j0qc3/antigravity/stable/\
+                      2.5.5-4923483625488384/linux-x64/Antigravity%20IDE.tar.gz",
+            bytes: 240_837_095,
+            sha256: "0c5233b297d2b3aebb61af49f8944012c2953d361a5ebb16978490636917f831",
+        },
+        // Downloaded and summed 2026-09-25: the same single directory with the program at its top,
+        // built for aarch64.
+        Archive {
+            machine: "aarch64",
+            address: "https://edgedl.me.gvt1.com/edgedl/release2/j0qc3/antigravity/stable/\
+                      2.5.5-4923483625488384/linux-arm/Antigravity%20IDE.tar.gz",
+            bytes: 236_865_493,
+            sha256: "88c167108980c33a223a8d7f0aa6aaf4dec61f0cc3950235a2698e9ffc38a49e",
+        },
+    ],
     install_dir: "/opt/antigravity-ide",
     program: "antigravity-ide",
     flags: &["--ozone-platform=wayland"],
@@ -1092,8 +1169,8 @@ mod tests {
         }
         assert!(!AccountKind::Free.needs_login());
         assert!(AccountKind::Subscription.needs_login() && AccountKind::ApiKey.needs_login());
-        // QCode has no login of its own to make for a window the person signs in to themselves.
-        assert!(!AccountKind::InApp.needs_login());
+        // A window is signed in to once, in the wizard, and QCode stores that login.
+        assert!(AccountKind::InApp.needs_login());
         assert_eq!(HarnessKind::AntigravityIde.record().accounts, [AccountKind::InApp]);
         for harness in HarnessKind::TERMINAL {
             assert!(!harness.supports(AccountKind::InApp), "{harness:?}");
@@ -1102,10 +1179,16 @@ mod tests {
 
     #[test]
     fn a_new_conversation_is_the_program_in_unattended_mode() {
-        assert_eq!(HarnessKind::ClaudeCode.command_line(None), ["claude", "--dangerously-skip-permissions"]);
+        assert_eq!(
+            HarnessKind::ClaudeCode.command_line(None),
+            ["claude", "--dangerously-skip-permissions", "--settings", CLAUDE_NO_MODE_WARNING]
+        );
         assert_eq!(HarnessKind::OpenCode.command_line(None), ["opencode", "--auto"]);
         assert_eq!(HarnessKind::GeminiCli.command_line(None), ["gemini", "--approval-mode=yolo"]);
-        assert_eq!(HarnessKind::Codex.command_line(None), ["codex", "--dangerously-bypass-approvals-and-sandbox"]);
+        assert_eq!(
+            HarnessKind::Codex.command_line(None),
+            ["codex", "--dangerously-bypass-approvals-and-sandbox", "--dangerously-bypass-hook-trust"]
+        );
         assert_eq!(HarnessKind::KimiCode.command_line(None), ["kimi", "--auto"]);
         assert_eq!(HarnessKind::QwenCode.command_line(None), ["qwen", "--approval-mode=yolo"]);
     }
@@ -1115,7 +1198,7 @@ mod tests {
         let id = "2afe99eb-008a-4542-b160-1aa5b29bb95f";
         assert_eq!(
             HarnessKind::ClaudeCode.command_line(Some(id)),
-            ["claude", "--dangerously-skip-permissions", "--resume", id]
+            ["claude", "--dangerously-skip-permissions", "--settings", CLAUDE_NO_MODE_WARNING, "--resume", id]
         );
         assert_eq!(
             HarnessKind::OpenCode.command_line(Some("ses_f4acc7e75ffeEArYIV9UJooqnn")),
@@ -1125,7 +1208,7 @@ mod tests {
         // The subcommand comes first, so the unattended-mode argument is the subcommand's own.
         assert_eq!(
             HarnessKind::Codex.command_line(Some(id)),
-            ["codex", "resume", "--dangerously-bypass-approvals-and-sandbox", id]
+            ["codex", "resume", "--dangerously-bypass-approvals-and-sandbox", "--dangerously-bypass-hook-trust", id]
         );
         let kimi = "session_e3f864de-1a92-4498-a9f7-5fd551a34703";
         assert_eq!(HarnessKind::KimiCode.command_line(Some(kimi)), ["kimi", "--auto", "--session", kimi]);
@@ -1145,7 +1228,9 @@ mod tests {
     fn verified_claude_code_facts() {
         let record = HarnessKind::ClaudeCode.record();
         assert_eq!(record.command, "claude");
-        assert_eq!(record.auto_run, ["--dangerously-skip-permissions"]);
+        assert_eq!(record.auto_run, ["--dangerously-skip-permissions", "--settings", CLAUDE_NO_MODE_WARNING]);
+        let settings: serde_json::Value = serde_json::from_str(CLAUDE_NO_MODE_WARNING).expect("the settings are JSON");
+        assert_eq!(settings["skipDangerousModePermissionPrompt"], true);
         assert_eq!(record.identity, [".claude/.credentials.json"]);
         assert!(record.install.iter().any(|step| step.contains("@anthropic-ai/claude-code")));
     }
@@ -1204,15 +1289,33 @@ mod tests {
         let desktop = HarnessKind::AntigravityIde.desktop().expect("it opens a window");
         assert_eq!(record.command, desktop.command());
         assert_eq!(desktop.command(), "/opt/antigravity-ide/antigravity-ide");
-        // The address is the maker's own, carries the version this record describes, and is the
-        // Linux x64 archive of the IDE rather than of the other product on the same page.
-        assert!(desktop.archive.starts_with("https://"), "{}", desktop.archive);
-        assert!(desktop.archive.contains(desktop.version), "{}", desktop.archive);
-        assert!(desktop.archive.contains("/linux-x64/"), "{}", desktop.archive);
-        assert!(!desktop.archive.contains(' ') && !desktop.archive.contains('\n'), "{}", desktop.archive);
-        assert_eq!(desktop.bytes, 240_837_095);
-        assert_eq!(desktop.sha256.len(), 64);
-        assert!(desktop.sha256.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        // One archive for each processor, each the maker's own, of the version this record
+        // describes, and of the IDE rather than of the other product on the same page, with the
+        // length and the digest measured on the download.
+        let archives: Vec<(&str, &str, u64, &str)> =
+            desktop.archives.iter().map(|a| (a.machine, a.address, a.bytes, a.sha256)).collect();
+        assert_eq!(
+            archives,
+            [
+                (
+                    "x86_64",
+                    "https://edgedl.me.gvt1.com/edgedl/release2/j0qc3/antigravity/stable/2.5.5-4923483625488384/linux-x64/Antigravity%20IDE.tar.gz",
+                    240_837_095,
+                    "0c5233b297d2b3aebb61af49f8944012c2953d361a5ebb16978490636917f831",
+                ),
+                (
+                    "aarch64",
+                    "https://edgedl.me.gvt1.com/edgedl/release2/j0qc3/antigravity/stable/2.5.5-4923483625488384/linux-arm/Antigravity%20IDE.tar.gz",
+                    236_865_493,
+                    "88c167108980c33a223a8d7f0aa6aaf4dec61f0cc3950235a2698e9ffc38a49e",
+                ),
+            ]
+        );
+        for archive in desktop.archives {
+            assert!(archive.address.contains(desktop.version), "{}", archive.address);
+            assert!(!archive.address.contains(['\'', ' ', '\n']), "{}", archive.address);
+            assert!(archive.sha256.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        }
         // The one flag the window needs, and the two that must never be added: one blanked the
         // window, the other would give up the application's own sandbox.
         assert_eq!(desktop.flags, ["--ozone-platform=wayland"]);
@@ -1220,12 +1323,13 @@ mod tests {
         assert!(!desktop.flags.contains(&"--ignore-gpu-blocklist"), "it left the window empty");
         // Nothing is installed from a registry, and nothing of the archive is carried here.
         assert!(record.install.is_empty() && record.auto_run.is_empty() && record.resume.is_none());
-        assert!(record.identity.is_empty(), "the login lives in the workspace's home volume");
+        // The login is kept in the application's own database, whose two rows QCode carries.
+        assert_eq!(record.identity, [crate::desktop::login::DATABASE]);
         let settings = record.settings.expect("the template turns telemetry and the updater off");
         assert!(settings.contents.contains("\"telemetry.telemetryLevel\": \"off\""), "{}", settings.contents);
         assert!(settings.contents.contains("\"update.mode\": \"none\""), "{}", settings.contents);
-        // Refusing the workspace trust question on someone's behalf is not QCode's to do.
-        assert!(!settings.contents.contains("workspace.trust"), "{}", settings.contents);
+        // No question about the folder under a QCode template, the owner's rule of 2026-09-24.
+        assert!(settings.contents.contains("\"security.workspace.trust.enabled\": false"), "{}", settings.contents);
         assert!(desktop.image_mib > 1_000, "the person is told how large it is: {}", desktop.image_mib);
     }
 
@@ -1258,7 +1362,7 @@ mod tests {
     fn verified_codex_facts() {
         let record = HarnessKind::Codex.record();
         assert_eq!(record.command, "codex");
-        assert_eq!(record.auto_run, ["--dangerously-bypass-approvals-and-sandbox"]);
+        assert_eq!(record.auto_run, ["--dangerously-bypass-approvals-and-sandbox", "--dangerously-bypass-hook-trust"]);
         assert_eq!(record.identity, [".codex/auth.json"]);
         assert!(record.install.iter().any(|step| step.contains("@openai/codex")));
         // The folder's trust is answered where Codex keeps the answer, so a tab opens on its prompt.

@@ -51,6 +51,43 @@ impl Source {
     }
 }
 
+/// What becomes of a folder a new workspace starts from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Place {
+    /// Copied into the workspace's own `Work/`; the person's folder is only read. The default,
+    /// because it is the one that cannot change anything of theirs.
+    Copy,
+    /// Used where it stands: nothing is copied, and the agents work in the folder itself.
+    InPlace,
+}
+
+impl Place {
+    /// The two, in the order the dialog offers them.
+    pub const ALL: [Self; 2] = [Self::Copy, Self::InPlace];
+
+    /// The one at `index` of [`Place::ALL`]; anything else is the copy, which changes nothing of
+    /// the person's.
+    #[must_use]
+    pub fn from_index(index: usize) -> Self {
+        Self::ALL.get(index).copied().unwrap_or(Self::Copy)
+    }
+
+    /// Its place in [`Place::ALL`].
+    #[must_use]
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|place| *place == self).unwrap_or(0)
+    }
+
+    /// The translated label of its option.
+    #[must_use]
+    pub fn label(self) -> String {
+        match self {
+            Self::Copy => t!("workspaces.place-copy"),
+            Self::InPlace => t!("workspaces.place-in-place"),
+        }
+    }
+}
+
 /// What stopped a workspace being made, kept apart from its wording.
 ///
 /// A name that is already taken is never quietly turned into `name-2`: it becomes
@@ -68,6 +105,12 @@ pub enum Problem {
     NoFolder,
     /// The chosen folder holds the store, so copying it would copy the copy.
     FolderHoldsStore,
+    /// The folder to use where it stands and the store are one inside the other: the agents
+    /// would reach every workspace and profile, or work inside QCode's own folder.
+    PlaceTouchesStore,
+    /// The folder to use where it stands is not there, or is no folder; the text is what the file
+    /// system said.
+    PlaceGone(String),
     /// No address was written to clone.
     NoUrl,
     /// An address that would reach git as an option rather than a repository.
@@ -84,7 +127,7 @@ impl Problem {
     pub fn field(&self) -> &'static str {
         match self {
             Self::Name(_) | Self::Taken(_) => NAME_FIELD,
-            Self::NoFolder | Self::FolderHoldsStore => FOLDER_FIELD,
+            Self::NoFolder | Self::FolderHoldsStore | Self::PlaceTouchesStore | Self::PlaceGone(_) => FOLDER_FIELD,
             Self::NoUrl | Self::UrlIsOption | Self::NoEngine => URL_FIELD,
             // The store refusing to be written, and work that ran and stopped, are about
             // nothing the person typed; marking a field would blame the wrong thing, so they
@@ -97,11 +140,13 @@ impl Problem {
     #[must_use]
     pub fn message(&self) -> String {
         match self {
-            Self::Name(problem) => name_message(*problem),
+            Self::Name(problem) => problem.said(),
             Self::Taken(id) => t!("workspaces.name-taken", id = id.as_str()),
             Self::Blocked(detail) => format!("{} {detail}", t!("workspaces.blocked")),
             Self::NoFolder => t!("workspaces.folder-missing"),
             Self::FolderHoldsStore => t!("workspaces.folder-inside"),
+            Self::PlaceTouchesStore => t!("workspaces.place-store"),
+            Self::PlaceGone(detail) => format!("{} {detail}", t!("workspaces.place-gone")),
             Self::NoUrl => t!("workspaces.url-missing"),
             Self::UrlIsOption => t!("workspaces.url-flag"),
             Self::NoEngine => t!("workspaces.engine-missing"),
@@ -132,25 +177,6 @@ pub const URL_FIELD: &str = "url";
 /// The name of the problem that belongs to no field: it is shown above the form and nowhere else.
 pub const WORK_FIELD: &str = "work";
 
-/// The sentence for one reason a name cannot become an identifier. The position is counted from
-/// one, because that is how a person counts the letters of the name they just typed.
-fn name_message(problem: WorkspaceIdError) -> String {
-    match problem {
-        WorkspaceIdError::Empty => t!("workspaces.name-empty"),
-        WorkspaceIdError::Illegal { position, character } => t!(
-            "workspaces.name-illegal",
-            character = character.to_string(),
-            position = i64::try_from(position.saturating_add(1)).unwrap_or(i64::MAX),
-        ),
-        WorkspaceIdError::TooLong { length } => t!(
-            "workspaces.name-too-long",
-            length = i64::try_from(length).unwrap_or(i64::MAX),
-            max = i64::try_from(WorkspaceId::MAX_LEN).unwrap_or(i64::MAX),
-        ),
-        WorkspaceIdError::Reserved => t!("workspaces.name-reserved"),
-    }
-}
-
 /// Everything the new-workspace dialog holds while it is open.
 #[derive(Debug)]
 pub struct Draft {
@@ -162,8 +188,10 @@ pub struct Draft {
     pub url: String,
     /// The folder browser of the folder source.
     pub browser: FileBrowser,
-    /// The folder chosen to copy.
+    /// The folder chosen to start from.
     pub folder: Option<PathBuf>,
+    /// Whether that folder is copied or used where it stands.
+    pub place: Place,
     /// What stopped the last attempt, until something is changed.
     pub problem: Option<Problem>,
     /// Whether the long work is running, which turns the dialog into its own progress.
@@ -180,6 +208,7 @@ impl Draft {
             url: String::new(),
             browser: FileBrowser::new(start, PickMode::Folders),
             folder: None,
+            place: Place::Copy,
             problem: None,
             busy: false,
         }
@@ -213,12 +242,19 @@ impl Draft {
         }
         match self.source {
             Source::Empty => None,
-            Source::Folder => match &self.folder {
-                None => Some(Problem::NoFolder),
+            Source::Folder => match (&self.folder, self.place) {
+                (None, _) => Some(Problem::NoFolder),
                 // A folder holding the store would be copied into its own copy, which never
                 // ends; the store is inside it exactly when its path starts with the folder.
-                Some(folder) if store.starts_with(folder) => Some(Problem::FolderHoldsStore),
-                Some(_) => None,
+                (Some(folder), Place::Copy) if store.starts_with(folder) => Some(Problem::FolderHoldsStore),
+                (Some(_), Place::Copy) => None,
+                // Mounted as the work folder, a folder holding the store hands the agents every
+                // workspace and profile; one inside the store works in QCode's own folder, where
+                // deleting another workspace could take it along.
+                (Some(folder), Place::InPlace) if store.starts_with(folder) || folder.starts_with(store) => {
+                    Some(Problem::PlaceTouchesStore)
+                }
+                (Some(_), Place::InPlace) => None,
             },
             Source::Git => match self.url.trim() {
                 "" => Some(Problem::NoUrl),

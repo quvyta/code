@@ -163,6 +163,7 @@ fn said(error: &EngineError) -> String {
         EngineError::NotRunnable { command, error } => format!("{}: {error}", command.program.display()),
         EngineError::Failed(failure) => failure.output.trim().to_owned(),
         EngineError::Cancelled { command } => command.program.display().to_string(),
+        EngineError::TimedOut { command, after } => crate::engine::run::timed_out(command, *after),
     }
 }
 

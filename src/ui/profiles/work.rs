@@ -11,11 +11,14 @@ use qframe::widgets::TerminalSession;
 use crate::base;
 use crate::engine::names;
 use crate::engine::run::{EngineError, build_image, capture, stream};
+use crate::engine::scratch::Scratch;
 use crate::engine::{Access, ContainerCreate, CopyIn, Engine, Exec, HostUser, ImageBuild, Mount, MountSource, Network};
 use crate::profile::identity::{self, STORE_DIR};
-use crate::profile::{Profile, SafeName};
+use crate::profile::own::{self, Own};
+use crate::profile::{Profile, SafeName, account};
 
 use super::recipe;
+use super::shell;
 use super::status::{Readiness, Revision, Status};
 
 /// How long a container that only waits to be `exec`'d into stays up: a day, which outlives any
@@ -46,6 +49,9 @@ impl From<EngineError> for Problem {
             EngineError::NotRunnable { error, .. } => Self::Unreachable(error.to_string()),
             EngineError::Failed(failure) => Self::Refused(failure.output),
             EngineError::Cancelled { .. } => Self::Cancelled,
+            EngineError::TimedOut { command, after } => {
+                Self::Unreachable(crate::engine::run::timed_out(&command, after))
+            }
         }
     }
 }
@@ -110,7 +116,26 @@ pub fn build(
     cancel: &dyn Fn() -> bool,
     line: &mut dyn FnMut(&str),
 ) -> Result<(), Problem> {
-    build_from(engine, &profile.image(), &recipe::image(profile), Fresh::No, cancel, line)
+    build_from(engine, &profile.image(), &recipe::image(profile), None, Fresh::No, cancel, line)
+}
+
+/// What a person added to a profile in its shell, as a build puts it back after the recipe.
+#[derive(Debug, Clone, Default)]
+pub struct Additions {
+    /// The commands and the home's paths.
+    pub own: Own,
+    /// The archive of the home's files, when there is one.
+    pub archive: Option<PathBuf>,
+}
+
+impl Additions {
+    /// What was added to `profile`, read from the store's `Profiles/` folder at `profiles`. A
+    /// file that cannot be read adds nothing, and the rebuild's log is not the place it is
+    /// reported: the profile's list says so.
+    #[must_use]
+    pub fn of(profiles: &Path, profile: &SafeName) -> Self {
+        Self { own: Own::load(profiles, profile).0, archive: shell::archive_of(profiles, profile) }
+    }
 }
 
 /// Whether a build may reuse the layers an earlier one left.
@@ -127,14 +152,23 @@ fn build_from(
     engine: &Engine,
     image: &str,
     recipe: &recipe::Recipe,
+    additions: Option<&Additions>,
     fresh: Fresh,
     cancel: &dyn Fn() -> bool,
     line: &mut dyn FnMut(&str),
 ) -> Result<(), Problem> {
     // The image's name as a folder name: `qcode/profile/x` has slashes a folder cannot.
-    let context = scratch(&format!("build-{}", image.replace('/', "-")))?;
+    let folder = Scratch::new(&format!("build-{}", image.replace('/', "-")))
+        .map_err(|error| Problem::Machine(error.to_string()))?;
+    let context = folder.path();
     let containerfile = context.join("Containerfile");
-    let written = std::fs::write(&containerfile, recipe.labelled()).and_then(|()| {
+    // The additions come after the label, so a profile's image says it was built from its
+    // recipe whatever was added to it, as an image the shell committed does.
+    let tail = additions.map(|added| added.own.containerfile_tail(added.archive.is_some())).unwrap_or_default();
+    let written = std::fs::write(&containerfile, recipe.labelled() + &tail).and_then(|()| {
+        if let Some(archive) = additions.and_then(|added| added.archive.as_ref()) {
+            std::fs::copy(archive, context.join(own::HOME_ARCHIVE))?;
+        }
         for (path, contents) in &recipe.files {
             let target = context.join(path);
             if let Some(parent) = target.parent() {
@@ -146,7 +180,7 @@ fn build_from(
     });
     let result = match written {
         Ok(()) => {
-            let request = ImageBuild { image, containerfile: &containerfile, context: &context };
+            let request = ImageBuild { image, containerfile: &containerfile, context };
             match fresh {
                 Fresh::No => build_image(engine, &request, cancel, line).map_err(Problem::from),
                 // Not `build_image`, whose rule is to take the name away from anything but a
@@ -159,7 +193,7 @@ fn build_from(
         }
         Err(error) => Err(Problem::Machine(error.to_string())),
     };
-    let _ = std::fs::remove_dir_all(&context);
+    drop(folder);
     result
 }
 
@@ -185,6 +219,26 @@ pub fn build_whole(
     build(engine, profile, cancel, line)
 }
 
+/// [`build_whole`] of a profile of the store whose `Profiles/` folder is `profiles`, with what
+/// the person added to it in its shell put back after the recipe: an engine that never had the
+/// image, or lost it, gets the one the person made.
+///
+/// # Errors
+///
+/// As [`build_whole`].
+pub fn build_whole_in(
+    engine: &Engine,
+    profile: &Profile,
+    profiles: &Path,
+    cancel: &dyn Fn() -> bool,
+    base_started: &mut dyn FnMut(),
+    line: &mut dyn FnMut(&str),
+) -> Result<(), Problem> {
+    ensure_base(engine, profile, cancel, base_started, line)?;
+    let additions = Additions::of(profiles, &profile.name);
+    build_from(engine, &profile.image(), &recipe::image(profile), Some(&additions), Fresh::No, cancel, line)
+}
+
 /// Builds the image of a profile that has one again, from the recipe this QCode writes for it
 /// and from its first step, so that what the recipe installs is fetched again too.
 ///
@@ -194,18 +248,25 @@ pub fn build_whole(
 /// profile's containers is made the new image is used, and the old one is removed once no
 /// container is made from it. A rebuild that fails or is stopped leaves the old image as it was.
 ///
+/// After the recipe come what the person added in the profile's shell, read from the store's
+/// `Profiles/` folder at `profiles`: every command they ran there as the administrator, then the
+/// home's files they changed. A command that fails fails the rebuild, the engine's log names it,
+/// and the image that was there stays.
+///
 /// # Errors
 ///
 /// When a build context cannot be written, or the engine refuses, fails or is stopped.
 pub fn rebuild(
     engine: &Engine,
     profile: &Profile,
+    profiles: &Path,
     cancel: &dyn Fn() -> bool,
     base_started: &mut dyn FnMut(),
     line: &mut dyn FnMut(&str),
 ) -> Result<(), Problem> {
     ensure_base(engine, profile, cancel, base_started, line)?;
-    rebuild_from(engine, &profile.image(), &recipe::image(profile), cancel, line)
+    let additions = Additions::of(profiles, &profile.name);
+    rebuild_from(engine, &profile.image(), &recipe::image(profile), Some(&additions), cancel, line)
 }
 
 /// Builds `image` again from `recipe`, from its first step, and lets the image it replaces go
@@ -218,11 +279,12 @@ pub(crate) fn rebuild_from(
     engine: &Engine,
     image: &str,
     recipe: &recipe::Recipe,
+    additions: Option<&Additions>,
     cancel: &dyn Fn() -> bool,
     line: &mut dyn FnMut(&str),
 ) -> Result<(), Problem> {
     let before = capture(&engine.image_exists(image)).ok();
-    build_from(engine, image, recipe, Fresh::Rebuild, cancel, line)?;
+    build_from(engine, image, recipe, additions, Fresh::Rebuild, cancel, line)?;
     // The old image keeps its layers on the disk under no name at all. A running container still
     // holds it and the engine then refuses, which is the answer wanted: the container goes on,
     // and the next workspace container made for the profile removes the image after it.
@@ -262,6 +324,18 @@ pub struct LoginContainer {
     pub name: String,
     /// The directory on this machine the container copies the login into.
     pub capture: PathBuf,
+    /// The private folder `capture` is, when this login made it; it goes when this does, so a
+    /// login that ends any way at all leaves no token on the machine.
+    folder: Option<Scratch>,
+}
+
+impl LoginContainer {
+    /// A container that copies its login into `capture`, a folder somebody else made and takes
+    /// away.
+    #[must_use]
+    pub fn into_folder(name: String, capture: PathBuf) -> Self {
+        Self { name, capture, folder: None }
+    }
 }
 
 /// Creates and starts the container a login happens in.
@@ -277,10 +351,11 @@ pub fn open_login(engine: &Engine, profile: &Profile) -> Result<LoginContainer, 
     let name = login_container(&profile.name);
     // A container left behind by a login that was interrupted must not be signed in to again.
     let _ = capture(&engine.remove_container(&name));
-    let folder = scratch(&format!("login-{}", profile.name))?;
+    let folder =
+        Scratch::new(&format!("login-{}", profile.name)).map_err(|error| Problem::Machine(error.to_string()))?;
     let user = HostUser::current().map_err(|error| Problem::Machine(error.to_string()))?;
     let mounts = [Mount {
-        source: MountSource::Path(&folder),
+        source: MountSource::Path(folder.path()),
         target: Path::new(recipe::CAPTURE_DIR),
         access: Access::ReadWrite,
     }];
@@ -297,11 +372,8 @@ pub fn open_login(engine: &Engine, profile: &Profile) -> Result<LoginContainer, 
     };
     let started = capture(&engine.create_container(&request)).and_then(|_| capture(&engine.start_container(&name)));
     match started {
-        Ok(_) => Ok(LoginContainer { name, capture: folder }),
-        Err(error) => {
-            let _ = std::fs::remove_dir_all(&folder);
-            Err(error.into())
-        }
+        Ok(_) => Ok(LoginContainer { name, capture: folder.path().to_owned(), folder: Some(folder) }),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -341,6 +413,12 @@ pub fn store_login(engine: &Engine, profile: &Profile, container: &LoginContaine
         Ok(_) => {}
         Err(EngineError::Failed(_)) => return Err(Problem::NoLogin),
         Err(error) => return Err(error.into()),
+    }
+    // The half of the login a harness keeps among its other settings goes along, or a workspace
+    // given the files alone is asked to sign in again (see `profile::account`).
+    if let Some(take) = account::take(profile.harness, recipe::CAPTURE_DIR) {
+        let words: Vec<&str> = take.iter().map(String::as_str).collect();
+        capture(&engine.exec_without_terminal(&Exec { container: &container.name, command: &words }))?;
     }
     let stored = count_files(&container.capture);
     if stored == 0 {
@@ -389,7 +467,10 @@ pub fn store_login(engine: &Engine, profile: &Profile, container: &LoginContaine
 /// reported: the person is done with it either way, and the next login starts by clearing it.
 pub fn close_login(engine: &Engine, container: &LoginContainer) {
     let _ = capture(&engine.remove_container(&container.name));
-    let _ = std::fs::remove_dir_all(&container.capture);
+    // Only a folder this login made is its to remove; one it was handed goes with its maker.
+    if let Some(folder) = &container.folder {
+        let _ = std::fs::remove_dir_all(folder.path());
+    }
 }
 
 /// Removes a profile's credentials volume, which is what signing out means.
@@ -415,14 +496,6 @@ fn count_files(folder: &Path) -> usize {
             if path.is_dir() { count_files(&path) } else { 1 }
         })
         .sum()
-}
-
-/// A directory of this machine for one piece of work, emptied when the work is over.
-fn scratch(purpose: &str) -> Result<PathBuf, Problem> {
-    let folder = std::env::temp_dir().join(format!("qcode-{purpose}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&folder);
-    std::fs::create_dir_all(&folder).map_err(|error| Problem::Machine(error.to_string()))?;
-    Ok(folder)
 }
 
 /// The container a profile's login is made in.

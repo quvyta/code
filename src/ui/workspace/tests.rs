@@ -26,8 +26,10 @@ use crate::store::{
 
 use super::plan::{CODE_DIR, SHELL};
 
+mod admin;
 mod backups;
 mod bridge;
+mod close;
 mod closed_sign_in;
 mod desktop;
 mod engine_help;
@@ -35,6 +37,7 @@ mod files;
 mod guidance;
 mod history;
 mod missing_image;
+mod new_line;
 mod rebuilt_image;
 mod registry;
 mod shine;
@@ -309,7 +312,16 @@ fn a_tab_opens_inside_a_container_and_never_on_this_machine() {
     assert_eq!(harness.program, Path::new(NO_ENGINE));
     assert_eq!(
         words,
-        ["exec", "--interactive", "--tty", "qcode-firefly-claude-sub", "claude", "--dangerously-skip-permissions"],
+        [
+            "exec",
+            "--interactive",
+            "--tty",
+            "qcode-firefly-claude-sub",
+            "claude",
+            "--dangerously-skip-permissions",
+            "--settings",
+            "{\"skipDangerousModePermissionPrompt\":true}"
+        ],
         "the harness is an argument of the engine, so it runs in the container"
     );
 }
@@ -424,7 +436,11 @@ fn a_provider_tab_runs_the_relay_which_starts_the_harness_and_an_ordinary_tab_do
     // harness itself.
     assert_eq!(program[0], "node", "{program:?}");
     assert!(program[1].ends_with("qcode-relay.mjs"), "{program:?}");
-    assert_eq!(&program[2..], ["claude", "--dangerously-skip-permissions"], "{program:?}");
+    assert_eq!(
+        &program[2..],
+        ["claude", "--dangerously-skip-permissions", "--settings", "{\"skipDangerousModePermissionPrompt\":true}"],
+        "{program:?}"
+    );
 
     // A profile that signs in the ordinary way runs its harness and nothing else: no relay is
     // started for a tab that has no provider to reach.
@@ -462,7 +478,7 @@ fn a_tab_on_a_ready_made_service_is_told_the_window_the_service_gives_without_me
     let scratch = Scratch::new("provider-ready-made");
     // What the Providers page writes when the person picks Xiaomi's Token Plan and pastes a key:
     // the maker's models with the window it publishes, nothing measured.
-    let path = std::env::temp_dir().join("qcode-workspace-providers-ready-made").join("providers.toml");
+    let path = scratch.0.join("providers.toml");
     let mut providers = crate::provider::Providers::in_memory();
     let kind = crate::provider::ProviderKind::MimoTokenPlan;
     let entry = crate::provider::ProviderEntry::new(
@@ -563,14 +579,19 @@ fn a_codex_tab_on_a_provider_names_the_relay_on_its_command_line_before_a_conver
     assert_eq!(program[2], "codex");
     assert_eq!(program[3], "-c", "the provider comes right after the program: {program:?}");
     assert!(program.contains(&"model=\"kimi-for-coding\"".to_owned()), "{program:?}");
-    assert_eq!(program.last().map(String::as_str), Some("--dangerously-bypass-approvals-and-sandbox"));
+    assert_eq!(program.last().map(String::as_str), Some("--dangerously-bypass-hook-trust"));
     // Resuming, the subcommand still follows the provider, and the unattended argument still
     // follows the subcommand.
     let resumed = workspace.program(&workspace.tabs()[1], editor).expect("a harness tab runs something");
     let at = resumed.iter().position(|word| word == "resume").expect("the subcommand is there");
     assert_eq!(
         &resumed[at..],
-        ["resume", "--dangerously-bypass-approvals-and-sandbox", "01a0cf22-23dc-7fd0-8c28-6a9fef67a234"]
+        [
+            "resume",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--dangerously-bypass-hook-trust",
+            "01a0cf22-23dc-7fd0-8c28-6a9fef67a234"
+        ]
     );
     assert!(resumed[3..at].iter().any(|word| word.starts_with("model_providers.qcode=")), "{resumed:?}");
 
@@ -1920,4 +1941,55 @@ fn a_running_harness_counts_as_an_agent_at_work_and_a_running_shell_does_not() {
     open(&mut screen, claude());
     screen.attach(key(&screen, 1), alive());
     assert_eq!(super::agents_at_work(&screen), 1, "the harness is at work");
+}
+
+/// A stand-in engine that answers everything with success and writes down every call.
+fn recording_engine(scratch: &Scratch) -> (Engine, PathBuf) {
+    let (binary, calls) = (scratch.0.join("engine"), scratch.0.join("calls"));
+    let script = format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n", calls.display());
+    std::fs::write(&binary, script).expect("the stand-in engine is written");
+    std::fs::set_permissions(&binary, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("it can be run");
+    (Engine::new(EngineKind::Podman, &binary), calls)
+}
+
+#[test]
+fn closing_a_harness_tab_ends_what_it_started_inside_its_container() {
+    // The engine's command attached to the tab's terminal is only the outside of it: in the
+    // endurance trial (2026-09-24) a closed tab's harness and relay went on running in the
+    // container, and the tab could not be opened again.
+    let scratch = Scratch::new("close-ends");
+    let (engine, calls) = recording_engine(&scratch);
+    let workspaces =
+        vec![workspace("firefly", "Firefly", scratch.paths(), vec![profile("claude-sub", HarnessKind::ClaudeCode)])];
+    let mut screen = WorkspaceScreen::new(Some(engine), HostUser::Ids { uid: 1000, gid: 1000 }, workspaces);
+    apply(&mut screen, Msg::OpenWorkspace(0));
+    open(&mut screen, claude());
+    open(&mut screen, Choice::Shell);
+    let token = screen.workspace().expect("a workspace").tabs()[0].token().to_owned();
+    let mut harness = harness(screen, SIZE.0, SIZE.1);
+
+    let line: Vec<char> = strip(&harness).chars().collect();
+    let label: Vec<char> = "claude-sub".chars().collect();
+    let at = line.windows(label.len()).position(|cells| cells == label.as_slice()).expect("the tab is on the strip");
+    let mark = (at + label.len()..line.len()).find(|&x| line[x] == '×').expect("the tab has a close mark");
+    harness.click(i32::try_from(mark).expect("a column"), 0).render();
+    harness.advance(Duration::from_secs(2)).render();
+
+    let written = std::fs::read_to_string(&calls).unwrap_or_default();
+    let ended: Vec<&str> =
+        written.lines().filter(|call| call.starts_with("exec ") && call.contains("kill -TERM")).collect();
+    assert_eq!(ended.len(), 1, "one ending, for the one harness tab closed: {written}");
+    assert!(
+        ended[0].contains("qcode-firefly-claude-sub") && ended[0].ends_with(&format!("QCODE_BRIDGE {token}")),
+        "{}",
+        ended[0]
+    );
+
+    // A shell tab started nothing that carries a token; closing it asks nothing of the container.
+    let line: Vec<char> = strip(&harness).chars().collect();
+    let mark = line.iter().position(|&cell| cell == '×').expect("the shell tab has a close mark");
+    harness.click(i32::try_from(mark).expect("a column"), 0).render();
+    harness.advance(Duration::from_secs(2)).render();
+    let written = std::fs::read_to_string(&calls).unwrap_or_default();
+    assert_eq!(written.lines().filter(|call| call.contains("kill -TERM")).count(), 1, "{written}");
 }

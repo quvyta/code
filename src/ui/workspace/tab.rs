@@ -51,6 +51,9 @@ pub enum TabKind {
     /// A sound of the workspace: played in a container of its own made for it, or, when it
     /// cannot or should not play, described.
     Sound(String),
+    /// `bash` as root in the container of the profile of this name, asked for by the person to
+    /// install what the system of that container lacks. What it changes stays in this workspace.
+    Admin(String),
     /// A window of the desktop harness of the profile of this name, open on the person's own
     /// screen from a container of its own. The tab has no terminal: it says where the window
     /// stands and offers the two things that can be done to it.
@@ -68,8 +71,15 @@ impl TabKind {
             | Self::Pdf(file)
             | Self::Office(file)
             | Self::Sound(file) => Some(file),
-            Self::Shell | Self::Profile(_) | Self::New | Self::Desktop(_) => None,
+            Self::Shell | Self::Profile(_) | Self::New | Self::Desktop(_) | Self::Admin(_) => None,
         }
+    }
+
+    /// Whether an agent works in a tab of this kind: a harness in a terminal, or the window of a
+    /// desktop harness. Quitting and closing a tab ask about the same tabs through this.
+    #[must_use]
+    pub fn runs_agent(&self) -> bool {
+        matches!(self, Self::Profile(_) | Self::Desktop(_))
     }
 
     /// The profile the tab belongs to, when it belongs to one: a harness in a terminal or a
@@ -80,6 +90,7 @@ impl TabKind {
             Self::Profile(name) | Self::Desktop(name) => Some(name),
             Self::Shell
             | Self::New
+            | Self::Admin(_)
             | Self::Image(_)
             | Self::Markdown(_)
             | Self::Editor(_)
@@ -235,6 +246,9 @@ pub struct Tab {
     /// Why the oldest waiting message could not be typed into the harness, when an attempt was
     /// made and failed. Cleared as soon as one is typed in.
     undelivered: Option<Undelivered>,
+    /// The session's last input that was not the person's: when it started, or the Return QCode
+    /// wrote after the last message it typed in. Input later than this is the person typing.
+    own_input: Option<std::time::Instant>,
     /// The other tab of an exchange of messages the loop limit ended, named as the person knows
     /// it, until the person has read the line that says so.
     stopped: Option<String>,
@@ -267,6 +281,7 @@ impl Tab {
             letters: Vec::new(),
             letters_shown: false,
             undelivered: None,
+            own_input: None,
             stopped: None,
             build_log: LogBuffer::new(BUILD_LINES),
         }
@@ -489,8 +504,18 @@ impl Tab {
         self.undelivered = Some(why);
     }
 
+    /// Whether the person has typed into the session since it started and since QCode last typed
+    /// a message into it.
+    #[must_use]
+    pub fn person_typed(&self) -> bool {
+        self.session.as_ref().is_some_and(|session| self.own_input.is_none_or(|own| session.last_input() > own))
+    }
+
     /// Takes the oldest waiting message away, once it has been typed into the harness.
     pub fn delivered(&mut self) {
+        if let Some(session) = &self.session {
+            self.own_input = Some(session.last_input());
+        }
         if !self.letters.is_empty() {
             self.letters.remove(0);
         }
@@ -503,6 +528,14 @@ impl Tab {
     /// Shows the waiting messages, or hides them.
     pub fn show_letters(&mut self, shown: bool) {
         self.letters_shown = shown;
+    }
+
+    /// Takes every waiting message out of the tab, oldest first, because its agent asked for them
+    /// from its inbox: they are delivered by being handed over, and none of them is typed in.
+    pub fn take_letters(&mut self) -> Vec<Letter> {
+        self.letters_shown = false;
+        self.undelivered = None;
+        std::mem::take(&mut self.letters)
     }
 
     /// Throws the waiting messages away.
@@ -575,6 +608,7 @@ impl Tab {
 
     /// Attaches `session` and marks the tab as running.
     pub fn attached(&mut self, session: TerminalSession) {
+        self.own_input = Some(session.last_input());
         self.session = Some(session);
         self.state = TabState::Running;
     }

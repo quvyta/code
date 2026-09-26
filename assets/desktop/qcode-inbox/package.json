@@ -1,0 +1,11 @@
+{
+  "name": "qcode-inbox",
+  "displayName": "QCode inbox",
+  "description": "Tells the agent of this window when another tab of its QCode workspace has sent it a message.",
+  "publisher": "quvyta",
+  "version": "1.0.0",
+  "license": "MIT",
+  "engines": { "vscode": "^1.90.0" },
+  "activationEvents": ["onStartupFinished"],
+  "main": "./extension.js"
+}
