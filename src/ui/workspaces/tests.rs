@@ -762,8 +762,11 @@ fn a_new_workspace_is_the_first_row_of_the_list_for_the_pointer_and_the_keyboard
     while !harness.is_focused(super::LIST) {
         harness.press("tab");
     }
-    // The keyboard starts on the first workspace, so Enter still opens it as it always did; one
-    // row up is the way to a new one, and moving there opens nothing by itself.
+    // The click left the new row chosen; the first workspace is one row down, where Enter still
+    // opens it as it always did. One row up is the way back to a new one, and moving there opens
+    // nothing by itself.
+    harness.press("down").render();
+    assert!(!harness.app().state.on_new, "the first workspace is chosen");
     harness.press("up").render();
     assert!(harness.app().state.overlay.is_none(), "moving onto the row only chooses it");
     harness.press("enter").render();

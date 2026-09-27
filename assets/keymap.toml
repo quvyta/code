@@ -10,10 +10,30 @@ back = "esc"
 # A blank tab on the project screen, the way a browser opens one. A focused terminal keeps the
 # key for the program inside it.
 new-tab = "ctrl+t"
-# From a harness back to QCode: the keyboard moves to the tab strip, where the arrows switch tabs
-# and Tab walks on. Terminals do not report a lone ctrl+alt tap without losing AltGr characters
+# From a harness back to QCode: the keyboard moves to the tab strip, where the arrows switch tabs,
+# Enter or Down goes into the tab shown and Tab walks on. Terminals do not report a lone ctrl+alt tap without losing AltGr characters
 # such as `@` on a Turkish keyboard; this is the nearest chord every terminal sends as it is.
 leave-terminal = "ctrl+alt+space"
+# Names the open tab. A focused terminal lets it through, as it does the key list's F1: a key
+# that types nothing is QCode's own.
+rename-tab = "f2"
+# Straight to another tab, with the keyboard landing in it, from anywhere on the project screen and
+# from inside a harness, whose terminal lets these through. Ctrl+PgUp and Ctrl+PgDn are what
+# browsers and editors switch tabs with, every terminal sends them as they are, and none of the
+# harnesses QCode runs (Claude Code, opencode, Codex) gives them a meaning. Alt with a digit is the
+# same in every terminal too, and the harnesses leave the digits to typing; a terminal that has
+# tabs of its own takes these keys only while it shows more than one.
+next-tab = "ctrl+pgdn"
+previous-tab = "ctrl+pgup"
+tab-1 = "alt+1"
+tab-2 = "alt+2"
+tab-3 = "alt+3"
+tab-4 = "alt+4"
+tab-5 = "alt+5"
+tab-6 = "alt+6"
+tab-7 = "alt+7"
+tab-8 = "alt+8"
+tab-9 = "alt+9"
 
 # The list of every key. `?` is the framework's own key for it; F1 is the key help has
 # everywhere else, and it still works while a text field has the keyboard and takes `?` as text.

@@ -286,7 +286,10 @@ The program is installed as `qcode` and also as `quvyta-code`.
 
 | Key | What it does |
 |---|---|
-| `←` `→` (or `h` `l`) | Move between tabs, while the tab strip has the keyboard |
+| `ctrl+pgdn` `ctrl+pgup` | Go to the next or previous tab, with the keyboard in it |
+| `alt+1` … `alt+9` | Go straight to that tab, with the keyboard in it |
+| `←` `→` (or `h` `l`) | Move between tabs, while the tab strip has the keyboard; `enter` or `↓` steps into the tab |
+| `f2` | Name the open tab (or right-click a tab and choose **Rename**) |
 | `ctrl+shift+←` `ctrl+shift+→` | Move the open tab left or right |
 | `ctrl+t` | Open a new tab |
 | `ctrl+w` | Close the tab |
@@ -310,7 +313,7 @@ In the file tree of the side panel:
 | `shift+↑` `shift+↓` | Select a range of entries |
 | `shift+f10` or the menu key | The entry's context menu |
 
-While a harness or shell tab has the keyboard, keys go to it, `esc` and `?` included; `f1`, `alt+b`, `ctrl+alt+space`, `shift+tab` and `ctrl+q` still reach qcode. The mouse reaches a harness that uses it.
+While a harness or shell tab has the keyboard, keys go to it, `esc` and `?` included; `f1`, `f2`, `alt+b`, `ctrl+alt+space`, `ctrl+pgup`, `ctrl+pgdn`, `alt+1` … `alt+9`, `shift+tab` and `ctrl+q` still reach qcode. The mouse reaches a harness that uses it.
 
 ## Built-in apps
 
@@ -481,6 +484,23 @@ The **Workspace** part of the side panel also shows when the last backup was mad
 
 ![The list of a workspace's backups, the newest taken just before a restore, with the choice of the workspace's files, its assets or a profile's conversations above it](https://raw.githubusercontent.com/quvyta/code/main/docs/screenshots/backups.png)
 
+## Many opencode tabs, one opencode
+
+opencode is a server and an interface in one program, and one of them costs most of a gigabyte.
+So the opencode tabs of a profile made with a QCode template share one opencode server in the
+profile's container, and each tab runs only opencode's interface, attached to it. Measured on a
+Raspberry Pi 5 with oh-my-openagent: seven tabs took 5.0 GB and 241 threads each on its own, and
+take 2.4 GB and 112 threads sharing one server. From the second tab on, sharing is the smaller;
+one tab alone costs about 140 MB more.
+
+Each tab still shows a conversation of its own, opens it again next time, and is told apart from
+the others when its agent sends a message. Closing a tab stops what its agent was doing, as it
+did before, and removes its conversation if nothing was said in it. If the server stops, it is
+started again and every tab attaches to its conversation again. A while after the last tab is
+closed, the server stops too. A profile made with **base** is opencode as it comes: every tab runs
+its own. The first tab of a profile without the network waits over a minute before it opens,
+because opencode first tries to fetch its plugins' packages.
+
 ## Tabs talking to each other
 
 The agents in a workspace's harness tabs can hand each other work: the one in a Claude Code tab can
@@ -488,7 +508,18 @@ ask the one in a Codex tab to write a test, and hear back. qcode gives every har
 this, `list_tabs`, `send_message` and `check_inbox`, through a small MCP server it registers in each harness's
 own settings, next to anything you added there. The server runs inside the container and talks
 to qcode through a socket in the workspace's `Containers/MCP/` folder, so it works in a profile
-without the network too.
+without the network too. opencode tabs that share a server get the same three tools from a
+plugin qcode loads into that server instead, since an MCP server started once for all of them could
+not tell which tab is asking.
+
+Every tab has an id within its workspace (1, 2, 3 and on) that is never given to another tab while
+the workspace is open, and a name: the one you give it with `f2`, or else the title its harness gave
+the conversation, or the profile's name. `list_tabs` first tells the asking agent which tab it is,
+then lists the other agent tabs of the same workspace; tabs of another workspace are never listed.
+A message has a kind: `info` (no answer needed), `question` (the sender waits for the answer) or
+`report` (a task whose result the sender waits for), and it arrives under two short lines naming the
+sending tab's id and name, the kind and how to answer. A message sent to `all` goes to every other
+agent tab of the workspace, each by the same rules as a message to it alone.
 
 Messages go from tab to tab without asking you: you set the agents to work, and handing it to
 each other is part of that work. Two rules hold for every message all the same, and no setting

@@ -828,9 +828,27 @@ fn a_path_that_climbs_out_of_the_workspace_is_refused_everywhere() {
         id: WorkspaceId::parse("firefly").expect("a usable id"),
         active_tab: 0,
         tabs: vec![
-            SessionTab { kind: SessionTabKind::Markdown("../../outside.md".to_owned()), conversation: None, opened: 1 },
-            SessionTab { kind: SessionTabKind::Editor("/etc/passwd".to_owned()), conversation: None, opened: 2 },
-            SessionTab { kind: SessionTabKind::Image("art/the logo.png".to_owned()), conversation: None, opened: 3 },
+            SessionTab {
+                kind: SessionTabKind::Markdown("../../outside.md".to_owned()),
+                conversation: None,
+                opened: 1,
+                number: None,
+                name: None,
+            },
+            SessionTab {
+                kind: SessionTabKind::Editor("/etc/passwd".to_owned()),
+                conversation: None,
+                opened: 2,
+                number: None,
+                name: None,
+            },
+            SessionTab {
+                kind: SessionTabKind::Image("art/the logo.png".to_owned()),
+                conversation: None,
+                opened: 3,
+                number: None,
+                name: None,
+            },
         ],
     };
     screen.restore_tabs(0, &record);
@@ -895,7 +913,7 @@ fn file_tabs_are_kept_in_the_session_and_come_back_one_at_a_time() {
 #[test]
 fn a_restored_tab_whose_file_is_gone_says_so() {
     let scratch = with_files("gone");
-    let tab = |kind| SessionTab { kind, conversation: None, opened: 1 };
+    let tab = |kind| SessionTab { kind, conversation: None, opened: 1, number: None, name: None };
     let record = SessionWorkspace {
         id: WorkspaceId::parse("firefly").expect("a usable id"),
         active_tab: 0,

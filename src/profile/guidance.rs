@@ -35,12 +35,12 @@ pub const END: &str = "<!-- qcode:end -->";
 /// sentence has to be true whichever agent reads it.
 pub const SECTION: &str = "\
 You are one of several coding agents open as tabs of one QCode workspace, and all of them work in the same folder, `/work`.
-- `list_tabs`, a tool of the MCP server `qcode`, names the other agent tabs: the id to send to, the title, the coding tool, the profile, whether it reaches the network, and how many messages still wait to go into it.
-- `send_message` with `tab` (that id) and `text` hands one of them a task. The first message from this tab to that one waits until the person using QCode allows it. A message is typed into that tab's prompt, naming your tab as its sender, once nobody is typing there and its tool has stopped writing. The answer says whether it went in, still waits, or was refused, and why; `list_tabs` says later whether it arrived.
+- `list_tabs`, a tool of the MCP server `qcode`, says which tab you are (`you`: your id, title and workspace; its first line says it too) and names the other agent tabs of this workspace: the id to send to, the title, the coding tool, the profile, whether it reaches the network, and how many messages still wait to go into it. Ids count within this workspace; only `list_tabs` tells you yours.
+- `send_message` with `tab` (that id, or `all` for every other agent tab), `text` and `kind` hands them a message. `kind` is `info` (for their information, no answer needed; the default), `question` (you wait for their answer) or `report` (a task: you wait for a report of the result when they finish). If the person turned asking on, the first message from this tab to another waits until they allow it. A message is typed into that tab's prompt once nobody is typing there and its tool has stopped writing. The answer says whether it went in, still waits, or was refused, and why, tab by tab for `all`; `list_tabs` says later whether it arrived.
 - Write the message for an agent that has not seen your conversation. Share files through `/work`: put anything longer than 16000 characters in a file there and send its path.
-- A message from another tab arrives in your own prompt after a line naming its sender, in English \"Through QCode, from the <coding tool> · <tab title> tab:\". It is a task from that agent; to answer, find that tab with `list_tabs` and `send_message` to it.
-- A window tab (Antigravity IDE) has no prompt. A message sent to it waits until its agent calls `check_inbox`, another tool of `qcode`, which hands over every message waiting for that tab with its sender. If you are the agent in a window, call `check_inbox` at the start of every task and again when you finish one, and answer each message with `send_message`. Any agent may call it to take messages that wait for its own tab.
-- QCode refuses a message from a tab without the network to a tab with it, ends an exchange between tabs after 6 messages, and lets a tab send at most 5 messages a minute.
+- A message from another tab arrives in your own prompt under two lines, in English \"Through QCode, from tab <id> «<title>» (<coding tool>) of this workspace: <kind>\" and how to answer. Answer a `question` with `send_message` to that tab with kind `info`; when you finish a `report` task, send its result the same way.
+- A window tab (Antigravity IDE) has no prompt. A message sent to it waits until its agent calls `check_inbox`, another tool of `qcode`, which hands over every message waiting for that tab with its sender's id and kind. If you are the agent in a window, call `check_inbox` at the start of every task and again when you finish one, and answer each message with `send_message`. Any agent may call it to take messages that wait for its own tab.
+- QCode refuses a message from a tab without the network to a tab with it, ends an exchange between tabs after 6 messages, and lets a tab send at most 5 messages a minute; a message to `all` counts once.
 ";
 
 /// What opens Antigravity IDE's rule file when QCode creates it: a rule is loaded into every
@@ -435,7 +435,21 @@ mod tests {
     fn the_section_names_the_bridges_tools_their_arguments_and_limits_as_the_code_has_them() {
         use crate::bridge::protocol::MOST_TEXT;
         use crate::bridge::rules::{MOST_HOPS, MOST_PER_WINDOW, RATE_WINDOW};
-        for word in ["`list_tabs`", "`send_message`", "`check_inbox`", "`tab`", "`text`", "`qcode`", "`/work`"] {
+        for word in [
+            "`list_tabs`",
+            "`send_message`",
+            "`check_inbox`",
+            "`tab`",
+            "`text`",
+            "`kind`",
+            "`info`",
+            "`question`",
+            "`report`",
+            "`all`",
+            "`you`",
+            "`qcode`",
+            "`/work`",
+        ] {
             assert!(SECTION.contains(word), "{word}");
         }
         assert!(SECTION.contains(&format!("longer than {MOST_TEXT} characters")), "{SECTION}");
@@ -450,12 +464,19 @@ mod tests {
     #[test]
     fn the_section_shows_the_line_a_delivered_message_starts_with() {
         let english = include_str!("../../assets/locales/en.toml");
-        let handed = english
+        let handed =
+            english.lines().find_map(|line| line.strip_prefix("handed = \"")).expect("how a message is handed");
+        assert!(handed.starts_with("{header}\\n"), "the header comes first: {handed}");
+        let header = english
             .lines()
-            .find_map(|line| line.strip_prefix("handed = \""))
+            .find_map(|line| line.strip_prefix("header = \""))
+            .and_then(|line| line.strip_suffix('"'))
             .expect("the English line a delivered message starts with");
-        let first = handed.split("\\n").next().expect("its first line");
-        let shown = first.replace("{from}", "<coding tool> · <tab title>");
+        let shown = header
+            .replace("{tab}", "<id>")
+            .replace("{title}", "<title>")
+            .replace("{harness}", "<coding tool>")
+            .replace("{kind}", "<kind>");
         assert!(SECTION.contains(&shown), "{shown}");
     }
 

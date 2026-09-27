@@ -602,6 +602,8 @@ fn a_window_tab_brought_back_from_the_last_session_waits_to_be_asked() {
             kind: SessionTabKind::Desktop(WINDOW.to_owned()),
             conversation: None,
             opened: 1_789_700_000,
+            number: None,
+            name: None,
         }],
     };
     screen.restore_tabs(0, &record);
@@ -631,6 +633,8 @@ fn asking_for_the_window_lifts_the_hold_a_restored_tab_has() {
             kind: SessionTabKind::Desktop(WINDOW.to_owned()),
             conversation: None,
             opened: 1_789_700_000,
+            number: None,
+            name: None,
         }],
     };
     screen.restore_tabs(0, &record);

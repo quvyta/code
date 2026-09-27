@@ -307,6 +307,8 @@ fn new_chats() -> Session {
         kind: SessionTabKind::Profile("claude-sub".to_owned()),
         conversation: conversation.map(str::to_owned),
         opened,
+        number: None,
+        name: None,
     };
     Session {
         active: Some(WorkspaceId::parse("firefly").expect("an id")),
@@ -343,12 +345,12 @@ fn a_restored_new_chat_resumes_the_newest_conversation_it_could_have_had() {
         conversation("c-before", None, 900_000),
     ];
     let first = key(&screen, 0);
-    apply(&mut screen, Msg::Woken(first, 0, Ok(()), Some(found.clone())));
+    apply(&mut screen, Msg::Woken(first, 0, Ok(()), Some(found.clone()), None));
     assert_eq!(conversation_of(&screen, 0).as_deref(), Some("c-new"), "the newest one no other tab shows");
 
     apply(&mut screen, Msg::OpenTab(1));
     let second = key(&screen, 1);
-    apply(&mut screen, Msg::Woken(second, 0, Ok(()), Some(found)));
+    apply(&mut screen, Msg::Woken(second, 0, Ok(()), Some(found), None));
     assert_eq!(conversation_of(&screen, 1).as_deref(), Some("c-second"), "the next one, used after it opened");
 
     let recorded = screen.session();
@@ -362,13 +364,13 @@ fn a_restored_new_chat_with_nothing_to_resume_starts_a_new_one() {
     let mut screen = restore(&new_chats(), &scratch);
     let first = key(&screen, 0);
     let older = vec![conversation("c-before", None, 900_000), conversation("c-taken", None, 9_000_000)];
-    apply(&mut screen, Msg::Woken(first, 0, Ok(()), Some(older)));
+    apply(&mut screen, Msg::Woken(first, 0, Ok(()), Some(older), None));
     assert_eq!(conversation_of(&screen, 0), None, "nothing used since it opened and not taken");
 
     let scratch = Scratch::new("history-restore-unread");
     let mut screen = restore(&new_chats(), &scratch);
     let first = key(&screen, 0);
-    apply(&mut screen, Msg::Woken(first, 0, Ok(()), None));
+    apply(&mut screen, Msg::Woken(first, 0, Ok(()), None, None));
     assert_eq!(conversation_of(&screen, 0), None, "a reading that failed starts a new conversation, quietly");
     let state = screen.workspace().expect("a workspace").tabs()[0].state().clone();
     assert!(matches!(state, TabState::Failed(_)), "the tab went on to spawn its session: {state:?}");
@@ -381,7 +383,7 @@ fn a_tab_that_resumes_a_conversation_already_is_not_given_another() {
     session.workspaces[0].active_tab = 2;
     let mut screen = restore(&session, &scratch);
     let tab = key(&screen, 2);
-    apply(&mut screen, Msg::Woken(tab, 0, Ok(()), Some(vec![conversation("c-new", None, 9_000_000)])));
+    apply(&mut screen, Msg::Woken(tab, 0, Ok(()), Some(vec![conversation("c-new", None, 9_000_000)]), None));
     assert_eq!(conversation_of(&screen, 2).as_deref(), Some("c-taken"));
     assert_eq!(
         words(&screen, tab)[4..],

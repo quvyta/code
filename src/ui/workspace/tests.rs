@@ -34,12 +34,15 @@ mod closed_sign_in;
 mod desktop;
 mod engine_help;
 mod files;
+mod focus;
 mod guidance;
 mod history;
+mod identity;
 mod missing_image;
 mod new_line;
 mod rebuilt_image;
 mod registry;
+mod shared;
 mod shine;
 mod sound;
 mod viewers;
@@ -528,8 +531,13 @@ fn a_tab_on_a_ready_made_service_is_told_the_window_the_service_gives_without_me
 fn an_opencode_tab_on_a_provider_is_told_of_the_relay_in_its_own_configuration_with_the_measured_window() {
     let scratch = Scratch::new("provider-opencode");
     let path = measured_providers_file("opencode", "ev1", "qwen3-coder:30b", 31_512);
-    let profiles =
-        vec![Profile { harness: HarnessKind::OpenCode, ..provider_profile("oc-tab", "ev1", "qwen3-coder:30b") }];
+    // Under base, where opencode runs one process per tab and the relay starts it; a QCode
+    // template's opencode tabs share a server the relay starts instead (`tests/shared.rs`).
+    let profiles = vec![Profile {
+        harness: HarnessKind::OpenCode,
+        template: Template::Base,
+        ..provider_profile("oc-tab", "ev1", "qwen3-coder:30b")
+    }];
     let mut screen = WorkspaceScreen::new(
         Some(engine()),
         HostUser::Ids { uid: 1000, gid: 1000 },
@@ -1562,18 +1570,32 @@ fn recorded() -> Session {
                 id: id("firefly"),
                 active_tab: 1,
                 tabs: vec![
-                    SessionTab { kind: SessionTabKind::Shell, conversation: None, opened: 100 },
+                    SessionTab {
+                        kind: SessionTabKind::Shell,
+                        conversation: None,
+                        opened: 100,
+                        number: Some(4),
+                        name: None,
+                    },
                     SessionTab {
                         kind: SessionTabKind::Profile("claude-sub".to_owned()),
                         conversation: Some("c-42".to_owned()),
                         opened: 200,
+                        number: Some(9),
+                        name: Some("reviewer".to_owned()),
                     },
                 ],
             },
             SessionWorkspace {
                 id: id("moth"),
                 active_tab: 0,
-                tabs: vec![SessionTab { kind: SessionTabKind::Shell, conversation: None, opened: 300 }],
+                tabs: vec![SessionTab {
+                    kind: SessionTabKind::Shell,
+                    conversation: None,
+                    opened: 300,
+                    number: Some(2),
+                    name: None,
+                }],
             },
         ],
     }
@@ -1743,7 +1765,13 @@ fn with_no_workspace_left_the_middle_offers_to_open_one() {
 #[test]
 fn a_blank_tab_comes_back_blank_and_never_starts() {
     let mut session = recorded();
-    session.workspaces[1].tabs.push(SessionTab { kind: SessionTabKind::New, conversation: None, opened: 400 });
+    session.workspaces[1].tabs.push(SessionTab {
+        kind: SessionTabKind::New,
+        conversation: None,
+        opened: 400,
+        number: Some(3),
+        name: None,
+    });
     session.workspaces[1].active_tab = 1;
     let (mut screen, _scratches) = restored(&session);
     assert_eq!(screen.session(), session, "a blank tab is kept in the session like any other");
@@ -1827,7 +1855,7 @@ impl App for Keyed {
         match name {
             "help" => Some(KeyedMsg::Help),
             "leave-terminal" => Some(KeyedMsg::Screen(Msg::EnterTerminal)),
-            _ => None,
+            _ => super::switch(name).map(KeyedMsg::Screen),
         }
     }
 }

@@ -31,6 +31,7 @@ use qframe::widgets::{
 
 use crate::engine::Engine;
 use crate::store::{Store, WorkspaceEntry, WorkspaceId};
+use crate::ui::keys::Wrapping;
 
 pub use draft::{Place, Source};
 
@@ -133,6 +134,9 @@ pub struct Workspaces {
     entries: Vec<WorkspaceEntry>,
     trouble: Option<String>,
     listed: bool,
+    /// The control the keyboard was on went away with a closed dialog or a deleted workspace, so
+    /// the next listing puts it back on the list, or on the empty page's button.
+    refocus: bool,
     selected: usize,
     /// Whether the selection is on the row that makes a new workspace rather than on `selected`.
     on_new: bool,
@@ -162,6 +166,7 @@ impl Workspaces {
             entries: Vec::new(),
             trouble: None,
             listed: false,
+            refocus: false,
             selected: 0,
             on_new: false,
             overlay: None,
@@ -208,10 +213,13 @@ pub fn update(workspaces: &mut Workspaces, message: Msg) -> (Command<Msg>, Optio
             workspaces.listed = true;
             workspaces.selected = workspaces.selected.min(workspaces.entries.len().saturating_sub(1));
             // The list is not on screen until the store has answered, so the keyboard is put
-            // on it here rather than when the screen opened. Only the first answer does it: a
+            // on it here rather than when the screen opened. Only the first answer does it, and
+            // the answer after a dialog or a workspace went away with the keyboard's control: a
             // refresh must never take the keyboard off what the person is in the middle of.
-            if first && !workspaces.entries.is_empty() && workspaces.overlay.is_none() {
-                Command::focus(LIST)
+            let refocus = std::mem::take(&mut workspaces.refocus);
+            if (first || refocus) && workspaces.overlay.is_none() {
+                // An empty list has one button, which is what Enter should press.
+                Command::focus(if workspaces.entries.is_empty() { EMPTY } else { LIST })
             } else {
                 Command::none()
             }
@@ -297,6 +305,9 @@ const NAME_INPUT: &str = "workspace-name";
 
 /// The name of the list, for the focus and the tests.
 const LIST: &str = "workspaces";
+
+/// The name of the empty list's page, whose one button makes the first workspace.
+const EMPTY: &str = "workspaces-empty";
 
 /// The name of the list the workspace to delete is chosen from.
 const DELETE_LIST: &str = "workspace-delete-list";
@@ -407,6 +418,7 @@ fn submit(workspaces: &mut Workspaces) -> Command<Msg> {
         // Nothing to fill: the workspace works in the person's folder, which is whole already.
         (Source::Folder, Some(_), _) if in_place => {
             workspaces.overlay = None;
+            workspaces.refocus = true;
             return Command::batch([
                 Command::toast(Toast::success(t!("workspaces.created-toast", name = file.name))),
                 list(&workspaces.store),
@@ -417,6 +429,7 @@ fn submit(workspaces: &mut Workspaces) -> Command<Msg> {
         // An empty workspace is whole the moment its folders are there.
         _ => {
             workspaces.overlay = None;
+            workspaces.refocus = true;
             return Command::batch([
                 Command::toast(Toast::success(t!("workspaces.created-toast", name = file.name))),
                 list(&workspaces.store),
@@ -457,10 +470,12 @@ fn finished(workspaces: &mut Workspaces, outcome: &TaskOutcome) -> Command<Msg> 
     let told = match outcome {
         TaskOutcome::Done => {
             workspaces.overlay = None;
+            workspaces.refocus = true;
             Command::toast(Toast::success(t!("workspaces.created-toast", name = name)))
         }
         TaskOutcome::Cancelled => {
             workspaces.overlay = None;
+            workspaces.refocus = true;
             Command::toast(
                 Toast::warning(t!("workspaces.cancelled-toast", name = name)).body(t!("workspaces.cancelled-body")),
             )
@@ -567,6 +582,7 @@ fn delete(workspaces: &mut Workspaces) -> Command<Msg> {
 /// is left.
 fn deleted(workspaces: &mut Workspaces, survey: &Survey, outcome: Outcome) -> Command<Msg> {
     workspaces.deleting = false;
+    workspaces.refocus = true;
     let told = match outcome {
         Outcome::Deleted => {
             workspaces.deleted.clone_from(&survey.id);
@@ -644,7 +660,8 @@ fn body(workspaces: &Workspaces, ui: &mut View<'_, Msg>) {
                 .message(t!("workspaces.empty-message"))
                 .action(Button::new(t!("workspaces.new")).variant("primary").on_press(Msg::Start)),
         )
-        .fill();
+        .fill()
+        .id(EMPTY);
         return;
     }
     // The way to a new workspace is the list's first row, so the keyboard reaches it the way it
@@ -656,7 +673,8 @@ fn body(workspaces: &Workspaces, ui: &mut View<'_, Msg>) {
         .selected(Some(selected))
         .on_select(|row| row.checked_sub(1).map_or(Msg::SelectNew, Msg::Select))
         .on_activate(|row| row.checked_sub(1).map_or(Msg::Start, Msg::Activate));
-    ui.add(list).id(LIST).fill();
+    let rows = workspaces.entries.len() + 1;
+    ui.add(Wrapping::new(list, Some(selected), rows)).id(LIST).fill();
     ui.row(|ui| {
         ui.spacer();
         let mut delete = Button::new(t!("workspaces.removal.button")).variant("danger").loading(workspaces.deleting);
@@ -734,10 +752,9 @@ fn choose_doomed(workspaces: &Workspaces, chosen: usize, ui: &mut View<'_, Msg>)
     let rows = u16::try_from(items.len()).unwrap_or(u16::MAX).min(LOG_ROWS);
     ui.add_with(dialog, |ui| {
         ui.add(Text::new(t!("workspaces.removal.choose-message")).role("secondary")).fill_width();
-        ui.add(List::new(items).selected(Some(chosen)).on_select(Msg::DeleteSelect).on_activate(Msg::DeletePick))
-            .id(DELETE_LIST)
-            .height(Length::Cells(rows))
-            .fill_width();
+        let count = items.len();
+        let list = List::new(items).selected(Some(chosen)).on_select(Msg::DeleteSelect).on_activate(Msg::DeletePick);
+        ui.add(Wrapping::new(list, Some(chosen), count)).id(DELETE_LIST).height(Length::Cells(rows)).fill_width();
     });
 }
 
@@ -793,14 +810,13 @@ fn form(workspaces: &Workspaces, draft: &Draft, ui: &mut View<'_, Msg>) {
             // A radio group rather than segments: its chosen option carries a mark of its own, so
             // the plain empty workspace reads as the one chosen, where a lit segment under a resting
             // pointer looked like a choice of its own.
-            ui.add(
-                RadioGroup::new(Source::ALL.map(Source::label))
-                    .horizontal(true)
-                    .selected(Some(draft.source.index()))
-                    .on_select(Msg::Source),
-            )
-            .id(SOURCE_GROUP)
-            .fill_width();
+            let group = RadioGroup::new(Source::ALL.map(Source::label))
+                .horizontal(true)
+                .selected(Some(draft.source.index()))
+                .on_select(Msg::Source);
+            ui.add(Wrapping::new(group, Some(draft.source.index()), Source::ALL.len()).across(true))
+                .id(SOURCE_GROUP)
+                .fill_width();
         });
         match draft.source {
             Source::Empty => {}
@@ -821,14 +837,13 @@ fn form(workspaces: &Workspaces, draft: &Draft, ui: &mut View<'_, Msg>) {
                         .fill_width();
                 });
                 fields.field(Field::new(t!("workspaces.place-label")), |ui| {
-                    ui.add(
-                        RadioGroup::new(Place::ALL.map(Place::label))
-                            .horizontal(true)
-                            .selected(Some(draft.place.index()))
-                            .on_select(Msg::Place),
-                    )
-                    .id(PLACE_GROUP)
-                    .fill_width();
+                    let group = RadioGroup::new(Place::ALL.map(Place::label))
+                        .horizontal(true)
+                        .selected(Some(draft.place.index()))
+                        .on_select(Msg::Place);
+                    ui.add(Wrapping::new(group, Some(draft.place.index()), Place::ALL.len()).across(true))
+                        .id(PLACE_GROUP)
+                        .fill_width();
                 });
                 FilePicker::new(&draft.browser, Msg::Picker)
                     .show(fields.ui())

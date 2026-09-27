@@ -5,6 +5,21 @@ Every release of quvyta-code, newest first. The format follows
 [Semantic Versioning](https://semver.org/); while the version starts with 0, a minor release may
 change files qcode writes, and the notes say so when it does.
 
+## 0.1.19 - 2026-09-28
+
+### Added
+
+- **Every tab has an id and a name of its own.** Tabs are numbered within their workspace, 1, 2, 3 and on, and a number is never given again while the workspace is open, so two workspaces side by side no longer share one count. Right-click a tab and choose **Rename**, or press F2, to name it; leave the name empty to go back to the automatic one. Without a name, a harness tab takes the title its harness gave the conversation, and two tabs that would read the same show their number after the name. Ids and names come back when qcode opens again.
+- **An agent always knows which tab it is.** `list_tabs` now starts with the asking tab itself (its id, name and workspace) and lists only the other tabs of the same workspace, also for opencode tabs sharing one server and for the helpers an agent starts.
+- **Messages say what they want.** `send_message` takes a kind: `info` (no answer needed), `question` (the sender waits for an answer) or `report` (a task whose result the sender waits for). Every message arrives in the other tab under two short lines naming the sending tab's id and name, the kind, and how to answer. `tab: "all"` sends one message to every other agent tab of the workspace, each by the same rules as a message to it alone, and the answer says tab by tab what happened. The instructions qcode writes for the agents say all this.
+- **Switch tabs from the keyboard.** Ctrl+PgDn and Ctrl+PgUp go to the next and previous tab and Alt+1 to Alt+9 straight to a tab, also from inside a harness.
+
+### Changed
+
+- **The keyboard lands in the tab you switch to.** Clicking a tab, switching with a key, opening a new tab or another workspace puts the keyboard in the program of that tab at once: no more clicking inside opencode before typing. On the tab strip the arrows still walk the tabs, and Enter or Down steps into the one shown.
+- **Every screen works from the keyboard.** Lists and choices go round at their ends (Down on the last row goes to the first, Up on the first to the last) on the home screen, workspaces, profiles, providers, the setup and profile wizards, the new tab page and the side panel's lists. Each wizard page puts the keyboard on its question, and closing a dialog gives the keyboard back to the list it came from. Settings' own rows do not go round yet.
+- **opencode tabs share one opencode.** The opencode tabs of a profile made with a QCode template run one opencode server in the profile's container, and each tab only opencode's interface attached to it. Seven tabs of one profile took 5.0 GB together before and take 2.4 GB now (measured on a Raspberry Pi 5). Every tab keeps its own conversation and its place in messages between tabs; closing a tab stops its agent, and a server that stops is started again under every tab. A profile made with base still runs one opencode per tab.
+
 ## 0.1.18 - 2026-09-27
 
 ### Added

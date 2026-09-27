@@ -8,6 +8,7 @@ use qframe::widgets::{
 };
 
 use crate::engine::ContainerState;
+use crate::ui::keys::Wrapping;
 
 use super::file_ops::{is_within, stem};
 use super::files::{self, FileMsg, FileTree, NameFor};
@@ -233,14 +234,11 @@ fn chooser(panel: &Panel, ui: &mut View<'_, Msg>) {
             let items = missing.iter().map(|widget| ListItem::new(widget.title()).icon(widget.icon(), None));
             let offered = missing.clone();
             let row = panel.chooser_row.min(missing.len() - 1);
-            ui.add(
-                List::new(items)
-                    .selected(Some(row))
-                    .on_select(Msg::HighlightWidget)
-                    .on_activate(move |index| Msg::AddWidget(offered[index])),
-            )
-            .id(CHOOSER_ID)
-            .width(Length::Cells(26));
+            let list = List::new(items)
+                .selected(Some(row))
+                .on_select(Msg::HighlightWidget)
+                .on_activate(move |index| Msg::AddWidget(offered[index]));
+            ui.add(Wrapping::new(list, Some(row), missing.len())).id(CHOOSER_ID).width(Length::Cells(26));
         })
         .show(ui);
 }
@@ -599,7 +597,8 @@ fn containers_widget(screen: &WorkspaceScreen, workspace: &OpenWorkspace, ui: &m
                 .icon("dot", Some(tone(&container.state)))
                 .detail(state_text(&container.state))
         });
-        ui.add(List::new(rows).selected(Some(workspace.container_row)).on_select(Msg::SelectContainer))
+        let list = List::new(rows).selected(Some(workspace.container_row)).on_select(Msg::SelectContainer);
+        ui.add(Wrapping::new(list, Some(workspace.container_row), workspace.containers().len()))
             .fill()
             .id("workspace-containers");
     }

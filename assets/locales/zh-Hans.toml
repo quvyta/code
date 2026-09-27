@@ -40,6 +40,21 @@ back = "离开此屏幕"
 new-tab = "打开新标签页"
 leave-terminal = "在工具与标签页之间切换"
 
+# Naming a tab.
+rename-tab = "给打开的标签页命名"
+# The keys that switch tabs from anywhere on the project screen.
+next-tab = "转到下一个标签页"
+previous-tab = "转到上一个标签页"
+tab-1 = "转到标签页 1"
+tab-2 = "转到标签页 2"
+tab-3 = "转到标签页 3"
+tab-4 = "转到标签页 4"
+tab-5 = "转到标签页 5"
+tab-6 = "转到标签页 6"
+tab-7 = "转到标签页 7"
+tab-8 = "转到标签页 8"
+tab-9 = "转到标签页 9"
+
 
 [setup]
 step-language = "语言"
@@ -321,6 +336,7 @@ history.unread = "对话读不出来"
 hints.tabs = "标签页"
 hints.close = "关闭标签页"
 hints.leave = "离开终端"
+hints.enter = "进入标签页"
 panel.title = "面板"
 panel.add = "添加一个部件"
 panel.remove = "把 {widget} 从面板移除"
@@ -508,13 +524,21 @@ close-agent.message = "智能体还在运行。关闭标签页会停止它，它
 close-agent.confirm = "结束并关闭"
 close-agent.cancel = "让它继续运行"
 
+# Naming a tab, from its menu on the strip or with its key.
+rename.item = "重命名"
+rename.title = "重命名 {tab}"
+rename.label = "名称"
+rename.hint = "留空即恢复自动名称。"
+rename.keep = "重命名"
+rename.cancel = "取消"
+
 # The bridge between tabs: what the person is asked and shown, and the answers the agent of a
 # tab reads when it lists the other tabs or sends one of them a message.
 [bridge]
 closed = "{workspace} 的标签页之间无法互相发送消息"
 asking = "正在等待回答"
 delivering = "正在递送消息"
-handed = "经由 QCode，来自 {from} 标签页：\n\n{text}"
+handed = "{header}\n{reply}\n\n{text}"
 waiting = "这里有 {n} 条消息在等着，最后一条来自 {from}"
 waiting-stuck = "这里有 {n} 条消息在等着，最后一条来自 {from}：送不进去，这个标签页里的编程工具没在运行"
 letter.from = "来自 {from}"
@@ -568,6 +592,19 @@ close.title = "关闭 {tab}？"
 close.message = { other = "{n} 条来自其他标签页的消息等在这个标签页里。关掉它会丢掉这些消息，发送它们的智能体也不会被告知。" }
 close.confirm = "关闭并丢弃"
 close.cancel = "保留标签页"
+
+# Who a tab is and what a message asks: the list names the asking tab first, and every message
+# arrives under two lines that say who sent it, what kind it is and how to answer.
+answer.you = "你是工作区 «{workspace}» 里的标签页 {tab}，«{title}»。"
+answer.all = "这个工作区里另外 {n} 个助手标签页各自的情况："
+answer.all-tab = "标签页 {tab} «{title}»：{what}"
+header = "经由 QCode，来自这个工作区的标签页 {tab} «{title}»（{harness}）：{kind}"
+kind.info = "供你参考，不需要回复。"
+kind.question = "一个问题，发送方在等你的回答。"
+kind.report = "一项任务，发送方在等你完成后报告结果。"
+reply.info = "要回复的话，用 send_message，tab \"{tab}\"。"
+reply.question = "用 send_message 回答：tab \"{tab}\"，kind \"info\"。"
+reply.report = "完成后用 send_message 发送结果：tab \"{tab}\"，kind \"info\"（如果需要先问点什么，用 kind \"question\"）。"
 
 [settings]
 title = "设置"

@@ -50,6 +50,7 @@ use crate::profile::{
 };
 use crate::provider::{ProviderEntry, Providers};
 use crate::store::Store;
+use crate::ui::keys::Wrapping;
 use crate::ui::settings::engine::help;
 
 pub use shell_page::{ShellMsg, ShellPage, Side as ShellSide, Stage as ShellStage};
@@ -445,7 +446,8 @@ pub fn update(state: &mut Profiles, message: Msg) -> Command<Msg> {
             state.choose_when_read = None;
             let taken = state.rows.iter().map(|row| row.profile.name.as_str().to_owned());
             state.draft = Some(Draft::new(taken, state.providers.clone()));
-            Command::focus("profile-name")
+            // The page's first question, the harness, above the name that follows from it.
+            Command::focus("profile-harness")
         }
         Msg::Cancel => leave(state),
         // Finish stands where Next would on the last page. A profile with no sign-in ends on its
@@ -468,16 +470,14 @@ pub fn update(state: &mut Profiles, message: Msg) -> Command<Msg> {
             leave(state)
         }
         Msg::Back => {
-            if let Some(draft) = &mut state.draft {
-                draft.back();
-            }
-            Command::none()
+            let Some(draft) = &mut state.draft else { return Command::none() };
+            draft.back();
+            arrive(draft)
         }
         Msg::Step(index) => {
-            if let Some(draft) = &mut state.draft {
-                draft.go_to(index);
-            }
-            Command::none()
+            let Some(draft) = &mut state.draft else { return Command::none() };
+            draft.go_to(index);
+            arrive(draft)
         }
         Msg::Next => next(state),
         Msg::Name(name) => {
@@ -836,8 +836,24 @@ fn next(state: &mut Profiles) -> Command<Msg> {
         Some(Blocked::Unsupported(_)) => Command::focus("profile-system"),
         Some(Blocked::NoChromium) => Command::focus("profile-extras"),
         None if draft.stage == Stage::Image && draft.build == Build::Waiting => start_build(state),
-        None => Command::none(),
+        None => arrive(draft),
     }
+}
+
+/// Puts the keyboard on the question of the page just reached, the way the first-start wizard
+/// does, rather than leaving it on a button of the page left. The image page has no question: its
+/// build starts by itself, and Next, where the keyboard already is, is what follows it.
+fn arrive(draft: &Draft) -> Command<Msg> {
+    let control = match draft.stage {
+        Stage::Harness => "profile-harness",
+        Stage::System => "profile-system",
+        Stage::Template => "profile-template",
+        Stage::Account => "profile-account",
+        Stage::Permissions => "profile-assets",
+        Stage::Image => return Command::none(),
+        Stage::Login => "login-open",
+    };
+    Command::focus(control)
 }
 
 /// Leaves the wizard. Whatever the engine has already made — the image, the login — stays; what
@@ -1231,11 +1247,17 @@ pub fn view(state: &Profiles, ui: &mut View<'_, Msg>) {
 }
 
 /// The control that takes the keyboard when the screen opens, once there is one: the list of
-/// profiles. An empty screen has a single button and nothing to walk, so nothing is focused and
-/// the button is one Tab away.
+/// profiles, or on an empty screen its one button, so Enter makes the first profile without a
+/// Tab the screen never mentions.
 #[must_use]
 pub fn entry(state: &Profiles) -> Option<&'static str> {
-    (!state.rows().is_empty()).then_some("profiles")
+    if state.loading {
+        None
+    } else if state.rows().is_empty() {
+        Some("profiles-empty")
+    } else {
+        Some("profiles")
+    }
 }
 
 /// The keys of the profiles screen that are not in the keymap, for the key list.
@@ -1308,7 +1330,10 @@ fn draw_list(state: &Profiles, ui: &mut View<'_, Msg>) {
             .selected(Some(chosen))
             .on_select(|row| row.checked_sub(1).map_or(Msg::SelectNew, Msg::Select))
             .on_activate(|row| row.checked_sub(1).map_or(Msg::New, Msg::Select));
-        ui.add(table).id("profiles").height(Length::Cells(height)).fill_width();
+        ui.add(Wrapping::new(table, Some(chosen), rows.len() + 1))
+            .id("profiles")
+            .height(Length::Cells(height))
+            .fill_width();
 
         // What can be done to the chosen profile stands once, right under the rows, and nothing
         // stands there while the new-profile row is chosen: the rows themselves stay plain.
@@ -1629,12 +1654,10 @@ fn draw_harness(draft: &Draft, ui: &mut View<'_, Msg>) {
     };
     let chosen = HarnessKind::ALL.iter().position(|harness| *harness == draft.harness);
     ui.add(Text::new(t!("profiles.wizard.harness-lead")).role("secondary")).fill_width();
-    ui.add(
-        RadioGroup::new(HarnessKind::ALL.map(|harness| harness.record().display_name.to_owned()))
-            .selected(chosen)
-            .on_select(Msg::PickHarness),
-    )
-    .id("profile-harness");
+    let group = RadioGroup::new(HarnessKind::ALL.map(|harness| harness.record().display_name.to_owned()))
+        .selected(chosen)
+        .on_select(Msg::PickHarness);
+    ui.add(Wrapping::new(group, chosen, HarnessKind::ALL.len())).id("profile-harness");
     // A person who went back from the system page to change the harness learns at once that the
     // system they chose there cannot run this one, not only when they reach it again.
     if let Some(refusal) = draft.os.refuses(draft.harness) {
@@ -1658,7 +1681,9 @@ fn draw_harness(draft: &Draft, ui: &mut View<'_, Msg>) {
                 TextInput::new(draft.name.clone())
                     .invalid(error.is_some())
                     .max_length(SafeName::MAX_LENGTH)
-                    .on_change(Msg::Name),
+                    .on_change(Msg::Name)
+                    // The name is the page's last question, so Enter after it goes on.
+                    .on_submit(|_| Msg::Next),
             )
             .id("profile-name")
             .fill_width();
@@ -1679,7 +1704,8 @@ fn draw_harness(draft: &Draft, ui: &mut View<'_, Msg>) {
 fn draw_system(draft: &Draft, ui: &mut View<'_, Msg>) {
     let chosen = Os::ALL.iter().position(|os| *os == draft.os);
     ui.add(Text::new(t!("profiles.wizard.system-lead")).role("secondary")).fill_width();
-    ui.add(RadioGroup::new(Os::ALL.map(system_option)).selected(chosen).on_select(Msg::PickOs)).id("profile-system");
+    let group = RadioGroup::new(Os::ALL.map(system_option)).selected(chosen).on_select(Msg::PickOs);
+    ui.add(Wrapping::new(group, chosen, Os::ALL.len())).id("profile-system");
     let detail = t!(match draft.os {
         Os::Debian => "profiles.wizard.system-debian-detail",
         Os::Arch => "profiles.wizard.system-arch-detail",
@@ -1725,13 +1751,12 @@ fn refusal_line(refusal: Refusal, draft: &Draft) -> String {
 fn draw_template(draft: &Draft, ui: &mut View<'_, Msg>) {
     let offered = Template::offered(draft.harness);
     let chosen = offered.iter().position(|template| *template == draft.template);
+    let count = offered.len();
     ui.add(Text::new(t!("profiles.wizard.template-lead")).role("secondary")).fill_width();
-    ui.add(
-        RadioGroup::new(offered.into_iter().map(template_word).collect::<Vec<_>>())
-            .selected(chosen)
-            .on_select(Msg::PickTemplate),
-    )
-    .id("profile-template");
+    let group = RadioGroup::new(offered.into_iter().map(template_word).collect::<Vec<_>>())
+        .selected(chosen)
+        .on_select(Msg::PickTemplate);
+    ui.add(Wrapping::new(group, chosen, count)).id("profile-template");
     let detail = match draft.template {
         Template::Base => t!("profiles.wizard.template-base-detail"),
         Template::Recommended => t!("profiles.template.recommended-detail"),
@@ -1893,12 +1918,10 @@ fn draw_account(draft: &Draft, ui: &mut View<'_, Msg>) {
     let offered = draft.harness.record().accounts;
     let chosen = offered.iter().position(|account| *account == draft.account);
     ui.add(Text::new(t!("profiles.wizard.account-lead")).role("secondary")).fill_width();
-    ui.add(
-        RadioGroup::new(offered.iter().map(|account| account_word(*account)))
-            .selected(chosen)
-            .on_select(Msg::PickAccount),
-    )
-    .id("profile-account");
+    let group = RadioGroup::new(offered.iter().map(|account| account_word(*account)))
+        .selected(chosen)
+        .on_select(Msg::PickAccount);
+    ui.add(Wrapping::new(group, chosen, offered.len())).id("profile-account");
     if let Some(detail) = no_login_detail(draft.account, draft.harness.record().display_name) {
         ui.add(Text::new(detail).role("secondary")).fill_width();
     }
@@ -1925,12 +1948,10 @@ fn draw_provider_choice(draft: &Draft, ui: &mut View<'_, Msg>) {
     }
     let chosen_tag = draft.providers.iter().position(|entry| Some(entry.tag.as_str()) == draft.provider_tag.as_deref());
     ui.add(Text::new(t!("profiles.wizard.provider-lead")).role("secondary")).fill_width();
-    ui.add(
-        RadioGroup::new(draft.providers.iter().map(|entry| entry.tag.to_string()))
-            .selected(chosen_tag)
-            .on_select(Msg::PickProvider),
-    )
-    .id("profile-provider");
+    let group = RadioGroup::new(draft.providers.iter().map(|entry| entry.tag.to_string()))
+        .selected(chosen_tag)
+        .on_select(Msg::PickProvider);
+    ui.add(Wrapping::new(group, chosen_tag, draft.providers.len())).id("profile-provider");
     let models = draft.provider_models();
     if models.is_empty() {
         ui.add(Text::new(t!("profiles.wizard.provider-model-none")).role("secondary")).fill_width();
@@ -1940,12 +1961,10 @@ fn draw_provider_choice(draft: &Draft, ui: &mut View<'_, Msg>) {
     }
     let chosen_model = models.iter().position(|model| Some(model.id.as_str()) == draft.provider_model.as_deref());
     ui.add(Text::new(t!("profiles.wizard.provider-model-lead")).role("secondary")).fill_width();
-    ui.add(
-        RadioGroup::new(models.iter().map(|model| model.id.clone()))
-            .selected(chosen_model)
-            .on_select(Msg::PickProviderModel),
-    )
-    .id("profile-provider-model");
+    let group = RadioGroup::new(models.iter().map(|model| model.id.clone()))
+        .selected(chosen_model)
+        .on_select(Msg::PickProviderModel);
+    ui.add(Wrapping::new(group, chosen_model, models.len())).id("profile-provider-model");
     // Only a window QCode measured, or one a ready-made service gives for its own models, is
     // handed to Claude Code; without one it works to the room of its own models and prints a
     // warning at every start. Measuring is left to the person on the Providers page, because it
@@ -1971,21 +1990,17 @@ fn draw_permissions(draft: &Draft, ui: &mut View<'_, Msg>) {
     ui.add(Text::new(t!("profiles.access-rw")).role("secondary"));
     ui.add(Text::new(t!("profiles.wizard.code-why")).role("secondary")).fill_width();
     ui.add(Text::new(t!("profiles.wizard.permissions-assets")).bold());
-    ui.add(
-        RadioGroup::new(MountAccess::ALL.map(access_word))
-            .selected(MountAccess::ALL.iter().position(|access| *access == draft.assets))
-            .horizontal(true)
-            .on_select(Msg::PickAssets),
-    )
-    .id("profile-assets");
+    let assets = MountAccess::ALL.iter().position(|access| *access == draft.assets);
+    let group =
+        RadioGroup::new(MountAccess::ALL.map(access_word)).selected(assets).horizontal(true).on_select(Msg::PickAssets);
+    ui.add(Wrapping::new(group, assets, MountAccess::ALL.len()).across(true)).id("profile-assets");
     ui.add(Text::new(t!("profiles.wizard.permissions-network")).bold());
-    ui.add(
-        RadioGroup::new(NetworkMode::ALL.map(network_word))
-            .selected(NetworkMode::ALL.iter().position(|mode| *mode == draft.network))
-            .horizontal(true)
-            .on_select(Msg::PickNetwork),
-    )
-    .id("profile-network");
+    let network = NetworkMode::ALL.iter().position(|mode| *mode == draft.network);
+    let group = RadioGroup::new(NetworkMode::ALL.map(network_word))
+        .selected(network)
+        .horizontal(true)
+        .on_select(Msg::PickNetwork);
+    ui.add(Wrapping::new(group, network, NetworkMode::ALL.len()).across(true)).id("profile-network");
     // Chosen here, after the template: this is where the person turns the network off, so this
     // is where they learn what of a QCode template that costs.
     if let Some(offline) = offline_line(draft) {

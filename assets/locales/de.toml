@@ -40,6 +40,21 @@ back = "diesen Bildschirm verlassen"
 new-tab = "einen neuen Tab öffnen"
 leave-terminal = "zwischen Werkzeug und Tabs wechseln"
 
+# Naming a tab.
+rename-tab = "den offenen Tab benennen"
+# The keys that switch tabs from anywhere on the project screen.
+next-tab = "zum nächsten Tab"
+previous-tab = "zum vorherigen Tab"
+tab-1 = "zu Tab 1"
+tab-2 = "zu Tab 2"
+tab-3 = "zu Tab 3"
+tab-4 = "zu Tab 4"
+tab-5 = "zu Tab 5"
+tab-6 = "zu Tab 6"
+tab-7 = "zu Tab 7"
+tab-8 = "zu Tab 8"
+tab-9 = "zu Tab 9"
+
 
 [setup]
 step-language = "Sprache"
@@ -321,6 +336,7 @@ history.unread = "Die Chats konnten nicht gelesen werden"
 hints.tabs = "Tabs"
 hints.close = "Tab schließen"
 hints.leave = "das Terminal verlassen"
+hints.enter = "in den Tab"
 panel.title = "Leiste"
 panel.add = "Ein Widget hinzufügen"
 panel.remove = "{widget} aus der Leiste nehmen"
@@ -508,13 +524,21 @@ close-agent.message = "Der Agent läuft noch. Das Schließen des Tabs stoppt ihn
 close-agent.confirm = "Beenden und schließen"
 close-agent.cancel = "Weiterlaufen lassen"
 
+# Naming a tab, from its menu on the strip or with its key.
+rename.item = "Umbenennen"
+rename.title = "{tab} umbenennen"
+rename.label = "Name"
+rename.hint = "Leer lassen, um zum automatischen Namen zurückzukehren."
+rename.keep = "Umbenennen"
+rename.cancel = "Abbrechen"
+
 # The bridge between tabs: what the person is asked and shown, and the answers the agent of a
 # tab reads when it lists the other tabs or sends one of them a message.
 [bridge]
 closed = "Die Tabs von {workspace} können einander keine Nachrichten schicken"
 asking = "Wartet auf eine Antwort"
 delivering = "Eine Nachricht wird übergeben"
-handed = "Über QCode, aus dem Tab {from}:\n\n{text}"
+handed = "{header}\n{reply}\n\n{text}"
 waiting = { one = "Hier wartet eine Nachricht von {from}", other = "Hier warten {n} Nachrichten, die letzte von {from}" }
 waiting-stuck = { one = "Hier wartet eine Nachricht von {from}: sie konnte nicht übergeben werden, das Coding-Werkzeug in diesem Tab läuft nicht", other = "Hier warten {n} Nachrichten, die letzte von {from}: sie konnten nicht übergeben werden, das Coding-Werkzeug in diesem Tab läuft nicht" }
 letter.from = "Von {from}"
@@ -568,6 +592,19 @@ close.title = "{tab} schließen?"
 close.message = { one = "Eine Nachricht aus einem anderen Tab wartet in diesem Tab. Beim Schließen wird die Nachricht weggeworfen, und der Agent, der sie geschickt hat, wird nicht darüber informiert.", other = "{n} Nachrichten aus anderen Tabs warten in diesem Tab. Beim Schließen werden sie weggeworfen, und die Agenten, die sie geschickt haben, werden nicht darüber informiert." }
 close.confirm = "Schließen und verwerfen"
 close.cancel = "Tab behalten"
+
+# Who a tab is and what a message asks: the list names the asking tab first, and every message
+# arrives under two lines that say who sent it, what kind it is and how to answer.
+answer.you = "Du bist Tab {tab}, «{title}», im Arbeitsbereich «{workspace}»."
+answer.all = { one = "Der eine andere Agenten-Tab dieses Arbeitsbereichs:", other = "Jeder der {n} anderen Agenten-Tabs dieses Arbeitsbereichs:" }
+answer.all-tab = "Tab {tab} «{title}»: {what}"
+header = "Über QCode, von Tab {tab} «{title}» ({harness}) dieses Arbeitsbereichs: {kind}"
+kind.info = "zur Kenntnis, keine Antwort nötig."
+kind.question = "eine Frage, der Absender wartet auf deine Antwort."
+kind.report = "eine Aufgabe, der Absender wartet auf einen Bericht über das Ergebnis, wenn du fertig bist."
+reply.info = "Um zurückzuschreiben, nutze send_message mit tab \"{tab}\"."
+reply.question = "Antworte mit send_message, tab \"{tab}\", kind \"info\"."
+reply.report = "Wenn du fertig bist, schick das Ergebnis mit send_message, tab \"{tab}\", kind \"info\" (kind \"question\", wenn du vorher etwas fragen musst)."
 
 [settings]
 title = "Einstellungen"

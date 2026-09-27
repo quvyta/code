@@ -209,6 +209,14 @@ impl TabState {
 #[derive(Debug)]
 pub struct Tab {
     key: TabKey,
+    /// The tab's id inside its workspace, the one agents know it by: 1 for the workspace's first
+    /// tab, then 2 and on. Given by the workspace when the tab joins it and never given again
+    /// while the workspace is open, so the id of a closed tab never lands on another. 0 until
+    /// then.
+    number: u32,
+    /// The name the person gave the tab, which the strip, the list agents read and the header of
+    /// every message the tab sends show in place of the automatic one.
+    name: Option<String>,
     kind: TabKind,
     state: TabState,
     /// When the tab was opened, in seconds since the Unix epoch.
@@ -263,6 +271,8 @@ impl Tab {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs());
         Self {
             key,
+            number: 0,
+            name: None,
             kind,
             state: TabState::Starting,
             opened: now,
@@ -312,6 +322,29 @@ impl Tab {
     #[must_use]
     pub fn key(&self) -> TabKey {
         self.key
+    }
+
+    /// The tab's id inside its workspace, which agents send to; 0 before it joined one.
+    #[must_use]
+    pub fn number(&self) -> u32 {
+        self.number
+    }
+
+    /// Gives the tab its id inside its workspace. Only the workspace does this, as the tab joins it.
+    pub(super) fn numbered(&mut self, number: u32) {
+        self.number = number;
+    }
+
+    /// The name the person gave the tab, when they gave it one.
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// Gives the tab the person's `name`, or with `None` takes it away, after which the tab reads
+    /// its automatic name again.
+    pub fn rename(&mut self, name: Option<String>) {
+        self.name = name;
     }
 
     /// What the tab opens.
@@ -564,8 +597,9 @@ impl Tab {
     /// Turns a blank tab into a tab of `kind` showing `conversation`, opened now and waiting for
     /// its container. The key stays, so the tab keeps its place in the strip.
     pub fn choose(&mut self, kind: TabKind, conversation: Option<String>) {
-        let key = self.key;
-        *self = Self { conversation, ..Self::new(key, kind) };
+        // The tab stays the same tab to the agents and the person: its id and its name go with it.
+        let (key, number, name) = (self.key, self.number, self.name.take());
+        *self = Self { conversation, number, name, ..Self::new(key, kind) };
     }
 
     /// Records that the tab shows `conversation`, once that is known, so the session file keeps

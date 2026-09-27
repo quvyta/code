@@ -40,6 +40,21 @@ back = "bu ekrandan çık"
 new-tab = "yeni sekme aç"
 leave-terminal = "düzenek ile sekmeler arasında geç"
 
+# Naming a tab.
+rename-tab = "açık sekmeye ad ver"
+# Proje ekranının her yerinden sekme değiştiren tuşlar.
+next-tab = "sonraki sekmeye geç"
+previous-tab = "önceki sekmeye geç"
+tab-1 = "1. sekmeye geç"
+tab-2 = "2. sekmeye geç"
+tab-3 = "3. sekmeye geç"
+tab-4 = "4. sekmeye geç"
+tab-5 = "5. sekmeye geç"
+tab-6 = "6. sekmeye geç"
+tab-7 = "7. sekmeye geç"
+tab-8 = "8. sekmeye geç"
+tab-9 = "9. sekmeye geç"
+
 
 [setup]
 step-language = "Dil"
@@ -321,6 +336,7 @@ history.unread = "Sohbetler okunamadı"
 hints.tabs = "sekmeler"
 hints.close = "sekmeyi kapat"
 hints.leave = "terminalden çık"
+hints.enter = "sekmeye gir"
 panel.title = "Panel"
 panel.add = "Widget ekle"
 panel.remove = "Panelden kaldır: {widget}"
@@ -508,13 +524,21 @@ close-agent.message = "Ajan hâlâ çalışıyor. Sekmeyi kapatınca durur, o an
 close-agent.confirm = "Durdur ve kapat"
 close-agent.cancel = "Çalışmaya devam etsin"
 
+# Naming a tab, from its menu on the strip or with its key.
+rename.item = "Yeniden adlandır"
+rename.title = "{tab} sekmesini yeniden adlandır"
+rename.label = "Ad"
+rename.hint = "Otomatik ada dönmek için boş bırak."
+rename.keep = "Yeniden adlandır"
+rename.cancel = "Vazgeç"
+
 # Sekmeler arası köprü: kişiye sorulan ve gösterilenler, bir sekmenin ajanı öbür sekmeleri
 # listelediğinde ya da birine mesaj gönderdiğinde okuduğu cevaplar.
 [bridge]
 closed = "{workspace} çalışma alanının sekmeleri birbirine mesaj gönderemiyor"
 asking = "Cevap bekleniyor"
 delivering = "Mesaj iletiliyor"
-handed = "QCode aracılığıyla {from} sekmesinden:\n\n{text}"
+handed = "{header}\n{reply}\n\n{text}"
 waiting = { one = "{from} sekmesinden bir mesaj burada bekliyor", other = "Burada {n} mesaj bekliyor, sonuncusu {from} sekmesinden" }
 waiting-stuck = { one = "{from} sekmesinden bir mesaj burada bekliyor: iletilemedi, bu sekmedeki kodlama aracı çalışmıyor", other = "Burada {n} mesaj bekliyor, sonuncusu {from} sekmesinden: iletilemediler, bu sekmedeki kodlama aracı çalışmıyor" }
 letter.from = "Gönderen: {from}"
@@ -568,6 +592,19 @@ close.title = "{tab} kapatılsın mı?"
 close.message = { one = "Bu sekmede başka bir sekmeden gelen bir mesaj bekliyor. Kapatırsan mesaj atılır ve onu gönderen ajana söylenmez.", other = "Bu sekmede başka sekmelerden gelen {n} mesaj bekliyor. Kapatırsan hepsi atılır ve onları gönderen ajanlara söylenmez." }
 close.confirm = "Kapat ve at"
 close.cancel = "Sekmeyi tut"
+
+# Who a tab is and what a message asks: the list names the asking tab first, and every message
+# arrives under two lines that say who sent it, what kind it is and how to answer.
+answer.you = "Sen «{workspace}» çalışma alanındaki {tab} numaralı sekmesin: «{title}»."
+answer.all = { one = "Bu çalışma alanındaki öbür ajan sekmesi:", other = "Bu çalışma alanındaki öbür {n} ajan sekmesinin her biri:" }
+answer.all-tab = "{tab} numaralı sekme «{title}»: {what}"
+header = "QCode aracılığıyla, bu çalışma alanının {tab} numaralı sekmesinden «{title}» ({harness}): {kind}"
+kind.info = "bilgin olsun diye, cevap beklenmiyor."
+kind.question = "bir soru, gönderen cevabını bekliyor."
+kind.report = "bir görev, gönderen bitirdiğinde sonucun raporunu bekliyor."
+reply.info = "Yazmak istersen send_message ile tab \"{tab}\" kullan."
+reply.question = "Cevabını send_message ile gönder: tab \"{tab}\", kind \"info\"."
+reply.report = "Bitirince sonucu send_message ile gönder: tab \"{tab}\", kind \"info\" (önce bir şey sorman gerekirse kind \"question\")."
 
 [settings]
 title = "Ayarlar"

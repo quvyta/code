@@ -592,7 +592,7 @@ fn a_round_takes_the_conversations_of_every_profile_whose_tab_was_open_since_the
 fn a_tab_brought_back_and_never_shown_has_run_no_harness() {
     let scratch = Scratch::new("round-waiting");
     let mut screen = two_profiles(&scratch, engine());
-    let tab = |kind| SessionTab { kind, conversation: None, opened: 0 };
+    let tab = |kind| SessionTab { kind, conversation: None, opened: 0, number: None, name: None };
     let record = SessionWorkspace {
         id: WorkspaceId::parse("firefly").expect("an id"),
         active_tab: 0,

@@ -40,6 +40,21 @@ back = "この画面から出る"
 new-tab = "新しいタブを開く"
 leave-terminal = "ツールとタブを行き来する"
 
+# Naming a tab.
+rename-tab = "開いているタブに名前をつける"
+# The keys that switch tabs from anywhere on the project screen.
+next-tab = "次のタブへ"
+previous-tab = "前のタブへ"
+tab-1 = "タブ 1 へ"
+tab-2 = "タブ 2 へ"
+tab-3 = "タブ 3 へ"
+tab-4 = "タブ 4 へ"
+tab-5 = "タブ 5 へ"
+tab-6 = "タブ 6 へ"
+tab-7 = "タブ 7 へ"
+tab-8 = "タブ 8 へ"
+tab-9 = "タブ 9 へ"
+
 
 [setup]
 step-language = "言語"
@@ -321,6 +336,7 @@ history.unread = "会話を読めませんでした"
 hints.tabs = "タブ"
 hints.close = "タブを閉じる"
 hints.leave = "ターミナルから出る"
+hints.enter = "タブの中へ"
 panel.title = "パネル"
 panel.add = "ウィジェットを足す"
 panel.remove = "{widget} をパネルから外す"
@@ -508,13 +524,21 @@ close-agent.message = "エージェントはまだ動いています。タブを
 close-agent.confirm = "終了して閉じる"
 close-agent.cancel = "動かしたままにする"
 
+# Naming a tab, from its menu on the strip or with its key.
+rename.item = "名前を変える"
+rename.title = "{tab} の名前を変える"
+rename.label = "名前"
+rename.hint = "空にすると自動の名前に戻ります。"
+rename.keep = "名前を変える"
+rename.cancel = "やめる"
+
 # The bridge between tabs: what the person is asked and shown, and the answers the agent of a
 # tab reads when it lists the other tabs or sends one of them a message.
 [bridge]
 closed = "{workspace} のタブどうしはメッセージを送り合えません"
 asking = "返事を待っています"
 delivering = "メッセージを渡しています"
-handed = "QCode 経由、{from} タブから:\n\n{text}"
+handed = "{header}\n{reply}\n\n{text}"
 waiting = "ここに {n} 件のメッセージが待っています。最後は {from} から"
 waiting-stuck = "ここに {n} 件のメッセージが待っています。最後は {from} から。このタブの開発ツールが動いていないので渡せませんでした"
 letter.from = "{from} から"
@@ -568,6 +592,19 @@ close.title = "{tab} を閉じますか？"
 close.message = { other = "他のタブからのメッセージが {n} 件、このタブに残っています。このタブを閉じると捨てられ、送信元のエージェントには知らせられません。" }
 close.confirm = "閉じて捨てる"
 close.cancel = "タブはそのまま"
+
+# Who a tab is and what a message asks: the list names the asking tab first, and every message
+# arrives under two lines that say who sent it, what kind it is and how to answer.
+answer.you = "あなたはワークスペース «{workspace}» のタブ {tab}、«{title}» です。"
+answer.all = "このワークスペースの他の {n} つのエージェントのタブそれぞれ:"
+answer.all-tab = "タブ {tab} «{title}»: {what}"
+header = "QCode 経由、このワークスペースのタブ {tab} «{title}» ({harness}) から: {kind}"
+kind.info = "お知らせです。返事は要りません。"
+kind.question = "質問です。送り主はあなたの答えを待っています。"
+kind.report = "作業の依頼です。送り主は終わったときの結果の報告を待っています。"
+reply.info = "返事を書くなら send_message で tab \"{tab}\" を使ってください。"
+reply.question = "send_message で答えてください: tab \"{tab}\"、kind \"info\"。"
+reply.report = "終わったら send_message で結果を送ってください: tab \"{tab}\"、kind \"info\"(先に何か聞く必要があれば kind \"question\")。"
 
 [settings]
 title = "設定"

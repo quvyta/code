@@ -28,6 +28,7 @@ use crate::base::apps::{Editor, Sound};
 use crate::engine::EngineKind;
 use crate::profile::SafeName;
 use crate::store::{Config, OnClose, Platform};
+use crate::ui::keys::Wrapping;
 
 use engine::{EngineState, Gate, Health};
 use identity::ProfileIdentity;
@@ -521,12 +522,10 @@ pub fn view(screen: &Settings, ui: &mut View<'_, Msg>) {
                             Health::Working | Health::Missing(_) => {
                                 let names = ENGINES.map(engine::name);
                                 let chosen = ENGINES.iter().position(|kind| *kind == screen.engine.kind()).unwrap_or(0);
-                                ui.add(
-                                    Segmented::new(names)
-                                        .selected(chosen)
-                                        .on_select(move |index| Msg::Engine(ENGINES[index])),
-                                )
-                                .id("engine");
+                                let choice = Segmented::new(names)
+                                    .selected(chosen)
+                                    .on_select(move |index| Msg::Engine(ENGINES[index]));
+                                ui.add(Wrapping::new(choice, Some(chosen), ENGINES.len()).across(true)).id("engine");
                             }
                         });
 
@@ -540,12 +539,10 @@ pub fn view(screen: &Settings, ui: &mut View<'_, Msg>) {
                             t!("settings.on-close-text")
                         };
                         list.row(SettingRow::new(t!("settings.on-close")).description(about), |ui| {
-                            ui.add(
-                                Segmented::new(choices)
-                                    .selected(chosen)
-                                    .on_select(|index| Msg::OnClose(OnClose::ALL[index])),
-                            )
-                            .id("on-close");
+                            let choice = Segmented::new(choices)
+                                .selected(chosen)
+                                .on_select(|index| Msg::OnClose(OnClose::ALL[index]));
+                            ui.add(Wrapping::new(choice, Some(chosen), OnClose::ALL.len()).across(true)).id("on-close");
                         });
                         if let Some(row) = screen.service {
                             service_row(list, row);
@@ -558,12 +555,12 @@ pub fn view(screen: &Settings, ui: &mut View<'_, Msg>) {
                         let row =
                             SettingRow::new(t!("settings.backup-every")).description(t!("settings.backup-every-text"));
                         list.row(row, |ui| {
-                            ui.add(
-                                Segmented::new(choices)
-                                    .selected(chosen.unwrap_or(0))
-                                    .on_select(|index| Msg::BackupEvery(BackupEvery::ALL[index])),
-                            )
-                            .id("backup-every");
+                            let at = chosen.unwrap_or(0);
+                            let choice = Segmented::new(choices)
+                                .selected(at)
+                                .on_select(|index| Msg::BackupEvery(BackupEvery::ALL[index]));
+                            ui.add(Wrapping::new(choice, Some(at), BackupEvery::ALL.len()).across(true))
+                                .id("backup-every");
                         });
 
                         list.heading(t!("settings.apps"));
@@ -574,23 +571,20 @@ pub fn view(screen: &Settings, ui: &mut View<'_, Msg>) {
                         list.row(
                             SettingRow::new(t!("settings.editor")).description(t!("settings.editor-text")),
                             |ui| {
-                                ui.add(
-                                    Segmented::new(names)
-                                        .selected(chosen)
-                                        .on_select(move |index| Msg::Editor(Editor::ALL[index])),
-                                )
-                                .id("editor");
+                                let choice = Segmented::new(names)
+                                    .selected(chosen)
+                                    .on_select(move |index| Msg::Editor(Editor::ALL[index]));
+                                ui.add(Wrapping::new(choice, Some(chosen), Editor::ALL.len()).across(true))
+                                    .id("editor");
                             },
                         );
                         let choices = Sound::ALL.map(|choice| t!(&format!("settings.sound-{}", choice.key())));
                         let chosen = Sound::ALL.iter().position(|sound| *sound == screen.sound).unwrap_or(0);
                         list.row(SettingRow::new(t!("settings.sound")).description(t!("settings.sound-text")), |ui| {
-                            ui.add(
-                                Segmented::new(choices)
-                                    .selected(chosen)
-                                    .on_select(|index| Msg::Sound(Sound::ALL[index])),
-                            )
-                            .id("sound");
+                            let choice = Segmented::new(choices)
+                                .selected(chosen)
+                                .on_select(|index| Msg::Sound(Sound::ALL[index]));
+                            ui.add(Wrapping::new(choice, Some(chosen), Sound::ALL.len()).across(true)).id("sound");
                         });
 
                         list.heading(t!("settings.folder"));

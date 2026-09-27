@@ -150,7 +150,13 @@ fn endurance_home_is_prepared() {
     for (name, harness, tag, model) in PROFILES {
         store.write_profile(&profile(name, harness, tag, model)).expect("the profile is written");
         add_profile(&paths, name, today).expect("the workspace carries the profile");
-        tabs.push(SessionTab { kind: SessionTabKind::Profile(name.to_owned()), conversation: None, opened: 0 });
+        tabs.push(SessionTab {
+            kind: SessionTabKind::Profile(name.to_owned()),
+            conversation: None,
+            opened: 0,
+            number: None,
+            name: None,
+        });
     }
     std::fs::create_dir_all(paths.code.join("ledger")).expect("the ledger folder");
 

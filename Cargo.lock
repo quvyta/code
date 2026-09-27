@@ -679,7 +679,7 @@ dependencies = [
 
 [[package]]
 name = "quvyta-code"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "quvyta-framework",
  "rustix",

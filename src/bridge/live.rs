@@ -23,7 +23,7 @@ use std::sync::mpsc;
 use serde_json::Value;
 
 use super::config;
-use super::protocol::{Answer, Listed, Question, Received, Request};
+use super::protocol::{Answer, Kind, Listed, Question, Received, Request, You};
 use super::socket::Listener;
 use crate::engine::run::capture;
 use crate::engine::{Engine, EngineKind, Exec, HostUser, detect};
@@ -131,7 +131,7 @@ fn questions() -> Vec<String> {
         r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.to_owned(),
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#.to_owned(),
         r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_tabs","arguments":{}}}"#.to_owned(),
-        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"send_message","arguments":{"tab":"7","text":"run the tests"}}}"#.to_owned(),
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"send_message","arguments":{"tab":"7","text":"run the tests","kind":"report"}}}"#.to_owned(),
         format!(r#"{{"jsonrpc":"2.0","id":5,"method":"server/discover","params":{{{modern}}}}}"#),
         format!(r#"{{"jsonrpc":"2.0","id":6,"method":"tools/list","params":{{{modern}}}}}"#),
         r#"{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"1900-01-01"}}}"#.to_owned(),
@@ -153,6 +153,13 @@ fn answer_as_qcode(listener: &Listener, seen: mpsc::Sender<Question>) -> std::th
             let answer = match &question.request {
                 Request::List => Answer::listed(
                     "one tab".to_owned(),
+                    You {
+                        tab: "2".to_owned(),
+                        title: "reviewer".to_owned(),
+                        harness: "Claude Code".to_owned(),
+                        profile: "claude-sub".to_owned(),
+                        workspace: "Firefly".to_owned(),
+                    },
                     vec![Listed {
                         tab: "7".to_owned(),
                         title: "codex-main".to_owned(),
@@ -164,10 +171,17 @@ fn answer_as_qcode(listener: &Listener, seen: mpsc::Sender<Question>) -> std::th
                         trouble: Some("the coding tool in that tab is not running".to_owned()),
                     }],
                 ),
-                Request::Send { tab, text } => Answer::done(format!("queued for {tab}: {text}")),
+                Request::Send { to, text, kind } => {
+                    Answer::done(format!("queued for {to:?} as {}: {text}", kind.word()))
+                }
                 Request::Inbox | Request::Peek => Answer::received(
                     "one message".to_owned(),
-                    vec![Received { from: "Codex · codex-main".to_owned(), text: "the tests pass".to_owned() }],
+                    vec![Received {
+                        from: "Codex · codex-main".to_owned(),
+                        tab: "7".to_owned(),
+                        kind: Kind::Question,
+                        text: "the tests pass".to_owned(),
+                    }],
                 ),
             };
             call.answer(answer);
@@ -210,7 +224,12 @@ fn check_answers(kind: EngineKind, answers: &std::collections::HashMap<u64, Valu
     assert_eq!(names, ["list_tabs", "send_message", "check_inbox"]);
     assert_eq!(answers[&3]["result"]["isError"], false);
     assert_eq!(answers[&3]["result"]["structuredContent"]["tabs"][0]["tab"], "7", "{kind:?}: {}", answers[&3]);
-    assert_eq!(answers[&4]["result"]["content"][0]["text"], "queued for 7: run the tests", "{kind:?}");
+    assert_eq!(answers[&3]["result"]["structuredContent"]["you"]["tab"], "2", "{kind:?}: {}", answers[&3]);
+    assert_eq!(answers[&3]["result"]["structuredContent"]["you"]["workspace"], "Firefly");
+    assert_eq!(
+        answers[&4]["result"]["content"][0]["text"], r#"queued for Tab("7") as report: run the tests"#,
+        "{kind:?}"
+    );
     assert_eq!(answers[&5]["result"]["supportedVersions"][0], "2026-07-28");
     assert_eq!(answers[&5]["result"]["resultType"], "complete");
     assert_eq!(answers[&6]["result"]["resultType"], "complete");
@@ -219,6 +238,7 @@ fn check_answers(kind: EngineKind, answers: &std::collections::HashMap<u64, Valu
     let inbox = &answers[&9]["result"]["structuredContent"]["messages"][0];
     assert_eq!(inbox["from"], "Codex · codex-main", "{kind:?}: {}", answers[&9]);
     assert_eq!(inbox["text"], "the tests pass", "{kind:?}: the inbox reaches the agent whole");
+    assert_eq!((&inbox["tab"], &inbox["kind"]), (&serde_json::json!("7"), &serde_json::json!("question")), "{kind:?}");
 }
 
 /// The token the tab whose settings are written would have. Nothing but a running QCode hands

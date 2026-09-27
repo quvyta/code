@@ -12,6 +12,7 @@ use qframe::date::DateTime;
 use qframe::prelude::*;
 
 use crate::profile::history::Conversation;
+use crate::ui::keys::Wrapping;
 
 use super::history::{self, HistoryKey, NEWEST, Shown};
 use super::{Msg, OpenWorkspace, TabKey, TabKind, WorkspaceScreen};
@@ -238,25 +239,27 @@ pub(super) fn view(screen: &WorkspaceScreen, workspace: &OpenWorkspace, tab: Tab
         Look { dot: ui.env().icons().glyph("bullet").into_owned(), indent: indent(ui), now: DateTime::now_local() };
     let items: Vec<ListItem> = rows.iter().map(|row| item(workspace, row, &look, ready)).collect();
     let selected = resting_row(&rows, screen.blank_row);
+    let first = rows.iter().position(Row::selectable);
+    let last = rows.iter().rposition(Row::selectable);
     ui.column(|ui| {
         ui.add(Text::new(t!("workspace.choose.title")).role("title"));
         if !ready {
             ui.add(Text::new(t!("workspace.no-engine")).role("secondary"));
         }
-        ui.add(
-            List::new(items)
-                .selected(Some(selected))
-                .on_select(Msg::HighlightChoice)
-                // A row that only says how a section stands has nothing to choose; activating it
-                // leaves the keyboard on it, where the pointer or the keys put it. The list never
-                // activates a heading or a gap, since it does not let the keyboard rest there.
-                .on_activate(move |index| {
-                    rows.get(index).and_then(|row| row.message(tab)).unwrap_or(Msg::HighlightChoice(index))
-                }),
-        )
-        .id(CHOICES_ID)
-        .width(Length::Cells(READABLE_WIDTH))
-        .fill_height();
+        let list = List::new(items)
+            .selected(Some(selected))
+            .on_select(Msg::HighlightChoice)
+            // A row that only says how a section stands has nothing to choose; activating it
+            // leaves the keyboard on it, where the pointer or the keys put it. The list never
+            // activates a heading or a gap, since it does not let the keyboard rest there.
+            .on_activate(move |index| {
+                rows.get(index).and_then(|row| row.message(tab)).unwrap_or(Msg::HighlightChoice(index))
+            });
+        let edges = (first == Some(selected), last == Some(selected));
+        ui.add(Wrapping::new(list, Some(selected), 0).edges(edges.0, edges.1))
+            .id(CHOICES_ID)
+            .width(Length::Cells(READABLE_WIDTH))
+            .fill_height();
     })
     .gap(1)
     .padding(Padding::symmetric(1, 2))

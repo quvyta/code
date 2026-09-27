@@ -109,6 +109,13 @@ impl Shelf {
         self.generation
     }
 
+    /// The title the harness gave the conversation `id`, when the last answer holds it and it has
+    /// one.
+    pub(super) fn title(&self, id: &str) -> Option<&str> {
+        let Some(Ok(found)) = &self.answer else { return None };
+        found.iter().find(|conversation| conversation.id == id)?.title.as_deref()
+    }
+
     /// What the section shows now.
     pub(super) fn shown(&self) -> Shown<'_> {
         if self.showing {
@@ -121,6 +128,21 @@ impl Shelf {
         }
     }
 }
+
+/// A conversation's title as a tab's label: its first line, cut to [`TITLE_CHARS`], since a title
+/// that is really the first prompt of the conversation can be a whole paragraph.
+pub(super) fn short_title(title: &str) -> String {
+    let line = title.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or_default();
+    if line.chars().count() <= TITLE_CHARS {
+        return line.to_owned();
+    }
+    let mut short: String = line.chars().take(TITLE_CHARS - 1).collect();
+    short.push('…');
+    short
+}
+
+/// The most characters of a conversation's title a tab's label carries.
+const TITLE_CHARS: usize = 32;
 
 /// Reads `harness`'s conversations out of the container `container`, in the words a row can
 /// show when it cannot; `started` is called when the container had to be started for it.

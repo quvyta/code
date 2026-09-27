@@ -40,6 +40,21 @@ back = "salir de esta pantalla"
 new-tab = "abrir una pestaña nueva"
 leave-terminal = "pasar de la herramienta a las pestañas"
 
+# Naming a tab.
+rename-tab = "poner nombre a la pestaña abierta"
+# The keys that switch tabs from anywhere on the project screen.
+next-tab = "ir a la pestaña siguiente"
+previous-tab = "ir a la pestaña anterior"
+tab-1 = "ir a la pestaña 1"
+tab-2 = "ir a la pestaña 2"
+tab-3 = "ir a la pestaña 3"
+tab-4 = "ir a la pestaña 4"
+tab-5 = "ir a la pestaña 5"
+tab-6 = "ir a la pestaña 6"
+tab-7 = "ir a la pestaña 7"
+tab-8 = "ir a la pestaña 8"
+tab-9 = "ir a la pestaña 9"
+
 
 [setup]
 step-language = "Idioma"
@@ -321,6 +336,7 @@ history.unread = "No se pudieron leer las conversaciones"
 hints.tabs = "pestañas"
 hints.close = "cerrar la pestaña"
 hints.leave = "salir de la terminal"
+hints.enter = "entrar en la pestaña"
 panel.title = "Panel"
 panel.add = "Añadir un widget"
 panel.remove = "Quitar {widget} del panel"
@@ -508,13 +524,21 @@ close-agent.message = "El agente sigue en marcha. Al cerrar la pestaña se detie
 close-agent.confirm = "Terminar y cerrar"
 close-agent.cancel = "Dejarlo correr"
 
+# Naming a tab, from its menu on the strip or with its key.
+rename.item = "Cambiar el nombre"
+rename.title = "Cambiar el nombre de {tab}"
+rename.label = "Nombre"
+rename.hint = "Déjalo vacío para volver al nombre automático."
+rename.keep = "Cambiar el nombre"
+rename.cancel = "Cancelar"
+
 # The bridge between tabs: what the person is asked and shown, and the answers the agent of a
 # tab reads when it lists the other tabs or sends one of them a message.
 [bridge]
 closed = "Las pestañas de {workspace} no pueden enviarse mensajes entre sí"
 asking = "Esperando una respuesta"
 delivering = "Entregando un mensaje"
-handed = "A través de QCode, desde la pestaña {from}:\n\n{text}"
+handed = "{header}\n{reply}\n\n{text}"
 waiting = { one = "Aquí espera un mensaje de {from}", other = "Aquí esperan {n} mensajes, el último de {from}" }
 waiting-stuck = { one = "Aquí espera un mensaje de {from}: no se pudo entregar, la herramienta de programación de esta pestaña no está en marcha", other = "Aquí esperan {n} mensajes, el último de {from}: no se pudieron entregar, la herramienta de programación de esta pestaña no está en marcha" }
 letter.from = "De {from}"
@@ -568,6 +592,19 @@ close.title = "¿Cerrar {tab}?"
 close.message = { one = "Un mensaje de otra pestaña espera en esta pestaña. Al cerrarla, el mensaje se tira y el agente que lo envió no será avisado.", other = "{n} mensajes de otras pestañas esperan en esta pestaña. Al cerrarla, los mensajes se tiran y los agentes que los enviaron no serán avisados." }
 close.confirm = "Cerrar y descartar"
 close.cancel = "Dejar la pestaña"
+
+# Who a tab is and what a message asks: the list names the asking tab first, and every message
+# arrives under two lines that say who sent it, what kind it is and how to answer.
+answer.you = "Eres la pestaña {tab}, «{title}», del espacio de trabajo «{workspace}»."
+answer.all = { one = "La otra pestaña con agente de este espacio de trabajo:", other = "Cada una de las otras {n} pestañas con agente de este espacio de trabajo:" }
+answer.all-tab = "pestaña {tab} «{title}»: {what}"
+header = "A través de QCode, desde la pestaña {tab} «{title}» ({harness}) de este espacio de trabajo: {kind}"
+kind.info = "para tu información, no hace falta respuesta."
+kind.question = "una pregunta, el remitente espera tu respuesta."
+kind.report = "una tarea, el remitente espera un informe del resultado cuando termines."
+reply.info = "Para contestar, usa send_message con tab \"{tab}\"."
+reply.question = "Responde con send_message, tab \"{tab}\", kind \"info\"."
+reply.report = "Cuando termines, envía el resultado con send_message, tab \"{tab}\", kind \"info\" (kind \"question\" si antes necesitas preguntar algo)."
 
 [settings]
 title = "Ajustes"

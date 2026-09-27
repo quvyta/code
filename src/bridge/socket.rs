@@ -292,7 +292,9 @@ mod tests {
     fn echo(question: &Result<Question, Malformed>) -> Answer {
         match question {
             Ok(Question { request: Request::Send { text, .. }, .. }) => Answer::done(text.clone()),
-            Ok(Question { request: Request::List, .. }) => Answer::listed("none".to_owned(), Vec::new()),
+            Ok(Question { request: Request::List, .. }) => {
+                Answer::listed("none".to_owned(), crate::bridge::protocol::You::default(), Vec::new())
+            }
             Ok(Question { request: Request::Inbox | Request::Peek, .. }) => {
                 Answer::received("empty".to_owned(), Vec::new())
             }

@@ -39,6 +39,21 @@ back = "leave this screen"
 new-tab = "open a new tab"
 leave-terminal = "between the harness and the tabs"
 
+# Naming a tab.
+rename-tab = "name the open tab"
+# The keys that switch tabs from anywhere on the project screen.
+next-tab = "go to the next tab"
+previous-tab = "go to the previous tab"
+tab-1 = "go to tab 1"
+tab-2 = "go to tab 2"
+tab-3 = "go to tab 3"
+tab-4 = "go to tab 4"
+tab-5 = "go to tab 5"
+tab-6 = "go to tab 6"
+tab-7 = "go to tab 7"
+tab-8 = "go to tab 8"
+tab-9 = "go to tab 9"
+
 
 [setup]
 step-language = "Language"
@@ -320,6 +335,7 @@ history.unread = "The chats could not be read"
 hints.tabs = "tabs"
 hints.close = "close tab"
 hints.leave = "leave the terminal"
+hints.enter = "into the tab"
 panel.title = "Panel"
 panel.add = "Add a widget"
 panel.remove = "Remove {widget} from the panel"
@@ -507,13 +523,21 @@ close-agent.message = "The agent is still running. Closing the tab stops it, so 
 close-agent.confirm = "End and close"
 close-agent.cancel = "Keep it running"
 
+# Naming a tab, from its menu on the strip or with its key.
+rename.item = "Rename"
+rename.title = "Rename {tab}"
+rename.label = "Name"
+rename.hint = "Leave it empty to go back to the automatic name."
+rename.keep = "Rename"
+rename.cancel = "Cancel"
+
 # The bridge between tabs: what the person is asked and shown, and the answers the agent of a
 # tab reads when it lists the other tabs or sends one of them a message.
 [bridge]
 closed = "The tabs of {workspace} cannot send each other messages"
 asking = "Waiting for an answer"
 delivering = "Handing a message over"
-handed = "Through QCode, from the {from} tab:\n\n{text}"
+handed = "{header}\n{reply}\n\n{text}"
 waiting = { one = "A message from {from} waits here", other = "{n} messages wait here, the last from {from}" }
 waiting-stuck = { one = "A message from {from} waits here: it could not be handed over, the coding tool in this tab is not running", other = "{n} messages wait here, the last from {from}: they could not be handed over, the coding tool in this tab is not running" }
 letter.from = "From {from}"
@@ -567,6 +591,19 @@ close.title = "Close {tab}?"
 close.message = { one = "A message from another tab waits in this tab. Closing it throws the message away, and the agent that sent it will not be told.", other = "{n} messages from other tabs wait in this tab. Closing it throws them away, and the agents that sent them will not be told." }
 close.confirm = "Close and discard"
 close.cancel = "Keep the tab"
+
+# Who a tab is and what a message asks: the list names the asking tab first, and every message
+# arrives under two lines that say who sent it, what kind it is and how to answer.
+answer.you = "You are tab {tab}, «{title}», in workspace «{workspace}»."
+answer.all = { one = "The one other agent tab of this workspace:", other = "Each of the {n} other agent tabs of this workspace:" }
+answer.all-tab = "tab {tab} «{title}»: {what}"
+header = "Through QCode, from tab {tab} «{title}» ({harness}) of this workspace: {kind}"
+kind.info = "for your information, no answer needed."
+kind.question = "a question, the sender waits for your answer."
+kind.report = "a task, the sender waits for a report of the result when you finish."
+reply.info = "To write back, use send_message with tab \"{tab}\"."
+reply.question = "Answer with send_message, tab \"{tab}\", kind \"info\"."
+reply.report = "When you finish, send the result with send_message, tab \"{tab}\", kind \"info\" (kind \"question\" if you need to ask something first)."
 
 [settings]
 title = "Settings"

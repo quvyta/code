@@ -208,6 +208,8 @@ fn a_pdf_tab_is_kept_in_the_session_and_its_file_looked_for_when_it_comes_back()
             kind: SessionTabKind::Pdf("../outside.pdf".to_owned()),
             conversation: None,
             opened: 1,
+            number: None,
+            name: None,
         }],
     };
     let mut escaping = one_workspace(&scratch);

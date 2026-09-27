@@ -26,7 +26,7 @@ use qframe::runtime::{Confirm, Task};
 use qframe::widgets::{ScrollView, Toast};
 
 use crate::bridge::config::Unregistered;
-use crate::bridge::protocol::{Answer, Listed, MOST_TEXT, Question, Received, Request};
+use crate::bridge::protocol::{Answer, Kind, Listed, MOST_TEXT, Outcome, Question, Received, Request, To, You};
 use crate::bridge::rules::{Decision, End, Refusal};
 use crate::bridge::socket::{Call, Inbox, Listener};
 use crate::profile::{HarnessKind, NetworkMode, Profile};
@@ -73,8 +73,17 @@ pub(super) enum Link {
 /// A message that was taken and waits in the tab it was sent to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Letter {
-    /// Who sent it: the harness and the title of the sending tab.
+    /// Who sent it, as the person reads it under the tab: the harness and the title of the
+    /// sending tab.
     pub from: String,
+    /// The id of the sending tab inside the workspace, the one to answer to.
+    pub tab: u32,
+    /// The title of the sending tab.
+    pub title: String,
+    /// The sending tab's harness, as it names itself.
+    pub harness: String,
+    /// What the sender asks of the receiver.
+    pub kind: Kind,
     /// The message.
     pub text: String,
 }
@@ -104,7 +113,7 @@ pub(super) struct Asking {
 #[derive(Debug)]
 struct Waiting {
     call: Option<Call>,
-    text: String,
+    letter: Letter,
     hop: u32,
 }
 
@@ -190,7 +199,7 @@ pub(super) fn answer(screen: &mut WorkspaceScreen, id: &str, call: Call, now: In
             call.answer(list(workspace, sender));
             Command::none()
         }
-        Request::Send { tab, text } => send(screen, id, sender, &tab, text, call, now),
+        Request::Send { to, text, kind } => send(screen, id, sender, &to, &text, kind, call, now),
         Request::Inbox => {
             call.answer(inbox(screen, sender));
             Command::none()
@@ -208,8 +217,7 @@ fn peek(workspace: &OpenWorkspace, key: TabKey) -> Answer {
     let Some(tab) = workspace.tabs.iter().find(|tab| tab.key() == key) else {
         return Answer::refused(t!("bridge.answer.stranger"));
     };
-    let messages: Vec<Received> =
-        tab.letters().iter().map(|letter| Received { from: letter.from.clone(), text: letter.text.clone() }).collect();
+    let messages: Vec<Received> = tab.letters().iter().map(received).collect();
     if messages.is_empty() {
         return Answer::received(t!("bridge.answer.inbox-empty"), messages);
     }
@@ -229,10 +237,53 @@ fn inbox(screen: &mut WorkspaceScreen, key: TabKey) -> Answer {
     let mut text = t!("bridge.answer.inbox", n = taken.len());
     for letter in &taken {
         text.push_str("\n\n");
-        text.push_str(&t!("bridge.handed", from = letter.from.as_str(), text = letter.text.as_str()));
+        text.push_str(&handed(letter));
     }
-    let messages = taken.into_iter().map(|letter| Received { from: letter.from, text: letter.text }).collect();
-    Answer::received(text, messages)
+    Answer::received(text, taken.iter().map(received).collect())
+}
+
+/// `letter` as an inbox answers it.
+fn received(letter: &Letter) -> Received {
+    Received { from: letter.from.clone(), tab: letter.tab.to_string(), kind: letter.kind, text: letter.text.clone() }
+}
+
+/// `letter` as its receiving agent reads it: two lines that say who sent it, what kind of message
+/// it is and how to answer, then the message.
+pub(super) fn handed(letter: &Letter) -> String {
+    let tab = letter.tab.to_string();
+    let kind = match letter.kind {
+        Kind::Info => t!("bridge.kind.info"),
+        Kind::Question => t!("bridge.kind.question"),
+        Kind::Report => t!("bridge.kind.report"),
+    };
+    let reply = match letter.kind {
+        Kind::Info => t!("bridge.reply.info", tab = tab.as_str()),
+        Kind::Question => t!("bridge.reply.question", tab = tab.as_str()),
+        Kind::Report => t!("bridge.reply.report", tab = tab.as_str()),
+    };
+    let header = t!(
+        "bridge.header",
+        tab = tab.as_str(),
+        title = letter.title.as_str(),
+        harness = letter.harness.as_str(),
+        kind = kind
+    );
+    t!("bridge.handed", header = header, reply = reply, text = letter.text.as_str())
+}
+
+/// The message `text` of the kind `kind`, sent by the tab `from` of `workspace`.
+fn letter(workspace: &OpenWorkspace, from: TabKey, kind: Kind, text: String) -> Letter {
+    let index = workspace.tabs.iter().position(|tab| tab.key() == from);
+    Letter {
+        from: named(workspace, from),
+        tab: index.map_or(0, |index| workspace.tabs[index].number()),
+        title: index.map(|index| workspace.tab_label(index)).unwrap_or_default(),
+        harness: profile_of(workspace, from)
+            .map(|profile| profile.harness.record().display_name.to_owned())
+            .unwrap_or_default(),
+        kind,
+        text,
+    }
 }
 
 /// The tab of `workspace` whose token the question carries.
@@ -240,8 +291,28 @@ fn inbox(screen: &mut WorkspaceScreen, key: TabKey) -> Answer {
 /// A window's tab counts here as much as a terminal's: the agent inside the window starts the
 /// same server and speaks for its own tab. What a window cannot be is a destination, which is
 /// [`others`]'s to say.
+///
+/// opencode's shared server asks for every tab of its profile with the server's own token, and
+/// names the conversation the question came from: the sender is the tab of that profile showing
+/// that conversation. A conversation alone names nobody, and neither does the token of another
+/// profile's server, so an agent cannot speak for a tab by knowing what it shows.
 fn sender(workspace: &OpenWorkspace, question: &Question) -> Option<TabKey> {
-    workspace.tabs.iter().find(|tab| tab.kind().profile().is_some() && tab.token() == question.token).map(Tab::key)
+    if let Some(tab) = workspace.tabs.iter().find(|tab| tab.kind().profile().is_some() && tab.token() == question.token)
+    {
+        return Some(tab.key());
+    }
+    let session = question.session.as_deref()?;
+    let profile = workspace.profiles.iter().find(|profile| {
+        super::shared::shares(profile) && workspace.servers.token(profile.name.as_str()) == question.token
+    })?;
+    workspace
+        .tabs
+        .iter()
+        .find(|tab| {
+            matches!(tab.kind(), TabKind::Profile(name) if name == profile.name.as_str())
+                && tab.conversation() == Some(session)
+        })
+        .map(Tab::key)
 }
 
 /// The profile of the tab `key`, when it belongs to one the store still has.
@@ -274,12 +345,24 @@ fn others(workspace: &OpenWorkspace, sender: TabKey) -> Vec<(usize, &Tab, &Profi
         .collect()
 }
 
-/// The answer to a list: every other harness tab of the workspace.
+/// The answer to a list: the asking tab itself, then every other harness tab of the workspace.
 fn list(workspace: &OpenWorkspace, sender: TabKey) -> Answer {
+    let index = workspace.tabs.iter().position(|tab| tab.key() == sender);
+    let profile = profile_of(workspace, sender);
+    let you = You {
+        tab: index.map(|index| workspace.tabs[index].number().to_string()).unwrap_or_default(),
+        title: index.map(|index| workspace.tab_label(index)).unwrap_or_default(),
+        harness: profile.map(|profile| profile.harness.record().display_name.to_owned()).unwrap_or_default(),
+        profile: profile.map(|profile| profile.name.as_str().to_owned()).unwrap_or_default(),
+        workspace: workspace.name.clone(),
+    };
+    let mut text =
+        t!("bridge.answer.you", tab = you.tab.as_str(), title = you.title.as_str(), workspace = you.workspace.as_str());
+    text.push('\n');
     let tabs: Vec<Listed> = others(workspace, sender)
         .into_iter()
         .map(|(index, tab, profile)| Listed {
-            tab: tab.key().0.to_string(),
+            tab: tab.number().to_string(),
             title: workspace.tab_label(index),
             harness: profile.harness.record().display_name.to_owned(),
             profile: profile.name.as_str().to_owned(),
@@ -290,9 +373,10 @@ fn list(workspace: &OpenWorkspace, sender: TabKey) -> Answer {
         })
         .collect();
     if tabs.is_empty() {
-        return Answer::listed(t!("bridge.answer.alone"), tabs);
+        text.push_str(&t!("bridge.answer.alone"));
+        return Answer::listed(text, you, tabs);
     }
-    let mut text = t!("bridge.answer.listed", n = tabs.len());
+    text.push_str(&t!("bridge.answer.listed", n = tabs.len()));
     for tab in &tabs {
         let network = if tab.network { t!("bridge.answer.online") } else { t!("bridge.answer.offline") };
         text.push('\n');
@@ -326,7 +410,7 @@ fn list(workspace: &OpenWorkspace, sender: TabKey) -> Answer {
             text.push_str(&t!("bridge.answer.by-inbox"));
         }
     }
-    Answer::listed(text, tabs)
+    Answer::listed(text, you, tabs)
 }
 
 /// Whether `tab` takes its messages only through its agent's inbox: a window, which has no prompt.
@@ -347,7 +431,7 @@ fn trouble(why: Undelivered) -> String {
 fn target(workspace: &OpenWorkspace, sender: TabKey, wanted: &str) -> Option<TabKey> {
     let others = others(workspace, sender);
     let wanted = wanted.trim();
-    if let Some((_, tab, _)) = others.iter().find(|(_, tab, _)| tab.key().0.to_string() == wanted) {
+    if let Some((_, tab, _)) = others.iter().find(|(_, tab, _)| tab.number().to_string() == wanted) {
         return Some(tab.key());
     }
     let titled: Vec<TabKey> = others
@@ -361,23 +445,36 @@ fn target(workspace: &OpenWorkspace, sender: TabKey, wanted: &str) -> Option<Tab
     }
 }
 
-/// Handles a message from `from` to the tab `wanted` of the workspace `id`.
+/// Handles a message of the kind `kind` from `from` to `to` in the workspace `id`: to one tab, or
+/// to every other agent tab, each of which it reaches by the same rules as a message to it alone.
+#[expect(clippy::too_many_arguments, reason = "a call carries all of these, and each is used once")]
 fn send(
     screen: &mut WorkspaceScreen,
     id: &str,
     from: TabKey,
-    wanted: &str,
-    text: String,
+    to: &To,
+    text: &str,
+    kind: Kind,
     call: Call,
     now: Instant,
 ) -> Command<Msg> {
     let Some(workspace) = screen.workspaces.iter().find(|workspace| workspace.id.as_str() == id) else {
         return Command::none();
     };
-    let Some(to) = target(workspace, from, wanted) else {
-        call.answer(Answer::refused(t!("bridge.answer.no-tab", tab = wanted)));
-        return Command::none();
+    let targets: Vec<TabKey> = match to {
+        To::Tab(wanted) => {
+            let Some(target) = target(workspace, from, wanted) else {
+                call.answer(Answer::refused(t!("bridge.answer.no-tab", tab = wanted.as_str())));
+                return Command::none();
+            };
+            vec![target]
+        }
+        To::All => others(workspace, from).into_iter().map(|(_, tab, _)| tab.key()).collect(),
     };
+    if targets.is_empty() {
+        call.answer(Answer::refused(t!("bridge.answer.alone")));
+        return Command::none();
+    }
     if text.trim().is_empty() {
         call.answer(Answer::refused(t!("bridge.answer.empty")));
         return Command::none();
@@ -386,30 +483,112 @@ fn send(
         call.answer(Answer::refused(t!("bridge.answer.long", most = MOST_TEXT)));
         return Command::none();
     }
-    let (Some(from_profile), Some(to_profile)) = (profile_of(workspace, from), profile_of(workspace, to)) else {
-        call.answer(Answer::refused(t!("bridge.answer.no-tab", tab = wanted)));
-        return Command::none();
-    };
     // The person gave the sending tab something since it was last handed a message: what it sends
     // now is their task, not its answer to another agent, and starts an exchange of its own. Without
     // this, a tab the person keeps giving work runs into the loop limit of answers it sent long ago.
-    let fresh = workspace.tabs.iter().any(|tab| tab.key() == from && tab.person_typed());
+    if workspace.tabs.iter().any(|tab| tab.key() == from && tab.person_typed()) {
+        screen.rules.new_chain(from.0);
+    }
+    // How each tab is known to the agent, taken before anything is handed over.
+    let named: Vec<(TabKey, String, String)> = targets
+        .iter()
+        .filter_map(|&key| {
+            let index = workspace.tabs.iter().position(|tab| tab.key() == key)?;
+            Some((key, workspace.tabs[index].number().to_string(), workspace.tab_label(index)))
+        })
+        .collect();
+    let mut call = Some(call);
+    let single = matches!(to, To::Tab(_));
+    let mut commands = Vec::new();
+    let mut counted = false;
+    let mut sent = Vec::new();
+    for (key, number, title) in named {
+        // A message to every tab is answered at once, tab by tab: a tab that waits for the
+        // person's answer is said to wait rather than holding the answer about all the others.
+        let mut parked = None;
+        let offered = offer(screen, from, key, text, kind, now, if single { &mut call } else { &mut parked });
+        commands.push(offered.command);
+        counted |= offered.counts;
+        if let Some(answer) = offered.answer {
+            sent.push(Outcome { tab: number, title, ok: answer.ok, text: answer.text });
+        }
+    }
+    // However many tabs a message went to, the sender sent one message.
+    if counted {
+        screen.rules.sent(from.0, now);
+    }
+    if let Some(call) = call {
+        let answer = if single {
+            sent.pop().map_or_else(
+                || Answer::refused(t!("bridge.answer.gone")),
+                |outcome| {
+                    if outcome.ok { Answer::done(outcome.text) } else { Answer::refused(outcome.text) }
+                },
+            )
+        } else {
+            let mut text = t!("bridge.answer.all", n = sent.len());
+            for outcome in &sent {
+                text.push('\n');
+                text.push_str(&t!(
+                    "bridge.answer.all-tab",
+                    tab = outcome.tab.as_str(),
+                    title = outcome.title.as_str(),
+                    what = outcome.text.as_str()
+                ));
+            }
+            Answer::broadcast(text, sent)
+        };
+        call.answer(answer);
+    }
+    Command::batch(commands)
+}
+
+/// What became of a message offered to one tab.
+struct Offered {
+    /// The answer about that tab; `None` when the call was kept to be answered once the person
+    /// has answered.
+    answer: Option<Answer>,
+    /// Whether the message counts against the sender's pace: it was taken, or waits for the
+    /// person.
+    counts: bool,
+    /// What has to run for it.
+    command: Command<Msg>,
+}
+
+/// Offers the message `text` of the kind `kind` from `from` to the tab `to`, by the rules. When
+/// it has to wait for the person's answer, `call` is kept with it to be answered then, when there
+/// is one; without one the answer says it waits.
+fn offer(
+    screen: &mut WorkspaceScreen,
+    from: TabKey,
+    to: TabKey,
+    text: &str,
+    kind: Kind,
+    now: Instant,
+    call: &mut Option<Call>,
+) -> Offered {
+    let answered = |answer: Answer| Offered { answer: Some(answer), counts: false, command: Command::none() };
+    let Some(workspace) = screen.owner(to) else {
+        return answered(Answer::refused(t!("bridge.answer.gone")));
+    };
+    let (Some(from_profile), Some(to_profile)) = (profile_of(workspace, from), profile_of(workspace, to)) else {
+        return answered(Answer::refused(t!("bridge.answer.no-tab", tab = named(workspace, to))));
+    };
     let ends = (
         End { tab: from.0, network: from_profile.network == NetworkMode::Full },
         End { tab: to.0, network: to_profile.network == NetworkMode::Full },
     );
     let (sender_name, receiver_name) = (named(workspace, from), named(workspace, to));
-    if fresh {
-        screen.rules.new_chain(from.0);
-    }
+    let letter = letter(workspace, from, kind, text.to_owned());
     let hop = match screen.rules.check(ends.0, ends.1, now) {
         Ok(hop) => hop,
         Err(refusal) => {
-            call.answer(Answer::refused(refused(refusal, &receiver_name)));
+            let answer = Answer::refused(refused(refusal, &receiver_name));
             if refusal == Refusal::Chain {
-                return ended(screen, (from, sender_name), (to, receiver_name));
+                let command = ended(screen, (from, sender_name), (to, receiver_name));
+                return Offered { answer: Some(answer), counts: false, command };
             }
-            return Command::none();
+            return answered(answer);
         }
     };
     // Without asking, a pair nobody was asked about is taken as allowed. What the person did
@@ -419,28 +598,24 @@ fn send(
         decision => decision,
     };
     match decision {
-        Some(Decision::Denied) => {
-            call.answer(Answer::refused(refused(Refusal::Denied, &receiver_name)));
-            Command::none()
-        }
+        Some(Decision::Denied) => answered(Answer::refused(refused(Refusal::Denied, &receiver_name))),
         Some(Decision::Allowed) => {
-            screen.rules.sent(from.0, now);
-            queue(screen, to, sender_name, text, hop, now);
+            queue(screen, to, letter, hop, now);
             // Typed in before the sender is answered, so the answer says what really happened
             // rather than what is about to be tried.
-            let delivering = deliver(screen, now);
-            call.answer(taken(screen, to, &receiver_name));
-            delivering
+            let command = deliver(screen, now);
+            Offered { answer: Some(taken(screen, to, &receiver_name)), counts: true, command }
         }
         None => {
-            screen.rules.sent(from.0, now);
-            let waiting = Waiting { call: Some(call), text: text.clone(), hop };
+            let waiting = Waiting { call: call.take(), letter, hop };
+            let answer = waiting.call.is_none().then(|| Answer::done(t!("bridge.answer.asking")));
             if let Some(asking) = screen.asking.iter_mut().find(|asking| asking.from == from && asking.to == to) {
                 asking.waiting.push(waiting);
-                return Command::none();
+                return Offered { answer, counts: true, command: Command::none() };
             }
+            let command = Command::batch([ask(&sender_name, &receiver_name, text, from, to), remind(from, to)]);
             screen.asking.push(Asking { from, to, waiting: vec![waiting] });
-            Command::batch([ask(&sender_name, &receiver_name, &text, from, to), remind(from, to)])
+            Offered { answer, counts: true, command }
         }
     }
 }
@@ -523,12 +698,12 @@ pub(super) fn allowed(screen: &mut WorkspaceScreen, from: TabKey, to: TabKey, al
         }
         return Command::none();
     };
-    let (sender_name, receiver_name) = (named(workspace, from), named(workspace, to));
+    let receiver_name = named(workspace, to);
     let now = Instant::now();
     let mut commands = Vec::new();
     for waiting in asking.waiting {
         if allow {
-            queue(screen, to, sender_name.clone(), waiting.text, waiting.hop, now);
+            queue(screen, to, waiting.letter, waiting.hop, now);
             commands.push(deliver(screen, now));
         }
         if let Some(call) = waiting.call {
@@ -604,7 +779,7 @@ fn hand_over(tab: &mut Tab, now: Instant) {
     {
         return;
     }
-    let text = t!("bridge.handed", from = letter.from.as_str(), text = letter.text.as_str());
+    let text = handed(&letter);
     // Enter is written rather than pasted: inside a paste it would be a line break in the text
     // instead of the person's own Return, and nothing would be sent off.
     match session.paste(&text).and_then(|()| session.write(b"\r")) {
@@ -626,11 +801,11 @@ pub(super) fn still_asking(screen: &mut WorkspaceScreen, from: TabKey, to: TabKe
     }
 }
 
-/// Leaves `text` from `from` waiting in the tab `to`, as step `hop` of its chain.
-fn queue(screen: &mut WorkspaceScreen, to: TabKey, from: String, text: String, hop: u32, now: Instant) {
+/// Leaves `letter` waiting in the tab `to`, as step `hop` of its chain.
+fn queue(screen: &mut WorkspaceScreen, to: TabKey, letter: Letter, hop: u32, now: Instant) {
     screen.rules.received(to.0, hop, now);
     if let Some((_, tab)) = screen.owner_mut(to).and_then(|workspace| workspace.find(to)) {
-        tab.receive(Letter { from, text });
+        tab.receive(letter);
     }
 }
 

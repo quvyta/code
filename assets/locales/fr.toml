@@ -41,6 +41,21 @@ back = "quitter cet écran"
 new-tab = "ouvrir un nouvel onglet"
 leave-terminal = "passer de l’outil aux onglets"
 
+# Naming a tab.
+rename-tab = "nommer l’onglet ouvert"
+# The keys that switch tabs from anywhere on the project screen.
+next-tab = "aller à l’onglet suivant"
+previous-tab = "aller à l’onglet précédent"
+tab-1 = "aller à l’onglet 1"
+tab-2 = "aller à l’onglet 2"
+tab-3 = "aller à l’onglet 3"
+tab-4 = "aller à l’onglet 4"
+tab-5 = "aller à l’onglet 5"
+tab-6 = "aller à l’onglet 6"
+tab-7 = "aller à l’onglet 7"
+tab-8 = "aller à l’onglet 8"
+tab-9 = "aller à l’onglet 9"
+
 
 [setup]
 step-language = "Langue"
@@ -322,6 +337,7 @@ history.unread = "Les conversations n’ont pas pu être lues"
 hints.tabs = "onglets"
 hints.close = "fermer l’onglet"
 hints.leave = "quitter le terminal"
+hints.enter = "entrer dans l’onglet"
 panel.title = "Panneau"
 panel.add = "Ajouter un widget"
 panel.remove = "Retirer {widget} du panneau"
@@ -509,13 +525,21 @@ close-agent.message = "L’agent tourne encore. Fermer l’onglet l’arrête, d
 close-agent.confirm = "Arrêter et fermer"
 close-agent.cancel = "Le laisser tourner"
 
+# Naming a tab, from its menu on the strip or with its key.
+rename.item = "Renommer"
+rename.title = "Renommer {tab}"
+rename.label = "Nom"
+rename.hint = "Laisse vide pour revenir au nom automatique."
+rename.keep = "Renommer"
+rename.cancel = "Annuler"
+
 # The bridge between tabs: what the person is asked and shown, and the answers the agent of a
 # tab reads when it lists the other tabs or sends one of them a message.
 [bridge]
 closed = "Les onglets de {workspace} ne peuvent pas s’envoyer de messages"
 asking = "En attente d’une réponse"
 delivering = "Remise d’un message"
-handed = "Par QCode, depuis l’onglet {from} :\n\n{text}"
+handed = "{header}\n{reply}\n\n{text}"
 waiting = { one = "Un message de {from} attend ici", other = "{n} messages attendent ici, le dernier de {from}" }
 waiting-stuck = { one = "Un message de {from} attend ici : il n’a pas pu être remis, l’outil de programmation de cet onglet ne tourne pas", other = "{n} messages attendent ici, le dernier de {from} : ils n’ont pas pu être remis, l’outil de programmation de cet onglet ne tourne pas" }
 letter.from = "De {from}"
@@ -569,6 +593,19 @@ close.title = "Fermer {tab} ?"
 close.message = { one = "Un message d’un autre onglet attend dans cet onglet. Le fermer supprime le message, et l’agent qui l’a envoyé ne sera pas prévenu.", other = "{n} messages d’autres onglets attendent dans cet onglet. Le fermer les supprime, et les agents qui les ont envoyés ne seront pas prévenus." }
 close.confirm = "Fermer et jeter"
 close.cancel = "Garder l’onglet"
+
+# Who a tab is and what a message asks: the list names the asking tab first, and every message
+# arrives under two lines that say who sent it, what kind it is and how to answer.
+answer.you = "Tu es l’onglet {tab}, «{title}», dans l’espace de travail «{workspace}»."
+answer.all = { one = "L’autre onglet à agent de cet espace de travail :", other = "Chacun des {n} autres onglets à agent de cet espace de travail :" }
+answer.all-tab = "onglet {tab} «{title}» : {what}"
+header = "Par QCode, depuis l’onglet {tab} «{title}» ({harness}) de cet espace de travail : {kind}"
+kind.info = "pour information, aucune réponse attendue."
+kind.question = "une question, l’expéditeur attend ta réponse."
+kind.report = "une tâche, l’expéditeur attend un compte rendu du résultat quand tu auras fini."
+reply.info = "Pour répondre, utilise send_message avec tab \"{tab}\"."
+reply.question = "Réponds avec send_message, tab \"{tab}\", kind \"info\"."
+reply.report = "Quand tu as fini, envoie le résultat avec send_message, tab \"{tab}\", kind \"info\" (kind \"question\" s’il te faut d’abord demander quelque chose)."
 
 [settings]
 title = "Réglages"

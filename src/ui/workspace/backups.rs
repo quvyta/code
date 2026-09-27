@@ -31,6 +31,7 @@ use crate::engine::{Engine, HostUser};
 use crate::profile::HarnessKind;
 use crate::profile::identity::Home;
 use crate::store::{WorkspacePaths, set_backup_assets, set_backup_skip};
+use crate::ui::keys::Wrapping;
 
 use super::{Msg, OpenWorkspace, TabKind, TabState, WorkspaceScreen};
 
@@ -1080,16 +1081,15 @@ fn contents(listing: &Listing, entries: Option<&[Entry]>, row: usize, ui: &mut V
                 (BackupOf::Code, false) => t!("workspace.backup.no-versions"),
             };
             let height = u16::try_from(entries.len().clamp(1, LIST_ROWS)).unwrap_or(1);
-            ui.add(
-                List::new(items)
-                    .selected(Some(row))
-                    .empty_text(empty)
-                    .on_select(Msg::HighlightBackup)
-                    .on_activate(Msg::ChooseBackup),
-            )
-            .id(LIST_ID)
-            .fill_width()
-            .height(Length::Cells(height));
+            let list = List::new(items)
+                .selected(Some(row))
+                .empty_text(empty)
+                .on_select(Msg::HighlightBackup)
+                .on_activate(Msg::ChooseBackup);
+            ui.add(Wrapping::new(list, Some(row), entries.len()))
+                .id(LIST_ID)
+                .fill_width()
+                .height(Length::Cells(height));
         }
         _ if listing.slow => {
             ui.add(Spinner::new().label(t!("workspace.backup.reading")));

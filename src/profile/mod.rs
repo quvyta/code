@@ -32,7 +32,9 @@ pub mod own;
 mod permission_live;
 mod template;
 
-pub use definition::{ASSUMED_CONTEXT_TOKENS, Loaded, MountAccess, NetworkMode, Profile, ProviderChoice};
+pub use definition::{
+    ASSUMED_CONTEXT_TOKENS, Loaded, MountAccess, NetworkMode, OPENCODE_CONFIG_CONTENT, Profile, ProviderChoice,
+};
 pub use harness::{
     AccountKind, Archive, ConfigFile, Desktop, Harness, HarnessKind, McpSettings, McpShape, Resume, Surface, SystemFile,
 };

@@ -40,6 +40,21 @@ back = "sair desta tela"
 new-tab = "abrir uma nova aba"
 leave-terminal = "alternar entre a ferramenta e as abas"
 
+# Naming a tab.
+rename-tab = "dar nome à aba aberta"
+# The keys that switch tabs from anywhere on the project screen.
+next-tab = "ir para a próxima aba"
+previous-tab = "ir para a aba anterior"
+tab-1 = "ir para a aba 1"
+tab-2 = "ir para a aba 2"
+tab-3 = "ir para a aba 3"
+tab-4 = "ir para a aba 4"
+tab-5 = "ir para a aba 5"
+tab-6 = "ir para a aba 6"
+tab-7 = "ir para a aba 7"
+tab-8 = "ir para a aba 8"
+tab-9 = "ir para a aba 9"
+
 
 [setup]
 step-language = "Idioma"
@@ -321,6 +336,7 @@ history.unread = "As conversas não puderam ser lidas"
 hints.tabs = "abas"
 hints.close = "fechar a aba"
 hints.leave = "sair do terminal"
+hints.enter = "entrar na aba"
 panel.title = "Painel"
 panel.add = "Adicionar um widget"
 panel.remove = "Tirar {widget} do painel"
@@ -508,13 +524,21 @@ close-agent.message = "O agente ainda está em execução. Fechar a aba o interr
 close-agent.confirm = "Encerrar e fechar"
 close-agent.cancel = "Deixar rodando"
 
+# Naming a tab, from its menu on the strip or with its key.
+rename.item = "Renomear"
+rename.title = "Renomear {tab}"
+rename.label = "Nome"
+rename.hint = "Deixe vazio para voltar ao nome automático."
+rename.keep = "Renomear"
+rename.cancel = "Cancelar"
+
 # The bridge between tabs: what the person is asked and shown, and the answers the agent of a
 # tab reads when it lists the other tabs or sends one of them a message.
 [bridge]
 closed = "As abas de {workspace} não podem mandar mensagens umas para as outras"
 asking = "Esperando uma resposta"
 delivering = "Entregando uma mensagem"
-handed = "Pelo QCode, da aba {from}:\n\n{text}"
+handed = "{header}\n{reply}\n\n{text}"
 waiting = { one = "Uma mensagem de {from} espera aqui", other = "{n} mensagens esperam aqui, a última de {from}" }
 waiting-stuck = { one = "Uma mensagem de {from} espera aqui: não deu para entregar, a ferramenta de programação desta aba não está rodando", other = "{n} mensagens esperam aqui, a última de {from}: não deu para entregar, a ferramenta de programação desta aba não está rodando" }
 letter.from = "De {from}"
@@ -568,6 +592,19 @@ close.title = "Fechar {tab}?"
 close.message = { one = "Uma mensagem de outra aba espera nesta aba. Fechá-la joga a mensagem fora, e o agente que a enviou não será avisado.", other = "{n} mensagens de outras abas esperam nesta aba. Fechá-la joga as mensagens fora, e os agentes que as enviaram não serão avisados." }
 close.confirm = "Fechar e descartar"
 close.cancel = "Manter a aba"
+
+# Who a tab is and what a message asks: the list names the asking tab first, and every message
+# arrives under two lines that say who sent it, what kind it is and how to answer.
+answer.you = "Você é a aba {tab}, «{title}», do espaço de trabalho «{workspace}»."
+answer.all = { one = "A outra aba com agente deste espaço de trabalho:", other = "Cada uma das outras {n} abas com agente deste espaço de trabalho:" }
+answer.all-tab = "aba {tab} «{title}»: {what}"
+header = "Pelo QCode, da aba {tab} «{title}» ({harness}) deste espaço de trabalho: {kind}"
+kind.info = "para sua informação, não precisa responder."
+kind.question = "uma pergunta, o remetente espera a sua resposta."
+kind.report = "uma tarefa, o remetente espera um relato do resultado quando você terminar."
+reply.info = "Para responder, use send_message com tab \"{tab}\"."
+reply.question = "Responda com send_message, tab \"{tab}\", kind \"info\"."
+reply.report = "Quando terminar, mande o resultado com send_message, tab \"{tab}\", kind \"info\" (kind \"question\" se antes precisar perguntar algo)."
 
 [settings]
 title = "Ajustes"

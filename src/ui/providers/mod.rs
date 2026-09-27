@@ -32,6 +32,7 @@ use crate::provider::{
     Providers as ProviderFile, Reached, Web, Wire, ask, permission_problems,
 };
 use crate::store::Loaded;
+use crate::ui::keys::Wrapping;
 
 pub use draft::{BASE_FIELD, Draft, KEY_FIELD, Problem, TAG_FIELD};
 
@@ -224,10 +225,17 @@ impl Providers {
     }
 }
 
-/// The control that takes the keyboard when the screen opens, once there is one.
+/// The control that takes the keyboard when the screen opens, once there is one: the list, or on
+/// an empty screen its one button.
 #[must_use]
 pub fn entry(state: &Providers) -> Option<&'static str> {
-    (!state.entries().is_empty()).then_some(LIST)
+    if state.loading {
+        None
+    } else if state.entries().is_empty() {
+        Some("providers-empty")
+    } else {
+        Some(LIST)
+    }
 }
 
 /// The keys of the providers screen that are not in the keymap, for the key list.
@@ -285,7 +293,12 @@ pub fn update(state: &mut Providers, message: Msg) -> Command<Msg> {
         }
         Msg::New => {
             state.draft = Some(Draft::new());
-            Command::focus(TAG_FIELD)
+            // A dialog gives the keyboard back, as it closes, to what had it as it opened, over
+            // any focus asked for in the same moment. The list is where both ways out of this
+            // one mean to leave it, the new provider chosen on it or nothing changed, so the list
+            // is what has the keyboard as the dialog opens, for the moment before the tag takes it.
+            let back = if state.entries().is_empty() { Command::none() } else { Command::focus(LIST) };
+            Command::batch([back, Command::focus(TAG_FIELD)])
         }
         Msg::Cancel => {
             // The key the person was typing goes with the dialog: nothing keeps it.
@@ -518,7 +531,8 @@ fn draw_list(state: &Providers, ui: &mut View<'_, Msg>) {
         let items = state.entries().iter().map(|entry| {
             ListItem::new(entry.tag.as_str().to_owned()).detail(format!("{}  {}", kind_word(entry.kind), entry.base))
         });
-        ui.add(List::new(items).selected(Some(state.selected)).on_select(Msg::Select)).id(LIST).fill_width();
+        let list = List::new(items).selected(Some(state.selected)).on_select(Msg::Select);
+        ui.add(Wrapping::new(list, Some(state.selected), state.entries().len())).id(LIST).fill_width();
 
         if let Some(entry) = state.selected() {
             draw_chosen(state, entry, ui);
@@ -548,7 +562,8 @@ fn draw_chosen(state: &Providers, entry: &ProviderEntry, ui: &mut View<'_, Msg>)
         // A server can offer more models than the screen has rows. The list takes the rows the
         // rest of the page leaves and scrolls inside them, so the answer to Try and every button
         // under it stay where a hand can reach them.
-        ui.add(List::new(items).selected(Some(state.model)).on_select(Msg::PickModel)).id(MODELS).fill();
+        let list = List::new(items).selected(Some(state.model)).on_select(Msg::PickModel);
+        ui.add(Wrapping::new(list, Some(state.model), entry.models.len())).id(MODELS).fill();
     }
     // A figure QCode did not ask the service for says where it was read.
     if let Some(model) = state.chosen_model()
@@ -624,8 +639,8 @@ fn draw_dialog(draft: &Draft, ui: &mut View<'_, Msg>) {
     let dialog = Modal::new().title(t!("provider.new-title")).width(DIALOG_WIDTH).on_close(Msg::Cancel);
     ui.add_with(dialog, |ui| {
         ui.column(|ui| {
-            ui.add(RadioGroup::new(ProviderKind::ALL.map(kind_word)).selected(chosen).on_select(Msg::PickKind))
-                .id("provider-kind");
+            let kinds = RadioGroup::new(ProviderKind::ALL.map(kind_word)).selected(chosen).on_select(Msg::PickKind);
+            ui.add(Wrapping::new(kinds, chosen, ProviderKind::ALL.len())).id("provider-kind");
             if !draft.kind.regions().is_empty() {
                 draw_ready_made(draft, ui);
             }
@@ -695,9 +710,10 @@ fn draw_dialog(draft: &Draft, ui: &mut View<'_, Msg>) {
 /// subscription answers, where each shape is asked, the header the key goes in, and the models
 /// it offers.
 fn draw_ready_made(draft: &Draft, ui: &mut View<'_, Msg>) {
+    let count = draft.kind.regions().len();
     let regions = draft.kind.regions().iter().map(|region| region_word(region.id));
-    ui.add(RadioGroup::new(regions).horizontal(true).selected(draft.region()).on_select(Msg::PickRegion))
-        .id("provider-region");
+    let group = RadioGroup::new(regions).horizontal(true).selected(draft.region()).on_select(Msg::PickRegion);
+    ui.add(Wrapping::new(group, draft.region(), count).across(true)).id("provider-region");
     // One block, read together: it is what picking the kind filled in.
     ui.column(|ui| {
         draw_speaks(draft.kind, &draft.base, ui);

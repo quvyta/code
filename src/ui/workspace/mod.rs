@@ -25,7 +25,10 @@ mod keep;
 mod panel;
 mod plan;
 mod relay;
+mod rename;
+mod shared;
 mod sound;
+mod strip;
 mod tab;
 mod viewer;
 mod watch;
@@ -59,13 +62,13 @@ use std::ffi::OsString;
 
 use qframe::date::Date;
 use qframe::icons::Icons;
-use qframe::keymap::KeyChord;
+use qframe::keymap::{Key, KeyChord};
 use qframe::prelude::*;
 use qframe::runtime::Task;
 use qframe::storage::FolderChange;
 use qframe::widgets::{
-    CollapsedMarker, EmptyState, LogView, Markdown, RailTab, ScrollView, ShimmerText, Side, SidePanel, Spinner,
-    TabEdit, TabRail, TabWidth, Terminal, TerminalEvent, TerminalSession, Toast,
+    CollapsedMarker, ContextItem, EmptyState, LogView, Markdown, RailTab, ScrollView, ShimmerText, Side, SidePanel,
+    Spinner, TabEdit, TabRail, TabWidth, Terminal, TerminalEvent, TerminalSession, Toast,
 };
 
 use std::path::{Path, PathBuf};
@@ -131,10 +134,29 @@ pub enum Msg {
     },
     /// A blank tab was asked for, to choose in it what it opens.
     NewTab,
+    /// The person asked to name the tab at this place, from its menu on the strip.
+    RenameTab(usize),
+    /// The person asked to name the open tab, with its key.
+    RenameOpenTab,
+    /// The name being given to a tab was edited.
+    TabName(String),
+    /// The name being given to a tab was kept.
+    NameTab,
+    /// Naming a tab was given up; its name stays as it was.
+    CancelRename,
     /// The keyboard was asked out of the harness, onto the tab strip.
     LeaveTerminal,
     /// The keyboard was asked back into the open tab's harness, from wherever it was.
     EnterTerminal,
+    /// A key on the tab strip or the rail is being handled, or with `false` has been: a switch
+    /// it makes in between leaves the keyboard walking there.
+    Walking(bool),
+    /// The keyboard was asked into the open tab, from the strip or the rail.
+    EnterTab,
+    /// The next tab was asked for, or with `false` the one before, going round at the ends.
+    NextTab(bool),
+    /// The tab at this place on the strip was asked for, counted from 0.
+    GoToTab(usize),
     /// A row of a blank tab's page was chosen: the blank tab of this key turns into it.
     Choose(TabKey, Choice),
     /// The keyboard moved to another row of a blank tab's page.
@@ -173,7 +195,7 @@ pub enum Msg {
     /// The container of a new-chat tab brought back from the last session is up, or the engine
     /// refused; with the profile's conversations when they could be read, to find the one the
     /// tab was showing.
-    Woken(TabKey, u64, Result<(), LaunchFailure>, Option<Vec<Conversation>>),
+    Woken(TabKey, u64, Result<(), LaunchFailure>, Option<Vec<Conversation>>, Option<String>),
     /// A tab's session printed something or ended.
     Output(TabKey, u64, TerminalEvent),
     /// Whether the container of a tab whose session ended is still running.
@@ -420,6 +442,12 @@ pub struct OpenWorkspace {
     /// Whether the workspace's provider relay is listening, for a tab of a profile that runs on
     /// a provider of the person's own.
     relay: relay::Link,
+    /// The tokens of the opencode servers the workspace's profile containers share between their
+    /// tabs ([`shared`]).
+    servers: shared::ServerTokens,
+    /// The id the next tab that joins the workspace is given. It only grows while the workspace
+    /// is open, so no two tabs are ever given the same one, even after one of them was closed.
+    next_number: u32,
 }
 
 impl OpenWorkspace {
@@ -454,6 +482,8 @@ impl OpenWorkspace {
             assets: file.backup_assets,
             link: bridge::Link::default(),
             relay: relay::Link::default(),
+            servers: shared::ServerTokens::default(),
+            next_number: 1,
         };
         workspace.set_profiles(profiles);
         workspace
@@ -576,6 +606,11 @@ impl OpenWorkspace {
             TabKind::Admin(_) => Some(vec!["bash".to_owned()]),
             TabKind::Profile(name) => {
                 let profile = self.profiles.iter().find(|profile| profile.name.as_str() == name)?;
+                // An interface attached to the profile's shared server; the relay, when there is
+                // one, starts the server rather than the tab.
+                if shared::shares(profile) {
+                    return Some(shared::tab_program(tab.conversation()));
+                }
                 let mut command = profile.harness.command_line(tab.conversation());
                 // A profile that runs on a provider of the person's own is pointed at the relay's
                 // address, so the relay has to be listening inside the container before the
@@ -604,12 +639,45 @@ impl OpenWorkspace {
         }
     }
 
-    /// The label of the tab at `index`: the profile's name, `Shell` numbered among the shell tabs
-    /// so several of them can be told apart, or `New tab` while it is blank.
+    /// Adds `tab` after the last tab, with the next id of the workspace, and returns where it is.
+    fn join(&mut self, mut tab: Tab) -> usize {
+        tab.numbered(self.next_number);
+        self.next_number += 1;
+        self.tabs.push(tab);
+        self.tabs.len() - 1
+    }
+
+    /// The label of the tab at `index`: the name the person gave it, or else its automatic one;
+    /// an agent tab whose automatic label another agent tab also reads carries its id after it,
+    /// so five opencode tabs never all read `opencode`.
     fn tab_label(&self, index: usize) -> String {
         let Some(tab) = self.tabs.get(index) else { return String::new() };
+        if let Some(name) = tab.name() {
+            return name.to_owned();
+        }
+        let label = self.automatic_label(index);
+        let alike = tab.kind().runs_agent()
+            && self.tabs.iter().enumerate().any(|(other, shown)| {
+                other != index
+                    && shown.kind().runs_agent()
+                    && shown.name().map_or_else(|| self.automatic_label(other), str::to_owned) == label
+            });
+        if alike { format!("{label} {}", tab.number()) } else { label }
+    }
+
+    /// The label the tab at `index` reads when the person gave it no name: for a harness tab, the
+    /// title its harness gave the conversation it shows, when the blank tab's page read one, and the
+    /// profile's name otherwise; `Shell` numbered among the shell tabs so several of them can be
+    /// told apart, or `New tab` while it is blank.
+    fn automatic_label(&self, index: usize) -> String {
+        let Some(tab) = self.tabs.get(index) else { return String::new() };
         match tab.kind() {
-            TabKind::Profile(name) => name.clone(),
+            TabKind::Profile(name) => tab
+                .conversation()
+                .and_then(|id| self.history.get(name)?.title(id))
+                .map(history::short_title)
+                .filter(|title| !title.is_empty())
+                .unwrap_or_else(|| name.clone()),
             TabKind::Admin(name) => t!("workspace.tab.admin", profile = name.clone()),
             // The window's tab is labelled by its profile like a harness tab, with the mark that
             // says it is a window rather than a terminal.
@@ -711,6 +779,11 @@ pub struct WorkspaceScreen {
     delivering: bool,
     /// Whether the person is asked before one tab first sends to another.
     ask_first: bool,
+    /// The tab being named, while the dialog that names it is open.
+    renaming: Option<rename::Renaming>,
+    /// Whether a key on the tab strip or the rail is being handled, so that a switch it makes
+    /// leaves the keyboard walking there instead of putting it in the tab.
+    walking: bool,
 }
 
 impl WorkspaceScreen {
@@ -751,6 +824,8 @@ impl WorkspaceScreen {
             asking: Vec::new(),
             delivering: false,
             ask_first: false,
+            renaming: None,
+            walking: false,
         }
     }
 
@@ -891,9 +966,14 @@ impl WorkspaceScreen {
     /// comes back blank; it never had a container. A tab of one of the workspace's files comes back
     /// whether or not the file is still there, and says so when it is shown; one whose path
     /// climbs out of the workspace is left out, because nothing QCode wrote would name one.
+    ///
+    /// A tab keeps the id and the name it had. One whose id the record does not give, or gives to
+    /// an earlier tab as well, is given a new one after every id the record gives.
     pub fn restore_tabs(&mut self, index: usize, record: &SessionWorkspace) {
         let Some(workspace) = self.workspaces.get_mut(index) else { return };
         let mut active = 0;
+        let highest = record.tabs.iter().filter_map(|saved| saved.number).max().unwrap_or(0);
+        workspace.next_number = workspace.next_number.max(highest.saturating_add(1));
         for (position, saved) in record.tabs.iter().enumerate() {
             let kind = match &saved.kind {
                 SessionTabKind::Shell => TabKind::Shell,
@@ -931,7 +1011,16 @@ impl WorkspaceScreen {
             // Opening QCode again is not asking to hear a sound again, and no more is it asking for
             // a window on the screen: both come back saying so, with the way to ask for them.
             tab.hold(matches!(tab.kind(), TabKind::Sound(_) | TabKind::Desktop(_)));
-            workspace.tabs.push(tab);
+            tab.rename(saved.name.clone());
+            match saved.number.filter(|number| workspace.tabs.iter().all(|tab| tab.number() != *number)) {
+                Some(number) => {
+                    tab.numbered(number);
+                    workspace.tabs.push(tab);
+                }
+                None => {
+                    workspace.join(tab);
+                }
+            }
         }
         workspace.active_tab = active;
     }
@@ -968,6 +1057,8 @@ impl WorkspaceScreen {
                             },
                             conversation: tab.conversation().map(str::to_owned),
                             opened: tab.opened(),
+                            number: Some(tab.number()),
+                            name: tab.name().map(str::to_owned),
                         })
                     })
                     .collect(),
@@ -1013,6 +1104,12 @@ impl WorkspaceScreen {
                 let name = tab.kind().profile();
                 let profile = workspace.profiles.iter().find(|profile| Some(profile.name.as_str()) == name);
                 if let Some(profile) = profile
+                    && shared::shares(profile)
+                {
+                    // The tab starts the server when no other tab has, so it carries what the
+                    // server starts with.
+                    env.extend(self.server_environment(workspace, profile));
+                } else if let Some(profile) = profile
                     && let Some(provider) = &profile.provider
                 {
                     // Each harness is pointed at the relay its own way, so the environment
@@ -1149,10 +1246,11 @@ fn follow_disk(screen: &mut WorkspaceScreen) -> Command<Msg> {
 
 /// Applies a message to the screen, leaving the start of a waiting tab to [`update`].
 fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
+    let walking = screen.walking;
     match message {
         Msg::OpenWorkspace(index) => {
             screen.set_active(index);
-            Command::batch([load_root(screen), list_containers(screen)])
+            Command::batch([load_root(screen), list_containers(screen), settle(screen, walking)])
         }
         Msg::CloseWorkspace(index) => {
             let backed = backups::closing(screen, index);
@@ -1172,8 +1270,9 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
             let tokens: Vec<String> = workspace.tabs.iter().map(|tab| tab.token().to_owned()).collect();
             relay::closed(workspace, &tokens);
             bridge::closed(screen, &keys);
+            rename::closed(screen, &keys);
             TabEdit::Close(index).apply(&mut screen.workspaces, &mut screen.active);
-            Command::batch([backed, silenced, load_root(screen), list_containers(screen)])
+            Command::batch([backed, silenced, load_root(screen), list_containers(screen), settle(screen, walking)])
         }
         // The application opens the list; nothing on this screen changes until a workspace comes
         // back from it.
@@ -1184,7 +1283,7 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
             {
                 workspace.active_tab = index;
             }
-            Command::none()
+            settle(screen, walking)
         }
         Msg::CloseTab(index) => {
             // Messages other agents left in the tab would go with it, and those agents were told
@@ -1200,13 +1299,17 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
             if let Some((key, harness)) = screen.workspace().and_then(|workspace| agent_running(workspace, index)) {
                 return ask_end(key, &harness);
             }
-            close_tab(screen, index)
+            let closed = close_tab(screen, index);
+            Command::batch([closed, settle(screen, walking)])
         }
         Msg::TabEnded => Command::none(),
         Msg::CloseTabAnyway(key) => {
             let index = screen.workspace().and_then(|workspace| workspace.tabs.iter().position(|tab| tab.key() == key));
             match index {
-                Some(index) => close_tab(screen, index),
+                Some(index) => {
+                    let closed = close_tab(screen, index);
+                    Command::batch([closed, settle(screen, walking)])
+                }
                 None => Command::none(),
             }
         }
@@ -1217,6 +1320,17 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
             Command::none()
         }
         Msg::NewTab => open_blank(screen),
+        Msg::RenameTab(index) => rename::open(screen, index),
+        Msg::RenameOpenTab => match screen.workspace().filter(|workspace| !workspace.tabs.is_empty()) {
+            Some(workspace) => rename::open(screen, workspace.active_tab),
+            None => Command::none(),
+        },
+        Msg::TabName(value) => {
+            rename::typed(screen, value);
+            Command::none()
+        }
+        Msg::NameTab => rename::submit(screen),
+        Msg::CancelRename => rename::cancel(screen),
         // The strip, because from there the arrows switch tabs and Tab reaches the rest of the
         // screen, the terminal included.
         Msg::LeaveTerminal => Command::focus(TABS_ID),
@@ -1226,6 +1340,28 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
             let terminal = screen.workspace().and_then(OpenWorkspace::active_tab).and_then(Tab::session).is_some();
             if terminal { Command::focus(TERMINAL_ID) } else { Command::none() }
         }
+        Msg::Walking(walking) => {
+            screen.walking = walking;
+            Command::none()
+        }
+        Msg::EnterTab => land(screen),
+        Msg::NextTab(forward) => {
+            let Some(workspace) = screen.workspaces.get_mut(screen.active) else { return Command::none() };
+            let count = workspace.tabs.len();
+            if count == 0 {
+                return Command::none();
+            }
+            workspace.active_tab =
+                if forward { (workspace.active_tab + 1) % count } else { (workspace.active_tab + count - 1) % count };
+            land(screen)
+        }
+        Msg::GoToTab(index) => match screen.workspaces.get_mut(screen.active) {
+            Some(workspace) if index < workspace.tabs.len() => {
+                workspace.active_tab = index;
+                land(screen)
+            }
+            _ => Command::none(),
+        },
         Msg::Choose(key, choice) => choose(screen, key, choice),
         Msg::HighlightChoice(row) => {
             screen.blank_row = row;
@@ -1303,9 +1439,12 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
                 None => Command::none(),
             }
         }
-        Msg::Woken(key, run, result, found) => {
+        Msg::Woken(key, run, result, found, shown) => {
             if let Some(found) = found {
                 resume_newest(screen, key, run, &found);
+            }
+            if let Some(conversation) = shown {
+                show(screen, key, run, conversation);
             }
             ready(screen, key, run, &result)
         }
@@ -1550,14 +1689,37 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
     }
 }
 
+/// After a switch: the keyboard lands in the tab, unless the switch was the keyboard walking the
+/// strip or the rail, where it stays.
+fn settle(screen: &WorkspaceScreen, walking: bool) -> Command<Msg> {
+    if walking { Command::none() } else { land(screen) }
+}
+
+/// Puts the keyboard in the open tab: its terminal, the page of a blank tab, a document, a
+/// window's button, or else the first thing on it that takes the keyboard. A tab still starting
+/// has none yet and is given it when its terminal comes up.
+///
+/// The widget is named rather than found inside the tab's part of the screen, because the runtime
+/// looks for it in the frame drawn before the switch, where that part still holds the tab left.
+fn land(screen: &WorkspaceScreen) -> Command<Msg> {
+    let Some(tab) = screen.workspace().and_then(OpenWorkspace::active_tab) else { return Command::none() };
+    let target = match tab.kind() {
+        TabKind::New => blank::CHOICES_ID,
+        TabKind::Markdown(_) | TabKind::Pdf(_) | TabKind::Office(_) => DOCUMENT_ID,
+        TabKind::Desktop(_) => desktop::WINDOW_ID,
+        _ if tab.session().is_some() => TERMINAL_ID,
+        _ => BODY_ID,
+    };
+    Command::focus(target)
+}
+
 /// Opens a blank tab after the last one and hands its page the keyboard. Nothing starts: the
 /// tab only asks what it should open.
 fn open_blank(screen: &mut WorkspaceScreen) -> Command<Msg> {
     let key = TabKey(screen.next_key);
     let Some(workspace) = screen.workspaces.get_mut(screen.active) else { return Command::none() };
     screen.next_key += 1;
-    workspace.tabs.push(Tab::blank(key));
-    workspace.active_tab = workspace.tabs.len() - 1;
+    workspace.active_tab = workspace.join(Tab::blank(key));
     screen.blank_row = 0;
     screen.expanded.clear();
     Command::focus(blank::CHOICES_ID)
@@ -1603,8 +1765,11 @@ fn choose(screen: &mut WorkspaceScreen, key: TabKey, choice: Choice) -> Command<
     tab.choose(kind, conversation);
     let run = tab.run();
     let token = tab.token().to_owned();
-    if let Some(provider) = &provider {
-        relay::entered(&*workspace, &token, &provider.tag);
+    let serving = serving(screen, key);
+    if let Some(provider) = &provider
+        && let Some(workspace) = screen.owner(key)
+    {
+        relay::entered(workspace, asking(serving.as_ref(), &token), &provider.tag);
     }
     // A window is not entered with a terminal, so it takes the window's own path and the keyboard
     // goes to the tab's one action rather than to a terminal that is not there.
@@ -1613,19 +1778,82 @@ fn choose(screen: &mut WorkspaceScreen, key: TabKey, choice: Choice) -> Command<
     }
     let launch = Launch::new(key, run, token, provider, providers_path);
     Command::batch([
-        Command::perform(move || {
-            let Launch { key, run, gate, token } = launch;
-            start(registry.as_deref(), &engine, &plan, user, gate.as_ref(), &token, |result| {
-                Msg::Ready(key, run, result)
-            })
-        }),
+        harness_start(registry, engine, plan, user, launch, serving),
         Command::focus(TERMINAL_ID),
         record,
         closed,
     ])
 }
 
+/// What the tab `key` needs before it starts when it is an opencode tab of a profile whose tabs
+/// share a server ([`shared`]); `None` for every other tab.
+fn serving(screen: &WorkspaceScreen, key: TabKey) -> Option<Serving> {
+    let workspace = screen.owner(key)?;
+    let tab = workspace.tabs.iter().find(|tab| tab.key() == key)?;
+    let TabKind::Profile(name) = tab.kind() else { return None };
+    let profile = workspace.profiles.iter().find(|profile| profile.name.as_str() == name)?;
+    shared::shares(profile).then(|| Serving {
+        environment: screen.server_environment(workspace, profile),
+        token: workspace.servers.token(name),
+        folder: workspace.paths.mcp(),
+        conversation: tab.conversation().map(str::to_owned),
+    })
+}
+
+/// The token the provider relay answers a tab's requests by: the tab's own, or its shared
+/// server's, which outlives every tab.
+fn asking<'a>(serving: Option<&'a Serving>, token: &'a str) -> &'a str {
+    serving.map_or(token, |serving| serving.token.as_str())
+}
+
+/// Brings the container of `plan` up for the harness tab of `launch` and answers with the message
+/// that starts it: at once, or, for a tab of a shared opencode server, once the server has made or
+/// found the conversation the tab shows.
+fn harness_start(
+    registry: Option<PathBuf>,
+    engine: Engine,
+    plan: ContainerPlan,
+    user: HostUser,
+    launch: Launch,
+    serving: Option<Serving>,
+) -> Command<Msg> {
+    Command::perform(move || {
+        let Launch { key, run, gate, token } = launch;
+        start(registry.as_deref(), &engine, &plan, user, gate.as_ref(), &token, |result| match serving {
+            None => Msg::Ready(key, run, result),
+            Some(serving) => {
+                let chosen = result.and_then(|()| {
+                    shared::ready(
+                        &engine,
+                        &plan.name,
+                        &serving.folder,
+                        &serving.environment,
+                        serving.conversation.as_deref(),
+                    )
+                });
+                match chosen {
+                    Ok(conversation) => Msg::Woken(key, run, Ok(()), None, Some(conversation)),
+                    Err(failure) => Msg::Woken(key, run, Err(failure), None, None),
+                }
+            }
+        })
+    })
+}
+
 impl WorkspaceScreen {
+    /// What the shared opencode server of `profile` in `workspace` starts with
+    /// ([`shared::server_environment`]): its token, and the provider's configuration made for that
+    /// token rather than a tab's, since the server outlives any one tab.
+    fn server_environment(&self, workspace: &OpenWorkspace, profile: &Profile) -> Vec<(String, String)> {
+        let token = workspace.servers.token(profile.name.as_str());
+        let provider = profile
+            .provider
+            .as_ref()
+            .map(|provider| provider.environment(profile.harness, &token, self.measured_window(provider)))
+            .unwrap_or_default();
+        shared::server_environment(&token, &provider)
+    }
+
     /// The window the model `provider` names is given on its server: what this machine measured,
     /// or for a ready-made service what it says it gives ([`crate::provider::Model::window`]);
     /// `None` when neither is known, or the provider is gone.
@@ -1711,6 +1939,7 @@ fn close_tab(screen: &mut WorkspaceScreen, index: usize) -> Command<Msg> {
     }
     TabEdit::Close(index).apply(&mut workspace.tabs, &mut workspace.active_tab);
     bridge::closed(screen, &gone);
+    rename::closed(screen, &gone);
     Command::batch([silenced, ending])
 }
 
@@ -1784,13 +2013,18 @@ fn wake(screen: &mut WorkspaceScreen) -> Command<Msg> {
     let user = screen.user;
     let registry = screen.registry.clone();
     let providers_path = screen.providers_path.clone();
+    let serving = screen
+        .workspaces
+        .get(screen.active)
+        .and_then(|workspace| workspace.tabs.get(workspace.active_tab))
+        .and_then(|tab| serving(screen, tab.key()));
     let Some(workspace) = screen.workspaces.get_mut(screen.active) else { return Command::none() };
     let Some(tab) = workspace.tabs.get(workspace.active_tab) else { return Command::none() };
     let Some(plan) = workspace.plan(tab.kind()) else { return Command::none() };
     let provider = provider_choice(workspace, tab.kind());
     let file = tab.kind().file().map(|file| workspace.files.path(file));
     let harness = match tab.kind() {
-        TabKind::Profile(name) if tab.conversation().is_none() => {
+        TabKind::Profile(name) if tab.conversation().is_none() && serving.is_none() => {
             workspace.profiles.iter().find(|profile| profile.name.as_str() == name).map(|profile| profile.harness)
         }
         _ => None,
@@ -1800,7 +2034,11 @@ fn wake(screen: &mut WorkspaceScreen) -> Command<Msg> {
     let (key, run) = (tab.key(), tab.run());
     let token = tab.token().to_owned();
     if let Some(provider) = &provider {
-        relay::entered(&*workspace, &token, &provider.tag);
+        relay::entered(&*workspace, asking(serving.as_ref(), &token), &provider.tag);
+    }
+    if serving.is_some() {
+        let launch = Launch::new(key, run, token, provider, providers_path);
+        return harness_start(registry, engine, plan, user, launch, serving);
     }
     match harness {
         None => bring_up(engine, plan, Launch::new(key, run, token, provider, providers_path), user, file, registry),
@@ -1814,10 +2052,29 @@ fn wake(screen: &mut WorkspaceScreen) -> Command<Msg> {
                     // container is up by now, so reading it starts nothing.
                     let found =
                         result.is_ok().then(|| history::read(&engine, &plan.name, harness, &mut || {}).ok()).flatten();
-                    Msg::Woken(key, run, result, found)
+                    Msg::Woken(key, run, result, found, None)
                 })
             })
         }
+    }
+}
+
+/// What the tab of a profile whose opencode tabs share a server needs before it starts, taken
+/// from the screen while it is at hand ([`shared`]).
+struct Serving {
+    environment: Vec<(String, String)>,
+    token: String,
+    folder: PathBuf,
+    conversation: Option<String>,
+}
+
+/// Gives the tab `key`, woken as `run`, the conversation its shared server made or found for it,
+/// so the tab opens it and the session file keeps it from now on.
+fn show(screen: &mut WorkspaceScreen, key: TabKey, run: u64, conversation: String) {
+    let Some(workspace) = screen.owner_mut(key) else { return };
+    let Some((_, tab)) = workspace.find(key) else { return };
+    if tab.run() == run && tab.state().is_starting() {
+        tab.show_conversation(conversation);
     }
 }
 
@@ -1938,14 +2195,18 @@ fn restart_tab(screen: &mut WorkspaceScreen, key: TabKey) -> Command<Msg> {
     }
     let Some(plan) = workspace.plan(&kind) else { return Command::none() };
     let provider = provider_choice(workspace, &kind);
-    if let Some(provider) = &provider {
-        let token = workspace.tabs.iter().find(|tab| tab.key() == key).map(|tab| tab.token().to_owned());
-        if let Some(token) = token {
-            relay::entered(&*workspace, &token, &provider.tag);
-        }
-    }
     let file = kind.file().map(|file| workspace.files.path(file));
-    bring_up(engine, plan, Launch::new(key, run, token, provider, providers_path), user, file, registry)
+    let serving = serving(screen, key);
+    if let Some(provider) = &provider
+        && let Some(workspace) = screen.owner(key)
+    {
+        relay::entered(workspace, asking(serving.as_ref(), &token), &provider.tag);
+    }
+    let launch = Launch::new(key, run, token, provider, providers_path);
+    if serving.is_some() {
+        return harness_start(registry, engine, plan, user, launch, serving);
+    }
+    bring_up(engine, plan, launch, user, file, registry)
 }
 
 /// What has to be true of a provider profile's provider before its tab is trusted to speak for
@@ -2204,8 +2465,7 @@ fn open_tab(screen: &mut WorkspaceScreen, kind: TabKind) -> Command<Msg> {
         return Command::focus(focus);
     }
     screen.next_key += 1;
-    workspace.tabs.push(Tab::waiting(key, kind));
-    workspace.active_tab = workspace.tabs.len() - 1;
+    workspace.active_tab = workspace.join(Tab::waiting(key, kind));
     Command::focus(focus)
 }
 
@@ -2407,6 +2667,9 @@ const DOCUMENT_ID: &str = "workspace-document";
 /// The name the tab strip is focused by; with no tab its `+` is the whole strip, and the focus.
 const TABS_ID: &str = "workspace-tabs";
 
+/// The open tab's own part of the screen, which the keyboard is put in when a tab is switched to.
+const BODY_ID: &str = "workspace-tab-body";
+
 /// Draws the workspace screen for an application whose messages are `P`: `wrap` turns the screen's
 /// own messages into the application's, `above` draws what the application puts over the tabs
 /// (its header) and `below` what it puts under the terminal (its footer).
@@ -2472,18 +2735,16 @@ fn rail(screen: &WorkspaceScreen, ui: &mut View<'_, Msg>) {
         let tab = RailTab::new(workspace.name.clone()).icon("folder");
         if running > 0 { tab.status("success").badge(running.to_string()) } else { tab }
     });
-    ui.add(
-        TabRail::new(tabs)
-            .active(screen.active)
-            .collapsed(true)
-            .collapsed_marker(CollapsedMarker::Initial)
-            .row_height(RAIL_ROWS)
-            .closable(Msg::CloseWorkspace)
-            .on_add(|| Msg::AddWorkspace)
-            .on_select(Msg::OpenWorkspace),
-    )
-    .fill()
-    .id("workspace-rail");
+    let rail = TabRail::new(tabs)
+        .active(screen.active)
+        .collapsed(true)
+        .collapsed_marker(CollapsedMarker::Initial)
+        .row_height(RAIL_ROWS)
+        .closable(Msg::CloseWorkspace)
+        .on_add(|| Msg::AddWorkspace)
+        .on_select(Msg::OpenWorkspace);
+    // The rail runs down, so the arrow that points at the tabs steps into them.
+    ui.add(strip::Walked::new(rail, &[Key::Enter, Key::Right])).fill().id("workspace-rail");
 }
 
 /// The tab strip, ending in the `+` that opens a blank tab right after its last tab, the way a
@@ -2494,17 +2755,17 @@ fn rail(screen: &WorkspaceScreen, ui: &mut View<'_, Msg>) {
 fn header(screen: &WorkspaceScreen, ui: &mut View<'_, Msg>) {
     let Some(workspace) = screen.workspace() else { return };
     let labels: Vec<String> = (0..workspace.tabs.len()).map(|index| workspace.tab_label(index)).collect();
-    ui.add(
-        Tabs::new(labels)
-            .active(workspace.active_tab)
-            .tab_width(TabWidth::Fit)
-            .closable(Msg::CloseTab)
-            .reorderable(move |from, to| Msg::MoveTab { from, to })
-            .on_select(Msg::OpenTab)
-            .on_add(|| Msg::NewTab),
-    )
-    .fill_width()
-    .id(TABS_ID);
+    let tabs = Tabs::new(labels)
+        .active(workspace.active_tab)
+        .tab_width(TabWidth::Fit)
+        .closable(Msg::CloseTab)
+        .reorderable(move |from, to| Msg::MoveTab { from, to })
+        .on_select(Msg::OpenTab)
+        .on_add(|| Msg::NewTab)
+        .context_menu(|index| vec![ContextItem::new(t!("workspace.rename.item"), Msg::RenameTab(index))]);
+    // The strip runs across, so the arrow that points at the tab steps into it.
+    ui.add(strip::Walked::new(tabs, &[Key::Enter, Key::Down])).fill_width().id(TABS_ID);
+    rename::view(screen, ui);
 }
 
 /// What the middle shows: the open tab, or why there is nothing to show, and under a tab the
@@ -2518,7 +2779,7 @@ fn center(screen: &WorkspaceScreen, ui: &mut View<'_, Msg>) {
     // rebuild the tab's terminal as another widget, or the keyboard the person is typing with is
     // taken from it the moment a message arrives.
     ui.column(|ui| {
-        ui.column(|ui| tab_body(screen, ui)).fill();
+        ui.column(|ui| tab_body(screen, ui)).fill().id(BODY_ID);
         if let Some(tab) = waiting {
             bridge::view(tab, ui);
         }
@@ -2772,10 +3033,32 @@ fn file_trouble(tab: &Tab, ui: &mut View<'_, Msg>) {
 /// `ctrl` or `alt` and keys that type nothing, such as `f1`, can pass; `?` still types into the
 /// program, because the terminal is where the person writes.
 fn tab_terminal(session: &TerminalSession) -> Terminal {
-    Terminal::new(session)
-        .pass_through(Scope::Global, "help")
-        .pass_through(Scope::Global, "toggle-panel")
-        .pass_through(Scope::App, "leave-terminal")
+    SWITCHES.iter().fold(
+        Terminal::new(session)
+            .pass_through(Scope::Global, "help")
+            .pass_through(Scope::Global, "toggle-panel")
+            .pass_through(Scope::App, "leave-terminal")
+            .pass_through(Scope::App, "rename-tab"),
+        |terminal, action| terminal.pass_through(Scope::App, *action),
+    )
+}
+
+/// The keymap's actions that switch tabs, which reach QCode from inside a harness so that one
+/// chord both switches and leaves the keyboard in the tab switched to.
+pub const SWITCHES: [&str; 11] =
+    ["next-tab", "previous-tab", "tab-1", "tab-2", "tab-3", "tab-4", "tab-5", "tab-6", "tab-7", "tab-8", "tab-9"];
+
+/// The message of the keymap action `name` when it switches tabs.
+#[must_use]
+pub fn switch(name: &str) -> Option<Msg> {
+    match name {
+        "next-tab" => Some(Msg::NextTab(true)),
+        "previous-tab" => Some(Msg::NextTab(false)),
+        _ => {
+            let place: usize = name.strip_prefix("tab-")?.parse().ok()?;
+            (1..=9).contains(&place).then(|| Msg::GoToTab(place - 1))
+        }
+    }
 }
 
 /// Puts a tab's terminal on screen.
@@ -2875,6 +3158,22 @@ pub fn entry(screen: &WorkspaceScreen) -> &'static str {
     }
 }
 
+/// The message a keymap action of the workspace screen stands for, when it is one: `new-tab`
+/// opens a blank tab, `leave-terminal` takes the keyboard back into the open tab's harness,
+/// `rename-tab` names the open tab and the switching keys ([`SWITCHES`]) go to another tab with the
+/// keyboard in it. The application sends them only while a workspace is open.
+#[must_use]
+pub fn action(name: &str) -> Option<Msg> {
+    match name {
+        "new-tab" => Some(Msg::NewTab),
+        // Inside a terminal the terminal's own node answers this key and leaves; here it arrives
+        // only from outside one, so it goes back in.
+        "leave-terminal" => Some(Msg::EnterTerminal),
+        "rename-tab" => Some(Msg::RenameOpenTab),
+        _ => switch(name),
+    }
+}
+
 /// What Esc means on the workspace screen before it means leaving it: while an entry of the file
 /// tree is cut, Esc lets it stay where it is. The application asks this when Esc reaches it,
 /// which is only after every nearer widget and dialog passed it on.
@@ -2895,6 +3194,7 @@ pub fn hints(icons: &Icons) -> Vec<(String, String)> {
     let label = |chord: &str| chord.parse::<KeyChord>().map_or_else(|_| chord.to_owned(), |chord| chord.label());
     vec![
         (tab_keys, t!("workspace.hints.tabs")),
+        (format!("{} {}", label("enter"), icons.glyph("arrow-down")), t!("workspace.hints.enter")),
         (label("ctrl+w"), t!("workspace.hints.close")),
         (label("shift+tab"), t!("workspace.hints.leave")),
     ]

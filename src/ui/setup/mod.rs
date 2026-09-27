@@ -30,6 +30,7 @@ use qframe::widgets::{
 
 use crate::engine::EngineKind;
 use crate::store::{Config, HostDirs, SetupStep};
+use crate::ui::keys::Wrapping;
 
 use gates::{EngineCheck, EngineProblem, Gates, LocationCheck, LocationProblem};
 use install::{InstallHost, Installer, Remedy};
@@ -654,8 +655,9 @@ fn language_page(setup: &Setup, ui: &mut View<'_, Msg>) {
         form.field(Field::new(t!("setup.language")), |ui| {
             let options: Vec<String> =
                 setup.languages.codes().iter().map(|code| t!(&format!("setup.language-{code}"))).collect();
-            ui.add(RadioGroup::new(options).selected(Some(setup.language)).on_select(Msg::Language))
-                .id("setup-language");
+            let count = options.len();
+            let group = RadioGroup::new(options).selected(Some(setup.language)).on_select(Msg::Language);
+            ui.add(Wrapping::new(group, Some(setup.language), count)).id("setup-language");
         });
     });
 }
@@ -672,7 +674,8 @@ fn engine_page(setup: &Setup, ui: &mut View<'_, Msg>) {
             let field = Field::new(t!("setup.engine")).error(setup.errors.get("setup-engine"));
             form.field(field, |ui| {
                 let options = ENGINES.map(|kind| t!(&format!("setup.engine-{}", kind.name())));
-                ui.add(RadioGroup::new(options).selected(Some(setup.engine)).on_select(Msg::Engine)).id("setup-engine");
+                let group = RadioGroup::new(options).selected(Some(setup.engine)).on_select(Msg::Engine);
+                ui.add(Wrapping::new(group, Some(setup.engine), ENGINES.len())).id("setup-engine");
             });
         });
         ui.add(Text::new(t!(&format!("setup.{}-note", setup.kind().name()))).role("faint")).fill_width();
@@ -846,13 +849,12 @@ fn location_page(setup: &Setup, ui: &mut View<'_, Msg>) {
                 None => t!("setup.location-default"),
             };
             let options = [default, t!("setup.location-custom")];
-            ui.add(
-                RadioGroup::new(options)
-                    .selected(Some(setup.place))
-                    .disabled(setup.default_path.is_none() && setup.place == DEFAULT_PLACE)
-                    .on_select(Msg::Place),
-            )
-            .id("setup-location");
+            let count = options.len();
+            let group = RadioGroup::new(options)
+                .selected(Some(setup.place))
+                .disabled(setup.default_path.is_none() && setup.place == DEFAULT_PLACE)
+                .on_select(Msg::Place);
+            ui.add(Wrapping::new(group, Some(setup.place), count)).id("setup-location");
         });
     });
     if setup.default_path.is_none() {

@@ -20,7 +20,7 @@ use qframe::widgets::TerminalSession;
 
 use super::*;
 
-use crate::bridge::protocol::{Answer, Malformed, Question, Request};
+use crate::bridge::protocol::{Answer, Kind, Malformed, Question, Request, To};
 use crate::bridge::rules::{MOST_HOPS, MOST_PER_WINDOW};
 use crate::bridge::socket::Call;
 use crate::ui::workspace::bridge::{ASK_WAIT, QUIET, RETRY_EVERY};
@@ -142,7 +142,7 @@ fn tab(harness: &Harness<Bridged>, index: usize) -> &Tab {
 /// Sends `request` from the tab at `index`, and answers the other end of the call.
 fn ask(harness: &mut Harness<Bridged>, index: usize, request: Request) -> Receiver<Answer> {
     let token = tab(harness, index).token().to_owned();
-    let (call, answers) = Call::new(Ok(Question { token, request }));
+    let (call, answers) = Call::new(Ok(Question { token, session: None, request }));
     harness.send(Test::Call(call));
     harness.render();
     answers
@@ -150,14 +150,14 @@ fn ask(harness: &mut Harness<Bridged>, index: usize, request: Request) -> Receiv
 
 /// A message from the Claude Code tab to the Codex tab.
 fn to_codex(harness: &mut Harness<Bridged>, text: &str) -> Receiver<Answer> {
-    let codex = tab(harness, 2).key().0.to_string();
-    ask(harness, 0, Request::Send { tab: codex, text: text.to_owned() })
+    let codex = tab(harness, 2).number().to_string();
+    ask(harness, 0, Request::Send { to: To::Tab(codex), text: text.to_owned(), kind: Kind::Info })
 }
 
 /// A message from the Codex tab to the Claude Code tab.
 fn to_claude(harness: &mut Harness<Bridged>, text: &str) -> Receiver<Answer> {
-    let claude = tab(harness, 0).key().0.to_string();
-    ask(harness, 2, Request::Send { tab: claude, text: text.to_owned() })
+    let claude = tab(harness, 0).number().to_string();
+    ask(harness, 2, Request::Send { to: To::Tab(claude), text: text.to_owned(), kind: Kind::Info })
 }
 
 /// A workspace with a Claude Code tab and, beside it, the window of a desktop profile, with the
@@ -182,6 +182,18 @@ fn an_agent_and_a_window_asking(scratch: &Scratch, ask: bool) -> Harness<Bridged
     harness.send(Test::Screen(Msg::TogglePanel(false))).send(Test::Screen(Msg::OpenTab(0)));
     harness.advance(Duration::from_secs(1)).render();
     harness
+}
+
+/// A message for information from the Claude Code tab, whose id is `tab`.
+fn from_claude(tab: u32, text: &str) -> Letter {
+    Letter {
+        from: "Claude Code · claude-sub".to_owned(),
+        tab,
+        title: "claude-sub".to_owned(),
+        harness: "Claude Code".to_owned(),
+        kind: Kind::Info,
+        text: text.to_owned(),
+    }
 }
 
 fn answered(answers: &Receiver<Answer>) -> Answer {
@@ -222,7 +234,7 @@ fn an_agent_lists_the_other_agent_tabs_and_never_a_shell() {
     assert!(answer.ok, "{answer:?}");
     let tabs = answer.tabs.expect("a list");
     assert_eq!(tabs.len(), 1, "only the Codex tab: {tabs:?}");
-    assert_eq!(tabs[0].tab, tab(&harness, 2).key().0.to_string());
+    assert_eq!(tabs[0].tab, tab(&harness, 2).number().to_string());
     assert_eq!((tabs[0].title.as_str(), tabs[0].harness.as_str(), tabs[0].network), ("codex-main", "Codex", false));
     assert!(answer.text.contains("codex-main, Codex, without the network"), "{}", answer.text);
 }
@@ -231,7 +243,8 @@ fn an_agent_lists_the_other_agent_tabs_and_never_a_shell() {
 fn a_question_from_no_tab_of_the_workspace_or_not_a_question_at_all_is_refused() {
     let scratch = Scratch::new("bridge-stranger");
     let mut harness = two_agents(&scratch, ONLINE, ONLINE);
-    let (call, answers) = Call::new(Ok(Question { token: "guessed".to_owned(), request: Request::List }));
+    let (call, answers) =
+        Call::new(Ok(Question { token: "guessed".to_owned(), session: None, request: Request::List }));
     harness.send(Test::Call(call));
     let answer = answered(&answers);
     assert!(!answer.ok && answer.text.contains("does not know which tab"), "{answer:?}");
@@ -262,8 +275,7 @@ fn with_asking_on_the_first_message_between_two_tabs_asks_the_person_and_is_take
     // told so rather than being left to believe the other agent has the work.
     assert!(answer.ok && answer.text.starts_with("Taken, but not handed over yet"), "{answer:?}");
     assert!(answer.text.contains("is not running") && answer.text.contains("list_tabs"), "{answer:?}");
-    let letter =
-        Letter { from: "Claude Code · claude-sub".to_owned(), text: "Please write the test for parse().".to_owned() };
+    let letter = from_claude(1, "Please write the test for parse().");
     assert_eq!(tab(&harness, 2).letters(), [letter]);
 
     // The answer holds for the pair: the next message goes without asking.
@@ -485,10 +497,15 @@ fn a_tab_sending_too_fast_is_slowed_down_and_told_so() {
 fn messages_that_cannot_be_sent_say_why_and_nothing_is_sent() {
     let scratch = Scratch::new("bridge-refusals");
     let mut harness = two_agents(&scratch, ONLINE, ONLINE);
-    let answer = answered(&ask(&mut harness, 0, Request::Send { tab: "99".to_owned(), text: "hi".to_owned() }));
+    let answer = answered(&ask(
+        &mut harness,
+        0,
+        Request::Send { to: To::Tab("99".to_owned()), text: "hi".to_owned(), kind: Kind::Info },
+    ));
     assert!(!answer.ok && answer.text.contains("no other agent tab 99"), "{answer:?}");
-    let own = tab(&harness, 0).key().0.to_string();
-    let answer = answered(&ask(&mut harness, 0, Request::Send { tab: own, text: "hi".to_owned() }));
+    let own = tab(&harness, 0).number().to_string();
+    let answer =
+        answered(&ask(&mut harness, 0, Request::Send { to: To::Tab(own), text: "hi".to_owned(), kind: Kind::Info }));
     assert!(!answer.ok, "a tab does not send to itself: {answer:?}");
     let answer = answered(&to_codex(&mut harness, "   "));
     assert!(!answer.ok && answer.text.contains("empty"), "{answer:?}");
@@ -496,7 +513,11 @@ fn messages_that_cannot_be_sent_say_why_and_nothing_is_sent() {
     let answer = answered(&to_codex(&mut harness, &long));
     assert!(!answer.ok && answer.text.contains("longer than"), "{answer:?}");
     // By its title, when only one tab has it.
-    let answer = answered(&ask(&mut harness, 0, Request::Send { tab: "codex-main".to_owned(), text: "hi".to_owned() }));
+    let answer = answered(&ask(
+        &mut harness,
+        0,
+        Request::Send { to: To::Tab("codex-main".to_owned()), text: "hi".to_owned(), kind: Kind::Info },
+    ));
     assert!(answer.ok, "the title names the tab: {answer:?}");
     assert_eq!(tab(&harness, 2).letters().len(), 1);
 }
@@ -681,7 +702,7 @@ fn a_message_goes_in_when_the_tab_falls_quiet_and_never_while_its_tool_is_still_
 
     deliver_at(&mut harness, spoke + QUIET);
     let read = written(&file, "parse()");
-    assert!(read.contains("Through QCode, from the Claude Code · claude-sub tab:"), "{read:?}");
+    assert!(read.contains("Through QCode, from tab 1 «claude-sub» (Claude Code) of this workspace:"), "{read:?}");
     assert!(read.contains("Please write the test for parse()."), "{read:?}");
     assert!(read.ends_with('\n'), "Return was written after it: {read:?}");
     assert!(tab(&harness, 2).letters().is_empty(), "it is gone from the queue");
@@ -721,7 +742,7 @@ fn a_message_waits_while_the_person_has_a_line_of_their_own_started_however_long
     deliver_at(&mut harness, sent + QUIET);
     let read = written(&file, "Run the tests.");
     assert!(read.starts_with("half a line and more\n"), "the person's line went out alone: {read:?}");
-    assert!(read.contains("Through QCode, from the Claude Code · claude-sub tab:"), "{read:?}");
+    assert!(read.contains("Through QCode, from tab 1 «claude-sub» (Claude Code) of this workspace:"), "{read:?}");
     assert!(tab(&harness, 2).letters().is_empty());
 }
 
@@ -850,7 +871,10 @@ fn the_message_written_into_a_tab_names_its_sender_in_turkish_too() {
     assert!(answer.text.starts_with("Alındı. Mesaj"), "{answer:?}");
     deliver_at(&mut harness, session.last_output() + QUIET);
     let read = written(&file, "parse()");
-    assert!(read.contains("QCode aracılığıyla Claude Code · claude-sub sekmesinden:"), "{read:?}");
+    assert!(
+        read.contains("QCode aracılığıyla, bu çalışma alanının 1 numaralı sekmesinden «claude-sub» (Claude Code):"),
+        "{read:?}"
+    );
     assert!(read.contains("parse() için testi yaz."), "{read:?}");
 }
 
@@ -867,7 +891,7 @@ fn an_agent_lists_the_window_tab_and_is_told_it_takes_messages_from_its_inbox() 
     assert!(answer.ok, "{answer:?}");
     let tabs = answer.tabs.expect("a list");
     assert_eq!(tabs.len(), 1, "the window is listed: {tabs:?}");
-    assert_eq!(tabs[0].tab, tab(&harness, 1).key().0.to_string());
+    assert_eq!(tabs[0].tab, tab(&harness, 1).number().to_string());
     assert_eq!(tabs[0].harness, "Antigravity IDE");
     assert!(tabs[0].inbox, "the list says it reads no prompt: {tabs:?}");
     assert!(answer.text.contains("check_inbox"), "the words say so too: {}", answer.text);
@@ -877,11 +901,15 @@ fn an_agent_lists_the_window_tab_and_is_told_it_takes_messages_from_its_inbox() 
 fn a_message_to_a_window_waits_for_its_inbox_and_its_sender_is_told_so_not_that_it_went_in() {
     let scratch = Scratch::new("bridge-window-waits");
     let mut harness = an_agent_and_a_window_asking(&scratch, false);
-    let window = tab(&harness, 1).key().0.to_string();
-    let answer = answered(&ask(&mut harness, 0, Request::Send { tab: window, text: "Count the files.".to_owned() }));
+    let window = tab(&harness, 1).number().to_string();
+    let answer = answered(&ask(
+        &mut harness,
+        0,
+        Request::Send { to: To::Tab(window), text: "Count the files.".to_owned(), kind: Kind::Info },
+    ));
     assert!(answer.ok, "{answer:?}");
     assert!(answer.text.contains("check_inbox") && !answer.text.contains("Delivered"), "{}", answer.text);
-    let letter = Letter { from: "Claude Code · claude-sub".to_owned(), text: "Count the files.".to_owned() };
+    let letter = from_claude(1, "Count the files.");
     assert_eq!(tab(&harness, 1).letters(), [letter], "the message waits in the window's tab");
     assert_eq!(tab(&harness, 1).undelivered(), Some(Undelivered::Inbox));
 
@@ -889,7 +917,7 @@ fn a_message_to_a_window_waits_for_its_inbox_and_its_sender_is_told_so_not_that_
     let answer = answered(&ask(
         &mut harness,
         0,
-        Request::Send { tab: "anti window".to_owned(), text: "And the dirs.".to_owned() },
+        Request::Send { to: To::Tab("anti window".to_owned()), text: "And the dirs.".to_owned(), kind: Kind::Info },
     ));
     assert!(answer.ok, "{answer:?}");
     assert_eq!(tab(&harness, 1).letters().len(), 2);
@@ -910,9 +938,13 @@ fn a_message_to_a_window_waits_for_its_inbox_and_its_sender_is_told_so_not_that_
 fn the_agent_in_a_window_takes_its_messages_from_its_inbox_once_and_answers_them() {
     let scratch = Scratch::new("bridge-window-inbox");
     let mut harness = an_agent_and_a_window_asking(&scratch, false);
-    let window = tab(&harness, 1).key().0.to_string();
+    let window = tab(&harness, 1).number().to_string();
     for text in ["Count the files.", "Then the dirs."] {
-        let answers = ask(&mut harness, 0, Request::Send { tab: window.clone(), text: text.to_owned() });
+        let answers = ask(
+            &mut harness,
+            0,
+            Request::Send { to: To::Tab(window.clone()), text: text.to_owned(), kind: Kind::Info },
+        );
         assert!(answered(&answers).ok);
     }
 
@@ -926,10 +958,11 @@ fn the_agent_in_a_window_takes_its_messages_from_its_inbox_once_and_answers_them
         "every message, oldest first, with its sender"
     );
     assert!(
-        inbox.text.contains("Count the files.") && inbox.text.contains("Claude Code · claude-sub"),
+        inbox.text.contains("Count the files.") && inbox.text.contains("from tab 1 «claude-sub» (Claude Code)"),
         "{}",
         inbox.text
     );
+    assert!(messages.iter().all(|m| m.tab == "1" && m.kind == Kind::Info), "{messages:?}");
     assert!(tab(&harness, 1).letters().is_empty(), "taken is delivered: nothing waits any more");
     assert_eq!(tab(&harness, 1).undelivered(), None);
 
@@ -939,8 +972,12 @@ fn the_agent_in_a_window_takes_its_messages_from_its_inbox_once_and_answers_them
     assert!(again.text.contains("No message waits"), "{}", again.text);
 
     // And the window's agent answers the way every agent does.
-    let claude = tab(&harness, 0).key().0.to_string();
-    let reply = answered(&ask(&mut harness, 1, Request::Send { tab: claude, text: "12 files.".to_owned() }));
+    let claude = tab(&harness, 0).number().to_string();
+    let reply = answered(&ask(
+        &mut harness,
+        1,
+        Request::Send { to: To::Tab(claude), text: "12 files.".to_owned(), kind: Kind::Info },
+    ));
     assert!(reply.ok, "{reply:?}");
     assert_eq!(tab(&harness, 0).letters().last().map(|letter| letter.text.as_str()), Some("12 files."));
 }
@@ -954,8 +991,15 @@ fn a_window_looking_at_its_inbox_sees_what_waits_and_leaves_it_for_its_agent() {
     let empty = answered(&ask(&mut harness, 1, Request::Peek));
     assert!(empty.ok && empty.messages.as_ref().is_some_and(Vec::is_empty), "{empty:?}");
 
-    let window = tab(&harness, 1).key().0.to_string();
-    assert!(answered(&ask(&mut harness, 0, Request::Send { tab: window, text: "Count the files.".to_owned() })).ok);
+    let window = tab(&harness, 1).number().to_string();
+    assert!(
+        answered(&ask(
+            &mut harness,
+            0,
+            Request::Send { to: To::Tab(window), text: "Count the files.".to_owned(), kind: Kind::Info }
+        ))
+        .ok
+    );
     for _ in 0..2 {
         let looked = answered(&ask(&mut harness, 1, Request::Peek));
         let messages = looked.messages.expect("the waiting messages");
@@ -1017,9 +1061,17 @@ fn closing_a_tab_with_messages_waiting_in_it_asks_before_they_are_thrown_away() 
 fn a_question_for_an_inbox_from_no_tab_of_the_workspace_takes_nothing() {
     let scratch = Scratch::new("bridge-window-stranger");
     let mut harness = an_agent_and_a_window_asking(&scratch, false);
-    let window = tab(&harness, 1).key().0.to_string();
-    assert!(answered(&ask(&mut harness, 0, Request::Send { tab: window, text: "Mine.".to_owned() })).ok);
-    let (call, answers) = Call::new(Ok(Question { token: "not-a-tab".to_owned(), request: Request::Inbox }));
+    let window = tab(&harness, 1).number().to_string();
+    assert!(
+        answered(&ask(
+            &mut harness,
+            0,
+            Request::Send { to: To::Tab(window), text: "Mine.".to_owned(), kind: Kind::Info }
+        ))
+        .ok
+    );
+    let (call, answers) =
+        Call::new(Ok(Question { token: "not-a-tab".to_owned(), session: None, request: Request::Inbox }));
     harness.send(Test::Call(call));
     let answer = answered(&answers);
     assert!(!answer.ok, "{answer:?}");
@@ -1030,8 +1082,15 @@ fn a_question_for_an_inbox_from_no_tab_of_the_workspace_takes_nothing() {
 fn nothing_is_timed_for_messages_that_wait_for_a_windows_inbox() {
     let scratch = Scratch::new("bridge-window-untimed");
     let mut harness = an_agent_and_a_window_asking(&scratch, false);
-    let window = tab(&harness, 1).key().0.to_string();
-    assert!(answered(&ask(&mut harness, 0, Request::Send { tab: window, text: "Wait.".to_owned() })).ok);
+    let window = tab(&harness, 1).number().to_string();
+    assert!(
+        answered(&ask(
+            &mut harness,
+            0,
+            Request::Send { to: To::Tab(window), text: "Wait.".to_owned(), kind: Kind::Info }
+        ))
+        .ok
+    );
     assert!(!harness.app().0.delivering, "no retry is set going for a message nobody will type in");
 }
 
@@ -1045,10 +1104,14 @@ fn the_agent_in_a_window_lists_the_terminal_tabs_and_gives_one_of_them_work() {
     assert!(answer.ok, "the window's agent speaks for its own tab: {answer:?}");
     let tabs = answer.tabs.expect("a list");
     assert_eq!(tabs.len(), 1, "only the Claude Code tab: {tabs:?}");
-    assert_eq!(tabs[0].tab, tab(&harness, 0).key().0.to_string());
+    assert_eq!(tabs[0].tab, tab(&harness, 0).number().to_string());
 
-    let claude = tab(&harness, 0).key().0.to_string();
-    let answers = ask(&mut harness, 1, Request::Send { tab: claude, text: "Rename parse() to read().".to_owned() });
+    let claude = tab(&harness, 0).number().to_string();
+    let answers = ask(
+        &mut harness,
+        1,
+        Request::Send { to: To::Tab(claude), text: "Rename parse() to read().".to_owned(), kind: Kind::Info },
+    );
     let screen = said(&harness);
     assert!(
         screen.contains("Let Antigravity IDE · anti window send messages to Claude Code · claude-sub?"),
@@ -1056,8 +1119,14 @@ fn the_agent_in_a_window_lists_the_terminal_tabs_and_gives_one_of_them_work() {
     );
     harness.click_text("Allow").render();
     assert!(answered(&answers).ok);
-    let letter =
-        Letter { from: "Antigravity IDE · anti window".to_owned(), text: "Rename parse() to read().".to_owned() };
+    let letter = Letter {
+        from: "Antigravity IDE · anti window".to_owned(),
+        tab: 2,
+        title: "anti window".to_owned(),
+        harness: "Antigravity IDE".to_owned(),
+        kind: Kind::Info,
+        text: "Rename parse() to read().".to_owned(),
+    };
     assert_eq!(tab(&harness, 0).letters(), [letter], "the work is waiting in the terminal tab");
 }
 
@@ -1075,7 +1144,7 @@ fn by_default_an_agent_sends_to_another_tab_without_asking_and_the_message_lands
     assert!(!said(&harness).contains("send messages to"), "nobody was asked:\n{}", harness.screen());
     assert!(!said(&harness).contains("Allow"), "{}", harness.screen());
     let read = written(&file, "parse()");
-    assert!(read.contains("Through QCode, from the Claude Code · claude-sub tab:"), "{read:?}");
+    assert!(read.contains("Through QCode, from tab 1 «claude-sub» (Claude Code) of this workspace:"), "{read:?}");
     assert!(read.contains("Please write the test for parse()."), "{read:?}");
 
     // The answer back goes the same way.
@@ -1171,4 +1240,134 @@ fn text_that_arrives_all_at_once_reaches_the_program_in_a_tab_with_every_space_a
     harness.events(&burst("one  two   three\n\nfour\n"));
     let read = written(&file, "four");
     assert_eq!(read, "one  two   three\n\nfour\n", "every space and every Return reached the program");
+}
+
+#[test]
+fn a_question_arrives_under_a_header_naming_its_sender_its_kind_and_how_to_answer() {
+    let scratch = Scratch::new("bridge-question");
+    let mut harness = two_agents(&scratch, ONLINE, ONLINE);
+    let file = scratch.0.join("codex-read.txt");
+    harness_in(&mut harness, &scratch, 2, &file, "");
+    std::thread::sleep(QUIET + Duration::from_millis(300));
+
+    let codex = tab(&harness, 2).number().to_string();
+    let question = Request::Send { to: To::Tab(codex), text: "Which test fails?".to_owned(), kind: Kind::Question };
+    let answer = answered(&ask(&mut harness, 0, question));
+    assert!(answer.ok && answer.text.starts_with("Delivered."), "{answer:?}");
+    let read = written(&file, "Which test fails?");
+    let expected = "Through QCode, from tab 1 «claude-sub» (Claude Code) of this workspace: a question, the sender \
+                    waits for your answer.\nAnswer with send_message, tab \"1\", kind \"info\".\n\nWhich test fails?";
+    assert!(read.starts_with(expected), "{read:?}");
+}
+
+/// A workspace whose tab without the network sends to four others: a Codex tab with the network,
+/// the window of a desktop profile, and two tabs without the network whose programs are running.
+fn five_agents(scratch: &Scratch) -> Harness<Bridged> {
+    let profiles = vec![
+        Profile { network: OFFLINE, ..profile("claude-sub", HarnessKind::ClaudeCode) },
+        Profile { network: ONLINE, ..profile("codex-main", HarnessKind::Codex) },
+        Profile { network: OFFLINE, ..profile("anti", HarnessKind::AntigravityIde) },
+        Profile { network: OFFLINE, ..profile("kimi", HarnessKind::KimiCode) },
+        Profile { network: OFFLINE, ..profile("qwen", HarnessKind::QwenCode) },
+    ];
+    let mut screen = WorkspaceScreen::new(
+        Some(engine()),
+        HostUser::Ids { uid: 1000, gid: 1000 },
+        vec![workspace("firefly", "Firefly", scratch.paths(), profiles)],
+    );
+    open(&mut screen, Choice::NewChat("claude-sub".to_owned()));
+    open(&mut screen, Choice::NewChat("codex-main".to_owned()));
+    open(&mut screen, Choice::Window("anti".to_owned()));
+    open(&mut screen, Choice::NewChat("kimi".to_owned()));
+    open(&mut screen, Choice::NewChat("qwen".to_owned()));
+    let mut harness = Harness::with_env(Bridged(screen, None), env(), SIZE.0, SIZE.1);
+    harness.set_locale("en").set_glyph_mode(GlyphMode::Unicode);
+    harness.send(Test::Screen(Msg::TogglePanel(false))).send(Test::Screen(Msg::OpenTab(0)));
+    harness.advance(Duration::from_secs(1)).render();
+    harness
+}
+
+#[test]
+fn a_message_to_all_goes_to_every_other_tab_by_its_own_rules_and_is_answered_tab_by_tab() {
+    let scratch = Scratch::new("bridge-all");
+    let mut harness = five_agents(&scratch);
+    let (kimi, qwen) = (scratch.0.join("kimi-read.txt"), scratch.0.join("qwen-read.txt"));
+    harness_in(&mut harness, &scratch, 3, &kimi, "");
+    harness_in(&mut harness, &scratch, 4, &qwen, "");
+    std::thread::sleep(QUIET + Duration::from_millis(300));
+
+    let all = Request::Send { to: To::All, text: "I am taking the parser.".to_owned(), kind: Kind::Report };
+    let answer = answered(&ask(&mut harness, 0, all));
+    assert!(answer.ok, "three of the four took it: {answer:?}");
+    let sent = answer.sent.clone().expect("what happened at each tab");
+    let at: Vec<(&str, bool)> = sent.iter().map(|outcome| (outcome.tab.as_str(), outcome.ok)).collect();
+    assert_eq!(at, [("2", false), ("3", true), ("4", true), ("5", true)], "{}", answer.text);
+    assert!(sent[0].text.contains("has no network"), "the network rule, as for a message to it alone: {sent:?}");
+    assert!(sent[1].text.contains("check_inbox"), "the window waits for its inbox: {sent:?}");
+    assert!(sent[2].text.starts_with("Delivered.") && sent[3].text.starts_with("Delivered."), "{sent:?}");
+    // An agent that reads only the words learns the same, tab by tab.
+    assert!(answer.text.starts_with("Each of the 4 other agent tabs of this workspace:"), "{}", answer.text);
+    for outcome in &sent {
+        let line = format!("tab {} «{}»: {}", outcome.tab, outcome.title, outcome.text);
+        assert!(answer.text.contains(&line), "{line}\n{}", answer.text);
+    }
+
+    assert!(tab(&harness, 1).letters().is_empty(), "nothing reached the tab with the network");
+    assert_eq!(tab(&harness, 2).letters().len(), 1, "the window holds it for its agent");
+    for file in [&kimi, &qwen] {
+        let read = written(file, "the parser");
+        assert!(
+            read.starts_with("Through QCode, from tab 1 «claude-sub» (Claude Code) of this workspace: a task"),
+            "{read:?}"
+        );
+    }
+}
+
+#[test]
+fn a_message_to_all_counts_once_against_the_pace() {
+    let scratch = Scratch::new("bridge-all-pace");
+    let mut harness = five_agents(&scratch);
+    let all = || Request::Send { to: To::All, text: "Status?".to_owned(), kind: Kind::Question };
+    // Three tabs take each of these; counted per tab, the second would already be refused.
+    for round in 1..=MOST_PER_WINDOW {
+        let answer = answered(&ask(&mut harness, 0, all()));
+        assert!(answer.ok, "message {round}: {answer:?}");
+    }
+    let answer = answered(&ask(&mut harness, 0, all()));
+    assert!(!answer.ok, "{answer:?}");
+    // The tab with the network is refused by the network rule first, as it was every time.
+    let paced: Vec<String> =
+        answer.sent.expect("each tab").into_iter().filter(|o| o.tab != "2").map(|o| o.text).collect();
+    assert_eq!(paced.len(), 3);
+    assert!(paced.iter().all(|text| text.contains("messages in the last")), "{paced:?}");
+}
+
+#[test]
+fn a_message_to_all_with_nobody_else_is_refused_and_says_why() {
+    let scratch = Scratch::new("bridge-all-alone");
+    let profiles = vec![profile("claude-sub", HarnessKind::ClaudeCode)];
+    let mut screen = WorkspaceScreen::new(
+        Some(engine()),
+        HostUser::Ids { uid: 1000, gid: 1000 },
+        vec![workspace("firefly", "Firefly", scratch.paths(), profiles)],
+    );
+    open(&mut screen, Choice::NewChat("claude-sub".to_owned()));
+    let mut harness = Harness::with_env(Bridged(screen, None), env(), SIZE.0, SIZE.1);
+    harness.set_locale("en").render();
+    let answer =
+        answered(&ask(&mut harness, 0, Request::Send { to: To::All, text: "hi".to_owned(), kind: Kind::Info }));
+    assert!(!answer.ok && answer.text.contains("No other tab"), "{answer:?}");
+}
+
+#[test]
+fn with_asking_on_a_message_to_all_says_which_tabs_wait_for_the_person_and_goes_when_allowed() {
+    let scratch = Scratch::new("bridge-all-asking");
+    let mut harness = two_agents_asking(&scratch, ONLINE, ONLINE);
+    let answer =
+        answered(&ask(&mut harness, 0, Request::Send { to: To::All, text: "Hello.".to_owned(), kind: Kind::Info }));
+    let sent = answer.sent.clone().expect("each tab");
+    assert_eq!(sent.len(), 1, "{answer:?}");
+    assert!(answer.ok && sent[0].text.contains("has not answered yet"), "answered at once, not held: {answer:?}");
+    harness.click_text("Allow").render();
+    assert_eq!(tab(&harness, 2).letters().len(), 1, "allowed, the message is taken");
 }

@@ -100,5 +100,7 @@ mod tests {
             assert!(SCRIPT.contains(word), "{word}");
         }
         assert!(SCRIPT.contains("2026-07-28") && SCRIPT.contains("2025-11-25"));
+        // The kinds QCode reads, offered to the agent as the only ones there are.
+        assert!(SCRIPT.contains(r#"enum: ["info", "question", "report"]"#));
     }
 }

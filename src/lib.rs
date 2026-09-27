@@ -22,6 +22,8 @@ pub mod switch;
 pub mod ui;
 
 #[cfg(test)]
+mod keyboard_tests;
+#[cfg(test)]
 mod reopen_tests;
 
 #[cfg(test)]
@@ -208,16 +210,20 @@ pub enum Page {
 impl Page {
     /// The name the page keeps its focus and its scrolling under, and the key the transition
     /// between pages watches.
+    ///
+    /// Never the name of a control on it: a screen asking for the keyboard to go to its list
+    /// while the list is not drawn yet would find the page of the same name instead, and the
+    /// keyboard would land on whatever the page shows first, such as a button about to go.
     fn key(self) -> &'static str {
         match self {
-            Self::Setup => "setup",
-            Self::Home => "home",
-            Self::Workspaces => "workspaces",
-            Self::Profiles => "profiles",
-            Self::Providers => "providers",
-            Self::Workspace => "workspace",
-            Self::Settings => "settings",
-            Self::Switch => "switch",
+            Self::Setup => "page-setup",
+            Self::Home => "page-home",
+            Self::Workspaces => "page-workspaces",
+            Self::Profiles => "page-profiles",
+            Self::Providers => "page-providers",
+            Self::Workspace => "page-workspace",
+            Self::Settings => "page-settings",
+            Self::Switch => "page-switch",
         }
     }
 }
@@ -1584,8 +1590,9 @@ impl App for QCode {
     /// keeps its own Esc, and then an open dialog, which closes instead of letting the screen go.
     /// On the workspace screen an entry of the file tree that waits to be pasted is let go first.
     /// `help` is the framework's own action for the list of keys; the application opens it.
-    /// `new-tab` opens a blank tab and `leave-terminal` takes the keyboard back into the open
-    /// tab's harness; both only mean something while a workspace is open.
+    /// `new-tab` opens a blank tab, `leave-terminal` takes the keyboard back into the open tab's
+    /// harness, `rename-tab` names the open tab, and the switching keys go to another tab with the
+    /// keyboard in it; all of them only mean something while a workspace is open.
     fn action(&self, name: &str) -> Option<Msg> {
         let workspace_open =
             self.page() == Page::Workspace && self.workspace.as_ref().is_some_and(|s| s.workspace().is_some());
@@ -1598,11 +1605,8 @@ impl App for QCode {
                     .map_or(Msg::Back, Msg::Workspace),
             ),
             "help" => Some(Msg::Help(true)),
-            "new-tab" => workspace_open.then_some(Msg::Workspace(ui::workspace::Msg::NewTab)),
-            // Inside a terminal the terminal's own node answers this key and leaves; here it
-            // arrives only from outside one, so it goes back in.
-            "leave-terminal" => workspace_open.then_some(Msg::Workspace(ui::workspace::Msg::EnterTerminal)),
-            _ => None,
+            // From inside a harness too: the terminal lets these keys through.
+            _ => ui::workspace::action(name).filter(|_| workspace_open).map(Msg::Workspace),
         }
     }
 
@@ -1800,6 +1804,34 @@ pub(crate) mod testing {
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("the test binary runs")
+    }
+
+    /// Which of `rows` is the one lit as the keyboard's row: the only one whose first letter
+    /// stands on a background none of the others has. A row off the screen is never it. Two rows
+    /// alone cannot say which of them is the odd one, so a test names at least three.
+    ///
+    /// Read from the painted cells rather than from a selection kept in the screen's state, so a
+    /// test says what a person sees, not what it set.
+    pub fn highlighted<'a, A: qframe::runtime::App>(harness: &Harness<A>, rows: &[&'a str]) -> Option<&'a str> {
+        assert!(rows.len() >= 3, "two rows cannot tell which is lit: {rows:?}");
+        let ground: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                harness.find(row).and_then(|(x, y)| {
+                    let (x, y) = (u16::try_from(x).ok()?, u16::try_from(y).ok()?);
+                    harness.bg(x, y)
+                })
+            })
+            .collect();
+        let lone: Vec<usize> = (0..rows.len())
+            .filter(|&at| {
+                ground[at].is_some() && ground.iter().enumerate().all(|(other, bg)| other == at || *bg != ground[at])
+            })
+            .collect();
+        match lone.as_slice() {
+            [at] => Some(rows[*at]),
+            _ => None,
+        }
     }
 
     /// The test binary, set to run only the test `name`, as [`in_child`] describes.
@@ -3342,8 +3374,8 @@ mod tests {
         let text = "active = \"alpha\"\n\n\
                     [[workspace]]\nid = \"beta\"\nactive-tab = 0\n\n\
                     [[workspace]]\nid = \"alpha\"\nactive-tab = 1\n\n\
-                    [[workspace.tab]]\nkind = \"shell\"\nopened = 10\n\n\
-                    [[workspace.tab]]\nkind = \"shell\"\nconversation = \"c-1\"\nopened = 20\n";
+                    [[workspace.tab]]\nkind = \"shell\"\nnumber = 1\nopened = 10\n\n\
+                    [[workspace.tab]]\nkind = \"shell\"\nconversation = \"c-1\"\nnumber = 2\nopened = 20\n";
         std::fs::write(&file, text).expect("a session file");
         let app = app_with_absent_engine(config(&root, &["beta"])).with_session(Some(file.clone()));
         let mut harness = harness(app, SIZE.0, SIZE.1);

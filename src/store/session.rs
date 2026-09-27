@@ -22,6 +22,8 @@
 //! kind = "profile"
 //! profile = "claude-sub"
 //! conversation = "4f1c…"
+//! number = 2
+//! name = "reviewer"
 //! opened = 1758197000
 //!
 //! [[workspace.tab]]
@@ -33,6 +35,10 @@
 //! file = "guide/harbour.md"
 //! opened = 1758197400
 //! ```
+//!
+//! A tab keeps its id inside the workspace (`number`) and the name the person gave it (`name`), so
+//! an agent that learnt which tab is which finds them where they were. A file written before tabs
+//! had either brings its tabs back with new ids.
 //!
 //! A tab that opens one of the workspace's files — `image`, `markdown`, `editor`, `pdf`, `office` or
 //! `sound` — names the file
@@ -94,6 +100,10 @@ pub struct SessionTab {
     pub conversation: Option<String>,
     /// When the tab was opened, in seconds since the Unix epoch.
     pub opened: u64,
+    /// The tab's id inside its workspace, when the file says it.
+    pub number: Option<u32>,
+    /// The name the person gave the tab, when they gave it one.
+    pub name: Option<String>,
 }
 
 /// One workspace of a saved session, with its tabs in the order they were shown.
@@ -224,6 +234,12 @@ impl Session {
                 if let Some(conversation) = &tab.conversation {
                     let _ = writeln!(out, "conversation = {}", quoted(conversation));
                 }
+                if let Some(number) = tab.number {
+                    let _ = writeln!(out, "number = {number}");
+                }
+                if let Some(name) = &tab.name {
+                    let _ = writeln!(out, "name = {}", quoted(name));
+                }
                 let _ = writeln!(out, "opened = {}", tab.opened);
             }
         }
@@ -255,6 +271,8 @@ fn shape() -> Shape {
         .optional("profile", ValueKind::text())
         .optional("file", ValueKind::text())
         .optional("conversation", ValueKind::text())
+        .optional("number", ValueKind::integer())
+        .optional("name", ValueKind::text())
         .required("opened", ValueKind::integer());
     let workspace = Shape::new()
         .required("id", ValueKind::text())
@@ -345,7 +363,18 @@ fn session_tab(entry: &Table, diagnostics: &mut Vec<Diagnostic>) -> Option<Sessi
         }
         None => 0,
     };
-    Some(SessionTab { kind, conversation: entry.text("conversation").map(str::to_owned), opened })
+    // An id the workspace could never have given is read as none, and the tab is given a new one.
+    let number = match entry.integer("number").map(u32::try_from) {
+        Some(Ok(number)) if number > 0 => Some(number),
+        Some(_) => {
+            let at = entry.value_location("number").cloned();
+            diagnostics.push(Diagnostic::warning(at, "`number` is not a tab's id; the tab is given a new one"));
+            None
+        }
+        None => None,
+    };
+    let name = entry.text("name").map(str::trim).filter(|name| !name.is_empty()).map(str::to_owned);
+    Some(SessionTab { kind, conversation: entry.text("conversation").map(str::to_owned), opened, number, name })
 }
 
 #[cfg(test)]
@@ -370,47 +399,75 @@ mod tests {
                     id: id("firefly"),
                     active_tab: 1,
                     tabs: vec![
-                        SessionTab { kind: SessionTabKind::Shell, conversation: None, opened: 1_758_196_800 },
+                        SessionTab {
+                            kind: SessionTabKind::Shell,
+                            conversation: None,
+                            opened: 1_758_196_800,
+                            number: None,
+                            name: None,
+                        },
                         SessionTab {
                             kind: SessionTabKind::Profile("claude-sub".to_owned()),
                             conversation: Some("4f1c \"quoted\"".to_owned()),
                             opened: 1_758_197_000,
+                            number: Some(7),
+                            name: Some("the \"reviewer\"".to_owned()),
                         },
-                        SessionTab { kind: SessionTabKind::New, conversation: None, opened: 1_758_197_300 },
+                        SessionTab {
+                            kind: SessionTabKind::New,
+                            conversation: None,
+                            opened: 1_758_197_300,
+                            number: None,
+                            name: None,
+                        },
                         SessionTab {
                             kind: SessionTabKind::Image("art/logo \"one\".png".to_owned()),
                             conversation: None,
                             opened: 1_758_197_400,
+                            number: None,
+                            name: None,
                         },
                         SessionTab {
                             kind: SessionTabKind::Markdown("guide/harbour.md".to_owned()),
                             conversation: None,
                             opened: 1_758_197_500,
+                            number: None,
+                            name: None,
                         },
                         SessionTab {
                             kind: SessionTabKind::Editor("src/main.rs".to_owned()),
                             conversation: None,
                             opened: 1_758_197_600,
+                            number: None,
+                            name: None,
                         },
                         SessionTab {
                             kind: SessionTabKind::Pdf("papers/tide tables.pdf".to_owned()),
                             conversation: None,
                             opened: 1_758_197_700,
+                            number: None,
+                            name: None,
                         },
                         SessionTab {
                             kind: SessionTabKind::Office("letters/to the harbour master.docx".to_owned()),
                             conversation: None,
                             opened: 1_758_197_800,
+                            number: None,
+                            name: None,
                         },
                         SessionTab {
                             kind: SessionTabKind::Sound("sounds/foghorn.ogg".to_owned()),
                             conversation: None,
                             opened: 1_758_197_900,
+                            number: None,
+                            name: None,
                         },
                         SessionTab {
                             kind: SessionTabKind::Desktop("antigravity".to_owned()),
                             conversation: None,
                             opened: 1_758_198_000,
+                            number: None,
+                            name: None,
                         },
                     ],
                 },
@@ -496,6 +553,21 @@ mod tests {
         let tabs = &read.value.workspaces[0].tabs;
         assert_eq!(tabs.len(), 1);
         assert_eq!(tabs[0].kind, SessionTabKind::Editor("notes.txt".to_owned()));
+    }
+
+    #[test]
+    fn a_tab_keeps_its_id_and_name_and_an_id_it_could_not_have_is_dropped() {
+        let text = "[[workspace]]\nid = \"moth\"\n\n\
+                    [[workspace.tab]]\nkind = \"shell\"\nnumber = 4\nname = \"  logs  \"\nopened = 1\n\n\
+                    [[workspace.tab]]\nkind = \"shell\"\nnumber = 0\nopened = 2\n\n\
+                    [[workspace.tab]]\nkind = \"shell\"\nnumber = -3\nname = \"\"\nopened = 3\n";
+        let read = Session::parse(NAME, text);
+        let places: Vec<String> = read.diagnostics.iter().map(located).collect();
+        assert_eq!(places, ["session.toml:12:10", "session.toml:17:10"], "{:?}", read.diagnostics);
+        let tabs = &read.value.workspaces[0].tabs;
+        assert_eq!((tabs[0].number, tabs[0].name.as_deref()), (Some(4), Some("logs")));
+        assert_eq!((tabs[1].number, tabs[1].name.as_deref()), (None, None));
+        assert_eq!((tabs[2].number, tabs[2].name.as_deref()), (None, None), "an empty name is no name");
     }
 
     #[test]

@@ -43,8 +43,13 @@ fn click_close(harness: &mut Harness<Screen>, title: &str) {
     harness.click(i32::try_from(mark).expect("a column"), 0).render();
 }
 
-/// Moves the keyboard onto the tab strip the way the person does, with Tab.
+/// Moves the keyboard onto the tab strip the way the person does: out of a harness with the key
+/// that leaves it, since a click on a tab leaves the keyboard in its terminal, which takes Tab as
+/// its own; and elsewhere with Tab.
 fn focus_strip(harness: &mut Harness<Screen>) {
+    if harness.is_focused("workspace-terminal") {
+        harness.press("ctrl+alt+space");
+    }
     for _ in 0..16 {
         if harness.is_focused("workspace-tabs") {
             return;

@@ -452,9 +452,21 @@ fn the_tabs_of_a_workspace_come_back_the_way_they_were_left() {
             id: id.clone(),
             active_tab: 2,
             tabs: vec![
-                SessionTab { kind: SessionTabKind::Shell, conversation: None, opened: 10 },
-                SessionTab { kind: SessionTabKind::Markdown("README.md".to_owned()), conversation: None, opened: 20 },
-                SessionTab { kind: SessionTabKind::Desktop("antigravity".to_owned()), conversation: None, opened: 30 },
+                SessionTab { kind: SessionTabKind::Shell, conversation: None, opened: 10, number: None, name: None },
+                SessionTab {
+                    kind: SessionTabKind::Markdown("README.md".to_owned()),
+                    conversation: None,
+                    opened: 20,
+                    number: None,
+                    name: None,
+                },
+                SessionTab {
+                    kind: SessionTabKind::Desktop("antigravity".to_owned()),
+                    conversation: None,
+                    opened: 30,
+                    number: None,
+                    name: None,
+                },
             ],
         }],
     };
