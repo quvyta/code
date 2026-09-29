@@ -20,6 +20,7 @@
 mod draft;
 #[cfg(test)]
 mod tests;
+mod tried;
 
 use std::path::PathBuf;
 
@@ -32,9 +33,11 @@ use crate::provider::{
     Providers as ProviderFile, Reached, Web, Wire, ask, permission_problems,
 };
 use crate::store::Loaded;
-use crate::ui::keys::Wrapping;
+use crate::ui::page;
 
 pub use draft::{BASE_FIELD, Draft, KEY_FIELD, Problem, TAG_FIELD};
+
+use tried::{Reason, TRIED, Verdict};
 
 /// Width of the add dialog. Wide enough for an address to read as one line, the longest being a
 /// ready-made service's API root with the name of its shape in front of it.
@@ -266,6 +269,13 @@ pub fn update(state: &mut Providers, message: Msg) -> Command<Msg> {
                 value = value.at(path);
             }
             state.file = value;
+            // A file written before the record of tried models, or before a model in it was
+            // tried, is shown in the same order a fresh answer would be.
+            for mut entry in state.file.entries().to_vec() {
+                ordered(&mut entry);
+                let tag = entry.tag.as_str().to_owned();
+                state.file.replace(&tag, entry);
+            }
             state.problems = diagnostics;
             state.loading = false;
             state.selected = state.selected.min(state.entries().len().saturating_sub(1));
@@ -394,6 +404,7 @@ pub fn update(state: &mut Providers, message: Msg) -> Command<Msg> {
                             model
                         })
                         .collect();
+                    ordered(&mut entry);
                     let tag = entry.tag.as_str().to_owned();
                     state.file.replace(&tag, entry);
                     state.model = 0;
@@ -494,57 +505,63 @@ pub fn view(state: &Providers, ui: &mut View<'_, Msg>) {
 
 /// The providers, the key-file line and everything about the chosen one.
 fn draw_list(state: &Providers, ui: &mut View<'_, Msg>) {
-    ui.column(|ui| {
-        ui.add(Text::new(t!("provider.title")).bold());
-        // Where the key is kept and what carries it, in a line of its own. This is not a
-        // footnote and it is not behind anything: a person who shares a backup should know what
-        // they are sharing before they do it.
-        ui.add(Text::new(key_file_line(state)).color("warning")).fill_width();
-        for problem in state.permissions() {
-            let (place, mode, wanted) = (
-                problem.place.display().to_string(),
-                format!("{:04o}", problem.mode),
-                format!("{:04o}", problem.wanted),
-            );
-            let said =
-                t!("provider.permissions", place = place.as_str(), mode = mode.as_str(), wanted = wanted.as_str());
-            ui.add(Text::new(said).color("warning")).fill_width();
-        }
-        for problem in state.problems() {
-            ui.add(Text::new(problem.to_string()).color("warning")).fill_width();
-        }
-        if state.loading {
-            ui.add(Text::new(t!("provider.reading")).role("secondary"));
-            return;
-        }
-        if state.entries().is_empty() {
-            ui.add(
-                EmptyState::new(t!("provider.empty-title"))
-                    .icon("inbox")
-                    .message(t!("provider.empty-message"))
-                    .action(Button::new(t!("provider.new")).variant("primary").on_press(Msg::New)),
-            )
-            .id("providers-empty")
-            .fill();
-            return;
-        }
-        let items = state.entries().iter().map(|entry| {
-            ListItem::new(entry.tag.as_str().to_owned()).detail(format!("{}  {}", kind_word(entry.kind), entry.base))
-        });
-        let list = List::new(items).selected(Some(state.selected)).on_select(Msg::Select);
-        ui.add(Wrapping::new(list, Some(state.selected), state.entries().len())).id(LIST).fill_width();
+    page::column(ui, page::WIDTH, |ui| {
+        ui.column(|ui| {
+            ui.add(Text::new(t!("provider.title")).bold());
+            // Where the key is kept and what carries it, in a line of its own. This is not a
+            // footnote and it is not behind anything: a person who shares a backup should know what
+            // they are sharing before they do it.
+            ui.add(Text::new(key_file_line(state)).color("warning")).fill_width();
+            for problem in state.permissions() {
+                let (place, mode, wanted) = (
+                    problem.place.display().to_string(),
+                    format!("{:04o}", problem.mode),
+                    format!("{:04o}", problem.wanted),
+                );
+                let said =
+                    t!("provider.permissions", place = place.as_str(), mode = mode.as_str(), wanted = wanted.as_str());
+                ui.add(Text::new(said).color("warning")).fill_width();
+            }
+            for problem in state.problems() {
+                ui.add(Text::new(problem.to_string()).color("warning")).fill_width();
+            }
+            if state.loading {
+                ui.add(Text::new(t!("provider.reading")).role("secondary"));
+                return;
+            }
+            if state.entries().is_empty() {
+                ui.add(
+                    EmptyState::new(t!("provider.empty-title"))
+                        .icon("inbox")
+                        .message(t!("provider.empty-message"))
+                        .action(Button::new(t!("provider.new")).variant("primary").on_press(Msg::New)),
+                )
+                .id("providers-empty")
+                .fill();
+                return;
+            }
+            let items = state.entries().iter().map(|entry| {
+                ListItem::new(entry.tag.as_str().to_owned()).detail(format!(
+                    "{}  {}",
+                    kind_word(entry.kind),
+                    entry.base
+                ))
+            });
+            let list = List::new(items).label_first(true).selected(Some(state.selected)).on_select(Msg::Select);
+            ui.add(list.wrap(true)).id(LIST).fill_width();
 
-        if let Some(entry) = state.selected() {
-            draw_chosen(state, entry, ui);
-        }
-        ui.row(|ui| {
-            ui.add(Button::new(t!("provider.new")).icon("add").on_press(Msg::New)).id("provider-new");
-            ui.spacer();
+            if let Some(entry) = state.selected() {
+                draw_chosen(state, entry, ui);
+            }
+            ui.row(|ui| {
+                ui.add(Button::new(t!("provider.new")).icon("add").on_press(Msg::New)).id("provider-new");
+                ui.spacer();
+            })
+            .fill_width();
         })
-        .fill_width();
-    })
-    .fill()
-    .gap(1);
+        .fill()
+        .gap(1);
+    });
 }
 
 /// Everything about the provider the person is looking at.
@@ -558,12 +575,18 @@ fn draw_chosen(state: &Providers, entry: &ProviderEntry, ui: &mut View<'_, Msg>)
     if entry.models.is_empty() {
         ui.add(Text::new(t!("provider.no-models")).role("secondary")).fill_width();
     } else {
-        let items = entry.models.iter().map(|model| ListItem::new(model.id.clone()).detail(windows(model, entry.kind)));
+        let items = entry.models.iter().map(|model| model_row(model, entry.kind));
         // A server can offer more models than the screen has rows. The list takes the rows the
         // rest of the page leaves and scrolls inside them, so the answer to Try and every button
         // under it stay where a hand can reach them.
         let list = List::new(items).selected(Some(state.model)).on_select(Msg::PickModel);
-        ui.add(Wrapping::new(list, Some(state.model), entry.models.len())).id(MODELS).fill();
+        ui.add(list.wrap(true)).id(MODELS).fill();
+    }
+    // What QCode saw of the chosen model in a harness, in words, beside the mark on its row.
+    if let Some(model) = state.chosen_model()
+        && let Some((text, tone)) = verdict_line(model, entry.kind)
+    {
+        ui.add(Text::new(text).color(tone)).fill_width();
     }
     // A figure QCode did not ask the service for says where it was read.
     if let Some(model) = state.chosen_model()
@@ -640,7 +663,7 @@ fn draw_dialog(draft: &Draft, ui: &mut View<'_, Msg>) {
     ui.add_with(dialog, |ui| {
         ui.column(|ui| {
             let kinds = RadioGroup::new(ProviderKind::ALL.map(kind_word)).selected(chosen).on_select(Msg::PickKind);
-            ui.add(Wrapping::new(kinds, chosen, ProviderKind::ALL.len())).id("provider-kind");
+            ui.add(kinds.wrap(true)).id("provider-kind");
             if !draft.kind.regions().is_empty() {
                 draw_ready_made(draft, ui);
             }
@@ -710,10 +733,9 @@ fn draw_dialog(draft: &Draft, ui: &mut View<'_, Msg>) {
 /// subscription answers, where each shape is asked, the header the key goes in, and the models
 /// it offers.
 fn draw_ready_made(draft: &Draft, ui: &mut View<'_, Msg>) {
-    let count = draft.kind.regions().len();
     let regions = draft.kind.regions().iter().map(|region| region_word(region.id));
     let group = RadioGroup::new(regions).horizontal(true).selected(draft.region()).on_select(Msg::PickRegion);
-    ui.add(Wrapping::new(group, draft.region(), count).across(true)).id("provider-region");
+    ui.add(group.wrap(true)).id("provider-region");
     // One block, read together: it is what picking the kind filled in.
     ui.column(|ui| {
         draw_speaks(draft.kind, &draft.base, ui);
@@ -760,6 +782,53 @@ fn key_line(entry: &ProviderEntry) -> String {
         Some(Some(tail)) => t!("provider.key-shown", tail = tail.as_str()),
         Some(None) => t!("provider.key-hidden"),
         None => t!("provider.key-none"),
+    }
+}
+
+/// Puts the free models QCode saw work first and the ones it saw fail last. Only OpenRouter's
+/// free models were tried; any other provider's list stays as the provider gave it.
+fn ordered(entry: &mut ProviderEntry) {
+    if entry.kind == ProviderKind::OpenRouter {
+        TRIED.order(&mut entry.models);
+    }
+}
+
+/// What QCode saw of `model` on a provider of `kind`, when it was tried.
+fn verdict(model: &Model, kind: ProviderKind) -> Option<Verdict> {
+    (kind == ProviderKind::OpenRouter).then(|| TRIED.verdict(&model.id)).flatten()
+}
+
+/// A model's row: a mark for one seen working, and for one seen failing a faint row whose detail
+/// is the reason, since its windows do not matter to anyone who cannot use it.
+fn model_row(model: &Model, kind: ProviderKind) -> ListItem {
+    let row = ListItem::new(model.id.clone());
+    match verdict(model, kind) {
+        Some(Verdict::Works(_)) => row.icon("check", Some("success")).detail(windows(model, kind)),
+        Some(Verdict::Fails(harness, reason)) => {
+            row.icon("warning", Some("warning")).faint(true).detail(fails(harness, reason))
+        }
+        None => row.detail(windows(model, kind)),
+    }
+}
+
+/// Why a model does not work, in the fewest words.
+fn fails(harness: crate::profile::HarnessKind, reason: Reason) -> String {
+    let harness = harness.record().display_name;
+    match reason {
+        Reason::Empty => t!("provider.fails-empty", harness = harness),
+        Reason::Tools => t!("provider.fails-tools", harness = harness),
+        Reason::Half => t!("provider.fails-half", harness = harness),
+    }
+}
+
+/// The line under the list for a chosen model QCode tried, and its tone.
+fn verdict_line(model: &Model, kind: ProviderKind) -> Option<(String, &'static str)> {
+    match verdict(model, kind)? {
+        Verdict::Works(harnesses) => {
+            let names: Vec<&str> = harnesses.iter().map(|harness| harness.record().display_name).collect();
+            Some((t!("provider.tried", harnesses = names.join(", ").as_str()), "success"))
+        }
+        Verdict::Fails(harness, reason) => Some((fails(harness, reason), "warning")),
     }
 }
 

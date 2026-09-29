@@ -26,10 +26,17 @@ mod history_scripts;
 pub(crate) mod keep_live;
 #[cfg(test)]
 mod live;
+#[cfg(test)]
+mod memory_live;
 mod name;
+pub mod opencode_packages;
+#[cfg(test)]
+mod opencode_packages_live;
 pub mod own;
 #[cfg(test)]
 mod permission_live;
+#[cfg(test)]
+mod plugins_live;
 mod template;
 
 pub use definition::{
@@ -40,6 +47,8 @@ pub use harness::{
 };
 pub use name::SafeName;
 pub use template::{
-    Addition, CARGO_HOME, CLAUDE_MARKETPLACES, CLAUDE_PLUGINS, CLAUDE_STARTER_PLUGINS, Extra, GRAPHIFY_HOME,
-    GRAPHIFY_PACKAGE, OH_MY_OPENAGENT, OH_MY_OPENCODE_SLIM, RUSTUP_HOME, Template,
+    ACCESSLINT_PLUGIN, ACCESSLINT_PROGRAM, ACCESSLINT_SERVER, AGENT_SDK, AGENT_SDK_VENV, Addition, CARGO_HOME,
+    CLAUDE_EXTRA_PLUGINS, CLAUDE_MARKETPLACES, CLAUDE_PLUGINS, CLAUDE_STARTER_PLUGINS, Extra, GRAPHIFY_HOME,
+    GRAPHIFY_PACKAGE, OH_MY_OPENAGENT, OH_MY_OPENCODE_SLIM, OPENCODE_PLUGIN_SETTINGS, OPENCODE_SLIM_SETTINGS,
+    RUST_ANALYZER_PLUGIN, RUSTUP_HOME, SECURITY_GUIDANCE_PLUGIN, SLIM_OWN_SETTINGS, Template,
 };

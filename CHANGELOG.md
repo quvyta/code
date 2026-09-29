@@ -5,6 +5,35 @@ Every release of quvyta-code, newest first. The format follows
 [Semantic Versioning](https://semver.org/); while the version starts with 0, a minor release may
 change files qcode writes, and the notes say so when it does.
 
+## 0.1.20 - 2026-09-29
+
+### Added
+
+- **See which tabs are working.** A tab whose harness is working shows a thin turning mark before its name on the tab strip, and a still dot with reduced motion. A tab that only echoes a line you are still typing is not marked.
+- **The file tree copies.** It is now the Quvyta ecosystem's shared file manager: **Copy** in a file's or folder's menu, `ctrl+c`, `ctrl+x` and `ctrl+v`, or a drag released with `ctrl` held. A copy shows its progress and can be stopped, and refusals and questions speak of the folder shown.
+- **The providers page knows which free OpenRouter models work.** Asking an OpenRouter provider what it offers lists the free models QCode saw work in a harness first, marked, and the ones it saw fail last, with the reason on their row.
+
+### Changed
+
+- **The template step is a picker and switches.** Ready-made sets stand on top and every part a profile can carry has a switch of its own below; changing a switch by hand makes the set **Custom**. A part's note shows under its row for the keyboard as well as under a resting pointer, and the space bar moves the row's switch. oh-my-openagent and oh my opencode slim exclude each other. A set an older QCode cannot build is kept where an older QCode does not read it.
+- **Screens say less and stand in the middle.** The workspaces list, the profiles list, the providers page and what an open workspace shows in place of a terminal stand in the middle of a wide terminal at the width Settings keeps (the profiles list at a width where no column is cut); a terminal still takes every column. The setup wizard, the workspace screens, the profile wizard and the providers page say each note, problem and step in one short line, with every safety warning kept.
+- **Every list goes round its ends,** Settings' rows included.
+- **Narrow terminals keep the names.** On a narrow terminal a list row keeps its name and lets its note give way, so "Shell" no longer disappears from the new tab page at 80 columns. On a short terminal the new-workspace dialog opens its folder browser in a dialog of its own, with room for a column of folders.
+- **A conversation open in a tab is not offered again.** A blank tab's page leaves out a conversation another tab of the workspace shows, the empty one a shared opencode server made included, until that tab closes.
+- **opencode without the network opens in seconds.** A profile without the network drew its first tab after about a minute and a half, while opencode tried to fetch its plugins' packages; its image now holds them. These images are about 150 MB larger.
+- **Claude Code's plugins work without the network.** accesslint's server is installed in the image and started from there (four tabs took 508 MB beside it and take 174 MB), and security-guidance's first start installs nothing. Images with security-guidance are about 287 MB larger.
+- **rust-analyzer comes with its program.** Quvyta development installs rust-analyzer with Rust and its Claude Code plugin beside it; QCode extra, which has no Rust, no longer installs a plugin that could do nothing.
+- **Antigravity IDE is not offered for a profile without the network**, and no switch to no network once it is chosen; each page says why in one line.
+- **A message on its way leaves the screen free.** A message handed to a harness is pasted at once and its Return written a moment later from the screen's own timer, so you keep typing and closing tabs meanwhile.
+- Built against quvyta-framework 0.1.31.
+
+### Fixed
+
+- **Messages to Gemini CLI are sent.** Gemini CLI read a Return that came right after the paste as a new line, and most messages were left standing in its prompt; the Return now waits until it has shown it took the paste.
+- **The Quvyta development image builds again,** after newer cargo and uv broke it.
+- **A shared opencode server that will not stay up** is no longer started again forever once no tab is left.
+- **The file tree's root icon** lights up with its name when the row is chosen.
+
 ## 0.1.19 - 2026-09-28
 
 ### Added

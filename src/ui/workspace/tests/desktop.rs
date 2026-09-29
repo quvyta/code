@@ -139,11 +139,6 @@ impl Recording {
 /// What the application inside answers the sign-in's way back with, as `printf` is given it.
 const ANSWER: &str = "HTTP/1.1 200 OK\\r\\nContent-Length: 13\\r\\n\\r\\nsigned-in-417";
 
-/// A port nobody on this machine listens on right now.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").and_then(|socket| socket.local_addr()).expect("a free port").port()
-}
-
 /// Whether this machine could listen on `port` right now: nobody holds it.
 fn port_is_free(port: u16) -> bool {
     std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
@@ -276,15 +271,27 @@ fn open_window_on(engine: &Recording) -> (Harness<Screen>, TabKey) {
     (harness(screen, SIZE.0, SIZE.1), key)
 }
 
+/// A window on an engine of its own whose sign-in wants to come back to a port of this machine,
+/// with QCode listening there and the page opened in the person's browser. A port found free can
+/// read as taken for a moment ([`on_a_free_port`](crate::desktop::callback::test_ports::on_a_free_port)),
+/// and QCode then keeps the page closed, so the whole window is opened again on another.
+fn signing_in(name: &str) -> (Recording, Harness<Screen>, TabKey, u16) {
+    let (port, (engine, harness, key)) = crate::desktop::callback::test_ports::on_a_free_port(|port| {
+        let engine = Recording::new(name);
+        let (mut harness, key) = open_window_on(&engine);
+        harness.set_open_outcome(OpenOutcome::Opened);
+        harness.send(Msg::SignInWanted(key, 0, vec![google(port)]));
+        let opened = !harness.opens().is_empty();
+        opened.then_some((engine, harness, key))
+    });
+    (engine, harness, key, port)
+}
+
 #[test]
 fn a_sign_in_opens_in_the_persons_browser_after_its_way_back_is_listened_for() {
-    let engine = Recording::new("window-signin-browser");
-    let (mut harness, key) = open_window_on(&engine);
-    let port = free_port();
-    let address = google(port);
-    harness.set_open_outcome(OpenOutcome::Opened);
     // The address arrives the way the window's own program leaves it.
-    harness.send(Msg::SignInWanted(key, 0, vec![address.clone()]));
+    let (engine, mut harness, _, port) = signing_in("window-signin-browser");
+    let address = google(port);
 
     // The page goes to this machine's browser, through the framework's one door, which the
     // harness records instead of carrying out.
@@ -306,11 +313,7 @@ fn a_sign_in_opens_in_the_persons_browser_after_its_way_back_is_listened_for() {
 
 #[test]
 fn the_browser_sent_back_reaches_the_application_and_the_tab_says_it_arrived() {
-    let engine = Recording::new("window-signin-back");
-    let (mut harness, key) = open_window_on(&engine);
-    let port = free_port();
-    harness.set_open_outcome(OpenOutcome::Opened);
-    harness.send(Msg::SignInWanted(key, 0, vec![google(port)]));
+    let (engine, mut harness, _, port) = signing_in("window-signin-back");
 
     // Google sends the browser back with the code; QCode takes the connection at its next look.
     let browser = std::thread::spawn(move || come_back(port, "/oauth-callback?code=4%2F0Ab-417&state=s"));
@@ -343,11 +346,7 @@ fn the_browser_sent_back_reaches_the_application_and_the_tab_says_it_arrived() {
 
 #[test]
 fn a_sign_in_nobody_comes_back_from_gives_the_port_up_after_the_wait_and_says_so() {
-    let engine = Recording::new("window-signin-wait");
-    let (mut harness, key) = open_window_on(&engine);
-    let port = free_port();
-    harness.set_open_outcome(OpenOutcome::Opened);
-    harness.send(Msg::SignInWanted(key, 0, vec![google(port)]));
+    let (_engine, mut harness, _, port) = signing_in("window-signin-wait");
     harness.advance(crate::desktop::callback::WAIT - Duration::from_secs(1));
     assert!(!port_is_free(port), "a second short of the wait, it still listens");
     harness.advance(Duration::from_secs(2));
@@ -368,7 +367,8 @@ fn a_port_another_program_holds_keeps_the_page_closed_and_says_what_to_do() {
     // Opening it would hand the sign-in to whoever holds the port.
     assert_eq!(harness.opens(), [], "nothing is opened");
     let text = harness.screen();
-    assert!(text.contains(&format!("already listens on port {port}")), "{text}");
+    assert!(text.contains(&format!("Port {port} is taken by another program")), "{text}");
+    assert!(!text.contains("where this sign-in has to come back"), "said in fewer words: {text}");
     assert!(text.contains("the page was not opened"), "{text}");
     assert!(text.contains("Use the sign-in window here"), "the way round it is offered: {text}");
     drop(holder);
@@ -376,12 +376,8 @@ fn a_port_another_program_holds_keeps_the_page_closed_and_says_what_to_do() {
 
 #[test]
 fn the_sign_in_window_here_is_a_button_away_and_gives_the_port_up() {
-    let engine = Recording::new("window-signin-here");
-    let (mut harness, key) = open_window_on(&engine);
-    let port = free_port();
+    let (engine, mut harness, _, port) = signing_in("window-signin-here");
     let address = google(port);
-    harness.set_open_outcome(OpenOutcome::Opened);
-    harness.send(Msg::SignInWanted(key, 0, vec![address.clone()]));
     assert!(!port_is_free(port));
 
     harness.click_text("Use the sign-in window here");
@@ -410,7 +406,7 @@ fn the_sign_in_window_asked_for_on_an_old_image_says_how_to_get_one() {
     let engine = Recording::without_browser("window-signin-old-image");
     let (mut harness, key) = open_window_on(&engine);
     harness.set_open_outcome(OpenOutcome::Opened);
-    harness.send(Msg::SignInWanted(key, 0, vec![google(free_port())]));
+    harness.send(Msg::SignInWanted(key, 0, vec![google(crate::desktop::callback::test_ports::free_port())]));
     harness.click_text("Use the sign-in window here");
     assert!(engine.calls().iter().any(|call| call.starts_with("exec qcode-firefly-anti.desk sh -c ")));
     let text = harness.screen();
@@ -434,11 +430,7 @@ fn a_page_with_no_way_back_to_this_machine_only_opens() {
 
 #[test]
 fn a_window_that_closes_gives_its_sign_ins_port_up() {
-    let engine = Recording::new("window-signin-closed");
-    let (mut harness, key) = open_window_on(&engine);
-    let port = free_port();
-    harness.set_open_outcome(OpenOutcome::Opened);
-    harness.send(Msg::SignInWanted(key, 0, vec![google(port)]));
+    let (_engine, mut harness, key, port) = signing_in("window-signin-closed");
     assert!(!port_is_free(port));
     // What the wait on the container answers when the person closes the window.
     harness.send(Msg::WindowEnded(key, 0, Some(0)));
@@ -489,6 +481,27 @@ fn the_tab_says_it_is_opening_while_the_container_starts() {
     let mut harness = harness(screen, SIZE.0, SIZE.1);
     harness.render();
     assert!(harness.screen().contains("Opening the window"), "{}", harness.screen());
+}
+
+#[test]
+fn a_window_tab_is_marked_as_working_while_its_window_is_brought_up_and_not_once_it_is_up() {
+    let session = Session::new("window-working");
+    let mut screen = session.screen();
+    open(&mut screen, window());
+    let key = key(&screen, 0);
+    let mut harness = harness(screen, SIZE.0, SIZE.1);
+    let label = |harness: &Harness<Screen>| harness.screen().lines().next().unwrap_or_default().to_owned();
+    assert!(label(&harness).contains(&format!(" {WINDOW}")), "{}", label(&harness));
+    let marked = |harness: &Harness<Screen>| {
+        let line = label(harness);
+        let at = line.find(WINDOW).expect("the tab is on the strip");
+        line[..at].trim_end().chars().last().is_some_and(|cell| ('\u{2800}'..='\u{28ff}').contains(&cell))
+    };
+    assert!(marked(&harness), "{}", label(&harness));
+
+    // What the engine would have said once the container was up; the wait after it is not let run.
+    harness.send(Msg::WindowOpened(key, 0, Ok(Opening::Up)));
+    assert!(!marked(&harness), "{}", label(&harness));
 }
 
 #[test]

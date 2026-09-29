@@ -1,0 +1,68 @@
+# Free OpenRouter models QCode has run a real harness on, in a container with no network, through
+# its own relay: a plain question first, then a file to read and another to write.
+#
+# The providers page lists a `works` model first, in the order written here, and a `fails` model
+# last with its reason. Neither list adds a model to the page: only models OpenRouter itself
+# offers when it is asked are shown, so a model it no longer offers is simply not there.
+#
+# Each entry is one model run on one harness, named in `with`: "claude-code" or "opencode". A
+# model run on both is written twice.
+# `reason` is why a model did not work: "empty" (the harness got an empty answer), "tools"
+# (the service refused the harness's own tool definitions) or "half" (it used its tools only
+# part of the way).
+#
+# A model that was only busy (429) when it was tried is in neither list: that is the hour, not
+# the model.
+
+tried = "2026-09-22"
+
+[[works]]
+model = "nex-agi/nex-n2.5-mini:free"
+with = "claude-code"
+
+[[works]]
+model = "nex-agi/nex-n2.5-mini:free"
+with = "opencode"
+
+[[works]]
+model = "dots-studio/dots-3-note-preview:free"
+with = "claude-code"
+
+[[works]]
+model = "inclusionai/ling-3.0-flash-vl:free"
+with = "claude-code"
+
+[[works]]
+model = "thinkingmachines/inkling:free"
+with = "claude-code"
+
+[[works]]
+model = "poolside/laguna-s-2.1:free"
+with = "claude-code"
+
+[[works]]
+model = "nvidia/nemotron-3-ultra-550b-a55b:free"
+with = "claude-code"
+
+[[works]]
+model = "nex-agi/nex-n2.5-pro:free"
+with = "claude-code"
+
+[[works]]
+model = "nvidia/nemotron-3-super-120b-a12b:free"
+with = "claude-code"
+
+[[fails]]
+model = "liquid/lfm-2.5-2.6b:free"
+with = "claude-code"
+reason = "half"
+
+[[fails]]
+model = "cohere/north-mini-code:free"
+with = "claude-code"
+reason = "empty"
+
+[[fails]]
+model = "qwen/qwen3.8-27b:free"
+with = "claude-code"
+reason = "tools"

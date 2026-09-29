@@ -12,11 +12,12 @@ use crate::base::paths::{HOME_DIR, OPEN_HOME, USER};
 use crate::desktop::signin;
 use crate::profile::guidance;
 use crate::profile::{
-    AccountKind, Addition, CARGO_HOME, CLAUDE_MARKETPLACES, Desktop, GRAPHIFY_HOME, GRAPHIFY_PACKAGE, HarnessKind,
-    OH_MY_OPENAGENT, OH_MY_OPENCODE_SLIM, Profile, RUSTUP_HOME, Template,
+    ACCESSLINT_PLUGIN, ACCESSLINT_PROGRAM, ACCESSLINT_SERVER, AGENT_SDK, AGENT_SDK_VENV, AccountKind, Addition,
+    CARGO_HOME, CLAUDE_MARKETPLACES, Desktop, Extra, GRAPHIFY_HOME, GRAPHIFY_PACKAGE, HarnessKind, OH_MY_OPENAGENT,
+    OH_MY_OPENCODE_SLIM, Profile, RUST_ANALYZER_PLUGIN, RUSTUP_HOME, SECURITY_GUIDANCE_PLUGIN, Template,
 };
 
-/// Where the build context puts the files a template writes, so the `COPY` never has to know
+/// Where the build context puts the files a profile's set writes, so the `COPY` never has to know
 /// the home directory of the image.
 const STAGING: &str = "/qcode-template";
 
@@ -82,7 +83,7 @@ impl Recipe {
 /// needs system packages and an archive unpacked into `/opt`, neither of which the base image's
 /// own user may do, so those steps run as root and the image ends as its user again.
 ///
-/// What a QCode template adds is installed by [`addition_step`], in an order that matters: graphify's
+/// What a profile's parts add is installed by [`addition_step`], in an order that matters: graphify's
 /// system packages as root and nothing else as root; the configuration files before the Claude
 /// Code plugins, because installing a plugin adds it to the settings file and copying the file
 /// afterwards would forget every one of them.
@@ -120,7 +121,7 @@ pub fn image(profile: &Profile) -> Recipe {
     for (key, value) in harness.environment {
         lines.push(format!("ENV {key}=\"{value}\""));
     }
-    for (key, value) in profile.template.environment(profile.harness) {
+    for (key, value) in profile.environment() {
         lines.push(format!("ENV {key}=\"{value}\""));
     }
     // Copied as root whoever the image's user is, and left readable by the person the container
@@ -194,23 +195,37 @@ pub fn image(profile: &Profile) -> Recipe {
             path = file.path
         ));
     }
-    // After the template's files, because the step merges graphify's hooks into the settings they
-    // wrote. QCode extra has graphify's section written into the workspace instead, when a
-    // container comes up, beside QCode's own.
-    if additions.contains(&Addition::Graphify) && !profile.template.carries_high() {
+    // After the settings the profile's set wrote, because the step merges graphify's hooks into
+    // the file they wrote. QCode extra has graphify's section written into the workspace instead,
+    // when a container comes up, beside QCode's own.
+    if additions.contains(&Addition::Graphify) && !profile.carries_high() {
         lines.push(graphify_guidance(profile.harness));
+    }
+    if carries_the_agent_sdk(profile) {
+        // Where graphify's step is the only other thing that brings an interpreter: the packages a
+        // venv needs, as root like those, and the image goes back to its own user for the plugins
+        // themselves, which write into the home.
+        if desktop.is_none() {
+            lines.push("USER root".to_owned());
+        }
+        lines.push(agent_sdk_python_step(profile));
+        if desktop.is_none() {
+            lines.push(format!("USER {USER}"));
+        }
     }
     if additions.contains(&Addition::ClaudePlugins) {
         lines.push(addition_step(Addition::ClaudePlugins, profile));
     }
     // Only a mark, read by the courier that gives a workspace's home its login: the approvals are
-    // written into the application's database there, beside the login (`desktop::login`).
-    if desktop.is_some() && profile.template != Template::Base {
+    // written into the application's database there, beside the login (`desktop::login`). It is
+    // the recommended settings that grant them, so without that part there is nothing to mark.
+    if desktop.is_some() && profile.has(Extra::Settings) {
         lines.push(format!(
             "RUN mkdir -p \"$(dirname '{marker}')\" && echo agent-driven > '{marker}' && chmod 0644 '{marker}'",
             marker = crate::desktop::login::APPROVALS
         ));
     }
+    lines.extend(crate::profile::opencode_packages::step(profile));
     // Last, after every step that installs with npm, so those still land in the image's own
     // prefix. From here on whatever the person installs for their user — `npm -g`, `pipx`,
     // `uv tool` — goes into the home, which is the workspace's own volume: it stays when the
@@ -293,6 +308,9 @@ pub const SLIM_FAILED: &str = "oh my opencode slim:";
 /// The same for Quvyta development, whose steps are QCode extra's and its own.
 pub const DEV_FAILED: &str = "Quvyta development:";
 
+/// The same for a profile whose parts are its own, which no ready-made template names.
+pub const CUSTOM_FAILED: &str = "Custom:";
+
 /// The step that installs `addition` for `profile`, checked before it counts: each one ends by
 /// asking what it installed, so a step that seemed to work and left something out still fails the
 /// build. Of the Claude Code plugins, only the ones `profile` has switched on are installed, and
@@ -304,6 +322,9 @@ pub const DEV_FAILED: &str = "Quvyta development:";
 /// installing and that the build needs the network; the image is then not made, and never made
 /// with a part missing.
 fn addition_step(addition: Addition, profile: &Profile) -> String {
+    // rust-analyzer's plugin only names the program; with the plugin on, the toolchain brings it,
+    // and the sources of the standard library it reads.
+    let rust_analyzer = profile.claude_plugins().contains(&RUST_ANALYZER_PLUGIN);
     let (what, commands) = match addition {
         // Python and pipx from the system's own repositories, under its own names, then graphify
         // into the same place on every system.
@@ -326,14 +347,25 @@ fn addition_step(addition: Addition, profile: &Profile) -> String {
             commands.push("claude plugin list > /tmp/qcode-plugins".to_owned());
             commands.extend(plugins.iter().map(|plugin| format!("grep -qF '{plugin}' /tmp/qcode-plugins")));
             commands.push("rm /tmp/qcode-plugins".to_owned());
+            if plugins.contains(&ACCESSLINT_PLUGIN) {
+                commands.extend(accesslint_in_the_image());
+            }
+            if plugins.contains(&SECURITY_GUIDANCE_PLUGIN) {
+                commands.extend(security_guidance_in_the_image());
+            }
             ("the Claude Code plugins", commands)
         }
         // rustup's own installer, which picks the build for the machine the image is built on:
         // the same recipe makes an image for a laptop and for a Raspberry Pi. It is told where to
         // put everything and not to touch any shell's startup file; the image's `ENV` says where
         // it is instead. The toolchain is opened to everyone in the same step, so no second layer
-        // holds a copy of it. uv comes from its maker's installer the same way, straight into
-        // `/usr/local/bin`.
+        // holds a copy of it. The checks name `CARGO_HOME` as well: cargo 1.98 finds its `clippy`
+        // and `fmt` only there or on the path, not beside its own program, and said "no such
+        // command: clippy" with `RUSTUP_HOME` alone. uv comes from its maker's installer the same
+        // way, straight into `/usr/local/bin`; its receipt goes to a folder of the step's own,
+        // since the installer writes it under `$XDG_CONFIG_HOME` (by default the home), where a
+        // folder root made would be closed to the person the container runs as and fail
+        // `qcode-open-home` at the end.
         Addition::Rust => (
             "Rust and the build tools",
             vec![
@@ -341,16 +373,23 @@ fn addition_step(addition: Addition, profile: &Profile) -> String {
                 format!(
                     "curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location https://sh.rustup.rs \\\n \
                      | RUSTUP_HOME={RUSTUP_HOME} CARGO_HOME={CARGO_HOME} sh -s -- -y --no-modify-path --profile minimal \
-                     --default-toolchain stable --component clippy --component rustfmt"
+                     --default-toolchain stable --component clippy --component rustfmt{analyzer}",
+                    analyzer = if rust_analyzer { " --component rust-analyzer --component rust-src" } else { "" }
                 ),
                 format!("chmod -R a+rwX {RUSTUP_HOME} {CARGO_HOME}"),
                 format!(
-                    "RUSTUP_HOME={RUSTUP_HOME} {CARGO_HOME}/bin/cargo --version \\\n \
-                     && RUSTUP_HOME={RUSTUP_HOME} {CARGO_HOME}/bin/cargo clippy --version \\\n \
-                     && RUSTUP_HOME={RUSTUP_HOME} {CARGO_HOME}/bin/cargo fmt --version"
+                    "CARGO_HOME={CARGO_HOME} RUSTUP_HOME={RUSTUP_HOME} {CARGO_HOME}/bin/cargo --version \\\n \
+                     && CARGO_HOME={CARGO_HOME} RUSTUP_HOME={RUSTUP_HOME} {CARGO_HOME}/bin/cargo clippy --version \\\n \
+                     && CARGO_HOME={CARGO_HOME} RUSTUP_HOME={RUSTUP_HOME} {CARGO_HOME}/bin/cargo fmt --version{analyzer}",
+                    analyzer = if rust_analyzer {
+                        format!(" \\\n && CARGO_HOME={CARGO_HOME} RUSTUP_HOME={RUSTUP_HOME} {CARGO_HOME}/bin/rust-analyzer --version")
+                    } else {
+                        String::new()
+                    }
                 ),
                 "curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location https://astral.sh/uv/install.sh \\\n \
-                 | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh"
+                 | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 XDG_CONFIG_HOME=/tmp/qcode-uv sh \\\n \
+                 && rm -rf /tmp/qcode-uv"
                     .to_owned(),
                 "uv --version".to_owned(),
             ],
@@ -380,17 +419,119 @@ fn addition_step(addition: Addition, profile: &Profile) -> String {
             ],
         ),
     };
-    let (failed, template) = match profile.template {
-        Template::Slim => (SLIM_FAILED, "oh my opencode slim"),
-        Template::QuvytaDev => (DEV_FAILED, "Quvyta development"),
-        Template::High => (EXTRA_FAILED, "QCode extra"),
-        Template::Base | Template::Recommended => (RECOMMENDED_FAILED, "QCode recommended"),
-    };
+    let (failed, template) = failure_words(profile.template);
     format!(
         "RUN {{ {steps}; }} \\\n || {{ echo '{failed} could not install {what}. What {template} adds is downloaded while the image is built, so the build needs the network.' >&2; exit 1; }}",
         steps = commands.join(" \\\n && "),
     )
 }
+
+/// The words a step of `template`'s profile starts its complaint with, and the set's own name for
+/// what it adds, so every step that installs something says the same thing when it cannot.
+fn failure_words(template: Template) -> (&'static str, &'static str) {
+    match template {
+        Template::Slim => (SLIM_FAILED, "oh my opencode slim"),
+        Template::QuvytaDev => (DEV_FAILED, "Quvyta development"),
+        Template::High => (EXTRA_FAILED, "QCode extra"),
+        Template::Custom => (CUSTOM_FAILED, "a custom profile"),
+        Template::Base | Template::Recommended => (RECOMMENDED_FAILED, "QCode recommended"),
+    }
+}
+
+/// What makes the accesslint plugin's server a program of the image rather than one `npx` fetches
+/// at every tab's start ([`ACCESSLINT_PLUGIN`]): the package is installed with the image's other
+/// npm programs, and every server entry the plugin carries is written anew to start it by its
+/// path. The plugin's own words for its server are replaced, so the step ends by asking for the
+/// new entry and the program: a plugin that moved its file fails the build rather than going back
+/// to `npx` unseen. A newer server arrives with a rebuild, as every part of the image does.
+fn accesslint_in_the_image() -> Vec<String> {
+    let entries = "\"$HOME\"/.claude/plugins/cache/accesslint/accesslint/*/.mcp.json";
+    let program = format!("{IMAGE_NPM}/bin/{ACCESSLINT_PROGRAM}");
+    vec![
+        format!("npm install -g --cache /tmp/qcode-npm-cache {ACCESSLINT_SERVER}"),
+        "rm -rf /tmp/qcode-npm-cache".to_owned(),
+        format!(
+            "for entry in {entries}; do printf '%s\\n' '{{\"mcpServers\":{{\"accesslint\":{{\"command\":\"{program}\",\"args\":[]}}}}}}' > \"$entry\"; done"
+        ),
+        format!("grep -qF '\"{program}\"' {entries}"),
+        format!("! grep -qF npx {entries}"),
+        format!("test -x {program}"),
+    ]
+}
+
+/// What makes the security-guidance plugin's agent SDK an environment of the image rather than one
+/// its own SessionStart hook pip-installs at the first tab of every profile
+/// ([`SECURITY_GUIDANCE_PLUGIN`]).
+///
+/// The hook's own arrangement, read in plugin 2.0.8: it looks for the package in the interpreter
+/// that runs it, and where it is not there it builds `python -m venv --clear` at
+/// `~/.claude/security/agent-sdk-venv` and pip-installs into that. So the image makes that
+/// environment, in that place, with the same pip options the hook passes, and the first tab of a
+/// profile finds the package and installs nothing — with or without a network, and without the
+/// seconds and the ~110 MB the hook's own pip run holds while it goes (measured 2026-09-29: the
+/// hook answers `sdk_bootstrap: 3` after 9.2 s with no network, and `sdk_bootstrap: 1` after
+/// 0.6 s with the environment in the image). The environment is about 287 MB, once, in the image.
+///
+/// The interpreter is the one graphify's step brings where graphify is on; a set with the plugin
+/// and no graphify has no Python at all, and gets what a venv needs from [`agent_sdk_python_step`].
+/// Nothing is written outside the home, because that is where the hook looks: the environment is
+/// part of what a workspace's home volume is filled with when its container is made, as the
+/// plugin's own cache already is.
+///
+/// The step ends by running the plugin's own hook and asking for what it left behind: a mark inside
+/// the environment, which the hook's `venv --clear` would take with it if it decided to build its
+/// own. A plugin that moved its state somewhere else, or stopped looking at the environment at all,
+/// builds one here and fails the build rather than leaving an image whose first tab needs the
+/// network.
+fn security_guidance_in_the_image() -> Vec<String> {
+    let venv = format!("\"$HOME\"/{AGENT_SDK_VENV}");
+    let python = format!("{venv}/bin/python");
+    let mark = format!("{venv}/{SECURITY_GUIDANCE_MARK}");
+    let hook =
+        format!("\"$HOME\"/.claude/plugins/cache/claude-plugins-official/security-guidance/*/{SECURITY_GUIDANCE_HOOK}");
+    vec![
+        format!("python3 -m venv {venv}"),
+        format!(
+            "{python} -m pip install --quiet --disable-pip-version-check --prefer-binary --no-cache-dir {AGENT_SDK}"
+        ),
+        format!("{python} -c 'import {}'", AGENT_SDK.replace('-', "_")),
+        format!("touch {mark}"),
+        format!("python3 {hook} > /dev/null"),
+        format!("test -f {mark}"),
+        // Taken away with `-f`, since whether the mark is there is the check above's business and
+        // not the removal's: without the check this would fail for a reason of its own.
+        format!("rm -f {mark}"),
+    ]
+}
+
+/// Whether this profile's set carries the security-guidance plugin, which is the one that decides
+/// the image gets the agent SDK ([`SECURITY_GUIDANCE_PLUGIN`]).
+fn carries_the_agent_sdk(profile: &Profile) -> bool {
+    profile.additions().contains(&Addition::ClaudePlugins)
+        && profile.claude_plugins().contains(&SECURITY_GUIDANCE_PLUGIN)
+}
+
+/// The step that brings the Python a set with the plugin and no graphify has none of: the
+/// interpreter, and where the system keeps `ensurepip` out of it, the package that puts pip in a
+/// venv. Graphify's step brings the interpreter everywhere else, with pipx beside it, and the
+/// plugins' step runs as the image's own user, so this one is written as root and the image goes
+/// back to that user right after it ([`image`]).
+fn agent_sdk_python_step(profile: &Profile) -> String {
+    let (failed, template) = failure_words(profile.template);
+    format!(
+        "RUN {{ {install}; }} \\\n || {{ echo '{failed} could not install the Python the security-guidance plugin needs. What {template} adds is downloaded while the image is built, so the build needs the network.' >&2; exit 1; }}",
+        install = profile.os.install(profile.os.python_venv()),
+    )
+}
+
+/// The name of the mark the security-guidance step leaves inside the environment while the plugin's
+/// own hook runs, and takes away again: the hook clears that environment when it cannot use it, and
+/// the mark is what says it did not.
+const SECURITY_GUIDANCE_MARK: &str = "qcode-installed";
+
+/// The file of the security-guidance plugin that builds the environment, as the image's plugin cache
+/// holds it: every version of it under the marketplace's own folder.
+const SECURITY_GUIDANCE_HOOK: &str = "hooks/ensure_agent_sdk.py";
 
 /// The steps that put a desktop application into the image: the packages it needs, then the
 /// archive from its maker's address.
@@ -502,8 +643,8 @@ pub fn capture_script(profile: &Profile) -> String {
 mod tests {
     use super::*;
     use crate::profile::{
-        AccountKind, CLAUDE_PLUGINS, CLAUDE_STARTER_PLUGINS, Extra, HarnessKind, MountAccess, NetworkMode, SafeName,
-        Template,
+        AccountKind, CLAUDE_EXTRA_PLUGINS, CLAUDE_PLUGINS, CLAUDE_STARTER_PLUGINS, Extra, HarnessKind, MountAccess,
+        NetworkMode, SafeName, Template,
     };
 
     use crate::base::Os;
@@ -520,6 +661,16 @@ mod tests {
             network: NetworkMode::Full,
             without: Vec::new(),
             os: crate::base::Os::Debian,
+        }
+    }
+
+    /// A custom profile of `harness` with `parts` switched on and every other part of the list off,
+    /// which is what the wizard writes for a set nobody chose from a list: the set's own name is
+    /// `custom` and the file names everything it goes without.
+    fn custom(harness: HarnessKind, parts: &[Extra]) -> Profile {
+        Profile {
+            without: Template::available(harness).into_iter().filter(|part| !parts.contains(part)).collect(),
+            ..profile(harness, Template::Custom)
         }
     }
 
@@ -602,11 +753,21 @@ mod tests {
                 assert!(!file.contains(machine), "{os:?}: `{machine}` in {file}");
             }
             assert!(file.contains("chmod -R a+rwX /opt/rustup /opt/cargo"), "{os:?}: anyone may use it: {file}");
-            for check in ["/opt/cargo/bin/cargo --version", "cargo clippy --version", "cargo fmt --version"] {
-                assert!(file.contains(check), "{os:?}: `{check}` in {file}");
+            // Each check is told where cargo's own commands are: without it cargo 1.98 answered
+            // "no such command: clippy" and the image was not made.
+            for check in ["cargo --version", "cargo clippy --version", "cargo fmt --version"] {
+                let told = format!("CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup /opt/cargo/bin/{check}");
+                assert!(file.contains(&told), "{os:?}: `{told}` in {file}");
             }
             assert!(file.contains("https://astral.sh/uv/install.sh"), "{os:?}: {file}");
-            assert!(file.contains("| env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh"), "{os:?}: {file}");
+            // uv's receipt goes nowhere under the home, which a root step would leave closed.
+            assert!(
+                file.contains(
+                    "| env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 XDG_CONFIG_HOME=/tmp/qcode-uv sh \\\n \
+                     && rm -rf /tmp/qcode-uv"
+                ),
+                "{os:?}: {file}"
+            );
             assert!(file.contains("\\\n && uv --version"), "{os:?}: {file}");
             for variable in [
                 "\nENV RUSTUP_HOME=\"/opt/rustup\"\n",
@@ -907,13 +1068,26 @@ mod tests {
     }
 
     #[test]
-    fn a_command_line_harness_never_becomes_root_in_its_image_without_graphify() {
+    fn a_command_line_harness_is_root_in_its_image_only_where_it_installs_a_package() {
         for harness in HarnessKind::TERMINAL {
             let without = Profile { without: vec![Extra::Graphify], ..profile(harness, Template::Recommended) };
             for profile in [profile(harness, Template::Base), without] {
                 let file = image(&profile).containerfile;
-                assert!(!file.contains("USER root"), "{harness:?} {:?}: {file}", profile.template);
-                assert!(!file.contains("apt-get"), "{harness:?} {:?}: {file}", profile.template);
+                // Graphify is what brings the interpreter in every ready-made set, so a set that
+                // goes without it is root for nothing: no packages, no root.
+                let sdk = carries_the_agent_sdk(&profile);
+                assert_eq!(file.contains("USER root"), sdk, "{harness:?} {:?}: {file}", profile.template);
+                assert_eq!(file.contains("apt-get"), sdk, "{harness:?} {:?}: {file}", profile.template);
+                if sdk {
+                    // The one step as root installs the interpreter the plugin's environment needs
+                    // and nothing else, and the image goes straight back to its own user.
+                    let root = file.find("USER root").expect("a step as root");
+                    let back = file.find(&format!("USER {USER}")).expect("and back");
+                    let as_root = &file[root..back];
+                    assert!(as_root.contains("python3-venv"), "{harness:?}: {as_root}");
+                    assert!(!as_root.contains("claude plugin"), "{harness:?}: {as_root}");
+                    assert_eq!(as_root.matches("\nRUN ").count(), 1, "one step as root and no more: {as_root}");
+                }
             }
         }
     }
@@ -1056,12 +1230,12 @@ mod tests {
         for harness in HarnessKind::ALL {
             for template in [Template::Recommended, Template::High] {
                 let file = image(&profile(harness, template)).containerfile;
-                for (key, value) in template.environment(harness) {
+                for (key, value) in Template::maker_switches(harness) {
                     assert!(file.contains(&format!("\nENV {key}=\"{value}\"\n")), "{harness:?} {template:?}: {file}");
                 }
             }
             let base = image(&profile(harness, Template::Base)).containerfile;
-            for (key, _) in Template::Recommended.environment(harness) {
+            for (key, _) in Template::maker_switches(harness) {
                 assert!(!base.contains(key), "{harness:?}: {base}");
             }
         }
@@ -1132,7 +1306,7 @@ mod tests {
         for (repository, _) in CLAUDE_MARKETPLACES {
             assert!(file.contains(&format!("claude plugin marketplace add {repository}")), "{file}");
         }
-        for plugin in CLAUDE_PLUGINS {
+        for plugin in CLAUDE_EXTRA_PLUGINS {
             assert!(file.contains(&format!("claude plugin install {plugin}")), "{plugin}: {file}");
             assert!(file.contains(&format!("grep -qF '{plugin}'")), "{plugin} is checked after: {file}");
         }
@@ -1144,7 +1318,8 @@ mod tests {
     }
 
     #[test]
-    fn qcode_recommended_installs_the_starter_plugins_and_qcode_extra_every_one() {
+    fn qcode_recommended_installs_the_starter_plugins_qcode_extra_all_but_rust_analyzers_and_quvyta_development_every_one()
+     {
         let installed = |template| -> Vec<String> {
             let file = image(&profile(HarnessKind::ClaudeCode, template)).containerfile;
             file.split("claude plugin install ")
@@ -1154,7 +1329,7 @@ mod tests {
                 .collect()
         };
         assert_eq!(installed(Template::Recommended), CLAUDE_STARTER_PLUGINS);
-        assert_eq!(installed(Template::High), CLAUDE_PLUGINS);
+        assert_eq!(installed(Template::High), CLAUDE_EXTRA_PLUGINS);
         assert_eq!(installed(Template::QuvytaDev), CLAUDE_PLUGINS);
         let file = image(&profile(HarnessKind::ClaudeCode, Template::Recommended)).containerfile;
         let added: Vec<&str> = file
@@ -1169,11 +1344,245 @@ mod tests {
     }
 
     #[test]
+    fn every_image_with_the_accesslint_plugin_starts_its_server_from_the_image_and_no_other_installs_it() {
+        let with = [
+            profile(HarnessKind::ClaudeCode, Template::High),
+            profile(HarnessKind::ClaudeCode, Template::QuvytaDev),
+            custom(HarnessKind::ClaudeCode, &[Extra::Plugin(ACCESSLINT_PLUGIN)]),
+        ];
+        for carrying in with {
+            let file = image(&carrying).containerfile;
+            let step = steps(&file).into_iter().find(|step| step.contains("claude plugin install")).expect("plugins");
+            let installed = step.find("npm install -g --cache /tmp/qcode-npm-cache @accesslint/mcp").expect(&file);
+            assert!(
+                step.find("claude plugin install accesslint@accesslint").is_some_and(|at| at < installed),
+                "{step}"
+            );
+            assert!(step.contains("/usr/local/npm/bin/accesslint-mcp"), "{step}");
+            assert!(file.find(&step).is_some_and(|at| at < file.find("ENV NPM_CONFIG_PREFIX").unwrap_or(0)), "{file}");
+        }
+        for without in [
+            profile(HarnessKind::ClaudeCode, Template::Recommended),
+            profile(HarnessKind::ClaudeCode, Template::Base),
+            custom(HarnessKind::ClaudeCode, &[Extra::Plugin("superpowers@claude-plugins-official")]),
+            profile(HarnessKind::OpenCode, Template::High),
+        ] {
+            let file = image(&without).containerfile;
+            assert!(!file.contains("@accesslint/mcp"), "{:?} {:?}: {file}", without.harness, without.template);
+        }
+    }
+
+    /// Runs, in a real shell with `home` as the home directory, the commands of the accesslint
+    /// step after its install, with the program's own path standing where the image puts it.
+    fn point_accesslint(home: &std::path::Path, program: &std::path::Path) -> std::process::Output {
+        let commands: Vec<String> = accesslint_in_the_image()
+            .into_iter()
+            .skip(2)
+            .map(|command| command.replace("/usr/local/npm/bin/accesslint-mcp", &program.display().to_string()))
+            .collect();
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(commands.join(" && "))
+            .env("HOME", home)
+            .output()
+            .expect("a shell runs the step")
+    }
+
+    #[test]
+    fn the_accesslint_plugins_server_entry_is_written_to_start_the_images_program_in_a_real_shell() {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let root = std::env::temp_dir().join(format!("qcode-accesslint-{}-{stamp}", std::process::id()));
+        let program = root.join("accesslint-mcp");
+        std::fs::create_dir_all(&root).expect("a folder");
+        std::fs::write(&program, "#!/bin/sh\n").expect("the program");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).expect("runnable");
+        }
+        // The file as plugin 0.10.3 installs it.
+        let plugin = root.join("home/.claude/plugins/cache/accesslint/accesslint/0.10.3");
+        std::fs::create_dir_all(&plugin).expect("the plugin's folder");
+        let original = "{\n  \"mcpServers\": {\n    \"accesslint\": {\n      \"command\": \"npx\",\n      \"args\": [\"-y\", \"@accesslint/mcp@latest\"]\n    }\n  }\n}\n";
+        std::fs::write(plugin.join(".mcp.json"), original).expect("its entry");
+
+        let ran = point_accesslint(&root.join("home"), &program);
+        assert!(ran.status.success(), "{}", String::from_utf8_lossy(&ran.stderr));
+        let written = std::fs::read_to_string(plugin.join(".mcp.json")).expect("the entry");
+        let entry: serde_json::Value = serde_json::from_str(&written).expect("JSON");
+        assert_eq!(entry["mcpServers"]["accesslint"]["command"], program.display().to_string(), "{written}");
+        assert_eq!(entry["mcpServers"]["accesslint"]["args"], serde_json::json!([]), "{written}");
+
+        // A plugin that keeps its entry elsewhere fails the build instead of staying on npx.
+        std::fs::remove_dir_all(root.join("home")).expect("the plugin goes");
+        let moved = root.join("home/.claude/plugins/cache/accesslint/accesslint/0.11.0/config");
+        std::fs::create_dir_all(&moved).expect("a folder");
+        std::fs::write(moved.join(".mcp.json"), original).expect("its entry");
+        assert!(!point_accesslint(&root.join("home"), &program).status.success(), "a moved entry is not found");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn every_image_with_the_security_guidance_plugin_carries_its_agent_sdk_and_no_other_installs_it() {
+        let venv = format!("\"$HOME\"/{AGENT_SDK_VENV}");
+        let with = [
+            profile(HarnessKind::ClaudeCode, Template::Recommended),
+            profile(HarnessKind::ClaudeCode, Template::High),
+            profile(HarnessKind::ClaudeCode, Template::QuvytaDev),
+            custom(HarnessKind::ClaudeCode, &[Extra::Plugin(SECURITY_GUIDANCE_PLUGIN)]),
+        ];
+        for carrying in with {
+            let file = image(&carrying).containerfile;
+            let step = steps(&file).into_iter().find(|step| step.contains("claude plugin install")).expect("plugins");
+            // The plugin's own hook is what the check asks, so the plugin has to be in the image
+            // before it runs.
+            let installed = step.find("claude plugin install security-guidance@claude-plugins-official").expect(&file);
+            let made = step.find(&format!("python3 -m venv {venv}")).expect(&file);
+            assert!(installed < made, "{step}");
+            assert!(step.contains(&format!("{venv}/bin/python -m pip install")), "{step}");
+            // The mark is left inside the environment, where the hook looks, the plugin's own hook
+            // is asked, and what it left behind is asked of before the mark is taken away again.
+            let marked = step.find(&format!("touch {venv}/{SECURITY_GUIDANCE_MARK}")).expect(&file);
+            let asked = step.find("hooks/ensure_agent_sdk.py").expect(&file);
+            let checked = step.find(&format!("test -f {venv}/{SECURITY_GUIDANCE_MARK}")).expect(&file);
+            let taken = step.find(&format!("rm -f {venv}/{SECURITY_GUIDANCE_MARK}")).expect(&file);
+            assert!(made < marked && marked < asked && asked < checked && checked < taken, "{step}");
+            assert!(file.find(&step).is_some_and(|at| at < file.find("ENV NPM_CONFIG_PREFIX").unwrap_or(0)), "{file}");
+            // The plugins' step installs nothing from the system: an interpreter comes with
+            // graphify, and a set without it is given one in a step of its own.
+            assert!(!step.contains("apt-get install"), "{:?}: {step}", carrying.template);
+            assert!(carries_the_agent_sdk(&carrying), "{:?}", carrying.template);
+        }
+        // The plugin's own step is written as root, beside graphify's, and the image goes back to
+        // its user for the plugins themselves, which write into the home.
+        let own = image(&custom(HarnessKind::ClaudeCode, &[Extra::Plugin(SECURITY_GUIDANCE_PLUGIN)])).containerfile;
+        let python = own.find("python3-venv").expect("the Python a venv needs");
+        let back = own.find(&format!("USER {USER}")).expect("the image goes back to its user");
+        assert!(own.rfind("USER root").is_some_and(|root| root < python && python < back), "{own}");
+
+        for without in [
+            profile(HarnessKind::ClaudeCode, Template::Base),
+            custom(HarnessKind::ClaudeCode, &[Extra::Plugin("superpowers@claude-plugins-official")]),
+            custom(HarnessKind::ClaudeCode, &[Extra::Graphify]),
+            profile(HarnessKind::OpenCode, Template::QuvytaDev),
+        ] {
+            let file = image(&without).containerfile;
+            assert!(!file.contains(AGENT_SDK), "{:?} {:?}: {file}", without.harness, without.template);
+            assert!(!file.contains("ensure_agent_sdk.py"), "{:?} {:?}: {file}", without.harness, without.template);
+            assert!(!carries_the_agent_sdk(&without), "{:?} {:?}", without.harness, without.template);
+        }
+    }
+
+    /// Runs, in a real shell with `home` as the home directory, the commands of the security-guidance
+    /// step that check the environment: the mark it leaves, the plugin's own hook and what is asked
+    /// of what the hook left behind.
+    fn check_the_agent_sdk(home: &std::path::Path) -> std::process::Output {
+        let commands: Vec<String> = security_guidance_in_the_image().into_iter().skip(3).collect();
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(commands.join(" && "))
+            .env("HOME", home)
+            .output()
+            .expect("a shell runs the step")
+    }
+
+    /// The plugin's own hook, as much of it as this step depends on: it uses the environment beside
+    /// its state when that python imports the package, and where it does not, it clears the
+    /// environment and installs there (`ensure_agent_sdk.py`, 2.0.8).
+    const HOOK: &str = r#"
+import pathlib, subprocess, sys
+venv = pathlib.Path.home() / ".claude/security/agent-sdk-venv"
+python = venv / "bin/python"
+if not python.exists() or subprocess.run([str(python), "-c", "import claude_agent_sdk"], capture_output=True).returncode:
+    subprocess.run([sys.executable, "-m", "venv", "--clear", str(venv)], check=True)
+print('{"metrics": {"sdk_bootstrap": 1}}')
+"#;
+
+    /// A home with the plugin's hook where the image keeps it, and an environment beside its state
+    /// whose python answers the way `imports` says: what the step leaves behind once it has
+    /// installed. The environment's own `lib` folder is what makes it a venv rather than a folder.
+    fn agent_sdk_home(root: &std::path::Path, python: &str) -> std::path::PathBuf {
+        let home = root.join("home");
+        let hooks = home.join(".claude/plugins/cache/claude-plugins-official/security-guidance/2.0.8/hooks");
+        std::fs::create_dir_all(&hooks).expect("the plugin's folder");
+        std::fs::write(hooks.join("ensure_agent_sdk.py"), HOOK).expect("the plugin's hook");
+        let venv = home.join(AGENT_SDK_VENV);
+        std::fs::create_dir_all(venv.join("lib/python3.13/site-packages")).expect("the environment");
+        std::fs::create_dir_all(venv.join("bin")).expect("the environment's own bin");
+        let program = venv.join("bin/python");
+        std::fs::write(&program, python).expect("the environment's python");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).expect("runnable");
+        }
+        home
+    }
+
+    /// The environment's python as the image's is where the package imports, and as the step
+    /// failing to put it there is where it does not.
+    const IMPORTS: &str = "#!/bin/sh\nexit 0\n";
+    const DOES_NOT_IMPORT: &str = "#!/bin/sh\nexit 1\n";
+
+    #[test]
+    fn the_security_guidance_hooks_own_environment_is_the_one_it_finds_in_a_real_shell() {
+        // The plugin's own file, run by a real shell with a home of this test's own: where the
+        // environment's python imports the package, the hook uses it and builds nothing, and the
+        // mark the step left inside it is still there afterwards.
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let root = std::env::temp_dir().join(format!("qcode-agent-sdk-{}-{stamp}", std::process::id()));
+        let home = agent_sdk_home(&root, IMPORTS);
+        let venv = home.join(AGENT_SDK_VENV);
+        let ran = check_the_agent_sdk(&home);
+        assert!(ran.status.success(), "{}", String::from_utf8_lossy(&ran.stderr));
+        assert!(!venv.join(SECURITY_GUIDANCE_MARK).exists(), "the mark is taken away again");
+        assert!(venv.join("lib").is_dir(), "the environment is the one it found: {}", venv.display());
+
+        // An environment the hook cannot use: it clears it and installs into it, which takes the
+        // mark with it, so the step fails rather than leaving an image whose first tab needs the
+        // network.
+        std::fs::remove_dir_all(&home).expect("the home goes");
+        let home = agent_sdk_home(&root, DOES_NOT_IMPORT);
+        let ran = check_the_agent_sdk(&home);
+        assert!(!ran.status.success(), "the mark was there: {}", String::from_utf8_lossy(&ran.stdout));
+        assert!(!home.join(AGENT_SDK_VENV).join(SECURITY_GUIDANCE_MARK).exists(), "the mark is gone with it");
+
+        // A plugin that moved its file fails the step, whatever the environment holds.
+        std::fs::remove_dir_all(&home).expect("the home goes");
+        let moved = root.join("home/.claude/plugins/cache/claude-plugins-official/security-guidance/2.0.9/lib");
+        std::fs::create_dir_all(&moved).expect("a folder");
+        std::fs::write(moved.join("ensure_agent_sdk.py"), HOOK).expect("the plugin's hook");
+        assert!(!check_the_agent_sdk(&root.join("home")).status.success(), "a moved hook is not found");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rust_analyzers_plugin_comes_only_with_rust_and_the_program_it_names() {
+        let components = "--component clippy --component rustfmt --component rust-analyzer --component rust-src";
+        let check = "CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup /opt/cargo/bin/rust-analyzer --version";
+        let rust = |profile: &Profile| {
+            let file = image(profile).containerfile;
+            (file.contains(components), file.contains(check), file.contains("claude plugin install rust-analyzer-lsp"))
+        };
+        // Quvyta development, and a set of the person's own with Rust and the plugin: all of it.
+        let dev = profile(HarnessKind::ClaudeCode, Template::QuvytaDev);
+        assert_eq!(rust(&dev), (true, true, true));
+        let own = custom(HarnessKind::ClaudeCode, &[Extra::Rust, Extra::Plugin(RUST_ANALYZER_PLUGIN)]);
+        assert_eq!(rust(&own), (true, true, true));
+        // QCode extra has no Rust, so no plugin that would name a program it does not have.
+        assert_eq!(rust(&profile(HarnessKind::ClaudeCode, Template::High)), (false, false, false));
+        // Rust without the plugin, or for a harness that has no such plugin, is Rust alone.
+        let without = Profile { without: vec![Extra::Plugin(RUST_ANALYZER_PLUGIN)], ..dev };
+        assert_eq!(rust(&without), (false, false, false));
+        assert_eq!(rust(&profile(HarnessKind::OpenCode, Template::QuvytaDev)), (false, false, false));
+    }
+
+    #[test]
     fn a_part_switched_off_is_not_installed_and_the_rest_still_are() {
         let without = |without: Vec<Extra>| Profile { without, ..profile(HarnessKind::ClaudeCode, Template::High) };
         let file = image(&without(vec![Extra::Plugin("context7@claude-plugins-official")])).containerfile;
         assert!(!file.contains("context7"), "{file}");
-        for plugin in CLAUDE_PLUGINS.iter().filter(|plugin| !plugin.starts_with("context7@")) {
+        for plugin in CLAUDE_EXTRA_PLUGINS.iter().filter(|plugin| !plugin.starts_with("context7@")) {
             assert!(file.contains(&format!("claude plugin install {plugin}")), "{plugin}: {file}");
         }
         assert!(file.contains("pipx install --global graphifyy"), "{file}");
@@ -1198,14 +1607,17 @@ mod tests {
         assert!(!file.contains("graphify") && !file.contains("pipx"), "{file}");
         assert!(file.contains("claude plugin install superpowers@claude-plugins-official"), "{file}");
 
-        // Everything off is QCode recommended's image with everything off.
-        let file = image(&without(Template::High.extras(HarnessKind::ClaudeCode))).containerfile;
+        // Every part off is one image whichever set it started from: nothing of ours is written
+        // into it and nothing is downloaded beside the harness.
+        let file = image(&without(Template::High.parts(HarnessKind::ClaudeCode))).containerfile;
         let recommended = Profile {
-            without: Template::Recommended.extras(HarnessKind::ClaudeCode),
+            without: Template::Recommended.parts(HarnessKind::ClaudeCode),
             ..profile(HarnessKind::ClaudeCode, Template::Recommended)
         };
         assert_eq!(file, image(&recommended).containerfile);
+        assert_eq!(file, image(&profile(HarnessKind::ClaudeCode, Template::Base)).containerfile);
         assert!(!file.contains("claude plugin") && !file.contains("graphify"), "{file}");
+        assert!(!file.contains("COPY template"), "and no settings of ours: {file}");
     }
 
     #[test]
@@ -1251,7 +1663,7 @@ mod tests {
     }
 
     #[test]
-    fn every_step_of_a_qcode_template_says_whose_it_is_and_that_the_build_needs_the_network_when_it_fails() {
+    fn every_step_of_a_qcode_set_says_whose_it_is_and_that_the_build_needs_the_network_when_it_fails() {
         for (template, failed, name) in [
             (Template::Recommended, RECOMMENDED_FAILED, "QCode recommended"),
             (Template::High, EXTRA_FAILED, "QCode extra"),
@@ -1262,7 +1674,11 @@ mod tests {
                     .into_iter()
                     .filter(|step| ["pipx", "claude plugin", "oh-my-openagent"].iter().any(|word| step.contains(word)))
                     .collect();
-                assert_eq!(added.len(), template.additions(harness).len(), "{template:?} {harness:?}: {file}");
+                assert_eq!(
+                    added.len(),
+                    profile(harness, template).additions().len(),
+                    "{template:?} {harness:?}: {file}"
+                );
                 for step in added {
                     assert!(step.starts_with("{ "), "the whole step is one group: {step}");
                     assert!(step.contains(&format!("|| {{ echo '{failed} ")), "{step}");
@@ -1272,6 +1688,11 @@ mod tests {
                 }
             }
         }
+        // A set of the person's own says so in words of its own, and promises nothing of QCode's.
+        let file = image(&custom(HarnessKind::ClaudeCode, &Template::available(HarnessKind::ClaudeCode))).containerfile;
+        assert!(file.contains(&format!("|| {{ echo '{CUSTOM_FAILED} ")), "{file}");
+        assert!(file.contains("What a custom profile adds"), "{file}");
+        assert!(!file.contains(EXTRA_FAILED) && !file.contains(RECOMMENDED_FAILED), "{file}");
     }
 
     #[test]

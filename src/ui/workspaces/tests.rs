@@ -16,6 +16,7 @@ use qframe::runtime::Harness;
 use super::{Msg, Overlay, Workspaces, update, view};
 use crate::engine::{Engine, EngineKind, detect};
 use crate::store::Store;
+use crate::ui::page;
 
 /// A terminal big enough for the list and the dialog.
 const SIZE: (u16, u16) = (96, 34);
@@ -73,6 +74,20 @@ fn env() -> Env {
 /// A harness over the store at `root`, with the first listing already answered.
 fn screen(root: &Path, engine: Option<Engine>) -> Harness<Screen> {
     screen_over(Workspaces::new(Store::new(root), engine, Vec::new()))
+}
+
+/// A harness over the store at `root` in a terminal `wide` cells across and `tall` rows high,
+/// with the first listing already answered.
+fn screen_wide(root: &Path, wide: u16, tall: u16) -> Harness<Screen> {
+    let mut harness = Harness::with_env(
+        Screen { state: Workspaces::new(Store::new(root), None, Vec::new()), opened: Vec::new(), deleted: Vec::new() },
+        env(),
+        wide,
+        tall,
+    );
+    harness.set_locale("en").set_glyph_mode(GlyphMode::Unicode).set_reduced_motion(true);
+    harness.send(Msg::Refresh).render();
+    harness
 }
 
 /// A harness over `state`, with the first listing already answered.
@@ -139,6 +154,30 @@ fn the_workspace_opened_last_says_so_instead_of_its_day() {
 }
 
 #[test]
+fn the_list_stands_in_the_middle_at_a_readable_width() {
+    let scratch = Scratch::new("page");
+    let store = Store::new(scratch.path());
+    store.create_workspace("Firefly", qframe::date::Date::new(2026, 9, 17).expect("a real day")).expect("made");
+    let mut harness = screen_wide(scratch.path(), 200, 30);
+    // The heading stands at the page's left edge, a row's day at its right edge, and the page
+    // itself in the middle of a terminal twice as wide as it is.
+    let left = (200 - i32::from(page::WIDTH)) / 2;
+    let right = left + i32::from(page::WIDTH);
+    let (heading, _) = harness.find("Workspaces").expect("the heading is drawn");
+    assert!(heading.abs_diff(left) <= 1, "the heading does not stand at the page's edge:\n{}", harness.screen());
+    let (row, _) = harness.find("Firefly").expect("the workspace is listed");
+    assert!(row >= left && row < right, "the row is outside the page ({row}):\n{}", harness.screen());
+    let (day, _) = harness.find("Created 2026-09-17").expect("the day is shown");
+    assert_eq!(day + 18, right - 1, "the day does not end at the page's edge:\n{}", harness.screen());
+
+    harness.resize(70, 30).render();
+    let text = harness.screen();
+    assert!(text.contains("Firefly") && text.contains("Created 2026-09-17"), "{text}");
+    let (heading, _) = harness.find("Workspaces").expect("the heading is drawn");
+    assert!(heading < 8, "a narrow terminal keeps the page at its edge:\n{text}");
+}
+
+#[test]
 fn a_broken_workspace_is_listed_and_says_why_when_it_is_opened() {
     let scratch = Scratch::new("broken");
     let store = Store::new(scratch.path());
@@ -165,7 +204,18 @@ fn a_name_that_yields_no_folder_name_is_explained_where_it_was_typed() {
     harness.send(Msg::Start).render();
     typed(&mut harness, "...");
     let text = harness.screen();
-    assert!(text.contains("leaves nothing a folder can be called"), "{text}");
+    assert!(text.contains("Use at least one letter or digit."), "{text}");
+}
+
+#[test]
+fn the_form_refuses_an_empty_name_in_one_short_line() {
+    let scratch = Scratch::new("name-short");
+    let mut harness = screen_wide(scratch.path(), 120, 40);
+    harness.click_text("New workspace").render();
+    typed(&mut harness, "...");
+    let text = harness.screen();
+    assert!(text.contains("Use at least one letter or digit."), "{text}");
+    assert!(!text.contains("leaves nothing a folder can be called"), "{text}");
 }
 
 #[test]
@@ -868,6 +918,10 @@ fn a_folder_used_where_it_is_is_not_copied_and_the_workspace_names_it() {
     make_in_place(&mut harness, &own);
     let text = harness.screen();
     assert!(text.contains("change your real files"), "the choice says what it means:\n{text}");
+    // The promise about deleting stays, in fewer words than it once took.
+    let said = text.replace('▌', " ").split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(said.contains("Deleting the workspace leaves the folder."), "{text}");
+    assert!(!said.contains("everything in it as it is"), "{text}");
     assert!(text.contains("Folder to work in"), "{text}");
     harness.click_text("Create").render();
     settle(&mut harness, |harness| harness.app().state.overlay.is_none());
@@ -1132,4 +1186,31 @@ fn what_a_copy_leaves_behind_is_logged_in_the_language_on_screen() {
     let lines: Vec<String> = harness.app().state.log.iter().map(|line| line.text().to_owned()).collect();
     let socket = format!("{}: ne dosya ne klasör, olduğu yerde bırakıldı", source.join("socket").display());
     assert!(lines.contains(&socket), "{lines:#?}");
+}
+
+#[test]
+fn on_a_small_terminal_the_folder_browser_of_a_new_workspace_shows_several_folders_at_once() {
+    let scratch = Scratch::new("small-picker");
+    let folders = scratch.path().join("projects");
+    let names = ["alder", "birch", "cedar", "elm", "fir", "hazel", "larch", "maple", "oak", "pine", "rowan", "yew"];
+    for name in names {
+        fs::create_dir_all(folders.join(name)).expect("a folder to choose from");
+    }
+    let mut harness = screen_wide(&scratch.path().join("store"), 80, 24);
+    harness.click_text("New workspace").render();
+    harness.click_text("A folder").render();
+    harness.click_text("Browse…").render();
+    // The browser starts in the person's home folder; the test's own folders stand in for it.
+    harness.send(Msg::Picker(qframe::widgets::FilePickerMsg::Open(folders.clone()))).advance(Duration::from_millis(50));
+    harness.render();
+    let text = harness.screen();
+    let shown =
+        names.iter().filter(|name| text.lines().any(|line| line.split_whitespace().any(|word| word == **name))).count();
+    assert!(shown >= 5, "only {shown} folders can be seen at once:\n{text}");
+
+    // Choosing the folder that is open closes the browser and puts it in the form.
+    harness.click_text("Choose folder").render();
+    let text = harness.screen();
+    assert!(text.contains("Browse…") && text.contains("projects"), "the form holds the folder chosen:\n{text}");
+    assert!(!text.contains("Choose folder"), "the browser closed:\n{text}");
 }

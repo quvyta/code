@@ -9,7 +9,8 @@
 # server keeps no state and a harness that asks twice (a retry, a title, a side question) gets the
 # same answer for the same conversation. A request without tools is answered with plain text.
 #
-# Every request's path and the tool names it offered are written to /tmp/fake-model.log.
+# Every request's path and the tool names it offered are written to /tmp/fake-model.log, and every
+# request's body, one a line, to /tmp/fake-model.bodies, where a test finds what a harness sent.
 
 import http.server
 import json
@@ -17,8 +18,10 @@ import sys
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 41417
 COMMAND = "touch /tmp/outside-the-workspace /work/asked-nothing"
-FILE = "/work/edited-without-asking.txt"
-TEXT = "written without asking\n"
+# The file the second answer writes; a second argument names another, such as a source file a
+# language server of the harness is to wake up for, which then gets the words as a comment.
+FILE = sys.argv[2] if len(sys.argv) > 2 else "/work/edited-without-asking.txt"
+TEXT = ("// " if FILE.endswith(".rs") else "") + "written without asking\n"
 WRITE_COMMAND = "printf 'written without asking\\n' > " + FILE
 
 SHELL = ["Bash", "bash", "run_shell_command", "Shell", "shell", "exec_command", "shell_command"]
@@ -139,6 +142,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("content-length") or 0)
         raw = self.rfile.read(length)
+        with open("/tmp/fake-model.bodies", "ab") as out:
+            out.write(raw.replace(b"\n", b" ") + b"\n")
         try:
             req = json.loads(raw or b"{}")
         except ValueError:

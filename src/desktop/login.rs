@@ -683,10 +683,10 @@ mod tests {
         assert_eq!((onboarding_key, onboarding), ("antigravityOnboarding", "true"));
     }
 
-    /// Node, when this machine has one: the program runs in the image, which always has it.
+    /// Node, when this machine has one: the program runs in the image, which always has it, and a
+    /// machine without one fails these tests unless it says it has none knowingly.
     fn node() -> Option<PathBuf> {
-        let found = std::process::Command::new("sh").args(["-c", "command -v node"]).output().ok()?;
-        found.status.success().then(|| PathBuf::from(String::from_utf8_lossy(&found.stdout).trim()))
+        crate::testing::node("taking the login out")
     }
 
     /// A login as the application writes one after a Google sign-in: the token for `access-417`
@@ -763,10 +763,7 @@ mod tests {
     #[test]
     fn the_login_taken_out_of_a_window_is_readable_by_its_owner_alone() {
         use std::os::unix::fs::PermissionsExt as _;
-        let Some(node) = node() else {
-            eprintln!("skipped: this machine has no Node, and the program that takes the login out needs one");
-            return;
-        };
+        let Some(node) = node() else { return };
         let folder = Scratch::new("token-mode").expect("a folder");
         let spelled = |path: &Path| path.to_str().expect("a path").to_owned();
         let login = folder.path().join(STORED);

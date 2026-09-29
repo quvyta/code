@@ -4,8 +4,9 @@
 //! conversations in a file the test reads, and as `attach` notes every start in another file and
 //! then waits, the way an interface waits for its person. The script is the one QCode writes into
 //! a workspace, run unchanged; only its port, folders and log are its own, so that runs beside
-//! each other never meet. Without Node on the machine these tests say so and pass, like the
-//! history scripts' tests.
+//! each other never meet. A machine without Node fails these tests and says how to go on, for a
+//! pass without the script would read as checked; only `QCODE_SKIP_NODE=1` skips them, and says
+//! so in the log.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -145,17 +146,16 @@ if (what === "serve") {
 
 /// A run of the script against the stand-in: its own port, folders and log.
 struct Rig {
+    node: PathBuf,
     folder: PathBuf,
     port: u16,
 }
 
 impl Rig {
-    /// A rig, or `None` on a machine without Node.
+    /// A rig under this machine's own Node, or `None` where the machine is said to have none
+    /// knowingly.
     fn new(name: &str) -> Option<Self> {
-        if Command::new("node").arg("--version").output().is_err() {
-            eprintln!("node is not installed here; the shared server's script is not run");
-            return None;
-        }
+        let node = crate::testing::node("running the shared server's script")?;
         let folder = scratch(name);
         std::fs::create_dir_all(folder.join("bin")).expect("a folder for the stand-in");
         std::fs::create_dir_all(folder.join("work")).expect("a workspace folder");
@@ -170,7 +170,7 @@ impl Rig {
         // A port of this run's own, away from the ones QCode uses.
         let port =
             std::net::TcpListener::bind("127.0.0.1:0").expect("a free port").local_addr().expect("its port").port();
-        Some(Self { folder, port })
+        Some(Self { node, folder, port })
     }
 
     /// What QCode hands the script, pointed at this rig.
@@ -189,7 +189,7 @@ impl Rig {
     }
 
     fn command(&self, token: &str, arguments: &[&str]) -> Command {
-        let mut command = Command::new("node");
+        let mut command = Command::new(&self.node);
         command.arg(self.folder.join("qcode-opencode.mjs")).args(arguments);
         command.envs(self.environment(token)).env_remove(crate::bridge::TOKEN_VARIABLE);
         command
@@ -263,10 +263,54 @@ impl Rig {
     }
 }
 
+impl Rig {
+    /// Every process of this rig still running: the script, the keeper it leaves behind, the
+    /// stand-in's server and interfaces, and the tabs' loops. The keeper is started detached, in a
+    /// session of its own, and outlives the `ready` that started it, so it is no child of the
+    /// test's; each of them carries the rig's folder in its environment, and is found by that.
+    fn processes(&self) -> Vec<u32> {
+        let mark = format!("STAND_IN={}", self.folder.display());
+        let Ok(entries) = std::fs::read_dir("/proc") else { return Vec::new() };
+        entries
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|pid| *pid != std::process::id() && !zombie(*pid))
+            .filter(|pid| {
+                std::fs::read(format!("/proc/{pid}/environ"))
+                    .is_ok_and(|environment| environment.split(|byte| *byte == 0).any(|each| each == mark.as_bytes()))
+            })
+            .collect()
+    }
+
+    /// The keepers of this rig.
+    fn keepers(&self) -> Vec<u32> {
+        self.processes()
+            .into_iter()
+            .filter(|pid| {
+                std::fs::read(format!("/proc/{pid}/cmdline"))
+                    .is_ok_and(|words| words.split(|byte| *byte == 0).any(|word| word == b"keep"))
+            })
+            .collect()
+    }
+}
+
+/// Whether the test passes, fails or panics, nothing of the rig outlives it: a keeper left behind
+/// starts its server again for ever once the folder is gone, and asks ports other tests take
+/// later whether they are its server.
 impl Drop for Rig {
     fn drop(&mut self) {
-        for pid in self.servers() {
-            signal(pid, rustix::process::Signal::KILL);
+        // A tab's loop may start a process between one look and the next, so it is looked for
+        // until none is left, for a while that is generous but not endless.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let left = self.processes();
+            if left.is_empty() || Instant::now() > deadline {
+                break;
+            }
+            for pid in left {
+                signal(pid, rustix::process::Signal::KILL);
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
         let _ = std::fs::remove_dir_all(&self.folder);
     }
@@ -317,6 +361,20 @@ fn a_server_an_earlier_qcode_left_is_replaced_by_one_of_this_qcodes_token() {
         rig.lines("served.log").iter().filter_map(|line| line.split_whitespace().nth(1).map(str::to_owned)).collect();
     assert_eq!(tokens, ["old", "new"]);
     assert_eq!(rig.servers().len(), 1);
+}
+
+#[test]
+fn a_keeper_whose_server_will_not_come_back_ends_once_no_tab_is_left() {
+    let Some(rig) = Rig::new("lonely") else { return };
+    rig.ready("srv", None);
+    until("the keeper runs", || !rig.keepers().is_empty());
+    // opencode now ends as soon as it starts, and the server running is ended under a keeper no
+    // tab uses.
+    std::fs::write(rig.folder.join("bin").join("opencode"), "#!/bin/sh\nexit 1\n").expect("the stand-in");
+    for pid in rig.servers() {
+        signal(pid, rustix::process::Signal::KILL);
+    }
+    until("the keeper ends", || rig.keepers().is_empty());
 }
 
 #[test]

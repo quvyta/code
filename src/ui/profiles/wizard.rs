@@ -221,8 +221,11 @@ pub struct Draft {
     pub renamed: bool,
     /// The chosen harness.
     pub harness: HarnessKind,
-    /// The chosen template.
+    /// The row the template page's picker reads: the ready-made set last chosen while the switches
+    /// still read as it, and Custom once they do not ([`Draft::preset`]).
     pub template: Template,
+    /// The parts the image carries, each switched on or off on the template page.
+    pub parts: Vec<Extra>,
     /// The chosen account type.
     pub account: AccountKind,
     /// The providers the person has added, as the Providers page last had them, for the account
@@ -236,10 +239,6 @@ pub struct Draft {
     pub assets: MountAccess,
     /// What the container may reach.
     pub network: NetworkMode,
-    /// The parts of a QCode template's additions switched off. Kept while another template or harness
-    /// is looked at, so going back finds them as they were left; only the ones the chosen
-    /// template and harness add reach the profile.
-    pub without: Vec<Extra>,
     /// The system the image is built on.
     pub os: Os,
     /// How far the build has got.
@@ -272,8 +271,8 @@ pub enum Blocked {
     NoProvider,
     /// The chosen system does not run the chosen harness, for this reason.
     Unsupported(Refusal),
-    /// Chromium is on, and the chosen system has none that runs in a container.
-    NoChromium,
+    /// The containers are to reach no network, and the harness means nothing without it.
+    NeedsNetwork,
 }
 
 impl Draft {
@@ -288,6 +287,7 @@ impl Draft {
             renamed: false,
             harness,
             template: Template::Recommended,
+            parts: Template::Recommended.parts(harness),
             account: first_account(harness),
             providers,
             provider_tag: None,
@@ -296,7 +296,6 @@ impl Draft {
             // add to, so a new profile may write there unless the person narrows it.
             assets: MountAccess::ReadWrite,
             network: NetworkMode::Full,
-            without: Vec::new(),
             os: Os::Debian,
             build: Build::Waiting,
             log: LogBuffer::new(LOG_LINES),
@@ -319,14 +318,14 @@ impl Draft {
             name: profile.name.as_str().to_owned(),
             renamed: true,
             harness: profile.harness,
-            template: profile.template,
+            template: Self::reading(profile.template, &profile.parts(), profile.harness, profile.os),
+            parts: profile.parts(),
             account: profile.account,
             providers: Vec::new(),
             provider_tag: profile.provider.as_ref().map(|provider| provider.tag.clone()),
             provider_model: profile.provider.as_ref().map(|provider| provider.model.clone()),
             assets: profile.assets,
             network: profile.network,
-            without: profile.without.clone(),
             os: profile.os,
             build: Build::Done,
             log: LogBuffer::new(LOG_LINES),
@@ -421,6 +420,15 @@ impl Draft {
         matches!(self.build, Build::Failed(_)) && self.log.iter().any(|line| line.text().contains(recipe::SLIM_FAILED))
     }
 
+    /// Whether the build failed because a step of a profile whose parts are its own could not
+    /// download what it installs, which the step says in words of its own
+    /// (`recipe::CUSTOM_FAILED`) in the log.
+    #[must_use]
+    pub fn custom_download_failed(&self) -> bool {
+        matches!(self.build, Build::Failed(_))
+            && self.log.iter().any(|line| line.text().contains(recipe::CUSTOM_FAILED))
+    }
+
     /// Whether this draft is only a login for a profile that already exists.
     #[must_use]
     pub fn is_only_login(&self) -> bool {
@@ -441,6 +449,11 @@ impl Draft {
     /// Chooses a harness. While the name has not been touched it follows the harness, and a
     /// different harness brings its own first account type: the account page comes after this
     /// one, and each harness offers its own list, headed by the one most people start with.
+    ///
+    /// The parts follow the harness too. A ready-made set stays that set and gives what it gives
+    /// for the new harness, or QCode recommended where the set is not offered. A set of the
+    /// person's own keeps the parts this harness can have, so moving from Claude Code to opencode
+    /// does not take graphify away.
     pub fn choose_harness(&mut self, harness: HarnessKind) {
         let changed = harness != self.harness;
         self.harness = harness;
@@ -450,11 +463,49 @@ impl Draft {
         if changed || !harness.supports(self.account) {
             self.account = first_account(harness);
         }
-        // A template this harness is not offered, chosen for the one before, would build an image
-        // the page never showed.
-        if !Template::offered(harness).contains(&self.template) {
-            self.template = Template::Recommended;
+        match self.template {
+            Template::Custom => {
+                let available = Template::available(harness);
+                self.parts.retain(|part| available.contains(part));
+                self.settle();
+            }
+            set if Template::offered(harness).contains(&set) => self.choose(set),
+            _ => self.choose(Template::Recommended),
         }
+    }
+
+    /// The parts an image can carry on `os`, in the order the page lists them: what was asked
+    /// for, less what the system has none of.
+    fn keepable(os: Os, parts: Vec<Extra>) -> Vec<Extra> {
+        let parts = if os.chromium().is_none() {
+            parts.into_iter().filter(|part| *part != Extra::Chromium).collect()
+        } else {
+            parts
+        };
+        Extra::ordered(parts)
+    }
+
+    /// The row the picker reads for `parts` of a profile of `harness` on `os` that was written
+    /// under `template`.
+    ///
+    /// A ready-made set reads as itself while the switches are what it switches on, as far as the
+    /// system can carry them: Quvyta development on a system without a Chromium that runs in a
+    /// container is still Quvyta development. Otherwise the first ready-made set the switches are
+    /// exactly, and Custom when they are none. opencode's QCode recommended and QCode extra switch
+    /// on the same parts, so which of the two was chosen is kept, not guessed.
+    fn reading(template: Template, parts: &[Extra], harness: HarnessKind, os: Os) -> Template {
+        let offered = Template::offered(harness);
+        let exactly = |set: Template| Self::keepable(os, set.parts(harness)) == Self::keepable(os, parts.to_vec());
+        if template != Template::Custom && offered.contains(&template) && exactly(template) {
+            return template;
+        }
+        offered.into_iter().filter(|set| *set != Template::Custom).find(|set| exactly(*set)).unwrap_or(Template::Custom)
+    }
+
+    /// Drops a part the chosen system has none of, and reads the picker again from the switches.
+    fn settle(&mut self) {
+        self.parts = Self::keepable(self.os, std::mem::take(&mut self.parts));
+        self.template = Self::reading(self.template, &self.parts, self.harness, self.os);
     }
 
     /// The provider the tag `tag` names among the ones the person has added, if there is one.
@@ -472,7 +523,7 @@ impl Draft {
     }
 
     /// Chooses the provider tagged `tag`, and with it the first model it is known to offer, so
-    /// that picking a provider that already has one model chosen it for the person rather than
+    /// that picking a provider that already has one model chose it for the person rather than
     /// leaving a second, empty choice behind it.
     pub fn choose_provider(&mut self, tag: &str) {
         self.provider_tag = Some(tag.to_owned());
@@ -525,6 +576,10 @@ impl Draft {
 
     /// The profile the draft describes, if the name is usable and, for a provider account, both
     /// a provider and a model have been chosen.
+    ///
+    /// A ready-made set the picker reads is written as itself. The switches of a set of the
+    /// person's own are written in the terms an older QCode builds the same way where there are
+    /// such terms ([`Template::written_as`]), and as Custom only where there are not.
     #[must_use]
     pub fn profile(&self) -> Option<Profile> {
         let provider = match self.account {
@@ -533,44 +588,94 @@ impl Draft {
             }
             _ => None,
         };
+        let parts = &self.parts;
+        let template = match self.template {
+            Template::Custom => Template::written_as(parts, self.harness),
+            set => set,
+        };
         Some(Profile {
             name: SafeName::from_display(&self.name)?,
             harness: self.harness,
-            template: self.template,
+            template,
             account: self.account,
             provider,
             assets: self.assets,
             network: self.network,
-            without: self.without.iter().copied().filter(|extra| self.offers(*extra)).collect(),
+            without: template.parts(self.harness).into_iter().filter(|extra| !parts.contains(extra)).collect(),
             os: self.os,
         })
     }
 
-    /// Whether the chosen template adds `extra` for the chosen harness, so that it is offered.
+    /// The row the picker reads.
     #[must_use]
-    pub fn offers(&self, extra: Extra) -> bool {
-        self.template.extras(self.harness).contains(&extra)
+    pub fn preset(&self) -> Template {
+        self.template
     }
 
-    /// Whether `extra` is offered and switched on.
+    /// Every part this profile can have, whatever the picker reads: the list the page shows.
+    #[must_use]
+    pub fn offered(&self) -> Vec<Extra> {
+        Template::available(self.harness)
+    }
+
+    /// Whether `extra` is switched on.
     #[must_use]
     pub fn has(&self, extra: Extra) -> bool {
-        self.offers(extra) && !self.without.contains(&extra)
+        self.parts.contains(&extra)
     }
 
-    /// Whether anything at all is added to the image beside the harness and its settings: false
-    /// for base, and for a QCode template with every part switched off.
+    /// Whether anything is downloaded into the image beside the harness: the recommended settings
+    /// are written, not downloaded.
     #[must_use]
     pub fn adds_anything(&self) -> bool {
-        self.template.extras(self.harness).into_iter().any(|extra| self.has(extra))
+        self.parts.iter().any(|part| *part != Extra::Settings)
     }
 
-    /// Switches `extra` on or off.
+    /// Switches `extra` on or off, and the picker reads Custom unless the switches are now exactly
+    /// a ready-made set. The two teams of agents opencode has exclude each other: each one
+    /// switched on switches the other off, since a container runs one of them, not both. A part the
+    /// chosen system has none of stays off; its switch is disabled.
     pub fn switch(&mut self, extra: Extra, on: bool) {
-        self.without.retain(|left| *left != extra);
-        if !on {
-            self.without.push(extra);
+        if on {
+            let other = match extra {
+                Extra::OhMyOpenAgent => Some(Extra::OhMyOpenCodeSlim),
+                Extra::OhMyOpenCodeSlim => Some(Extra::OhMyOpenAgent),
+                _ => None,
+            };
+            self.parts.retain(|part| Some(*part) != other);
+            if !self.parts.contains(&extra) {
+                self.parts.push(extra);
+            }
+        } else {
+            self.parts.retain(|part| *part != extra);
         }
+        self.settle();
+    }
+
+    /// Chooses the picker's row `template`: a ready-made set switches on every part it gives and
+    /// every other part off. Custom switches every part off, which is the harness as it comes, the
+    /// start of a set of the person's own.
+    pub fn choose(&mut self, template: Template) {
+        self.parts = match template {
+            Template::Custom => Vec::new(),
+            _ => template.parts(self.harness),
+        };
+        self.template = template;
+        self.settle();
+    }
+
+    /// Chooses the system the image is built on. A part the new system has none of is switched
+    /// off: no image can carry it there.
+    pub fn choose_os(&mut self, os: Os) {
+        self.os = os;
+        self.settle();
+    }
+
+    /// Whether the chosen system has no Chromium that runs in a container, which the page says
+    /// beside the switch it cannot move.
+    #[must_use]
+    pub fn chromium_refused(&self) -> bool {
+        self.os.chromium().is_none()
     }
 
     /// The name as it will be written, which is not always the name as it was typed.
@@ -591,14 +696,36 @@ impl Draft {
             // A harness the system cannot run is never built there: the page says why and stays
             // until the person picks another system or goes back for another harness.
             Stage::System => self.os.refuses(self.harness).map(Blocked::Unsupported),
-            // Said where the part is switched, which is where it can be switched off.
-            Stage::Template if self.has(Extra::Chromium) && self.os.chromium().is_none() => Some(Blocked::NoChromium),
             Stage::Account if self.account == AccountKind::Provider && self.profile_provider().is_none() => {
                 Some(Blocked::NoProvider)
+            }
+            // Reached only by a profile file that asks for both; the page offers no such pair.
+            Stage::Permissions if self.network == NetworkMode::None && !self.harness.offered_offline() => {
+                Some(Blocked::NeedsNetwork)
             }
             Stage::Image if self.build != Build::Done => Some(Blocked::NoImage),
             _ => None,
         }
+    }
+
+    /// The harnesses the first page offers: all of them, less the ones that mean nothing in a
+    /// container with no network while that is what the profile's containers are to get.
+    #[must_use]
+    pub fn harnesses(&self) -> Vec<HarnessKind> {
+        HarnessKind::ALL
+            .into_iter()
+            .filter(|harness| self.network != NetworkMode::None || harness.offered_offline())
+            .collect()
+    }
+
+    /// The network modes the permissions page offers: both, less no network at all for a harness
+    /// that means nothing without it.
+    #[must_use]
+    pub fn networks(&self) -> Vec<NetworkMode> {
+        NetworkMode::ALL
+            .into_iter()
+            .filter(|mode| *mode != NetworkMode::None || self.harness.offered_offline())
+            .collect()
     }
 
     /// The provider and model the account page has chosen so far, when both are there.
@@ -793,7 +920,7 @@ mod tests {
     fn a_draft_becomes_the_profile_it_describes() {
         let mut draft = Draft::new([], Vec::new());
         draft.name = "Claude Abonelik".to_owned();
-        draft.template = Template::Recommended;
+        draft.choose(Template::Recommended);
         draft.assets = MountAccess::ReadWrite;
         draft.network = NetworkMode::None;
         let profile = draft.profile().expect("the name folds");
@@ -867,20 +994,63 @@ mod tests {
         draft.choose_harness(HarnessKind::GeminiCli);
         draft.advance();
         assert_eq!(draft.stage, Stage::System, "the system is chosen right after the harness");
-        draft.os = Os::Alpine;
+        draft.choose_os(Os::Alpine);
         assert_eq!(draft.advance(), Some(Blocked::Unsupported(Refusal::TerminalLibrary)));
         assert_eq!(draft.stage, Stage::System, "Gemini CLI is never built on Alpine");
-        draft.os = Os::Arch;
+        draft.choose_os(Os::Arch);
         assert_eq!(draft.advance(), None);
         assert_eq!(draft.stage, Stage::Template);
         assert_eq!(draft.profile().map(|profile| profile.os), Some(Os::Arch));
     }
 
     #[test]
+    fn every_switch_off_is_written_as_the_harness_as_it_comes_and_a_narrowed_set_as_that_set() {
+        let mut draft = Draft::new([], Vec::new());
+        draft.choose(Template::Custom);
+        assert!(draft.parts.is_empty());
+        let profile = draft.profile().expect("a profile");
+        assert_eq!((profile.template, profile.without), (Template::Base, Vec::new()), "what every QCode reads");
+
+        // QCode extra with graphify off reads Custom on the page and is written as QCode extra
+        // without graphify, which every QCode builds the same.
+        draft.choose(Template::High);
+        draft.switch(Extra::Graphify, false);
+        assert_eq!(draft.preset(), Template::Custom);
+        let profile = draft.profile().expect("a profile");
+        assert_eq!((profile.template, profile.without.clone()), (Template::High, vec![Extra::Graphify]));
+        // And opened again, the page reads it as it was left.
+        assert_eq!(Draft::for_edit(&profile, Vec::new()).preset(), Template::Custom);
+        draft.switch(Extra::Graphify, true);
+        assert_eq!(draft.preset(), Template::High, "every switch of QCode extra is on again");
+
+        // opencode's QCode extra switches on what QCode recommended does; the row chosen stays.
+        draft.choose_harness(HarnessKind::OpenCode);
+        assert_eq!(draft.preset(), Template::High);
+        assert_eq!(draft.profile().map(|profile| profile.template), Some(Template::High));
+        assert_eq!(Template::High.parts(HarnessKind::OpenCode), Template::Recommended.parts(HarnessKind::OpenCode));
+    }
+
+    #[test]
+    fn quvyta_development_on_a_system_without_chromium_is_still_that_set_without_the_browser() {
+        let mut draft = Draft::new([], Vec::new());
+        draft.choose_os(Os::Ubuntu);
+        draft.choose(Template::QuvytaDev);
+        assert!(!draft.has(Extra::Chromium) && draft.has(Extra::Rust));
+        assert_eq!(draft.preset(), Template::QuvytaDev);
+        draft.switch(Extra::Chromium, true);
+        assert!(!draft.has(Extra::Chromium), "no image can carry it there");
+        let profile = draft.profile().expect("a profile");
+        assert_eq!((profile.template, profile.without), (Template::QuvytaDev, vec![Extra::Chromium]));
+        // Back on Debian the browser is offered again, off until switched on.
+        draft.choose_os(Os::Debian);
+        assert_eq!(draft.preset(), Template::Custom);
+    }
+
+    #[test]
     fn a_new_draft_is_built_on_debian_and_a_login_draft_keeps_its_profiles_system() {
         let mut draft = Draft::new([], Vec::new());
         assert_eq!(draft.os, Os::Debian);
-        draft.os = Os::Ubuntu;
+        draft.choose_os(Os::Ubuntu);
         let profile = draft.profile().expect("a profile");
         assert_eq!(Draft::for_login(&profile).os, Os::Ubuntu);
     }

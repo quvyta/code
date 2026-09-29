@@ -211,7 +211,7 @@ fn a_template_lands_in_the_home_directory_of_the_image_it_is_built_into() {
         let image = stand_in_image(&engine, &folder);
         let profile = profile();
         let container = work::open_login(&engine, &profile).expect("the login container opens");
-        let file = Template::Recommended.files(profile.harness).into_iter().next().expect("claude-code has settings");
+        let file = profile.files().into_iter().next().expect("claude-code has settings");
         let found =
             in_container(&engine, &container.name, &format!("grep -q bypassPermissions \"$HOME/{}\"", file.path));
         assert!(found, "{:?}: the template reached the home directory", engine.kind());

@@ -6,7 +6,10 @@ use qframe::storage::Settings;
 
 use crate::base::Os;
 use crate::engine::names;
-use crate::profile::{AccountKind, Addition, ConfigFile, Extra, HarnessKind, SafeName, Template};
+use crate::profile::{
+    AccountKind, Addition, ConfigFile, Extra, HarnessKind, OPENCODE_PLUGIN_SETTINGS, OPENCODE_SLIM_SETTINGS,
+    SLIM_OWN_SETTINGS, SafeName, Template,
+};
 use crate::provider::Wire;
 
 /// Whether a directory is mounted into the container writable or read-only.
@@ -275,7 +278,11 @@ pub struct Profile {
     pub name: SafeName,
     /// The harness the profile runs.
     pub harness: HarnessKind,
-    /// How much of the harness's own configuration the image carries.
+    /// The set of parts the image is built with, which for a ready-made one is also what the person
+    /// chose from a list ([`Template::parts`]); [`Template::Custom`] means the file names the parts
+    /// it goes without out of the whole list ([`Template::available`]). An id this QCode does not
+    /// know is refused rather than read as the harness as it comes, which would build an image the
+    /// file never asked for.
     pub template: Template,
     /// What the profile signs in with.
     pub account: AccountKind,
@@ -286,8 +293,11 @@ pub struct Profile {
     pub assets: MountAccess,
     /// What the container may reach.
     pub network: NetworkMode,
-    /// The parts of a QCode template's additions the person switched off for this profile. Empty means
-    /// everything its template adds, which is what a file without the choice reads as.
+    /// The parts the image is built without. A file names only what it goes without, so a profile
+    /// that names nothing has everything, which is also how every file written before the choice
+    /// existed reads. For a ready-made set that is the parts it does not switch on; for a
+    /// [`Template::Custom`] profile it is the parts of the whole list its harness can have
+    /// ([`Template::available`]) that it does not carry.
     pub without: Vec<Extra>,
     /// The system the profile's image is built on. Debian, which every profile was built on before
     /// there was a choice, is what a file that names none reads as.
@@ -379,7 +389,25 @@ impl Profile {
         });
         let harness = root.text(HARNESS).and_then(HarnessKind::parse);
         let account = root.text(ACCOUNT).and_then(AccountKind::parse);
-        let template = root.text(TEMPLATE).and_then(Template::parse).unwrap_or(Template::Base);
+        // A file that names no template is one written before there were templates, and is the
+        // harness as it comes. A file that names one this QCode does not know is refused, naming
+        // the id: falling back to the harness as it comes, as this once did, would build an image
+        // the file never asked for, and the person's own set of parts would be read as no parts at
+        // all. An older QCode has no `custom` folder to look in, so a custom profile is not
+        // something it can reach this way; refusing it is the second of the two guards.
+        let template = match root.text(TEMPLATE) {
+            None => Template::Base,
+            Some(id) => match Template::parse(id) {
+                Some(template) => template,
+                None => {
+                    let message = format!(
+                        "`{TEMPLATE}` is `{id}`, which this QCode has no template for; the profile is not read"
+                    );
+                    diagnostics.push(Diagnostic::error(root.value_location(TEMPLATE).cloned(), message));
+                    return Loaded { profile: None, diagnostics };
+                }
+            },
+        };
         let os = root.text(OS).and_then(Os::parse).unwrap_or_default();
         let mounts = root.table(MOUNTS);
         let assets = mounts.and_then(|mounts| mounts.text(ASSETS)).and_then(MountAccess::parse);
@@ -430,9 +458,11 @@ impl Profile {
             diagnostics.push(Diagnostic::error(root.value_location(OS).cloned(), message));
             return Loaded { profile: None, diagnostics };
         }
-        // Chromium where the system has none that runs in a container was never offered either:
-        // the wizard stops on it. Built without it, the profile would not be what the file says.
-        if template.extras(harness).contains(&Extra::Chromium)
+        // Chromium where the system has none that runs in a container is refused there, and the
+        // wizard cannot switch it on: its switch is disabled on such a system, so a file that asks
+        // for it was written by hand. Built without it, the profile would not be what the file
+        // says, so it is refused rather than quietly built without.
+        if template.parts(harness).contains(&Extra::Chromium)
             && !without.contains(&Extra::Chromium)
             && os.chromium().is_none()
         {
@@ -504,60 +534,104 @@ impl Profile {
         settings.to_toml()
     }
 
-    /// Whether this profile's image gets `extra`: its template adds it for this harness, and the
-    /// person did not switch it off.
+    /// Whether this profile's image carries `extra`.
     #[must_use]
     pub fn has(&self, extra: Extra) -> bool {
-        self.template.extras(self.harness).contains(&extra) && !self.without.contains(&extra)
+        self.parts().contains(&extra)
+    }
+
+    /// The parts this profile's image carries, in the order the wizard lists them: what its set has,
+    /// less what the person switched off.
+    ///
+    /// The two teams of agents opencode has exclude each other here as they do on the page, since a
+    /// container runs one of them and its settings can name only one: a file written by hand that
+    /// asks for both is read as the one the wizard's own list puts last, so that the settings and
+    /// the build agree.
+    #[must_use]
+    pub fn parts(&self) -> Vec<Extra> {
+        let mut parts: Vec<Extra> =
+            self.template.parts(self.harness).into_iter().filter(|extra| !self.without.contains(extra)).collect();
+        if parts.contains(&Extra::OhMyOpenCodeSlim) {
+            parts.retain(|extra| *extra != Extra::OhMyOpenAgent);
+        }
+        Extra::ordered(parts)
+    }
+
+    /// Whether the workspace gets QCode extra's instructions, which QCode extra and Quvyta
+    /// development promise and a set of the person's own does not ([`Template::carries_high`]).
+    #[must_use]
+    pub fn carries_high(&self) -> bool {
+        self.template.carries_high()
     }
 
     /// The Claude Code plugins this profile's image gets, as `claude plugin install` takes them.
     #[must_use]
     pub fn claude_plugins(&self) -> Vec<&'static str> {
-        self.template
-            .extras(self.harness)
+        self.parts()
             .into_iter()
             .filter_map(|extra| match extra {
-                Extra::Plugin(plugin) if self.has(extra) => Some(plugin),
+                Extra::Plugin(plugin) => Some(plugin),
                 _ => None,
             })
             .collect()
     }
 
-    /// What this profile's image gets beside the harness, in the order it is installed: its
-    /// template's additions, less what the person switched off. The Claude Code plugins are one
-    /// addition, there while any one of them is on.
+    /// What this profile's image gets beside the harness, in the order it is installed. The Claude
+    /// Code plugins are one addition, there while any one of them is on.
     #[must_use]
     pub fn additions(&self) -> Vec<Addition> {
-        self.template
-            .additions(self.harness)
-            .iter()
-            .copied()
-            .filter(|addition| match addition {
-                Addition::Graphify => self.has(Extra::Graphify),
-                Addition::ClaudePlugins => !self.claude_plugins().is_empty(),
-                Addition::OhMyOpenAgent => self.has(Extra::OhMyOpenAgent),
-                Addition::OhMyOpenCodeSlim => self.has(Extra::OhMyOpenCodeSlim),
-                Addition::Rust => true,
-                // A system with no Chromium that runs in a container gets none; the wizard and the
-                // file both refuse the pair, so this only keeps a recipe from naming no package.
-                Addition::Chromium => self.has(Extra::Chromium) && self.os.chromium().is_some(),
-            })
-            .collect()
+        let parts = self.parts();
+        let mut additions = Vec::new();
+        if parts.contains(&Extra::Graphify) {
+            additions.push(Addition::Graphify);
+        }
+        if !self.claude_plugins().is_empty() {
+            additions.push(Addition::ClaudePlugins);
+        }
+        if parts.contains(&Extra::OhMyOpenCodeSlim) {
+            additions.push(Addition::OhMyOpenCodeSlim);
+        }
+        if parts.contains(&Extra::OhMyOpenAgent) {
+            additions.push(Addition::OhMyOpenAgent);
+        }
+        if parts.contains(&Extra::Rust) {
+            additions.push(Addition::Rust);
+        }
+        // A system with no Chromium that runs in a container gets none; the wizard and the file
+        // both refuse the pair, so this only keeps a recipe from naming no package.
+        if parts.contains(&Extra::Chromium) && self.os.chromium().is_some() {
+            additions.push(Addition::Chromium);
+        }
+        additions
+    }
+
+    /// The variables the image sets for the harness's own maker: what the "recommended settings"
+    /// part brings, and nothing at all without it.
+    #[must_use]
+    pub fn environment(&self) -> &'static [(&'static str, &'static str)] {
+        if self.has(Extra::Settings) { Template::maker_switches(self.harness) } else { &[] }
     }
 
     /// The configuration files this profile's image build writes, in the order they are written:
-    /// its template's, except that opencode without oh-my-openagent gets the settings of its
-    /// record, because the template's name the plugin by a path that would then lead nowhere.
+    /// nothing at all without the "recommended settings" part, and otherwise the harness's own
+    /// settings and its answers to its first-start questions. opencode's settings name the team
+    /// of agents it has, by the path npm installed it to in the image, because a plugin opencode
+    /// is not told about is a plugin it never loads.
     #[must_use]
     pub fn files(&self) -> Vec<ConfigFile> {
-        if self.template.extras(self.harness).contains(&Extra::OhMyOpenAgent) && !self.has(Extra::OhMyOpenAgent) {
-            return Template::plain_files(self.harness);
+        if !self.has(Extra::Settings) {
+            return Vec::new();
         }
-        if self.template.extras(self.harness).contains(&Extra::OhMyOpenCodeSlim) && !self.has(Extra::OhMyOpenCodeSlim) {
-            return Template::plain_files(self.harness);
+        let record = self.harness.record();
+        if self.harness == HarnessKind::OpenCode {
+            if self.has(Extra::OhMyOpenCodeSlim) {
+                return [OPENCODE_SLIM_SETTINGS, SLIM_OWN_SETTINGS].into_iter().chain(record.first_start).collect();
+            }
+            if self.has(Extra::OhMyOpenAgent) {
+                return std::iter::once(OPENCODE_PLUGIN_SETTINGS).chain(record.first_start).collect();
+            }
         }
-        self.template.files(self.harness)
+        Template::plain_files(self.harness)
     }
 }
 
@@ -601,6 +675,10 @@ const PROVIDER_MODEL: &str = "model";
 /// What a definition file may hold. The keys a profile cannot be guessed for are required, so
 /// a missing or wrong one is an error; the rest are choices that fall back to the safer of the
 /// two when they are missing or wrong.
+///
+/// `template` is free text here rather than a choice of the ids [`Template::ALL`] holds, so that a
+/// file naming an id this QCode does not know is reported once, with the reason, and the profile is
+/// left unread. A choice would drop the value and fall back to the harness as it comes instead.
 fn shape() -> Shape {
     let mounts = Shape::new()
         .optional(CODE, ValueKind::choice([Profile::CODE_MOUNT.id()]))
@@ -613,7 +691,7 @@ fn shape() -> Shape {
     Shape::new()
         .required(NAME, ValueKind::text())
         .required(HARNESS, ValueKind::choice(HarnessKind::ALL.map(|harness| harness.record().id)))
-        .optional(TEMPLATE, ValueKind::choice(Template::ALL.map(Template::id)))
+        .optional(TEMPLATE, ValueKind::text())
         .optional(OS, ValueKind::choice(Os::ALL.map(Os::id)))
         .required(ACCOUNT, ValueKind::choice(AccountKind::ALL.map(AccountKind::id)))
         .optional(IMAGE, ValueKind::text())
@@ -629,6 +707,86 @@ mod tests {
 
     use super::*;
     use crate::profile::{AccountKind, HarnessKind, Template};
+
+    /// A definition file of the kind QCode 0.1.19 writes: `template` as given (`-` for none, as
+    /// before there were templates), and the parts named in `without` switched off.
+    fn old_file(template: &str, harness: HarnessKind, os: Os, without: &[&str]) -> String {
+        let accounts = harness.record().accounts;
+        let account = accounts.iter().find(|a| **a != AccountKind::Provider).unwrap_or(&AccountKind::Provider);
+        let mut text = format!("name = \"p\"\nharness = \"{}\"\n", harness.record().id);
+        if template != "-" {
+            text.push_str(&format!("template = \"{template}\"\n"));
+        }
+        text.push_str(&format!("os = \"{}\"\naccount = \"{}\"\n", os.id(), account.id()));
+        if *account == AccountKind::Provider {
+            text.push_str("\n[provider]\ntag = \"t\"\nmodel = \"m\"\n");
+        }
+        if !without.is_empty() {
+            text.push_str("\n[additions]\n");
+            for id in without {
+                text.push_str(&format!("{id} = false\n"));
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn a_file_of_every_old_kind_builds_the_very_recipe_qcode_0_1_19_built_for_it() {
+        // Each line: the template, the harness, the system, the parts switched off and the
+        // revision of the recipe QCode 0.1.19 made of that file. The same revision is the same
+        // Containerfile and the same files beside it, so an image built before is not rebuilt.
+        // A line whose recipe was changed on purpose since then carries its new revision, under a
+        // `#` line that says why; every other line still reads 0.1.19's.
+        let lines = include_str!("old_revisions.txt").lines().filter(|line| !line.is_empty() && !line.starts_with('#'));
+        let mut read = 0;
+        for line in lines {
+            let fields: Vec<&str> = line.split(' ').collect();
+            let [template, harness, os, without, revision] = fields[..] else { panic!("a line of five: {line}") };
+            let harness = HarnessKind::parse(harness).unwrap_or_else(|| panic!("{line}"));
+            let os = Os::parse(os).unwrap_or_else(|| panic!("{line}"));
+            let without: Vec<&str> = if without == "-" { Vec::new() } else { without.split(',').collect() };
+            let text = old_file(template, harness, os, &without);
+            let loaded = Profile::parse("p.toml", &text);
+            let profile = loaded.profile.unwrap_or_else(|| panic!("{line}: {:?}", loaded.diagnostics));
+            assert_eq!(crate::ui::profiles::recipe::image(&profile).revision(), revision, "{line}\n{text}");
+            // Saved again, it keeps its template and reads back as the same profile.
+            let written = profile.to_toml();
+            let id = if template == "-" { "base" } else { template };
+            assert!(written.contains(&format!("template = \"{id}\"")), "{line}: {written}");
+            assert_eq!(Profile::parse("p.toml", &written).profile, Some(profile), "{line}: {written}");
+            read += 1;
+        }
+        assert!(read > 200, "every kind is there: {read}");
+    }
+
+    #[test]
+    fn a_file_naming_a_set_this_qcode_has_never_heard_of_is_refused_and_says_so() {
+        // A custom profile is not reached this way: its file is in a folder of its own that a QCode
+        // from before custom profiles does not read. A file that names an id nothing knows, in
+        // either folder, is refused with the id in the reason rather than read as the harness as it
+        // comes, which would build an image the file never asked for.
+        for id in ["base-plus", "as-it-comes", "templates", "everything"] {
+            let text =
+                format!("name = \"p\"\nharness = \"claude-code\"\ntemplate = \"{id}\"\naccount = \"subscription\"\n");
+            let loaded = Profile::parse("stranger.toml", &text);
+            assert_eq!(loaded.profile, None, "`{id}` is not a set of ours");
+            let refused =
+                loaded.diagnostics.iter().find(|d| d.severity == Severity::Error).expect("the reason is given");
+            assert!(refused.message.contains(id), "{}", refused.message);
+            assert_eq!(refused.location.as_ref().map(ToString::to_string).as_deref(), Some("stranger.toml:3:12"));
+        }
+        // The harness as it comes carries nothing; a custom file carries every part it does not
+        // switch off.
+        for (id, wanted) in [("base", Template::Base), ("custom", Template::Custom)] {
+            let text =
+                format!("name = \"p\"\nharness = \"claude-code\"\ntemplate = \"{id}\"\naccount = \"subscription\"\n");
+            let profile =
+                Profile::parse("own.toml", &text).profile.unwrap_or_else(|| panic!("`{id}` is a set of ours"));
+            assert_eq!(profile.template, wanted, "`{id}`");
+            let parts = if id == "base" { Vec::new() } else { Template::available(HarnessKind::ClaudeCode) };
+            assert_eq!(profile.parts(), parts, "`{id}`");
+        }
+    }
 
     const COMPLETE: &str = "\
 name = \"claude-sub\"
@@ -911,8 +1069,8 @@ mode = \"full\"
         assert_eq!(loaded.diagnostics, []);
         let profile = loaded.profile.expect("complete");
         assert_eq!(profile.without, []);
-        assert_eq!(profile.additions(), Template::High.additions(HarnessKind::ClaudeCode));
-        assert_eq!(profile.claude_plugins(), crate::profile::CLAUDE_PLUGINS);
+        assert_eq!(profile.additions(), [Addition::Graphify, Addition::ClaudePlugins]);
+        assert_eq!(profile.claude_plugins(), crate::profile::CLAUDE_EXTRA_PLUGINS);
         assert_eq!(profile.to_toml(), text, "nothing is added to it");
     }
 
@@ -929,7 +1087,7 @@ mode = \"full\"
         assert!(!read.has(Extra::Graphify) && !read.has(Extra::Plugin("context7@claude-plugins-official")));
         assert!(read.has(Extra::Plugin("superpowers@claude-plugins-official")));
         assert_eq!(read.additions(), [Addition::ClaudePlugins], "graphify is not installed");
-        assert_eq!(read.claude_plugins().len(), crate::profile::CLAUDE_PLUGINS.len() - 1);
+        assert_eq!(read.claude_plugins().len(), crate::profile::CLAUDE_EXTRA_PLUGINS.len() - 1);
         // A part named `true`, or not named, is on.
         let on = written.replace("graphify = false", "graphify = true");
         assert!(parse(&on).profile.expect("complete").has(Extra::Graphify));
@@ -970,7 +1128,9 @@ mode = \"full\"
         assert_eq!(high.template, Template::High);
         assert!(!high.claude_plugins().contains(&"context7@claude-plugins-official"));
         assert!(high.claude_plugins().contains(&"hookify@claude-plugins-official"), "a plugin new to extra is on");
-        assert_eq!(high.claude_plugins().len(), crate::profile::CLAUDE_PLUGINS.len() - 1);
+        assert_eq!(high.claude_plugins().len(), crate::profile::CLAUDE_EXTRA_PLUGINS.len() - 1);
+        // rust-analyzer's plugin left QCode extra, which has no Rust for it (2026-09-29).
+        assert!(!high.claude_plugins().contains(&crate::profile::RUST_ANALYZER_PLUGIN));
     }
 
     /// A profile that says it runs on a provider but names no tag or model cannot be pointed

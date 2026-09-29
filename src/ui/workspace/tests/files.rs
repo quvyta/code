@@ -1,7 +1,8 @@
-//! The workspace's files in the panel's file tree: the file manager, run end to end on real
-//! temporary folders through the screen's own messages the way a click or a key would send them,
-//! and the files opened in tabs: a picture and a text file in the workspace's container, a Markdown
-//! document by QCode itself, and nothing at all for what no built-in app opens yet.
+//! The workspace's files in the panel's file tree: the framework's file manager, bound to the
+//! workspace and run end to end on real temporary folders from where the person touches it (a
+//! right click and its menu, a click, a key, a drag), and the files opened in tabs: a picture and
+//! a text file in the workspace's container, a Markdown document by QCode itself, and nothing at all
+//! for what no built-in app opens yet.
 //!
 //! The engine of these tests cannot be run, so a picture or an editor never really starts; what
 //! is checked is the command the tab would spawn, which is where "nothing runs on this machine"
@@ -11,16 +12,19 @@ use super::*;
 
 use qframe::event::{Event, MouseButton, MouseEvent, MouseKind};
 use qframe::keymap::Modifiers;
-use qframe::widgets::TreeDrop;
+use qframe::widgets::{FileManagerMsg, FileManagerState, NameFor, TreeDrop};
 
 use crate::base::apps::Editor;
-use crate::ui::workspace::{FileMsg, FileTree, NameFor, escape, files};
+use crate::ui::workspace::{escape, files};
 
 /// Ctrl held, as a Ctrl+click holds it.
 const CTRL: Modifiers = Modifiers { ctrl: true, alt: false, shift: false };
 
 /// A moment for a menu or a dialog to settle.
 const MOMENT: Duration = Duration::from_millis(400);
+
+/// The id of the workspace `one_workspace` opens.
+const ID: &str = "firefly";
 
 /// The screen with the workspace folder read, motion off so menus and dialogs are there at once.
 fn files_harness(scratch: &Scratch) -> Harness<Screen> {
@@ -33,22 +37,49 @@ fn workspace_dir(scratch: &Scratch) -> std::path::PathBuf {
     scratch.0.join("Work")
 }
 
-fn tree(harness: &Harness<Screen>) -> &FileTree {
+/// A message of the open workspace's file manager, for what no key or click can say: a key that
+/// names a place outside the workspace, or an answer the background would give.
+fn to_files(message: FileManagerMsg) -> Msg {
+    Msg::Files(ID.to_owned(), message)
+}
+
+fn tree(harness: &Harness<Screen>) -> &FileManagerState {
     harness.app().0.workspace().expect("a workspace is open").files()
+}
+
+/// Presses a mouse button on the row showing `text` with `mods` held, and lets it go.
+fn click_with(harness: &mut Harness<Screen>, text: &str, button: MouseButton, mods: Modifiers) {
+    let (x, y) = harness.find(text).unwrap_or_else(|| panic!("`{text}` is on screen:\n{}", harness.screen()));
+    harness.events(&[
+        Event::Mouse(MouseEvent { kind: MouseKind::Down(button), x, y, mods }),
+        Event::Mouse(MouseEvent { kind: MouseKind::Up(button), x, y, mods }),
+    ]);
+    harness.advance(MOMENT);
 }
 
 /// Right-clicks the row showing `text`.
 fn right_click(harness: &mut Harness<Screen>, text: &str) {
-    let (x, y) = harness.find(text).unwrap_or_else(|| panic!("`{text}` is on screen:\n{}", harness.screen()));
-    harness.mouse(MouseKind::Down(MouseButton::Right), x, y);
-    harness.mouse(MouseKind::Up(MouseButton::Right), x, y);
-    harness.advance(MOMENT);
+    click_with(harness, text, MouseButton::Right, Modifiers::default());
 }
 
-/// Where the tree's top row, the workspace folder itself, is: the row above its first entry.
+/// Right-clicks the row showing `text` and chooses `item` from its menu.
+fn menu(harness: &mut Harness<Screen>, text: &str, item: &str) {
+    right_click(harness, text);
+    harness.click_text(item).advance(MOMENT);
+}
+
+/// Adds the rows showing `names` to the selection, one Ctrl+click each, the way the person picks
+/// several entries without opening any of them.
+fn choose(harness: &mut Harness<Screen>, names: &[&str]) {
+    for name in names {
+        click_with(harness, name, MouseButton::Left, CTRL);
+    }
+}
+
+/// Where the tree's top row, the workspace folder itself, is: the row that bears the workspace's
+/// name.
 fn root_row(harness: &Harness<Screen>) -> (i32, i32) {
-    let (x, y) = harness.find("src").expect("the first entry of the tree");
-    (x, y - 1)
+    harness.find("Firefly").expect("the workspace folder's row")
 }
 
 /// Right-clicks the workspace folder's own row.
@@ -59,15 +90,28 @@ fn right_click_root(harness: &mut Harness<Screen>) {
     harness.advance(MOMENT);
 }
 
+/// Reads the open folders again from the workspace folder's own menu.
+fn refresh(harness: &mut Harness<Screen>) {
+    right_click_root(harness);
+    harness.click_text("Refresh").advance(MOMENT);
+}
+
+/// Empties the field that has the keyboard and types `text` into it.
+fn retype(harness: &mut Harness<Screen>, text: &str) {
+    for _ in 0..24 {
+        harness.press("backspace");
+    }
+    harness.type_text(text).advance(MOMENT);
+}
+
 #[test]
 fn a_new_file_is_made_in_a_folder_from_its_menu() {
     let scratch = Scratch::new("new-file");
     let mut harness = files_harness(&scratch);
-    right_click(&mut harness, "src");
-    harness.click_text("New file").advance(MOMENT);
+    menu(&mut harness, "src", "New file");
     let text = harness.screen();
     assert!(text.contains("Name"), "a dialog asks for the name:\n{text}");
-    assert!(harness.is_focused("workspace-files-name"), "and its field has the keyboard");
+    assert!(harness.is_focused("file-manager-name"), "and its field has the keyboard");
 
     harness.type_text("lib.rs").press("enter").advance(MOMENT);
     assert!(workspace_dir(&scratch).join("src/lib.rs").is_file(), "the file is on disk:\n{}", harness.screen());
@@ -87,7 +131,7 @@ fn a_new_folder_is_made_at_the_root_from_the_workspace_folders_row() {
     right_click_root(&mut harness);
     let text = harness.screen();
     assert!(text.contains("New folder") && text.contains("Refresh"), "the workspace folder's menu:\n{text}");
-    assert!(!text.contains("Rename"), "nothing to rename at the root:\n{text}");
+    assert!(!text.contains("Rename") && !text.contains("Copy"), "nothing to rename or copy at the root:\n{text}");
     harness.click_text("New folder").advance(MOMENT);
     harness.type_text("docs").press("enter").advance(MOMENT);
     assert!(workspace_dir(&scratch).join("docs").is_dir(), "{}", harness.screen());
@@ -96,10 +140,34 @@ fn a_new_folder_is_made_at_the_root_from_the_workspace_folders_row() {
 }
 
 #[test]
+fn the_workspace_folders_row_carries_the_workspaces_icon_in_the_colour_of_its_name() {
+    let scratch = Scratch::new("root-icon");
+    let harness = files_harness(&scratch);
+    let (x, y) = harness.find("Firefly").expect("the workspace folder's row");
+    let line = harness.screen().lines().nth(usize::try_from(y).expect("a row")).unwrap_or_default().to_owned();
+    let glyph = harness.env().icons().glyph("workspace").into_owned();
+    assert!(line.contains(glyph.as_str()), "the top row is the workspace's, not a plain folder's:\n{line}");
+    let (x, y) = (u16::try_from(x).expect("a column"), u16::try_from(y).expect("a row"));
+    let (icon, name) = (harness.fg(x - 2, y), harness.fg(x, y));
+    assert!(icon.is_some(), "the icon is drawn");
+    assert_eq!(icon, name, "at rest the icon has the colour of the name beside it, no tone of its own");
+
+    // Chosen, the name rises and the icon rises with it.
+    let mut harness = harness;
+    harness.click(i32::from(x), i32::from(y)).advance(MOMENT);
+    harness.render();
+    let (x, y) = harness.find("Firefly").expect("the workspace folder's row, chosen");
+    let (x, y) = (u16::try_from(x).expect("a column"), u16::try_from(y).expect("a row"));
+    let (icon, name) = (harness.fg(x - 2, y), harness.fg(x, y));
+    assert_eq!(icon, name, "the chosen row's icon takes the colour its name takes:\n{}", harness.screen());
+}
+
+#[test]
 fn names_are_checked_as_they_are_typed() {
     let scratch = Scratch::new("names");
     let mut harness = files_harness(&scratch);
-    harness.send(Msg::Files(FileMsg::NewFile(String::new()))).advance(MOMENT);
+    right_click_root(&mut harness);
+    harness.click_text("New file").advance(MOMENT);
     assert!(!harness.screen().contains("cannot be empty"), "an empty field is not scolded at once");
     harness.press("enter").advance(MOMENT);
     assert!(harness.screen().contains("A name cannot be empty."), "{}", harness.screen());
@@ -110,7 +178,7 @@ fn names_are_checked_as_they_are_typed() {
         ("a/b", "A name cannot contain “/”."),
         ("..", "“.” and “..” already mean this folder"),
     ] {
-        harness.send(Msg::Files(FileMsg::Name(typed.to_owned()))).advance(MOMENT);
+        retype(&mut harness, typed);
         assert!(harness.screen().contains(said), "`{typed}`:\n{}", harness.screen());
     }
     harness.press("enter").advance(MOMENT);
@@ -124,9 +192,8 @@ fn names_are_checked_as_they_are_typed() {
 fn a_rename_starts_from_the_old_name_and_follows_the_entry() {
     let scratch = Scratch::new("rename");
     let mut harness = files_harness(&scratch);
-    harness.send(Msg::ExpandFile("src".to_owned(), true));
-    right_click(&mut harness, "src");
-    harness.click_text("Rename").advance(MOMENT);
+    harness.click_text("src").advance(MOMENT);
+    menu(&mut harness, "src", "Rename");
     let naming = tree(&harness).naming().expect("the dialog is open").clone();
     assert_eq!(naming.purpose, NameFor::Rename("src".to_owned()));
     assert_eq!(naming.value, "src", "the field starts with the old name");
@@ -134,7 +201,7 @@ fn a_rename_starts_from_the_old_name_and_follows_the_entry() {
     // An unchanged name is not a clash with itself.
     assert!(!harness.screen().contains("already has"), "{}", harness.screen());
 
-    harness.send(Msg::Files(FileMsg::Name("code".to_owned())));
+    retype(&mut harness, "code");
     harness.press("enter").advance(MOMENT);
     let root = workspace_dir(&scratch);
     assert!(root.join("code/main.rs").is_file() && !root.join("src").exists(), "{}", harness.screen());
@@ -145,25 +212,25 @@ fn a_rename_starts_from_the_old_name_and_follows_the_entry() {
 }
 
 #[test]
-fn a_rename_starts_with_the_name_before_its_extension_selected() {
+fn hidden_entries_are_shown_and_a_rename_starts_with_the_name_before_its_extension_selected() {
     let scratch = Scratch::new("rename-stem");
     let root = workspace_dir(&scratch);
     fs::write(root.join("report.final.md"), "").expect("a file with two dots");
     fs::write(root.join(".gitignore"), "").expect("a dotfile");
+    fs::create_dir_all(root.join("v1.2")).expect("a folder with a dot");
     let mut harness = files_harness(&scratch);
+    assert!(harness.screen().contains(".gitignore"), "a workspace's dotfiles are shown:\n{}", harness.screen());
 
     // Typing replaces what is selected, so what survives shows what was.
-    harness.send(Msg::Files(FileMsg::Rename("report.final.md".to_owned()))).advance(MOMENT);
+    menu(&mut harness, "report.final.md", "Rename");
     harness.type_text("summary").press("enter").advance(MOMENT);
     assert!(root.join("summary.md").is_file(), "only the part before the last dot:\n{}", harness.screen());
 
-    harness.send(Msg::Files(FileMsg::Rename(".gitignore".to_owned()))).advance(MOMENT);
+    menu(&mut harness, ".gitignore", "Rename");
     harness.type_text("ignored").press("enter").advance(MOMENT);
     assert!(root.join("ignored").is_file(), "a dotfile is all name:\n{}", harness.screen());
 
-    fs::create_dir_all(root.join("v1.2")).expect("a folder with a dot");
-    harness.send(Msg::Files(FileMsg::Refresh));
-    harness.send(Msg::Files(FileMsg::Rename("v1.2".to_owned()))).advance(MOMENT);
+    menu(&mut harness, "v1.2", "Rename");
     harness.type_text("old").press("enter").advance(MOMENT);
     assert!(root.join("old").is_dir(), "a folder has no extension:\n{}", harness.screen());
 }
@@ -172,12 +239,10 @@ fn a_rename_starts_with_the_name_before_its_extension_selected() {
 fn cut_and_paste_moves_an_entry_into_a_folder() {
     let scratch = Scratch::new("move");
     let mut harness = files_harness(&scratch);
-    right_click(&mut harness, "README.md");
-    harness.click_text("Cut").advance(MOMENT);
+    menu(&mut harness, "README.md", "Cut");
     assert_eq!(tree(&harness).cut(), ["README.md"]);
 
-    right_click(&mut harness, "src");
-    harness.click_text("Paste here").advance(MOMENT);
+    menu(&mut harness, "src", "Paste here");
     let root = workspace_dir(&scratch);
     assert!(root.join("src/README.md").is_file() && !root.join("README.md").exists(), "{}", harness.screen());
     assert_eq!(fs::read_to_string(root.join("src/README.md")).ok().as_deref(), Some("hello\n"), "moved, not made anew");
@@ -187,10 +252,49 @@ fn cut_and_paste_moves_an_entry_into_a_folder() {
     assert!(tree.is_open("src"), "into a folder that opens to show it");
 }
 
-/// Selects the entries `keys` together, the cursor on the first, the way Ctrl+clicks leave them.
-fn choose(harness: &mut Harness<Screen>, keys: &[&str]) {
-    harness.send(Msg::SelectFile(keys[0].to_owned()));
-    harness.send(Msg::Files(FileMsg::Choose(keys.iter().map(|key| (*key).to_owned()).collect())));
+#[test]
+fn copy_and_paste_makes_a_second_entry_and_keeps_the_first() {
+    let scratch = Scratch::new("copy");
+    let root = workspace_dir(&scratch);
+    let mut harness = files_harness(&scratch);
+    menu(&mut harness, "README.md", "Copy");
+    right_click(&mut harness, "src");
+    let text = harness.screen();
+    assert!(text.contains("Paste here") && text.contains("Cancel the copy"), "{text}");
+    harness.click_text("Paste here").advance(MOMENT);
+    assert_eq!(fs::read_to_string(root.join("src/README.md")).ok().as_deref(), Some("hello\n"), "a copy is made");
+    assert_eq!(fs::read_to_string(root.join("README.md")).ok().as_deref(), Some("hello\n"), "and the first stays");
+    assert_eq!(tree(&harness).selected(), Some("src/README.md"), "the selection follows the copy");
+}
+
+#[test]
+fn ctrl_c_and_ctrl_v_copy_the_entry_under_the_cursor_into_the_folder_under_it() {
+    let scratch = Scratch::new("copy-keys");
+    let root = workspace_dir(&scratch);
+    let mut harness = files_harness(&scratch);
+    // A click on the file would open it and hand the keyboard to its tab, so the tree is reached
+    // through the folder above it.
+    harness.click_text("src").advance(MOMENT);
+    harness.press("end").advance(MOMENT);
+    assert_eq!(tree(&harness).selected(), Some("README.md"), "{}", harness.screen());
+    harness.press("ctrl+c").advance(MOMENT);
+    harness.press("up").press("up").advance(MOMENT);
+    assert_eq!(tree(&harness).selected(), Some("src"), "{}", harness.screen());
+    harness.press("ctrl+v").advance(MOMENT);
+    assert!(root.join("src/README.md").is_file(), "pasted into the folder under the cursor:\n{}", harness.screen());
+    assert!(root.join("README.md").is_file(), "and the first stays");
+}
+
+#[test]
+fn ctrl_x_and_ctrl_v_move_the_entry_under_the_cursor() {
+    let scratch = Scratch::new("cut-keys");
+    let root = workspace_dir(&scratch);
+    let mut harness = files_harness(&scratch);
+    harness.click_text("src").advance(MOMENT);
+    harness.press("end").press("ctrl+x").advance(MOMENT);
+    assert_eq!(tree(&harness).cut(), ["README.md"], "{}", harness.screen());
+    harness.press("up").press("up").press("ctrl+v").advance(MOMENT);
+    assert!(root.join("src/README.md").is_file() && !root.join("README.md").exists(), "{}", harness.screen());
 }
 
 #[test]
@@ -198,12 +302,17 @@ fn ctrl_click_selects_several_entries() {
     let scratch = Scratch::new("choose");
     let mut harness = files_harness(&scratch);
     harness.click_text("README.md");
-    let (x, y) = harness.find("src").expect("the folder's row");
-    harness.events(&[
-        Event::Mouse(MouseEvent { kind: MouseKind::Down(MouseButton::Left), x, y, mods: CTRL }),
-        Event::Mouse(MouseEvent { kind: MouseKind::Up(MouseButton::Left), x, y, mods: CTRL }),
-    ]);
+    click_with(&mut harness, "src", MouseButton::Left, CTRL);
     assert_eq!(tree(&harness).chosen(), ["README.md", "src"], "{}", harness.screen());
+}
+
+#[test]
+fn ctrl_a_selects_every_entry_shown() {
+    let scratch = Scratch::new("choose-all");
+    let mut harness = files_harness(&scratch);
+    harness.click_text("src").advance(MOMENT);
+    harness.press("ctrl+a").advance(MOMENT);
+    assert_eq!(tree(&harness).chosen(), ["src", "src/main.rs", "README.md"], "{}", harness.screen());
 }
 
 #[test]
@@ -217,12 +326,12 @@ fn the_menu_of_a_selected_row_cuts_the_whole_selection_and_paste_moves_it_all() 
     right_click(&mut harness, "plan.txt");
     let text = harness.screen();
     assert!(text.contains("Cut 3 entries") && text.contains("Delete 3 entries"), "{text}");
+    assert!(text.contains("Copy 3 entries"), "{text}");
     assert!(!text.contains("Rename"), "a name is for one entry:\n{text}");
     harness.click_text("Cut 3 entries").advance(MOMENT);
     assert_eq!(tree(&harness).cut(), ["README.md", "plan.txt", "src"]);
 
-    right_click(&mut harness, "docs");
-    harness.click_text("Paste here").advance(MOMENT);
+    menu(&mut harness, "docs", "Paste here");
     for name in ["README.md", "plan.txt", "src/main.rs"] {
         assert!(root.join("docs").join(name).exists(), "{name} moved:\n{}", harness.screen());
         assert!(!root.join(name).exists(), "{name} left its place");
@@ -238,11 +347,13 @@ fn a_file_inside_a_selected_folder_travels_with_it() {
     let root = workspace_dir(&scratch);
     fs::create_dir_all(root.join("docs")).expect("a folder to move into");
     let mut harness = files_harness(&scratch);
-    harness.send(Msg::ExpandFile("src".to_owned(), true));
-    choose(&mut harness, &["src", "src/main.rs"]);
-    harness.send(Msg::Files(FileMsg::Cut("src".to_owned())));
+    harness.click_text("src").advance(MOMENT);
+    choose(&mut harness, &["main.rs"]);
+    assert_eq!(tree(&harness).chosen(), ["src", "src/main.rs"], "{}", harness.screen());
+    // The menu counts what it acts on, and the file goes inside its folder: one entry.
+    menu(&mut harness, "main.rs", "Cut");
     assert_eq!(tree(&harness).cut(), ["src"], "only the folder is cut; its file goes inside it");
-    harness.send(Msg::Files(FileMsg::Paste("docs".to_owned()))).advance(MOMENT);
+    menu(&mut harness, "docs", "Paste here");
     assert!(root.join("docs/src/main.rs").is_file(), "{}", harness.screen());
     assert!(!harness.screen().contains("could not be handled"), "nothing failed:\n{}", harness.screen());
 }
@@ -253,7 +364,7 @@ fn deleting_the_selection_asks_once_for_all_of_it() {
     let root = workspace_dir(&scratch);
     let mut harness = files_harness(&scratch);
     choose(&mut harness, &["README.md", "src"]);
-    harness.send(Msg::Files(FileMsg::Delete("src".to_owned()))).advance(MOMENT);
+    menu(&mut harness, "src", "Delete 2 entries");
     let text = harness.screen();
     assert!(text.contains("Delete 2 entries?"), "{text}");
     assert!(text.contains("README.md, src") && text.contains("everything in them"), "{text}");
@@ -265,9 +376,8 @@ fn deleting_the_selection_asks_once_for_all_of_it() {
 #[test]
 fn a_row_outside_the_selection_acts_on_itself_alone() {
     let scratch = Scratch::new("outside-selection");
-    let mut harness = files_harness(&scratch);
     fs::write(workspace_dir(&scratch).join("plan.txt"), "").expect("another file");
-    harness.send(Msg::Files(FileMsg::Refresh));
+    let mut harness = files_harness(&scratch);
     choose(&mut harness, &["README.md", "plan.txt"]);
     right_click(&mut harness, "src");
     let text = harness.screen();
@@ -293,23 +403,43 @@ fn dragging_the_selection_onto_a_folder_moves_it_there() {
 }
 
 #[test]
+fn dragging_with_ctrl_held_copies_instead() {
+    let scratch = Scratch::new("drag-copy");
+    let root = workspace_dir(&scratch);
+    let mut harness = files_harness(&scratch);
+    choose(&mut harness, &["README.md"]);
+    let (x, y) = harness.find("README.md").expect("a selected row");
+    let (tx, ty) = harness.find("src").expect("the folder");
+    // What counts is Ctrl at the release, the way a desktop file explorer decides it.
+    let mouse = |kind, x, y, mods| Event::Mouse(MouseEvent { kind, x, y, mods });
+    harness.events(&[
+        mouse(MouseKind::Down(MouseButton::Left), x, y, Modifiers::default()),
+        mouse(MouseKind::Drag(MouseButton::Left), tx, ty, Modifiers::default()),
+        mouse(MouseKind::Up(MouseButton::Left), tx, ty, CTRL),
+    ]);
+    harness.advance(MOMENT);
+    assert!(root.join("src/README.md").is_file(), "a copy went into the folder:\n{}", harness.screen());
+    assert!(root.join("README.md").is_file(), "and the first stayed");
+}
+
+#[test]
 fn a_drop_follows_the_same_rules_as_a_paste() {
     let scratch = Scratch::new("drop-rules");
     let root = workspace_dir(&scratch);
     fs::create_dir_all(root.join("src/deep")).expect("a folder below");
     let mut harness = files_harness(&scratch);
-    let drop = |keys: &[&str], into: Option<&str>| {
-        Msg::Files(FileMsg::Drop(TreeDrop {
-            keys: keys.iter().map(|key| (*key).to_owned()).collect(),
-            into: into.map(str::to_owned),
-        }))
-    };
-    harness.send(drop(&["src"], Some("src/deep"))).advance(MOMENT);
-    assert!(harness.screen().contains("A folder cannot go into itself"), "{}", harness.screen());
-    assert!(root.join("src/deep").is_dir());
+    // The click opens the folder and selects it; a folder dragged onto a folder inside it is not
+    // taken, the way a paste there is refused.
+    harness.click_text("src").advance(MOMENT);
+    let from = harness.find("src").expect("the folder");
+    let to = harness.find("deep").expect("a folder inside it");
+    harness.drag(from, to).advance(MOMENT);
+    assert!(root.join("src/deep").is_dir() && !root.join("src/deep/src").exists(), "{}", harness.screen());
 
-    harness.send(drop(&["src/main.rs"], None)).advance(MOMENT);
-    assert!(root.join("main.rs").is_file(), "the free space below the rows is the workspace folder");
+    // The free space below the rows is the workspace folder.
+    let drop = TreeDrop { keys: vec!["src/main.rs".to_owned()], into: None };
+    harness.send(to_files(FileManagerMsg::Drop(drop))).advance(MOMENT);
+    assert!(root.join("main.rs").is_file(), "{}", harness.screen());
 }
 
 #[test]
@@ -320,8 +450,8 @@ fn a_move_that_partly_fails_says_which_entries_stayed_and_why() {
     fs::write(root.join("plan.txt"), "plan\n").expect("a file that can move");
     let mut harness = files_harness(&scratch);
     choose(&mut harness, &["README.md", "plan.txt"]);
-    harness.send(Msg::Files(FileMsg::Cut("README.md".to_owned())));
-    harness.send(Msg::Files(FileMsg::Paste("src".to_owned()))).advance(MOMENT);
+    menu(&mut harness, "README.md", "Cut 2 entries");
+    menu(&mut harness, "src", "Paste here");
     assert!(root.join("src/plan.txt").is_file(), "what could move moved:\n{}", harness.screen());
     assert_eq!(fs::read_to_string(root.join("src/README.md")).ok().as_deref(), Some("other\n"), "nothing overwritten");
     assert_eq!(fs::read_to_string(root.join("README.md")).ok().as_deref(), Some("hello\n"));
@@ -336,18 +466,29 @@ fn a_move_that_partly_fails_says_which_entries_stayed_and_why() {
 fn the_cut_row_is_faint_and_esc_lets_it_stay() {
     let scratch = Scratch::new("faint");
     let mut harness = files_harness(&scratch);
-    let (x, y) = harness.find("README.md").expect("the row");
-    let (x, y) = (u16::try_from(x).expect("a column"), u16::try_from(y).expect("a row"));
-    let before = harness.fg(x, y);
-    harness.send(Msg::Files(FileMsg::Cut("README.md".to_owned())));
-    harness.hover(0, 0).render();
-    assert_ne!(harness.fg(x, y), before, "the cut row is drawn in another tone:\n{}", harness.screen());
+    // The colour of the name, wherever the row draws it: a selected row draws it a cell further in.
+    let colour = |harness: &Harness<Screen>| {
+        let (x, y) = harness.find("README.md").expect("the row");
+        harness.fg(u16::try_from(x).expect("a column"), u16::try_from(y).expect("a row"))
+    };
+    let before = colour(&harness);
+    // The menu selects the row it opens on, and a selected row is drawn brighter; Home takes the
+    // cursor, and the selection, back to the workspace folder's row.
+    menu(&mut harness, "README.md", "Cut");
+    harness.press("home").hover(0, 0).render();
+    assert_eq!(tree(&harness).selected(), Some(""), "{}", harness.screen());
+    assert_ne!(colour(&harness), before, "the cut row is drawn in another tone:\n{}", harness.screen());
 
     let esc = escape(&harness.app().0).expect("Esc lets the cut go before it leaves the screen");
     harness.send(esc);
     assert!(tree(&harness).cut().is_empty());
-    assert_eq!(harness.fg(x, y), before, "and the row is itself again");
+    assert_eq!(colour(&harness), before, "and the row is itself again:\n{}", harness.screen());
     assert!(escape(&harness.app().0).is_none(), "with nothing cut Esc is the screen's own again");
+
+    menu(&mut harness, "README.md", "Copy");
+    let esc = escape(&harness.app().0).expect("Esc lets a copy waiting to be pasted go too");
+    harness.send(esc);
+    assert!(tree(&harness).pending().is_empty(), "nothing waits to be pasted");
 }
 
 #[test]
@@ -358,13 +499,13 @@ fn a_folder_cannot_go_into_itself_and_a_clash_is_refused_with_a_reason() {
     fs::write(root.join("src/README.md"), "other\n").expect("a clashing file");
     let mut harness = files_harness(&scratch);
 
-    harness.send(Msg::Files(FileMsg::Cut("src".to_owned())));
-    harness.send(Msg::Files(FileMsg::Paste("src/deep".to_owned()))).advance(MOMENT);
+    menu(&mut harness, "src", "Cut");
+    harness.send(to_files(FileManagerMsg::Paste("src/deep".to_owned()))).advance(MOMENT);
     assert!(harness.screen().contains("A folder cannot go into itself"), "{}", harness.screen());
     assert!(root.join("src/deep").is_dir());
 
-    harness.send(Msg::Files(FileMsg::Cut("README.md".to_owned())));
-    harness.send(Msg::Files(FileMsg::Paste("src".to_owned()))).advance(MOMENT);
+    menu(&mut harness, "README.md", "Cut");
+    menu(&mut harness, "src", "Paste here");
     assert!(harness.screen().contains("already has something called"), "{}", harness.screen());
     assert_eq!(fs::read_to_string(root.join("README.md")).ok().as_deref(), Some("hello\n"));
     assert_eq!(fs::read_to_string(root.join("src/README.md")).ok().as_deref(), Some("other\n"));
@@ -375,9 +516,8 @@ fn a_folder_cannot_go_into_itself_and_a_clash_is_refused_with_a_reason() {
 fn a_folder_inside_the_cut_one_cannot_be_chosen_to_paste_into() {
     let scratch = Scratch::new("paste-disabled");
     let mut harness = files_harness(&scratch);
-    harness.send(Msg::Files(FileMsg::Cut("src".to_owned())));
-    right_click(&mut harness, "src");
-    harness.click_text("Paste here").advance(MOMENT);
+    menu(&mut harness, "src", "Cut");
+    menu(&mut harness, "src", "Paste here");
     assert!(workspace_dir(&scratch).join("src/main.rs").is_file(), "nothing moved:\n{}", harness.screen());
     assert_eq!(tree(&harness).cut(), ["src"]);
 }
@@ -386,7 +526,7 @@ fn a_folder_inside_the_cut_one_cannot_be_chosen_to_paste_into() {
 fn deleting_asks_first_and_a_folder_says_everything_in_it_goes() {
     let scratch = Scratch::new("delete");
     let mut harness = files_harness(&scratch);
-    harness.send(Msg::Files(FileMsg::Delete("src".to_owned()))).advance(MOMENT);
+    menu(&mut harness, "src", "Delete");
     let text = harness.screen();
     assert!(text.contains("Delete src?"), "{text}");
     // The dialog wraps its message, so the words are looked for on their own.
@@ -397,7 +537,7 @@ fn deleting_asks_first_and_a_folder_says_everything_in_it_goes() {
     harness.press("esc").advance(MOMENT);
     assert!(root.join("src").is_dir(), "Esc keeps it:\n{}", harness.screen());
 
-    harness.send(Msg::Files(FileMsg::Delete("README.md".to_owned()))).advance(MOMENT);
+    menu(&mut harness, "README.md", "Delete");
     assert!(!harness.screen().contains("everything in it"), "a file is only itself");
     harness.press("tab").press("enter").advance(MOMENT);
     assert!(!root.join("README.md").exists(), "confirming deletes it:\n{}", harness.screen());
@@ -409,11 +549,13 @@ fn paths_that_escape_the_workspace_are_refused() {
     let scratch = Scratch::new("escape");
     fs::write(scratch.0.join("keep.txt"), "keep\n").expect("a file beside the workspace");
     let mut harness = files_harness(&scratch);
-    harness.send(Msg::Files(FileMsg::DeleteConfirmed(vec!["../keep.txt".to_owned()]))).advance(MOMENT);
-    assert!(scratch.0.join("keep.txt").exists());
-    assert!(harness.screen().contains("outside the workspace folder"), "{}", harness.screen());
-    harness.send(Msg::Files(FileMsg::Cut("README.md".to_owned())));
-    harness.send(Msg::Files(FileMsg::Paste("..".to_owned()))).advance(MOMENT);
+    harness.send(to_files(FileManagerMsg::DeleteConfirmed(vec!["../keep.txt".to_owned()]))).advance(MOMENT);
+    assert!(scratch.0.join("keep.txt").exists(), "nothing outside is touched");
+    let text = harness.screen();
+    assert!(text.contains("The file operation was not done"), "the refusal is said:\n{text}");
+    assert!(text.contains("outside the folder shown"), "with its reason:\n{text}");
+    menu(&mut harness, "README.md", "Cut");
+    harness.send(to_files(FileManagerMsg::Paste("..".to_owned()))).advance(MOMENT);
     assert!(workspace_dir(&scratch).join("README.md").exists() && !scratch.0.join("README.md").exists());
 }
 
@@ -426,12 +568,18 @@ fn a_link_out_of_the_workspace_is_an_entry_and_deleting_it_leaves_its_target() {
     std::os::unix::fs::symlink(&away, workspace_dir(&scratch).join("door")).expect("a link");
     let mut harness = files_harness(&scratch);
     assert!(!tree(&harness).is_folder("door"), "a link is not opened like a folder");
-    harness.send(Msg::Files(FileMsg::NewFile("door".to_owned())));
-    harness.send(Msg::Files(FileMsg::Name("x".to_owned())));
-    harness.send(Msg::Files(FileMsg::Submit)).advance(MOMENT);
+    right_click(&mut harness, "door");
+    assert!(!harness.screen().contains("New file"), "nothing is offered to be made in it:\n{}", harness.screen());
+    harness.press("esc").advance(MOMENT);
+    // Its key reaching the manager some other way still makes nothing through it.
+    harness.send(to_files(FileManagerMsg::NewFile("door".to_owned())));
+    harness.send(to_files(FileManagerMsg::Name("x".to_owned())));
+    harness.send(to_files(FileManagerMsg::Submit)).advance(MOMENT);
     assert!(!away.join("x").exists(), "nothing is made through it");
-    harness.send(Msg::Files(FileMsg::DeleteConfirmed(vec!["door".to_owned()])));
-    assert!(!workspace_dir(&scratch).join("door").exists());
+    harness.press("esc").advance(MOMENT);
+    menu(&mut harness, "door", "Delete");
+    harness.press("tab").press("enter").advance(MOMENT);
+    assert!(!workspace_dir(&scratch).join("door").exists(), "{}", harness.screen());
     assert!(away.join("secret.txt").exists(), "what it pointed at stays");
 }
 
@@ -441,7 +589,7 @@ fn each_row_offers_what_can_be_done_to_it() {
     let mut harness = files_harness(&scratch);
     right_click(&mut harness, "README.md");
     let text = harness.screen();
-    for item in ["Rename", "Cut", "Delete"] {
+    for item in ["Rename", "Cut", "Copy", "Delete"] {
         assert!(text.contains(item), "`{item}` on a file:\n{text}");
     }
     for item in ["New file", "New folder", "Paste here"] {
@@ -451,13 +599,13 @@ fn each_row_offers_what_can_be_done_to_it() {
 
     right_click(&mut harness, "src");
     let text = harness.screen();
-    for item in ["New file", "New folder", "Rename", "Cut", "Delete"] {
+    for item in ["New file", "New folder", "Rename", "Cut", "Copy", "Delete"] {
         assert!(text.contains(item), "`{item}` on a folder:\n{text}");
     }
     assert!(!text.contains("Paste here"), "nothing to paste yet:\n{text}");
     harness.press("esc").advance(MOMENT);
 
-    harness.send(Msg::Files(FileMsg::Cut("README.md".to_owned())));
+    menu(&mut harness, "README.md", "Cut");
     right_click(&mut harness, "src");
     let text = harness.screen();
     assert!(text.contains("Paste here") && text.contains("Cancel the move"), "{text}");
@@ -470,11 +618,7 @@ fn a_click_or_enter_on_a_file_opens_it_while_ctrl_click_only_chooses_it() {
     let scratch = Scratch::new("open-or-choose");
     let mut harness = files_harness(&scratch);
     harness.click_text("src").advance(MOMENT);
-    let (x, y) = harness.find("README.md").expect("the file's row");
-    harness.events(&[
-        Event::Mouse(MouseEvent { kind: MouseKind::Down(MouseButton::Left), x, y, mods: CTRL }),
-        Event::Mouse(MouseEvent { kind: MouseKind::Up(MouseButton::Left), x, y, mods: CTRL }),
-    ]);
+    click_with(&mut harness, "README.md", MouseButton::Left, CTRL);
     assert_eq!(tree(&harness).chosen(), ["src", "README.md"], "{}", harness.screen());
     assert!(labels(&harness).is_empty(), "a Ctrl+click chooses without opening");
     harness.press("space").advance(MOMENT);
@@ -536,11 +680,7 @@ fn an_empty_workspace_folder_still_has_its_row_to_make_the_first_entry() {
     let mut harness = files_harness(&scratch);
     let text = harness.screen();
     assert!(text.contains("empty"), "the row says the folder is empty:\n{text}");
-    let (x, y) = harness.find("empty").expect("the empty row");
-    harness.mouse(MouseKind::Down(MouseButton::Right), x, y);
-    harness.mouse(MouseKind::Up(MouseButton::Right), x, y);
-    harness.advance(MOMENT);
-    harness.click_text("New file").advance(MOMENT);
+    menu(&mut harness, "empty", "New file");
     harness.type_text("first.txt").press("enter").advance(MOMENT);
     assert!(root.join("first.txt").is_file(), "{}", harness.screen());
     assert!(harness.screen().contains("first.txt"), "{}", harness.screen());
@@ -550,11 +690,12 @@ fn an_empty_workspace_folder_still_has_its_row_to_make_the_first_entry() {
 fn refresh_and_coming_back_read_the_open_folders_again() {
     let scratch = Scratch::new("refresh");
     let mut harness = files_harness(&scratch);
-    harness.send(Msg::ExpandFile("src".to_owned(), true));
+    harness.click_text("src").advance(MOMENT);
     fs::write(workspace_dir(&scratch).join("src/late.rs"), "").expect("a file made by someone else");
     fs::write(workspace_dir(&scratch).join("GUIDE.md"), "").expect("another");
-    assert!(!harness.screen().contains("late.rs"), "nothing is watched or polled");
-    harness.send(Msg::Files(FileMsg::Refresh));
+    harness.advance(MOMENT);
+    assert!(!harness.screen().contains("late.rs"), "a screen that does not follow the disk polls nothing");
+    refresh(&mut harness);
     let text = harness.screen();
     assert!(text.contains("late.rs") && text.contains("GUIDE.md"), "{text}");
 
@@ -567,15 +708,15 @@ fn refresh_and_coming_back_read_the_open_folders_again() {
 fn a_folder_removed_by_another_program_leaves_nothing_behind() {
     let scratch = Scratch::new("removed");
     let mut harness = files_harness(&scratch);
-    harness.send(Msg::ExpandFile("src".to_owned(), true));
-    harness.send(Msg::Files(FileMsg::Cut("src/main.rs".to_owned())));
+    harness.click_text("src").advance(MOMENT);
+    menu(&mut harness, "main.rs", "Cut");
     fs::remove_dir_all(workspace_dir(&scratch).join("src")).expect("removed by someone else");
-    harness.send(Msg::Files(FileMsg::Refresh));
+    refresh(&mut harness);
     let files = tree(&harness);
     assert!(!files.is_open("src"), "a folder that is gone is not remembered open");
     assert!(files.cut().is_empty(), "and nothing in it waits to be pasted");
     fs::create_dir_all(workspace_dir(&scratch).join("src")).expect("a new folder of the same name");
-    harness.send(Msg::Files(FileMsg::Refresh));
+    refresh(&mut harness);
     assert!(!tree(&harness).is_open("src"), "a new folder of the old name starts closed");
 }
 
@@ -587,8 +728,7 @@ fn the_menu_and_the_dialog_draw_no_brackets_or_frames() {
         harness.set_glyph_mode(mode).render();
         right_click(&mut harness, "src");
         let menu = harness.screen();
-        harness.press("esc").advance(MOMENT);
-        harness.send(Msg::Files(FileMsg::Rename("src".to_owned()))).advance(MOMENT);
+        harness.click_text("Rename").advance(MOMENT);
         let dialog = harness.screen();
         harness.press("esc").advance(MOMENT);
         for text in [menu, dialog] {
@@ -606,11 +746,10 @@ fn the_file_manager_speaks_turkish() {
     harness.set_locale("tr").render();
     right_click(&mut harness, "src");
     let text = harness.screen();
-    for item in ["Yeni dosya", "Yeni klasör", "Yeniden adlandır", "Kes", "Sil"] {
+    for item in ["Yeni dosya", "Yeni klasör", "Yeniden adlandır", "Kes", "Kopyala", "Sil"] {
         assert!(text.contains(item), "`{item}`:\n{text}");
     }
-    harness.press("esc").advance(MOMENT);
-    harness.send(Msg::Files(FileMsg::Delete("src".to_owned()))).advance(MOMENT);
+    harness.click_text("Sil").advance(MOMENT);
     let text = harness.screen();
     assert!(text.contains("src silinsin mi?") && text.contains("içindeki her şeyle"), "{text}");
 }
@@ -619,13 +758,7 @@ fn the_file_manager_speaks_turkish() {
 fn a_message_for_a_workspace_that_is_gone_changes_nothing() {
     let scratch = Scratch::new("gone");
     let mut screen: WorkspaceScreen = one_workspace(&scratch);
-    apply(
-        &mut screen,
-        Msg::Files(FileMsg::Done(
-            "elsewhere".to_owned(),
-            vec![("x".to_owned(), Ok(super::super::Change::Created("x".into())))],
-        )),
-    );
+    apply(&mut screen, Msg::Files("elsewhere".to_owned(), FileManagerMsg::Select("README.md".to_owned())));
     assert_eq!(screen.workspace().expect("a workspace").files().selected(), None);
 }
 

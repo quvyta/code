@@ -28,7 +28,7 @@ use crate::base::apps::{Editor, Sound};
 use crate::engine::EngineKind;
 use crate::profile::SafeName;
 use crate::store::{Config, OnClose, Platform};
-use crate::ui::keys::Wrapping;
+use crate::ui::page;
 
 use engine::{EngineState, Gate, Health};
 use identity::ProfileIdentity;
@@ -40,11 +40,6 @@ const CONTROL_WIDTH: u16 = 25;
 
 /// Rows between the blocks of the screen.
 const BLOCK_GAP: u16 = 1;
-
-/// Widest the settings column grows, in cells. A label, its description and a drop-down read as
-/// one line at this width; on a wide terminal a list stretched edge to edge leaves the label and
-/// its control too far apart to read together, so the column stays this wide in the middle.
-const PAGE_WIDTH: u16 = 84;
 
 /// The left margin a settings list keeps for its pillar. Everything drawn under the list keeps
 /// it too, so nothing stands further left than the settings themselves.
@@ -439,7 +434,7 @@ pub fn view(screen: &Settings, ui: &mut View<'_, Msg>) {
     let forced = ui.env().reduced_motion_forced();
     let gate = screen.gate();
 
-    let width = ui.size().width.min(PAGE_WIDTH);
+    let width = page::width(page::WIDTH, ui.size().width);
     // The scroll view is as tall as the page when the page fits, so the column around it can hold
     // the page in the middle of the screen; a page taller than the screen fills it and scrolls.
     ui.column(|ui| {
@@ -456,6 +451,8 @@ pub fn view(screen: &Settings, ui: &mut View<'_, Msg>) {
                     }
 
                     let list = SettingsList::show(ui, |list| {
+                        // Down on the last setting goes on to the first, as on every list of QCode.
+                        list.wrap(true);
                         list.heading(t!("settings.appearance"));
 
                         let codes: Vec<String> = languages.iter().map(|(code, _)| code.clone()).collect();
@@ -525,7 +522,7 @@ pub fn view(screen: &Settings, ui: &mut View<'_, Msg>) {
                                 let choice = Segmented::new(names)
                                     .selected(chosen)
                                     .on_select(move |index| Msg::Engine(ENGINES[index]));
-                                ui.add(Wrapping::new(choice, Some(chosen), ENGINES.len()).across(true)).id("engine");
+                                ui.add(choice.wrap(true)).id("engine");
                             }
                         });
 
@@ -542,7 +539,7 @@ pub fn view(screen: &Settings, ui: &mut View<'_, Msg>) {
                             let choice = Segmented::new(choices)
                                 .selected(chosen)
                                 .on_select(|index| Msg::OnClose(OnClose::ALL[index]));
-                            ui.add(Wrapping::new(choice, Some(chosen), OnClose::ALL.len()).across(true)).id("on-close");
+                            ui.add(choice.wrap(true)).id("on-close");
                         });
                         if let Some(row) = screen.service {
                             service_row(list, row);
@@ -559,8 +556,7 @@ pub fn view(screen: &Settings, ui: &mut View<'_, Msg>) {
                             let choice = Segmented::new(choices)
                                 .selected(at)
                                 .on_select(|index| Msg::BackupEvery(BackupEvery::ALL[index]));
-                            ui.add(Wrapping::new(choice, Some(at), BackupEvery::ALL.len()).across(true))
-                                .id("backup-every");
+                            ui.add(choice.wrap(true)).id("backup-every");
                         });
 
                         list.heading(t!("settings.apps"));
@@ -574,8 +570,7 @@ pub fn view(screen: &Settings, ui: &mut View<'_, Msg>) {
                                 let choice = Segmented::new(names)
                                     .selected(chosen)
                                     .on_select(move |index| Msg::Editor(Editor::ALL[index]));
-                                ui.add(Wrapping::new(choice, Some(chosen), Editor::ALL.len()).across(true))
-                                    .id("editor");
+                                ui.add(choice.wrap(true)).id("editor");
                             },
                         );
                         let choices = Sound::ALL.map(|choice| t!(&format!("settings.sound-{}", choice.key())));
@@ -584,7 +579,7 @@ pub fn view(screen: &Settings, ui: &mut View<'_, Msg>) {
                             let choice = Segmented::new(choices)
                                 .selected(chosen)
                                 .on_select(|index| Msg::Sound(Sound::ALL[index]));
-                            ui.add(Wrapping::new(choice, Some(chosen), Sound::ALL.len()).across(true)).id("sound");
+                            ui.add(choice.wrap(true)).id("sound");
                         });
 
                         list.heading(t!("settings.folder"));
@@ -882,7 +877,7 @@ mod tests {
         harness.render();
         let (label, _) = harness.find("Language").expect("the language row is shown");
         let (folder, _) = harness.find("Folder").expect("the folder row is shown");
-        let left = (160 - i32::from(super::PAGE_WIDTH)) / 2;
+        let left = (160 - i32::from(crate::ui::page::WIDTH)) / 2;
         assert!(
             label >= left && folder >= left,
             "the column starts in the middle, not at the edge:\n{}",
@@ -890,7 +885,7 @@ mod tests {
         );
         // The control at the end of a row ends where the column does.
         let (change, _) = harness.find("Change").expect("the folder row offers a change");
-        let right = left + i32::from(super::PAGE_WIDTH);
+        let right = left + i32::from(crate::ui::page::WIDTH);
         assert!(change + 6 <= right, "nothing reaches past the column:\n{}", harness.screen());
         assert!(change + 6 >= right - 4, "the column is as wide as it may be:\n{}", harness.screen());
 
@@ -996,6 +991,8 @@ mod tests {
         testing::translated("en", || {
             let forced_on = super::motion_note(true, true).expect("a forced setting says so");
             assert!(forced_on.contains("QUVYTA_REDUCED_MOTION"), "{forced_on}");
+            assert!(forced_on.contains("and decides"), "{forced_on}");
+            assert!(!forced_on.contains("cannot be changed here"), "said in fewer words: {forced_on}");
             let forced_off = super::motion_note(true, false).expect("a forced setting says so");
             assert!(forced_off.contains("QUVYTA_REDUCED_MOTION"), "{forced_off}");
             assert_ne!(forced_on, forced_off, "the value in force is named, not just the variable");
@@ -1008,7 +1005,7 @@ mod tests {
         testing::translated("tr", || {
             let note = super::motion_note(true, true).expect("a forced setting says so");
             assert!(note.contains("Kabuğunda"), "{note}");
-            assert!(note.contains("değiştirilemez"), "{note}");
+            assert!(note.contains("kararı o verir"), "{note}");
         });
     }
 
@@ -1125,6 +1122,25 @@ mod tests {
         // Language, theme, icons, then the switch, which the space bar moves.
         harness.press("down").press("down").press("down").press("space");
         assert_eq!(harness.app().asked, [Request::ReducedMotion(true)]);
+    }
+
+    #[test]
+    fn the_keys_go_round_the_ends_of_the_settings() {
+        let mut harness = testing::host(testing::screen(EngineKind::Podman, Health::Working), SIZE.0, SIZE.1);
+        harness.press("tab").press("tab");
+        assert!(harness.is_focused("settings"), "{}", harness.screen());
+        // Up on the language, the first row, goes round to asking first, the last, which the space
+        // bar switches.
+        harness.press("up").press("space");
+        assert_eq!(harness.app().asked, [Request::AskFirst(true)], "{}", harness.screen());
+        // Down from there goes round to the language again: three rows on is the motion switch.
+        harness.press("down").press("down").press("down").press("down").press("space");
+        assert_eq!(
+            harness.app().asked,
+            [Request::AskFirst(true), Request::ReducedMotion(true)],
+            "{}",
+            harness.screen()
+        );
     }
 
     #[test]

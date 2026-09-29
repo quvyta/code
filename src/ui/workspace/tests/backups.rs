@@ -9,7 +9,7 @@ use super::*;
 
 use qframe::date::{DateTime, TimeOfDay};
 
-use crate::ui::workspace::FileMsg;
+use qframe::widgets::FileManagerMsg;
 
 use crate::backup::conversations::Brought;
 use crate::backup::{BackupEvery, Entry, Reason, Snapshot, SnapshotId};
@@ -161,8 +161,13 @@ fn left_out_row(harness: &mut Harness<Screen>) -> String {
 /// Makes `key` the one selected entry, so the row a menu was on is drawn as any other again: a
 /// selected row is drawn brighter.
 fn select(harness: &mut Harness<Screen>, key: &str) {
-    harness.send(Msg::SelectFile(key.to_owned()));
-    harness.send(Msg::Files(FileMsg::Choose(vec![key.to_owned()])));
+    harness.send(files(FileManagerMsg::Select(key.to_owned())));
+    harness.send(files(FileManagerMsg::Choose(vec![key.to_owned()])));
+}
+
+/// A message of the file manager of the workspace these tests open.
+fn files(message: FileManagerMsg) -> Msg {
+    Msg::Files("firefly".to_owned(), message)
 }
 
 /// The colour the icon of the row showing `name` is drawn in.
@@ -291,9 +296,9 @@ fn a_folder_is_left_out_from_its_menu_and_taken_in_again_the_same_way() {
 #[test]
 fn a_left_out_entry_is_told_apart_from_a_cut_one() {
     let (_scratch, mut harness) = with_file("skip-cut");
-    harness.send(Msg::Files(FileMsg::Cut("README.md".to_owned())));
+    harness.send(files(FileManagerMsg::Cut("README.md".to_owned())));
     let cut = icon_colour(&harness, "README.md");
-    harness.send(Msg::Files(FileMsg::DropCut));
+    harness.send(files(FileManagerMsg::DropCut));
     right_click(&mut harness, "README.md");
     harness.click_text("Don't back up").advance(MOMENT);
     select(&mut harness, "src");
@@ -303,7 +308,7 @@ fn a_left_out_entry_is_told_apart_from_a_cut_one() {
 #[test]
 fn a_left_out_folder_takes_what_is_in_it_along_and_offers_nothing_for_it() {
     let (_scratch, mut harness) = with_file("skip-inside");
-    harness.send(Msg::ExpandFile("src".to_owned(), true));
+    harness.send(files(FileManagerMsg::Expand("src".to_owned(), true)));
     let plain = icon_colour(&harness, "main.rs");
     right_click(&mut harness, "src");
     harness.click_text("Don't back up").advance(MOMENT);
@@ -319,8 +324,8 @@ fn a_left_out_folder_takes_what_is_in_it_along_and_offers_nothing_for_it() {
 #[test]
 fn the_menu_of_a_selection_leaves_all_of_it_out() {
     let (scratch, mut harness) = with_file("skip-many");
-    harness.send(Msg::SelectFile("src".to_owned()));
-    harness.send(Msg::Files(FileMsg::Choose(vec!["src".to_owned(), "README.md".to_owned()])));
+    harness.send(files(FileManagerMsg::Select("src".to_owned())));
+    harness.send(files(FileManagerMsg::Choose(vec!["src".to_owned(), "README.md".to_owned()])));
     right_click(&mut harness, "README.md");
     harness.click_text("Don't back up").advance(MOMENT);
     assert_eq!(on_disk(&scratch), ["src", "README.md"]);

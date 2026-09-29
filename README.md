@@ -32,14 +32,16 @@ source under the MIT licence.
   extra** adds, for Claude Code, every other plugin qcode's author works with, and writes graphify's
   and qcode's own instructions into the workspace's instruction file. **Quvyta development** is
   QCode extra plus what building the Quvyta apps needs, in the image: Rust's stable toolchain with
-  clippy and rustfmt, a C compiler, pkg-config, OpenSSL's headers, git, ssh, curl, jq, uv and, as a
-  part you can switch off, Chromium for tests that drive a browser. **oh my opencode slim** is
+  clippy and rustfmt, rust-analyzer with its Claude Code plugin, a C compiler, pkg-config,
+  OpenSSL's headers, git, ssh, curl, jq, uv and, as a part you can switch off, Chromium for tests
+  that drive a browser. **oh my opencode slim** is
   opencode's alone: graphify and the same settings every QCode template writes, with
   [oh-my-opencode-slim](https://github.com/alvinunreal/oh-my-opencode-slim) (about 220 MB) in
   place of oh-my-openagent (about 470 MB), which it does not install. Its seven agents
   (orchestrator, explorer, oracle, council, librarian, designer, fixer) all run on the model the
-  profile signs in with; it asks for no key, sends no telemetry and never updates itself. What a
-  template adds is listed when you pick it, and each part can be switched off.
+  profile signs in with; it asks for no key, sends no telemetry and never updates itself. The
+  template step shows these ready-made sets above a switch for every part a profile can carry,
+  each part's note under its row; changing a switch by hand makes the set **Custom**.
 - **Signing in once.** A profile signs in through the harness's own sign-in flow, run in a
   terminal inside a container (Antigravity IDE: in its own window, with the page in your own
   browser). qcode then checks that the login is really there before it
@@ -278,7 +280,9 @@ The program is installed as `qcode` and also as `quvyta-code`.
    that draws in a terminal resumes a conversation this way. A profile the workspace
    does not have yet is added to it the moment you open it, and is written into the workspace's
    `workspace.qcode`. With no profile at all, the list offers **New profile**, which leads to the
-   profiles screen.
+   profiles screen. A conversation already open in another tab is not offered until that tab
+   closes. While a tab's harness is working, a thin turning mark stands before its name on the
+   tab strip (a still dot with reduced motion).
 5. **Continue.** The rail on the left holds the workspaces you have open, like the windows of a
    browser: `+` at its end adds another one, and each can be closed. **Continue** on the home
    screen brings back the open workspaces with their tabs as you left them, even after qcode was
@@ -414,25 +418,30 @@ The file tree of the side panel is also a file manager. It works on the workspac
 directly on your machine, so it needs no container and works with no engine running.
 
 - **Context menu.** Right-click an entry, or select it and press `shift+f10` or the menu key. On a
-  folder: **New file**, **New folder**, **Rename**, **Cut**, **Paste here** (once something is cut)
-  and **Delete**. On a file: **Rename**, **Cut** and **Delete**. The first row of the tree is the
-  workspace folder itself; its menu has **New file**, **New folder**, **Paste here** and **Refresh**.
-  With several entries selected, the menu cuts or deletes all of them. Folders and files also
-  offer **Don't back up** (or **Back up again**), and files **Earlier versions**; see
-  [Backups](#backups).
+  folder: **New file**, **New folder**, **Rename**, **Cut**, **Copy**, **Paste here** (once something
+  is cut or copied) and **Delete**. On a file: **Rename**, **Cut**, **Copy** and **Delete**. The
+  first row of the tree is the workspace folder itself; its menu has **New file**, **New folder**,
+  **Paste here** and **Refresh**. With several entries selected, the menu cuts, copies or deletes
+  all of them. Folders and files also offer **Don't back up** (or **Back up again**), and files
+  **Earlier versions**; see [Backups](#backups).
 - **Names** are asked for in a small dialog and checked as you type: not empty, no `/`, not `.` or
   `..`, and not a name the folder already has. A rename opens with the name before its extension
   selected.
-- **Moving** is **Cut**, then **Paste here** on the folder it goes to. A cut entry is drawn faded
-  until it is pasted; `esc` or **Cancel the move** in the menu lets it stay. A folder cannot go
-  into itself, and nothing is ever written over: when the target already has that name, nothing
-  moves and the reason is shown.
+- **Moving and copying.** **Cut** or **Copy**, then **Paste here** on the folder it goes to; or
+  `ctrl+x` or `ctrl+c` on the entry under the cursor and `ctrl+v` on the folder it goes to. A cut
+  entry is drawn faded until it is pasted; `esc`, **Cancel the move** or **Cancel the copy** lets it
+  stay. A copy shows how far it has come above the tree, with **Stop**; what was copied before you
+  stop stays. A folder cannot go into itself, and nothing is ever written over: when the target
+  already has that name, nothing moves and the reason is shown.
 - **Deleting** asks first and cannot be undone; for a folder the question says that everything in
   it goes too.
 - **Several entries.** `ctrl`+click adds or removes an entry, `shift`+click selects a range, and
-  `shift` with the arrow keys extends it; `space` adds or removes the entry under the cursor and
-  `esc` goes back to one. Cut, paste, delete and dragging act on all of them.
-- **Dragging** entries onto a folder, or onto the workspace folder's row, moves them there.
+  `shift` with the arrow keys extends it; `space` adds or removes the entry under the cursor,
+  `ctrl+a` selects every entry shown and `esc` goes back to one. Cut, copy, paste, delete and
+  dragging act on all of them.
+- **Dragging** entries onto a folder, or onto the workspace folder's row, moves them there; with
+  `ctrl` held when you let go, it copies them instead.
+- **Hidden entries**, the ones whose name starts with a dot, are shown like any other.
 - **Live.** The tree follows the disk: the folders on screen are watched, and when something
   changes in one, by qcode, a harness or any other program, only that folder is read again.
   Nothing is read on a timer. Where the system has no watch to give (so far, anywhere but Linux),
@@ -498,8 +507,8 @@ the others when its agent sends a message. Closing a tab stops what its agent wa
 did before, and removes its conversation if nothing was said in it. If the server stops, it is
 started again and every tab attaches to its conversation again. A while after the last tab is
 closed, the server stops too. A profile made with **base** is opencode as it comes: every tab runs
-its own. The first tab of a profile without the network waits over a minute before it opens,
-because opencode first tries to fetch its plugins' packages.
+its own. A profile without the network opens its first tab in seconds: the packages opencode
+would fetch for its plugins are put in the image while it is built.
 
 ## Tabs talking to each other
 

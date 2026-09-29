@@ -10,7 +10,7 @@ use crate::base::apps::Quiet;
 use crate::bridge;
 use crate::desktop::callback::{Ending, Stop};
 
-use super::bridge::{Letter, Undelivered};
+use super::bridge::{Letter, Pasted, Undelivered};
 use super::plan::LaunchFailure;
 
 /// How many lines of an image build a tab keeps: a build prints thousands, and the ones that
@@ -254,6 +254,10 @@ pub struct Tab {
     /// Why the oldest waiting message could not be typed into the harness, when an attempt was
     /// made and failed. Cleared as soon as one is typed in.
     undelivered: Option<Undelivered>,
+    /// A message written into this tab's prompt whose Return has not gone yet, and when it went
+    /// in. The tab owes that Return until it is written; nothing is owed to a tab that owes
+    /// nothing.
+    owed: Option<Pasted>,
     /// The session's last input that was not the person's: when it started, or the Return QCode
     /// wrote after the last message it typed in. Input later than this is the person typing.
     own_input: Option<std::time::Instant>,
@@ -291,6 +295,7 @@ impl Tab {
             letters: Vec::new(),
             letters_shown: false,
             undelivered: None,
+            owed: None,
             own_input: None,
             stopped: None,
             build_log: LogBuffer::new(BUILD_LINES),
@@ -537,18 +542,50 @@ impl Tab {
         self.undelivered = Some(why);
     }
 
-    /// Whether the person has typed into the session since it started and since QCode last typed
-    /// a message into it.
+    /// Records that `pasted` went into this tab's prompt and that the tab owes its Return until
+    /// [`Tab::returned`] says it has gone. A tab takes no further message in the meantime: two
+    /// messages in one prompt line are one message to the harness.
+    pub fn pasted(&mut self, pasted: Pasted) {
+        self.owed = Some(pasted);
+    }
+
+    /// The message whose Return this tab still owes, when it owes one: the paste that went in, the
+    /// harness's last output before it, and when it went, which is what the Return's own wait is
+    /// counted from.
+    #[must_use]
+    pub fn owed(&self) -> Option<&Pasted> {
+        self.owed.as_ref()
+    }
+
+    /// Records that the Return this tab owed has been written, and that the newest thing in the
+    /// terminal is QCode's own: what the person types after it is theirs, as before.
+    pub fn returned(&mut self) {
+        if let Some(session) = &self.session {
+            self.own_input = Some(session.last_input());
+        }
+        self.owed = None;
+    }
+
+    /// Puts `letter` back at the head of the waiting messages, as the oldest of them, and says why
+    /// it is waiting again: its Return could not be written, so the harness that would have read
+    /// it is gone and the message waits for the tab's own next start rather than being lost.
+    pub fn put_back(&mut self, letter: Letter) {
+        self.letters.insert(0, letter);
+        self.undelivered = Some(Undelivered::NotRunning);
+    }
+
+    /// Whether the person has typed into the session since it started and since QCode last wrote
+    /// into it: a message pasted in is QCode's own, and so is the Return that sends it, so neither
+    /// counts as the person typing while the Return is still owed.
     #[must_use]
     pub fn person_typed(&self) -> bool {
         self.session.as_ref().is_some_and(|session| self.own_input.is_none_or(|own| session.last_input() > own))
     }
 
-    /// Takes the oldest waiting message away, once it has been typed into the harness.
+    /// Takes the oldest waiting message away, once it has been typed into the harness. The
+    /// session's own last input is left to the Return that sends it, which is written later than
+    /// this paste.
     pub fn delivered(&mut self) {
-        if let Some(session) = &self.session {
-            self.own_input = Some(session.last_input());
-        }
         if !self.letters.is_empty() {
             self.letters.remove(0);
         }
@@ -667,7 +704,12 @@ impl Tab {
 
     /// Ends the tab's session, which is what closing a tab or restarting it does. The container
     /// itself is left alone: other tabs and other workspaces may be using it.
+    ///
+    /// A Return owed to the program that is ending is given up with it: what is left in a prompt
+    /// nobody will read is not a message the tab still holds, so a message whose Return could not
+    /// be written is the only one that comes back, and it has come back by then.
     pub fn close_session(&mut self) {
+        self.owed = None;
         if let Some(session) = self.session.take() {
             session.kill();
         }

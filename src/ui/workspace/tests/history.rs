@@ -435,3 +435,64 @@ fn the_history_has_no_brackets_in_any_glyph_mode_and_reads_as_turkish() {
     harness.set_locale("tr").render();
     assert!(harness.screen().contains("Henüz sohbet yok"), "{}", harness.screen());
 }
+
+#[test]
+fn a_conversation_open_in_a_tab_is_not_offered_again_until_the_tab_is_closed() {
+    let scratch = Scratch::new("history-open-tab");
+    let mut harness = page(&scratch);
+    answer(&mut harness, "claude-sub", Ok(chats(3)));
+    // The person opens Chat 2 from the page: that tab shows it from now on.
+    harness.click_text("Chat 2").advance(Duration::from_millis(300));
+    assert_eq!(harness.app().0.workspace().expect("a workspace").tabs()[0].conversation(), Some("c-2"));
+
+    // Another blank tab, from the strip's `+`; its page reads the conversations again.
+    harness.click_text("+").render();
+    answer(&mut harness, "claude-sub", Ok(chats(3)));
+    let text = harness.screen();
+    // The strip names the tab after its conversation; the page is everything under the strip.
+    let page = |text: &str| text.lines().skip(1).collect::<Vec<_>>().join("\n");
+    assert!(text.contains("What should this tab open?"), "{text}");
+    assert!(page(&text).contains("Chat 1") && page(&text).contains("Chat 3"), "the others are offered:\n{text}");
+    assert!(!page(&text).contains("Chat 2"), "the one open in a tab is not offered a second tab:\n{text}");
+
+    // The tab closes; the conversation it showed had been written in, so it is offered again.
+    let (x, y) = harness.find("×").expect("the first tab's close mark");
+    harness.click(x, y).render();
+    let text = harness.screen();
+    assert_eq!(harness.app().0.workspace().expect("a workspace").tabs().len(), 1, "the chat tab closed:\n{text}");
+    assert!(page(&text).contains("Chat 2"), "once its tab is gone, it is offered again:\n{text}");
+}
+
+#[test]
+fn the_empty_conversation_a_shared_server_made_for_an_open_tab_is_not_offered() {
+    let scratch = Scratch::new("history-shared-empty");
+    let open = OpenWorkspace::new(
+        &file("firefly", "Firefly", &["opencode"]),
+        scratch.paths(),
+        vec![profile("opencode", HarnessKind::OpenCode)],
+    );
+    let mut screen = WorkspaceScreen::new(Some(engine()), HostUser::ImageDefault, vec![open]);
+    open_chat_with_shared_conversation(&mut screen, "ses-new");
+    let mut harness = harness(screen, SIZE.0, SIZE.1);
+    harness.click_text("+").render();
+    let untitled = conversation("ses-new", None, now_ms());
+    answer(
+        &mut harness,
+        "opencode",
+        Ok(vec![untitled, conversation("ses-old", Some("Earlier work"), now_ms() - HOUR_MS)]),
+    );
+    let text = harness.screen();
+    assert!(text.contains("Earlier work"), "{text}");
+    assert!(!text.contains("Untitled chat"), "the open tab's conversation, still empty, is not offered:\n{text}");
+}
+
+/// Opens a new opencode chat on `screen` and gives it the conversation `id`, which is what the
+/// shared server's answer does before the tab starts. The engine of these tests cannot be run, so
+/// the answer is given the way the screen takes it.
+fn open_chat_with_shared_conversation(screen: &mut WorkspaceScreen, id: &str) {
+    open(screen, Choice::NewChat("opencode".to_owned()));
+    let active = screen.active;
+    if let Some(tab) = screen.workspaces.get_mut(active).and_then(|workspace| workspace.tabs.first_mut()) {
+        tab.show_conversation(id.to_owned());
+    }
+}

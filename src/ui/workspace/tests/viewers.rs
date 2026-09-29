@@ -181,7 +181,8 @@ fn a_very_long_text_is_cut_at_a_character_and_says_so() {
     apply(&mut screen, Msg::TextRead(key, 0, Ok(taken)));
     assert!(tab(&screen, key).is_partial());
     let harness = harness(screen, SIZE.0, SIZE.1);
-    assert!(harness.screen().contains("only its beginning is shown"), "{}", harness.screen());
+    assert!(harness.screen().contains("Only the text's start is shown"), "{}", harness.screen());
+    assert!(!harness.screen().contains("so only its beginning"), "said in fewer words:\n{}", harness.screen());
 }
 
 #[test]

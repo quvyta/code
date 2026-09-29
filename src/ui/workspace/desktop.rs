@@ -25,6 +25,7 @@ use qframe::widgets::EmptyState;
 
 use crate::desktop::{self, Display, NoDisplay, callback, signin};
 use crate::engine::Network;
+use crate::ui::page;
 
 use super::plan::{self, ContainerPlan, LaunchFailure};
 use super::{Back, Msg, OpenWorkspace, Shown, Tab, TabKey, TabKind, TabState, WorkspaceScreen};
@@ -420,68 +421,72 @@ pub(super) fn view(screen: &WorkspaceScreen, tab: &Tab, profile: &str, ui: &mut 
     let key = tab.key();
     let offline = plan_of(screen, key).is_some_and(|(_, offline)| offline);
     let (colour, headline, detail) = words(tab, profile, offline);
-    ui.column(|ui| {
+    // The page Settings keeps, so a line of explanation stays readable on a wide terminal.
+    page::column(ui, page::WIDTH, |ui| {
         ui.column(|ui| {
-            ui.add(Text::new(headline).role("title").color(colour));
-            if let Some(detail) = detail {
-                ui.add(Text::new(detail).role("secondary")).selectable(true).fill_width();
-            }
-            // What the window asked to have opened, if it asked: the person can see the address
-            // and copy it, whether or not a browser came up here.
-            if let Some((address, opened)) = tab.sign_in() {
-                // While the opening is still on its way there is nothing true to say about the
-                // browser, so only the address is shown; the sentence joins it a moment later.
-                let carried = tab.back().is_some();
-                let said = match opened {
-                    Some(Shown::InBrowser) if carried => Some(t!("workspace.window.signin-in-browser")),
-                    Some(Shown::InBrowser) => Some(t!("workspace.window.signin-browser-only")),
-                    Some(Shown::InWindow) => Some(t!("workspace.window.signin-opened")),
-                    Some(Shown::NoWindow) => Some(t!("workspace.window.signin-no-window")),
-                    Some(Shown::Nowhere) => Some(t!("workspace.window.signin-open-yourself")),
-                    Some(Shown::Held) | None => None,
-                };
-                if let Some(said) = said {
-                    ui.add(Text::new(said).role("secondary")).fill_width();
+            ui.column(|ui| {
+                ui.add(Text::new(headline).role("title").color(colour));
+                if let Some(detail) = detail {
+                    ui.add(Text::new(detail).role("secondary")).selectable(true).fill_width();
                 }
-                ui.add(Text::new(address.to_owned())).selectable(true).fill_width();
-                if let Some((port, back)) = tab.back() {
-                    let (role, words) = back_words(port, back);
-                    ui.add(Text::new(words).role(role)).selectable(true).fill_width();
+                // What the window asked to have opened, if it asked: the person can see the address
+                // and copy it, whether or not a browser came up here.
+                if let Some((address, opened)) = tab.sign_in() {
+                    // While the opening is still on its way there is nothing true to say about the
+                    // browser, so only the address is shown; the sentence joins it a moment later.
+                    let carried = tab.back().is_some();
+                    let said = match opened {
+                        Some(Shown::InBrowser) if carried => Some(t!("workspace.window.signin-in-browser")),
+                        Some(Shown::InBrowser) => Some(t!("workspace.window.signin-browser-only")),
+                        Some(Shown::InWindow) => Some(t!("workspace.window.signin-opened")),
+                        Some(Shown::NoWindow) => Some(t!("workspace.window.signin-no-window")),
+                        Some(Shown::Nowhere) => Some(t!("workspace.window.signin-open-yourself")),
+                        Some(Shown::Held) | None => None,
+                    };
+                    if let Some(said) = said {
+                        ui.add(Text::new(said).role("secondary")).fill_width();
+                    }
+                    ui.add(Text::new(address.to_owned())).selectable(true).fill_width();
+                    if let Some((port, back)) = tab.back() {
+                        let (role, words) = back_words(port, back);
+                        ui.add(Text::new(words).role(role)).selectable(true).fill_width();
+                    }
+                    // The window inside the container, for a sign-in the browser cannot finish:
+                    // offered under the default rather than instead of it, while there is a window.
+                    if tab.state() == &TabState::Running && opened.is_some() && opened != Some(Shown::InWindow) {
+                        ui.row(|ui| {
+                            ui.add(Button::new(t!("workspace.window.signin-here")).on_press(Msg::SignInHere(key)))
+                                .id("workspace-window-signin-here");
+                        });
+                    }
                 }
-                // The window inside the container, for a sign-in the browser cannot finish:
-                // offered under the default rather than instead of it, while there is a window.
-                if tab.state() == &TabState::Running && opened.is_some() && opened != Some(Shown::InWindow) {
-                    ui.row(|ui| {
-                        ui.add(Button::new(t!("workspace.window.signin-here")).on_press(Msg::SignInHere(key)))
-                            .id("workspace-window-signin-here");
-                    });
-                }
-            }
-            ui.row(|ui| match tab.state() {
-                TabState::Running => {
-                    ui.add(
-                        Button::new(t!("workspace.window.raise")).variant("primary").on_press(Msg::RaiseWindow(key)),
-                    )
-                    .id(WINDOW_ID);
-                    ui.add(Button::new(t!("workspace.window.close")).on_press(Msg::CloseWindow(key)))
-                        .id("workspace-window-close");
-                }
-                TabState::Waiting | TabState::Starting => {}
-                _ => {
-                    let again = t!("workspace.window.open");
-                    ui.add(Button::new(again).variant("primary").on_press(Msg::Restart(key))).id(WINDOW_ID);
-                }
+                ui.row(|ui| match tab.state() {
+                    TabState::Running => {
+                        ui.add(
+                            Button::new(t!("workspace.window.raise"))
+                                .variant("primary")
+                                .on_press(Msg::RaiseWindow(key)),
+                        )
+                        .id(WINDOW_ID);
+                        ui.add(Button::new(t!("workspace.window.close")).on_press(Msg::CloseWindow(key)))
+                            .id("workspace-window-close");
+                    }
+                    TabState::Waiting | TabState::Starting => {}
+                    _ => {
+                        let again = t!("workspace.window.open");
+                        ui.add(Button::new(again).variant("primary").on_press(Msg::Restart(key))).id(WINDOW_ID);
+                    }
+                })
+                .gap(2)
+                .fill_width();
             })
-            .gap(2)
+            .gap(1)
             .fill_width();
         })
-        .gap(1)
-        .width(Length::Cells(READABLE_WIDTH))
-        .fill_width();
-    })
-    .padding(Padding::symmetric(1, 2))
-    .fill()
-    .id("workspace-desktop");
+        .padding(Padding::symmetric(1, 2))
+        .fill()
+        .id("workspace-desktop");
+    });
 }
 
 /// What the tab says about the way back of a sign-in to `port`, and the role it is said in.
@@ -502,9 +507,6 @@ fn back_words(port: u16, back: &Back) -> (&'static str, String) {
         }
     }
 }
-
-/// The widest the tab's words grow, so a line of explanation stays readable on a wide terminal.
-const READABLE_WIDTH: u16 = 72;
 
 /// What the tab says: the colour of its first line, that line, and the quieter one under it.
 fn words(tab: &Tab, profile: &str, offline: bool) -> (&'static str, String, Option<String>) {

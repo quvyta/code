@@ -15,7 +15,7 @@ use qframe::icons::GlyphMode;
 use qframe::runtime::Harness;
 
 use super::*;
-use crate::profile::{MountAccess, NetworkMode, Template};
+use crate::profile::{HarnessKind, MountAccess, NetworkMode, Template};
 
 /// The screen on its own.
 struct Host {

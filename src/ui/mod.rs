@@ -1,8 +1,8 @@
 //! The screens of QCode.
 
 pub mod home;
-pub mod keys;
 pub mod logo;
+pub mod page;
 pub mod profiles;
 pub mod providers;
 pub mod settings;

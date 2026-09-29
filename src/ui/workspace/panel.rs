@@ -3,15 +3,13 @@
 use qframe::date::DateTime;
 use qframe::prelude::*;
 use qframe::widgets::{
-    ContextItem, ContextMenu, Field, Form, FormErrors, Modal, Popover, Section, ShimmerText, Spinner, Switch,
-    TextInput, Tooltip, Tree, TreeNode, WidgetDock,
+    Click, ContextItem, ContextMenu, FileManager, FileManagerState, MenuTarget, Popover, RowMark, Section, ShimmerText,
+    Spinner, Switch, Tooltip, WidgetDock,
 };
 
 use crate::engine::ContainerState;
-use crate::ui::keys::Wrapping;
 
-use super::file_ops::{is_within, stem};
-use super::files::{self, FileMsg, FileTree, NameFor};
+use super::files;
 use super::{Msg, OpenWorkspace, WorkspaceScreen};
 
 /// A widget the panel can carry.
@@ -200,9 +198,6 @@ pub(super) fn view(screen: &WorkspaceScreen, ui: &mut View<'_, Msg>) {
         })
         .fill_width();
         dock(screen, ui);
-        if let Some(workspace) = screen.workspace() {
-            naming(workspace.files(), ui);
-        }
         super::backups::view(screen, ui);
     })
     .gap(1)
@@ -238,7 +233,7 @@ fn chooser(panel: &Panel, ui: &mut View<'_, Msg>) {
                 .selected(Some(row))
                 .on_select(Msg::HighlightWidget)
                 .on_activate(move |index| Msg::AddWidget(offered[index]));
-            ui.add(Wrapping::new(list, Some(row), missing.len())).id(CHOOSER_ID).width(Length::Cells(26));
+            ui.add(list.wrap(true)).id(CHOOSER_ID).width(Length::Cells(26));
         })
         .show(ui);
 }
@@ -282,76 +277,76 @@ fn body(screen: &WorkspaceScreen, widget: PanelWidget, ui: &mut View<'_, Msg>) {
     }
 }
 
-/// The workspace's own files; with `engine` their earlier versions can be looked for too.
+/// The workspace's own files, in the framework's file manager; with `engine` their earlier
+/// versions can be looked for too.
 fn files_widget(workspace: &OpenWorkspace, engine: bool, ui: &mut View<'_, Msg>) {
     let tree = workspace.files();
-    if tree.children(files::ROOT).is_none() && tree.error().is_none() {
+    if tree.children(FileManagerState::ROOT).is_none() && tree.error().is_none() {
         // An unread folder is not an empty one, so it never says "empty" before it is known.
         ui.add(Spinner::new().label(t!("workspace.files.reading")));
         return;
     }
     if let Some(problem) = tree.error() {
+        // Said here rather than by the manager, so the panel names the folder it is about.
         ui.add(Text::new(t!("workspace.files.unreadable")).role("secondary"));
         ui.add(Text::new(problem.to_owned()).role("faint")).selectable(true);
         return;
     }
-    let cut = tree.cut().to_vec();
-    let folders = tree.folder_keys();
-    let chosen = tree.chosen().to_vec();
     let skip = workspace.backup_skip().to_vec();
-    let accepts = folders.clone();
-    ui.add(
-        Tree::new([root_node(workspace, tree)])
-            .selected(tree.selected())
-            .on_select(move |key| Msg::SelectFile(key.to_owned()))
-            // Enter or a click on a file opens it in a tab; on a folder they open the folder,
-            // which the tree does itself. Space and the modified clicks choose instead.
-            .on_activate(move |key| Msg::OpenFile(key.to_owned()))
-            .multi_select(tree.chosen(), |keys| Msg::Files(FileMsg::Choose(keys)))
-            .droppable(|drop| Msg::Files(FileMsg::Drop(drop)), move |key| key == files::ROOT || accepts.contains(key))
-            .on_expand(move |key, open| Msg::ExpandFile(key.to_owned(), open))
-            .context_menu(move |key| {
-                // The tree keeps the selection when the click is on one of its rows and makes the
-                // row the selection otherwise, so the menu acts on what the click was on.
-                let targets = files::targets(&chosen, key);
-                let backup = backup_item(key, &targets, &skip);
-                if targets.len() > 1 {
-                    many_menu(key, targets.len(), !cut.is_empty(), backup.into_iter().collect())
-                } else if key == files::ROOT || folders.contains(key) {
-                    folder_menu(key, &cut, backup.into_iter().collect())
-                } else {
-                    // Earlier versions are read out of the backup in a container.
-                    let versions =
-                        ContextItem::new(t!("workspace.files.versions"), Msg::ShowBackups(Some(key.to_owned())))
-                            .disabled(!engine);
-                    file_menu(key, !cut.is_empty(), std::iter::once(versions).chain(backup).collect())
-                }
-            }),
-    )
-    .fill()
-    .id(FILES_ID);
-}
-
-/// The workspace folder itself, as the one row at the top of the tree.
-///
-/// It is a row rather than nothing so the folder has a place of its own: its menu makes entries
-/// and pastes at the top, reached by a right click or by selecting it and pressing the menu key
-/// like any other row. A tree that is only as tall as its rows has no empty part below them to
-/// click, so the row is the one way the mouse and the keyboard reach the folder alike.
-fn root_node(workspace: &OpenWorkspace, tree: &FileTree) -> TreeNode {
-    let entries = nodes(tree, files::ROOT, workspace.backup_skip());
-    let mut root = TreeNode::new(files::ROOT, workspace.name().to_owned()).icon("workspace", None);
-    if entries.is_empty() {
-        root = root.detail(t!("workspace.files.empty"));
-    }
-    root.expandable(true).expanded(tree.is_open(files::ROOT)).children(entries)
+    let marked = skip.clone();
+    let folders = tree.folder_keys();
+    let root = tree.root().to_path_buf();
+    FileManager::new(tree, files::wrap(workspace.id()))
+        .root_label(workspace.name().to_owned())
+        // One click opens, as it always has in qcode: a file in its tab, a folder where it stands.
+        // Ctrl and Shift with a click still only select, and a drag still carries the selection.
+        .open_on(Click::Single)
+        .on_open(move |path| Msg::OpenFile(files::key_of(&root, path)))
+        .menu_for(move |target| own_items(target, &skip, engine))
+        .row_mark(move |key| mark(key, folders.contains(key), &marked))
+        .id(FILES_ID)
+        .show(ui)
+        .fill();
 }
 
 /// The name the file tree is focused by.
 pub(super) const FILES_ID: &str = "workspace-files";
 
-/// The name the field of the naming dialog is focused by.
-pub(super) const NAME_ID: &str = "workspace-files-name";
+/// The theme colour of the icon of an entry the backup leaves out.
+const LEFT_OUT_TONE: &str = "warning";
+
+/// What qcode says about the look of the row `key`, a folder when `folder`, in a workspace whose
+/// backup leaves `skip` out.
+///
+/// The workspace folder itself carries the workspace's icon, so the top row reads as the workspace
+/// rather than as one more folder. What the backup leaves out is faint, with everything in it, and
+/// its icon takes the warning tone so it is told apart from a cut entry, which is faint in its own
+/// colour; the workspace widget names it in words. A word beside the row would not do: the panel is
+/// narrow, and the tree gives a detail its room before the name.
+fn mark(key: &str, folder: bool, skip: &[String]) -> RowMark {
+    if key == FileManagerState::ROOT {
+        return RowMark::new().plain_sign("workspace");
+    }
+    if super::backups::is_left_out(skip, key) {
+        let icon = if folder { "folder" } else { "file" };
+        return RowMark::new().sign(icon, LEFT_OUT_TONE).faint(true);
+    }
+    RowMark::new()
+}
+
+/// qcode's own items on the menu of a row, in a workspace whose backup leaves `skip` out: a file's
+/// earlier versions, read out of the backup in a container and so only with `engine`, and leaving
+/// entries out of the backup or taking them in again. The manager puts them in a group of their
+/// own before its last, destructive item.
+fn own_items(target: &MenuTarget<'_>, skip: &[String], engine: bool) -> Vec<ContextItem<Msg>> {
+    let backup = backup_item(target.key, target.selection, skip);
+    if target.selection.len() > 1 || target.folder {
+        return backup.into_iter().collect();
+    }
+    let versions = ContextItem::new(t!("workspace.files.versions"), Msg::ShowBackups(Some(target.key.to_owned())))
+        .disabled(!engine);
+    std::iter::once(versions).chain(backup).collect()
+}
 
 /// The item that leaves the entries `targets`, asked for on the row `key`, out of the backup of a
 /// workspace that leaves `skip` out, or takes them in again when every one of them is left out by
@@ -361,7 +356,7 @@ pub(super) const NAME_ID: &str = "workspace-files-name";
 /// Unlike cutting and deleting, the item does not count what it acts on: it is undone as easily
 /// as it is done, and the menu stays narrow enough to leave the names below it readable.
 fn backup_item(key: &str, targets: &[String], skip: &[String]) -> Option<ContextItem<Msg>> {
-    let message = |out: bool| Msg::Files(FileMsg::LeaveOut(key.to_owned(), out));
+    let message = |out: bool| Msg::LeaveOut(key.to_owned(), out);
     if !targets.is_empty() && targets.iter().all(|target| skip.contains(target)) {
         return Some(ContextItem::new(t!("workspace.files.back-up"), message(false)));
     }
@@ -371,164 +366,9 @@ fn backup_item(key: &str, targets: &[String], skip: &[String]) -> Option<Context
     Some(ContextItem::new(t!("workspace.files.leave-out"), message(true)))
 }
 
-/// Puts the items of `backup`, when there are any, into a menu as a group of their own.
-fn add_backup(items: &mut Vec<ContextItem<Msg>>, backup: Vec<ContextItem<Msg>>) {
-    if !backup.is_empty() {
-        items.push(ContextItem::gap());
-        items.extend(backup);
-    }
-}
-
-/// The menu of a folder, or of the workspace folder itself when `key` is the root: what can be made
-/// in it and, while something is cut, pasting it here. A folder cannot take itself or a folder
-/// that holds it, so pasting there is shown but cannot be chosen.
-fn folder_menu(key: &str, cut: &[String], backup: Vec<ContextItem<Msg>>) -> Vec<ContextItem<Msg>> {
-    let message = |message: FileMsg| Msg::Files(message);
-    let mut items = vec![
-        ContextItem::new(t!("workspace.files.new-file"), message(FileMsg::NewFile(key.to_owned()))),
-        ContextItem::new(t!("workspace.files.new-folder"), message(FileMsg::NewFolder(key.to_owned()))),
-    ];
-    let root = key == files::ROOT;
-    if !root {
-        items.push(ContextItem::gap());
-        items.push(ContextItem::new(t!("workspace.files.rename"), message(FileMsg::Rename(key.to_owned()))));
-        items.push(ContextItem::new(t!("workspace.files.cut"), message(FileMsg::Cut(key.to_owned()))));
-    }
-    if !cut.is_empty() {
-        let paste = ContextItem::new(t!("workspace.files.paste"), message(FileMsg::Paste(key.to_owned())));
-        items.push(paste.disabled(cut.iter().any(|cut| is_within(key, cut))));
-        items.push(ContextItem::new(t!("workspace.files.drop-cut"), message(FileMsg::DropCut)));
-    }
-    add_backup(&mut items, backup);
-    items.push(ContextItem::gap());
-    if root {
-        items.push(ContextItem::new(t!("workspace.files.refresh"), message(FileMsg::Refresh)));
-    } else {
-        items.push(
-            ContextItem::new(t!("workspace.files.delete"), message(FileMsg::Delete(key.to_owned()))).danger(true),
-        );
-    }
-    items
-}
-
-/// The menu of a file.
-fn file_menu(key: &str, cutting: bool, backup: Vec<ContextItem<Msg>>) -> Vec<ContextItem<Msg>> {
-    let message = |message: FileMsg| Msg::Files(message);
-    let mut items = vec![
-        ContextItem::new(t!("workspace.files.rename"), message(FileMsg::Rename(key.to_owned()))),
-        ContextItem::new(t!("workspace.files.cut"), message(FileMsg::Cut(key.to_owned()))),
-    ];
-    if cutting {
-        items.push(ContextItem::new(t!("workspace.files.drop-cut"), message(FileMsg::DropCut)));
-    }
-    add_backup(&mut items, backup);
-    items.push(ContextItem::gap());
-    items.push(ContextItem::new(t!("workspace.files.delete"), message(FileMsg::Delete(key.to_owned()))).danger(true));
-    items
-}
-
-/// The menu of a row that is one of `count` selected entries: what can be done to all of them at
-/// once. A name is given to one entry at a time, so renaming is not offered.
-fn many_menu(key: &str, count: usize, cutting: bool, backup: Vec<ContextItem<Msg>>) -> Vec<ContextItem<Msg>> {
-    let message = |message: FileMsg| Msg::Files(message);
-    let mut items =
-        vec![ContextItem::new(t!("workspace.files.cut-many", n = count), message(FileMsg::Cut(key.to_owned())))];
-    if cutting {
-        items.push(ContextItem::new(t!("workspace.files.drop-cut"), message(FileMsg::DropCut)));
-    }
-    add_backup(&mut items, backup);
-    items.push(ContextItem::gap());
-    items.push(
-        ContextItem::new(t!("workspace.files.delete-many", n = count), message(FileMsg::Delete(key.to_owned())))
-            .danger(true),
-    );
-    items
-}
-
-/// The dialog that asks for a name, while one is asked for. It waits for an answer rather than
-/// sitting beside the tree: the name is all there is to do until it is given or dropped.
-fn naming(tree: &FileTree, ui: &mut View<'_, Msg>) {
-    let Some(naming) = tree.naming() else { return };
-    let (title, confirm) = match &naming.purpose {
-        NameFor::File => (t!("workspace.files.new-file-title"), t!("workspace.files.create")),
-        NameFor::Folder => (t!("workspace.files.new-folder-title"), t!("workspace.files.create")),
-        NameFor::Rename(key) => {
-            (t!("workspace.files.rename-title", name = super::file_ops::name_of(key)), t!("workspace.files.rename-do"))
-        }
-    };
-    let close = Msg::Files(FileMsg::CloseNaming);
-    let dialog = Modal::new()
-        .title(title)
-        .width(NAMING_WIDTH)
-        .on_close(close.clone())
-        .action(Button::new(t!("workspace.files.cancel")).on_press(close))
-        .action(Button::new(confirm).variant("primary").on_press(Msg::Files(FileMsg::Submit)));
-    let mut errors = FormErrors::new();
-    if let Some(problem) = tree.naming_problem() {
-        errors.set(NAME_ID, problem.message());
-    }
-    let value = naming.value.clone();
-    // A rename selects the name without its extension, so typing gives a new name and keeps the
-    // kind of file; a new entry starts empty and has nothing to select.
-    let selection = match &naming.purpose {
-        NameFor::Rename(key) => Some(stem(&value, tree.is_folder(key))),
-        NameFor::File | NameFor::Folder => None,
-    };
-    ui.add_with(dialog, |ui| {
-        Form::new().show(ui, |fields| {
-            fields.field(Field::new(t!("workspace.files.name-label")).error(errors.get(NAME_ID)), |ui| {
-                let mut input = TextInput::new(value)
-                    .invalid(errors.has(NAME_ID))
-                    .on_change(|value| Msg::Files(FileMsg::Name(value)))
-                    .on_submit(|_| Msg::Files(FileMsg::Submit));
-                if let Some(range) = selection {
-                    input = input.select_on_focus(range);
-                }
-                ui.add(input).id(NAME_ID).fill_width();
-            });
-        });
-    });
-}
-
-/// Width of the naming dialog, in cells: room for a long file name without covering the screen.
-const NAMING_WIDTH: u16 = 48;
-
 /// Cells of the panel a widget's own content never has: the dock's indent on the left, the
 /// panel's padding on the right. What is left is what a row of buttons has to fit in.
 const WIDGET_INSET: u16 = 7;
-
-/// The theme colour of the icon of an entry the backup leaves out.
-const LEFT_OUT_TONE: &str = "warning";
-
-/// The nodes below the folder `key`, as far as the tree has been read, in a workspace whose backup
-/// leaves `skip` out.
-fn nodes(tree: &FileTree, key: &str, skip: &[String]) -> Vec<TreeNode> {
-    let Some(entries) = tree.children(key) else { return Vec::new() };
-    entries
-        .iter()
-        .map(|entry| {
-            let child = files::child_key(key, &entry.name);
-            let icon = if entry.folder { "folder" } else { "file" };
-            // What was cut is drawn faint until it is pasted or let go, with everything in it.
-            // What the backup leaves out is faint too, with everything in it, and its icon takes
-            // the warning tone so the two are told apart; the workspace widget names it in words.
-            // A word beside the row would not do: the panel is narrow, and the tree gives a
-            // detail its room before the name.
-            let cut = tree.is_cut(&child);
-            let out = super::backups::is_left_out(skip, &child);
-            let tone = out.then_some(LEFT_OUT_TONE);
-            let mut node = TreeNode::new(child.clone(), entry.name.clone()).icon(icon, tone).faint(cut || out);
-            if entry.folder {
-                let open = tree.is_open(&child);
-                node = node.expandable(true).expanded(open).loading(tree.is_loading(&child));
-                if open {
-                    node = node.children(nodes(tree, &child, skip));
-                }
-            }
-            node
-        })
-        .collect()
-}
 
 /// What the workspace is and where it lives.
 fn info_widget(screen: &WorkspaceScreen, workspace: &OpenWorkspace, ui: &mut View<'_, Msg>) {
@@ -598,9 +438,7 @@ fn containers_widget(screen: &WorkspaceScreen, workspace: &OpenWorkspace, ui: &m
                 .detail(state_text(&container.state))
         });
         let list = List::new(rows).selected(Some(workspace.container_row)).on_select(Msg::SelectContainer);
-        ui.add(Wrapping::new(list, Some(workspace.container_row), workspace.containers().len()))
-            .fill()
-            .id("workspace-containers");
+        ui.add(list.wrap(true)).fill().id("workspace-containers");
     }
 
     let selected = workspace.containers().get(workspace.container_row);

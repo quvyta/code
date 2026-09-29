@@ -7,7 +7,6 @@ use qframe::widgets::Skeleton;
 use super::Msg;
 use super::engine::Gate;
 use crate::profile::SafeName;
-use crate::ui::keys::Wrapping;
 
 /// How many faint lines stand in for the profiles while the store is being read. Three is
 /// what a first store tends to hold; the list replaces them in one frame.
@@ -61,7 +60,7 @@ pub fn view(profiles: Option<&[ProfileIdentity]>, chosen: usize, engine: &Gate, 
     // is measured before it is placed in the middle, so its height must not depend on the room.
     let rows = u16::try_from(profiles.len()).unwrap_or(u16::MAX);
     let list = List::new(items).selected(Some(chosen)).on_select(Msg::Profile);
-    ui.add(Wrapping::new(list, Some(chosen), profiles.len())).id("profiles").height(Length::Cells(rows)).fill_width();
+    ui.add(list.wrap(true)).id("profiles").height(Length::Cells(rows)).fill_width();
 
     // The nearer reason wins: without a profile or without a login there is nothing to do even
     // with an engine running, and saying "needs an engine" there would send the person after the

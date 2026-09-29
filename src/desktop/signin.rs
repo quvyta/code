@@ -345,25 +345,43 @@ mod tests {
         assert_eq!(command[3..], ["sh", BROWSER_PROGRAM, "--ozone-platform=wayland", address]);
 
         // Run as the container would, with a stand-in browser: it starts with the address as one
-        // word, and the shell does not wait for it.
+        // word, and the shell does not wait for it. The stand-in says it has started, then waits
+        // for this test to let it go before it writes its words, so the shell answering while it
+        // still waits is the proof that nobody waited for it; no clock is read. It writes beside
+        // the final name and moves the file into place, so what is read is never half written.
         let dir = folder("page");
         let stand_in = dir.join("browser");
-        let seen = dir.join("seen");
-        std::fs::write(&stand_in, format!("#!/bin/sh\nsleep 1\nprintf '%s\\n' \"$@\" > '{}'\n", seen.display()))
-            .expect("a stand-in browser");
+        let (started, go, seen, gave_up) = (dir.join("started"), dir.join("go"), dir.join("seen"), dir.join("gave-up"));
+        let script = format!(
+            "#!/bin/sh\n: > '{started}'\n\
+             i=0; while [ ! -e '{go}' ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i + 1)); done\n\
+             [ -e '{go}' ] || {{ : > '{gave_up}'; exit 0; }}\n\
+             printf '%s\\n' \"$@\" > '{seen}.part' && mv '{seen}.part' '{seen}'\n",
+            started = started.display(),
+            go = go.display(),
+            gave_up = gave_up.display(),
+            seen = seen.display(),
+        );
+        std::fs::write(&stand_in, script).expect("a stand-in browser");
         std::fs::set_permissions(&stand_in, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("runnable");
         let mut here = command.clone();
         here[4] = stand_in.display().to_string();
-        let started = std::time::Instant::now();
         let out = std::process::Command::new(&here[0]).args(&here[1..]).output().expect("a shell");
         assert!(out.status.success());
-        assert!(started.elapsed() < std::time::Duration::from_millis(900), "the browser is not waited for");
+        assert!(!gave_up.exists(), "the shell waited for the browser until it gave up");
+        assert!(!seen.exists(), "the browser cannot have finished before it was let go");
         assert_eq!(String::from_utf8_lossy(&out.stdout), "", "a browser that is there says nothing");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while !seen.exists() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        let words = std::fs::read_to_string(&seen).expect("the stand-in browser ran");
+        let within = |path: &std::path::Path| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !path.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            path.exists()
+        };
+        assert!(within(&started), "the stand-in browser was started");
+        std::fs::write(&go, "").expect("the stand-in is let go");
+        assert!(within(&seen), "the stand-in browser wrote what it was started with");
+        let words = std::fs::read_to_string(&seen).expect("what it was started with");
         assert_eq!(words, format!("--ozone-platform=wayland\n{address}\n"));
 
         // An image with no browser says so rather than failing.

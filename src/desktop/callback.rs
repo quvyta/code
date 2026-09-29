@@ -531,9 +531,13 @@ mod tests {
         assert!(!asks_for("", "/"));
     }
 
-    /// A port nobody on this machine listens on right now.
-    fn free_port() -> u16 {
-        TcpListener::bind("127.0.0.1:0").and_then(|socket| socket.local_addr()).expect("a free port").port()
+    /// A port nobody else listens on, listened on for the way back `path` to `host`.
+    fn listening(path: &str, host: Loopback) -> (u16, Listener) {
+        super::test_ports::on_a_free_port(|port| match Listener::bind(&back(port, path, host)) {
+            Ok(listener) => Some(listener),
+            Err(NotListening::Taken) => None,
+            Err(refused) => panic!("it listens: {refused:?}"),
+        })
     }
 
     #[test]
@@ -546,8 +550,7 @@ mod tests {
 
     #[test]
     fn a_localhost_way_back_is_listened_for_on_both_loopbacks_where_the_machine_has_both() {
-        let port = free_port();
-        let listener = Listener::bind(&back(port, "/", Loopback::Localhost)).expect("it listens");
+        let (port, listener) = listening("/", Loopback::Localhost);
         assert_eq!(listener.port(), port);
         assert!(TcpStream::connect(("127.0.0.1", port)).is_ok());
         if TcpListener::bind("[::1]:0").is_ok() {
@@ -570,15 +573,22 @@ mod tests {
         }
     }
 
-    /// A stand-in carrier: a script that writes the request it is given into `seen` and answers
-    /// with `answer`, the way the application inside would.
+    /// A stand-in carrier: a shell that adds the first line of the request it is given to `seen`
+    /// and answers with `answer`, the way the application inside would.
+    ///
+    /// The words are given to `sh` rather than written into a program of their own: a program
+    /// written a moment before it is started cannot be started while another test's thread starts
+    /// a program of its own, whose child holds the file open for writing until it runs, and the
+    /// connection would be carried by nothing.
+    ///
+    /// Each request adds a line of its own rather than replacing the last one: the port is one of
+    /// this machine's, and a program of someone else's that still looks for a server it once had
+    /// there connects now and then, as `GET /global/health` was seen to.
     fn stand_in(dir: &Path, answer: &str) -> (EngineCommand, PathBuf) {
         let seen = dir.join("seen");
-        let script = dir.join("carrier");
-        std::fs::write(&script, format!("#!/bin/sh\nhead -n 1 > '{}'\nprintf '{answer}'\n", seen.display()))
-            .expect("a stand-in carrier");
-        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("runnable");
-        (EngineCommand { program: script, args: Vec::new(), deadline: None }, seen)
+        let words = format!("head -n 1 >> '{}'; printf '{answer}'", seen.display());
+        let args = vec!["-c".into(), words.into()];
+        (EngineCommand { program: PathBuf::from("/bin/sh"), args, deadline: None }, seen)
     }
 
     fn folder(name: &str) -> PathBuf {
@@ -602,8 +612,7 @@ mod tests {
     fn the_request_for_the_way_back_is_carried_in_its_answer_carried_out_and_the_port_given_up() {
         let dir = folder("carried");
         let (carrier, seen) = stand_in(&dir, "HTTP/1.1 200 OK\\r\\nContent-Length: 9\\r\\n\\r\\nsigned-in");
-        let port = free_port();
-        let listener = Listener::bind(&back(port, "/oauth-callback", Loopback::V4)).expect("it listens");
+        let (port, listener) = listening("/oauth-callback", Loopback::V4);
         let serving = std::thread::spawn(move || {
             listener.serve(&carrier, |pause| {
                 std::thread::sleep(pause);
@@ -616,10 +625,10 @@ mod tests {
         assert!(!serving.is_finished(), "a request for another path is not the sign-in");
         let answer = browse(port, "/oauth-callback?code=4%2F0Ab-7&state=s");
         assert!(answer.starts_with("HTTP/1.1 200 OK") && answer.ends_with("signed-in"), "{answer}");
-        assert_eq!(
-            std::fs::read_to_string(&seen).expect("the request was carried").trim_end(),
-            "GET /oauth-callback?code=4%2F0Ab-7&state=s HTTP/1.1"
-        );
+        let carried = std::fs::read_to_string(&seen).expect("the requests were carried");
+        let lines: Vec<&str> = carried.lines().map(str::trim_end).collect();
+        assert!(lines.contains(&"GET /favicon.ico HTTP/1.1"), "{carried}");
+        assert!(lines.contains(&"GET /oauth-callback?code=4%2F0Ab-7&state=s HTTP/1.1"), "{carried}");
         assert_eq!(serving.join().expect("the listener ends"), Ending::Returned);
         assert!(given_up(port), "the port is given up");
         let _ = std::fs::remove_dir_all(&dir);
@@ -627,8 +636,7 @@ mod tests {
 
     #[test]
     fn nothing_coming_back_ends_the_listening_after_the_wait_counted_in_its_own_sleeps() {
-        let port = free_port();
-        let listener = Listener::bind(&back(port, "/cb", Loopback::V4)).expect("it listens");
+        let (port, listener) = listening("/cb", Loopback::V4);
         let mut slept = Duration::ZERO;
         let carrier = EngineCommand { program: PathBuf::from("/qcode-nothing-here"), args: Vec::new(), deadline: None };
         let ending = listener.serve(&carrier, |pause| {
@@ -642,8 +650,7 @@ mod tests {
 
     #[test]
     fn a_stop_that_is_dropped_ends_the_listening_and_gives_the_port_up() {
-        let port = free_port();
-        let listener = Listener::bind(&back(port, "/cb", Loopback::V4)).expect("it listens");
+        let (port, listener) = listening("/cb", Loopback::V4);
         let (stop, flag) = Stop::new();
         let carrier = EngineCommand { program: PathBuf::from("/qcode-nothing-here"), args: Vec::new(), deadline: None };
         let serving = std::thread::spawn(move || {
@@ -668,5 +675,34 @@ mod tests {
         assert_eq!(words[6..], ["45049", "127.0.0.1,::1"]);
         assert!(!words.iter().any(|word| word == "--tty"), "a terminal would change the bytes");
         assert!(!super::CARRIER.contains('\\'));
+    }
+}
+
+/// Free ports for the tests that listen for a way back, here and on the screens that start one.
+#[cfg(test)]
+pub(crate) mod test_ports {
+    use std::net::TcpListener;
+
+    /// A port nobody on this machine listens on right now.
+    pub(crate) fn free_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0").and_then(|socket| socket.local_addr()).expect("a free port").port()
+    }
+
+    /// What `listen` makes of a port found free, tried again on another while it answers `None`
+    /// for a port that read as taken, a finite number of times.
+    ///
+    /// A free port is found by listening on one and letting it go, and it can read as taken for a
+    /// moment after: another test's thread that starts a program right then hands the child a copy
+    /// of every socket open in this process, the one being let go included, and the child holds it
+    /// until it runs its own program. That is not the listener refusing anything, so another port
+    /// is found.
+    pub(crate) fn on_a_free_port<T>(mut listen: impl FnMut(u16) -> Option<T>) -> (u16, T) {
+        for _ in 0..100 {
+            let port = free_port();
+            if let Some(listening) = listen(port) {
+                return (port, listening);
+            }
+        }
+        panic!("every port found free was taken again before it could be listened on");
     }
 }

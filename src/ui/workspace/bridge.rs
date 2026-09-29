@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use qframe::prelude::*;
 use qframe::runtime::{Confirm, Task};
-use qframe::widgets::{ScrollView, Toast};
+use qframe::widgets::{ScrollView, TerminalSession, Toast};
 
 use crate::bridge::config::Unregistered;
 use crate::bridge::protocol::{Answer, Kind, Listed, MOST_TEXT, Outcome, Question, Received, Request, To, You};
@@ -41,6 +41,116 @@ pub(super) const ASK_WAIT: Duration = Duration::from_secs(45);
 /// tab. Generous on purpose: a shorter wait buys no correctness and types into a tool that is still
 /// drawing on a loaded machine.
 pub(super) const QUIET: Duration = Duration::from_secs(2);
+
+/// Whether the program in `session` has written within [`QUIET`] of `now`. The bridge waits for it
+/// to stop before typing a message in, and the tab strip marks the tab as working while it has not.
+pub(super) fn speaking(session: &TerminalSession, now: Instant) -> bool {
+    now.saturating_duration_since(session.last_output()) < QUIET
+}
+
+/// How long after a harness has taken a pasted message its Return is written.
+///
+/// Gemini CLI 0.61 reads a Return that comes within 40 ms of a paste as a new line inside the
+/// pasted text, not as sending it (its prompt guards against a paste whose own line breaks would
+/// send it half-written, unless the terminal speaks the kitty keyboard protocol), and any Return
+/// within 30 ms of the last typed key the same way. A Return written straight after the paste
+/// sent 3 messages of 20 into a real Gemini CLI; the rest stood in its prompt until somebody
+/// pressed Return. The window starts when the harness handles the paste, which only the harness
+/// knows, so this is counted from the moment it shows that it has: its first output after the
+/// paste ([`PASTE_TAKEN`]). Two and a half times the longer window, so a loaded machine drawing
+/// late still falls outside it; short enough that nobody waits on it.
+pub(super) const AFTER_PASTE: Duration = Duration::from_millis(100);
+
+/// How long a harness is given to show that it took a paste before the Return is written anyway.
+/// A line editor draws the pasted text at once; a program that never echoes (a plain `cat`)
+/// still gets its Return, [`AFTER_PASTE`] after this.
+pub(super) const PASTE_TAKEN: Duration = Duration::from_millis(500);
+
+/// A message written into a tab's prompt, and the Return that prompt is still owed.
+///
+/// Both waits are counted from `at`, the moment the paste went in, and `before` is what the harness
+/// had drawn up to then: the first thing it draws afterwards is how it says it took the message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pasted {
+    /// When the paste was written into the prompt.
+    at: Instant,
+    /// The harness's last output before the paste.
+    before: Instant,
+    /// The message as it was written in, kept so that a harness which ends before its Return has
+    /// the message put back in the tab rather than lost with its prompt.
+    letter: Letter,
+}
+
+impl Pasted {
+    /// Whether the Return for this paste is due at `now`, on the rule [`due`] gives.
+    fn due(&self, session: &TerminalSession, now: Instant) -> bool {
+        due(session, self.at, self.before, now)
+    }
+
+    /// The message as it was written into the prompt, for a tab that has to have it back.
+    fn letter(&self) -> Letter {
+        self.letter.clone()
+    }
+}
+
+/// Whether the Return for a paste written at `at` into `session`, which had drawn nothing since
+/// `before`, is due at `now`: once the harness has shown that it took the paste and [`AFTER_PASTE`]
+/// has passed, or [`PASTE_TAKEN`] and [`AFTER_PASTE`] together when it shows nothing at all, as a
+/// plain `cat` does not.
+///
+/// This is the whole rule, the screen's and [`type_in`]'s alike, so that neither can drift from
+/// the other.
+fn due(session: &TerminalSession, at: Instant, before: Instant, now: Instant) -> bool {
+    let waited = now.saturating_duration_since(at);
+    if session.last_output() > before { waited >= AFTER_PASTE } else { waited >= PASTE_TAKEN + AFTER_PASTE }
+}
+
+/// Writes the message `letter` into `session` as the one paste a handover is made in, and says when
+/// it went in and what the harness had drawn before it: the two things [`due`] reads.
+fn paste_in(session: &TerminalSession, letter: Letter) -> std::io::Result<Pasted> {
+    let before = session.last_output();
+    session.paste(&handed(&letter))?;
+    Ok(Pasted { at: Instant::now(), before, letter })
+}
+
+/// Types `text` into `session` the way a message is handed to a harness: as one paste, then a
+/// Return once the harness has taken the paste ([`AFTER_PASTE`]).
+///
+/// The Return is written rather than pasted: inside a paste it would be a line break in the text
+/// instead of the person's own Return, and nothing would be sent off. Waits at most
+/// [`PASTE_TAKEN`] and [`AFTER_PASTE`] together, on the calling thread, on the rule [`due`] gives,
+/// which is the same one the screen keeps its own waits to.
+///
+/// The screen does not call this: it writes that Return from its own timer instead, and leaves
+/// the wait to the tab ([`Pasted`]). This is the way the live tests hand a message to a real
+/// harness, whose thread is nothing but the wait.
+///
+/// # Errors
+///
+/// The session's own error when the program no longer reads its input.
+#[cfg(test)]
+pub(crate) fn type_in(session: &TerminalSession, text: &str) -> std::io::Result<()> {
+    let before = session.last_output();
+    session.paste(text)?;
+    let at = Instant::now();
+    while !due(session, at, before, Instant::now()) {
+        std::thread::sleep(RETURN_EVERY);
+    }
+    session.write(b"\r")
+}
+
+/// How often a tab that owes a Return is looked at again. Its wait ends within [`PASTE_TAKEN`] and
+/// [`AFTER_PASTE`] of the paste, so a look has to be finer than that for the Return to go as soon
+/// as the rule allows; a look is one message and nothing else, and the screen is free between them.
+pub(super) const RETURN_EVERY: Duration = Duration::from_millis(50);
+
+/// Looks again at the Return the tab `key` is owed, once [`RETURN_EVERY`] has passed. Every tab's
+/// wait is its own, so a tab that is owed a Return is looked at by its own timer and no other.
+fn owed_again(key: TabKey) -> Command<Msg> {
+    Command::task(Task::new(t!("bridge.delivering"), move |cx| {
+        if cx.sleep(RETURN_EVERY) { Ok(Msg::Return(key)) } else { Err(String::new()) }
+    }))
+}
 
 /// How often a tab that still holds messages is looked at again. Nothing is timed while no tab
 /// holds one.
@@ -737,55 +847,96 @@ fn taken(screen: &WorkspaceScreen, to: TabKey, name: &str) -> Answer {
 /// now, and asks to be called again while any message is still waiting. Nothing is timed while
 /// no tab holds a message.
 pub(super) fn deliver(screen: &mut WorkspaceScreen, now: Instant) -> Command<Msg> {
+    let mut commands = Vec::new();
     let mut waiting = false;
     for workspace in &mut screen.workspaces {
         for tab in &mut workspace.tabs {
-            hand_over(tab, now);
+            commands.push(hand_over(tab, now));
             // A window's messages wait for its agent, not for a moment of quiet, so nothing is
             // timed for them.
             waiting |= !tab.letters().is_empty() && !by_inbox(tab);
         }
     }
     if !waiting || screen.delivering {
-        return Command::none();
+        // What a paste is owed is timed by the tab itself, whether or not another look at a
+        // waiting message is already set going, so those commands go out either way.
+        return Command::batch(commands);
     }
     screen.delivering = true;
-    Command::task(Task::new(t!("bridge.delivering"), move |cx| {
+    commands.push(Command::task(Task::new(t!("bridge.delivering"), move |cx| {
         if cx.sleep(RETRY_EVERY) { Ok(Msg::Deliver) } else { Err(String::new()) }
-    }))
+    })));
+    Command::batch(commands)
 }
 
 /// Types the oldest message waiting in `tab` into its harness, when the tab has a session, the
 /// person has not been typing in it and the program has not been writing. A message that cannot
 /// go in stays where it is and the tab keeps why, because dropping it would leave the agent that
 /// sent it believing its work had been handed over.
-fn hand_over(tab: &mut Tab, now: Instant) {
-    let Some(letter) = tab.letters().first().cloned() else { return };
+///
+/// The paste goes in at once and the tab is left owing its Return, which [`returned`] writes from
+/// the screen's own timer. Waiting here for the harness to take the paste would hold the whole
+/// screen still for as long as the wait lasts, and a message to every tab would hold it once per
+/// tab: a person cannot type, and no tab can be closed, while a message is on its way.
+fn hand_over(tab: &mut Tab, now: Instant) -> Command<Msg> {
+    let Some(letter) = tab.letters().first().cloned() else { return Command::none() };
     if by_inbox(tab) {
         tab.not_delivered(Undelivered::Inbox);
-        return;
+        return Command::none();
+    }
+    // A message whose Return has not gone yet is still in that prompt: a second one would join it
+    // in a single line, and the harness would read both as one message.
+    if tab.owed().is_some() {
+        return Command::none();
     }
     let Some(session) = tab.session().cloned() else {
         tab.not_delivered(Undelivered::NotRunning);
-        return;
+        return Command::none();
     };
     // A line the person started and has not sent holds every message back, however long they
     // pause over it: a message typed in then joins their line and goes out with their Return
     // (seen in the endurance trial, 2026-09-24). Once they send or clear it, the usual quiet is
     // enough.
-    if session.line_pending()
-        || now.saturating_duration_since(session.last_input()) < QUIET
-        || now.saturating_duration_since(session.last_output()) < QUIET
+    if session.line_pending() || now.saturating_duration_since(session.last_input()) < QUIET || speaking(&session, now)
     {
-        return;
+        return Command::none();
     }
-    let text = handed(&letter);
-    // Enter is written rather than pasted: inside a paste it would be a line break in the text
-    // instead of the person's own Return, and nothing would be sent off.
-    match session.paste(&text).and_then(|()| session.write(b"\r")) {
-        Ok(()) => tab.delivered(),
-        Err(_) => tab.not_delivered(Undelivered::NotRunning),
+    match paste_in(&session, letter) {
+        Ok(pasted) => {
+            tab.pasted(pasted);
+            tab.delivered();
+            owed_again(tab.key())
+        }
+        Err(_) => {
+            tab.not_delivered(Undelivered::NotRunning);
+            Command::none()
+        }
     }
+}
+
+/// Writes the Return the tab `key` is owed, when the rule in [`due`] says it is time, and looks
+/// again in [`RETURN_EVERY`] when it is not yet.
+///
+/// A harness that no longer reads its input cannot be sent the message: the paste went in and the
+/// program went away, so the message goes back into the tab, where the person can read it and the
+/// tab's own restart hands it over again, rather than being lost with a prompt that is gone.
+pub(super) fn returned(screen: &mut WorkspaceScreen, key: TabKey, now: Instant) -> Command<Msg> {
+    let Some((_, tab)) = screen.owner_mut(key).and_then(|workspace| workspace.find(key)) else {
+        return Command::none();
+    };
+    let Some(pasted) = tab.owed().cloned() else { return Command::none() };
+    let Some(session) = tab.session().cloned() else {
+        tab.returned();
+        return Command::none();
+    };
+    if !pasted.due(&session, now) {
+        return owed_again(key);
+    }
+    tab.returned();
+    if session.write(b"\r").is_err() {
+        tab.put_back(pasted.letter());
+    }
+    Command::none()
 }
 
 /// Tells the senders of messages that have waited [`ASK_WAIT`] on the person's answer about
@@ -810,15 +961,45 @@ fn queue(screen: &mut WorkspaceScreen, to: TabKey, letter: Letter, hop: u32, now
 }
 
 /// Asks the person before the tab `key`, named `name` on the strip, is closed with `waiting`
-/// messages from other tabs still in it. They would go with the tab, and the agents that sent them
-/// were told their work was taken, so nothing about it would reach anyone again.
-pub(super) fn ask_close(key: TabKey, name: &str, waiting: usize) -> Command<Msg> {
+/// messages from other tabs still in it, or with `owed` telling whether a message it has already
+/// taken still stands in its prompt without its Return.
+///
+/// Either way the messages would go with the tab, and the agents that sent them were told their
+/// work was taken, so nothing about it would reach anyone again. A message waiting its Return is
+/// a moment from being sent, so keeping the tab a moment is enough; the words say so.
+pub(super) fn ask_close(key: TabKey, name: &str, waiting: usize, owed: bool) -> Command<Msg> {
+    let mut said = Vec::new();
+    if waiting > 0 {
+        said.push(t!("bridge.close.message", n = waiting));
+    }
+    if owed {
+        said.push(t!("bridge.close.owed"));
+    }
     Command::confirm(
         Confirm::new(t!("bridge.close.title", tab = name), Msg::CloseTabAnyway(key))
-            .message(t!("bridge.close.message", n = waiting))
+            .message(said.join(" "))
             .confirm_label(t!("bridge.close.confirm"))
             .cancel_label(t!("bridge.close.cancel")),
     )
+}
+
+/// Writes the Return the tab `key` owes as the tab is closed, before its program is ended.
+///
+/// A message that was pasted into that prompt was taken out of the tab, and its sender was told
+/// the tool there had it. Waiting for the rule in [`due`] would lose it: the program is going, and
+/// the person has answered that this tab goes. So the Return is written now, which is the last
+/// thing the tab can do for that message, and the words of the question say what it amounts to.
+pub(super) fn returning_on_close(screen: &mut WorkspaceScreen, key: TabKey) {
+    let Some((_, tab)) = screen.owner_mut(key).and_then(|workspace| workspace.find(key)) else { return };
+    if tab.owed().is_none() {
+        return;
+    }
+    let Some(session) = tab.session().cloned() else { return };
+    tab.returned();
+    // A program that no longer reads its input takes nothing anyway, and the tab is going with it:
+    // there is nowhere left to put the message back, so what the person was asked about is what
+    // happens.
+    let _ = session.write(b"\r");
 }
 
 /// Forgets the tabs of `keys`, which were closed: the rules drop them, and a message waiting on

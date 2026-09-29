@@ -3,6 +3,9 @@
 //! ```text
 //! {store}/
 //!   Profiles/
+//!     <profile>.toml
+//!     custom/
+//!       <profile>.toml
 //!   Workspaces/
 //!     <workspace>/
 //!       workspace.qcode
@@ -10,6 +13,9 @@
 //!       Assets/
 //!       Containers/Harness/<profile>/
 //! ```
+//!
+//! A profile whose parts are its own is written in `Profiles/custom/`, so that a QCode from
+//! before that folder is there does not read it and build an image the file never asked for.
 //!
 //! `Backup/` and `Containers/MCP/` are not created here; they are born with the features that
 //! need them. Nothing in this module panics: a store that cannot be read or written is a
@@ -26,7 +32,7 @@ use qframe::storage::atomic_write;
 use qframe::t;
 
 use crate::backup::Place;
-use crate::profile::Profile;
+use crate::profile::{Profile, Template};
 
 use super::workspace::outside;
 use super::{Loaded, WorkspaceFile, WorkspaceId, WorkspaceIdError, WorkspaceProfile};
@@ -36,6 +42,9 @@ const WORKSPACE_FILE: &str = "workspace.qcode";
 
 /// The folder the profile definitions live in.
 const PROFILES: &str = "Profiles";
+
+/// The folder inside it the definitions of profiles whose parts are their own live in.
+const CUSTOM: &str = "custom";
 
 /// The folder the workspaces live in.
 const WORKSPACES: &str = "Workspaces";
@@ -343,21 +352,20 @@ impl Store {
     /// A `Profiles/` folder that is not there yet is not a problem: it means no profiles. A file
     /// that cannot be read or cannot be understood is reported and the rest are still returned,
     /// so one broken definition never hides the profiles that work.
+    ///
+    /// Custom profiles live in [`Store::custom_profiles_dir`], which is read as well: their parts
+    /// are their own, and a QCode older than that folder does not see them at all.
     #[must_use]
     pub fn profiles(&self) -> Loaded<Vec<Profile>> {
-        let folder = self.profiles_dir();
         let mut value = Vec::new();
         let mut diagnostics = Vec::new();
-        let entries = match fs::read_dir(&folder) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Loaded { value, diagnostics },
-            Err(error) => return Loaded { value, diagnostics: vec![blocked(&folder, &error)] },
-        };
-        let mut files: Vec<PathBuf> = entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|extension| extension == "toml"))
-            .collect();
+        let mut files = Vec::new();
+        for folder in [self.profiles_dir(), self.custom_profiles_dir()] {
+            match definition_files(&folder) {
+                Ok(found) => files.extend(found),
+                Err(problem) => diagnostics.push(problem),
+            }
+        }
         files.sort();
         for path in files {
             match fs::read_to_string(&path) {
@@ -372,14 +380,44 @@ impl Store {
         Loaded { value, diagnostics }
     }
 
-    /// Writes a profile's definition file atomically, making the store's folders first.
+    /// The folder a custom profile's definition file is in.
+    #[must_use]
+    pub fn custom_profiles_dir(&self) -> PathBuf {
+        self.profiles_dir().join(CUSTOM)
+    }
+
+    /// The folder `profile`'s definition file is in, and its name: a ready-made template's is the
+    /// one every profile's file has always been in, and a custom one's is the folder of its own,
+    /// which a QCode that does not know it never reads.
+    #[must_use]
+    pub fn profile_file(&self, profile: &Profile) -> PathBuf {
+        let folder = match profile.template {
+            Template::Custom => self.custom_profiles_dir(),
+            _ => self.profiles_dir(),
+        };
+        folder.join(format!("{}.toml", profile.name))
+    }
+
+    /// Writes a profile's definition file atomically, making the store's folders first, and takes
+    /// away the file of the kind it is not: a profile has one definition, whichever folder holds
+    /// it, and two of them would list it twice.
     ///
     /// # Errors
     ///
     /// A diagnostic naming the folder or file that could not be written.
     pub fn write_profile(&self, profile: &Profile) -> Result<(), Diagnostic> {
         self.prepare()?;
-        let path = self.profiles_dir().join(format!("{}.toml", profile.name));
+        let path = self.profile_file(profile);
+        // Made only when a custom profile is written, so a store without one looks as it always did.
+        if let Some(folder) = path.parent() {
+            fs::create_dir_all(folder).map_err(|error| blocked(folder, &error))?;
+        }
+        let stale = if profile.template == Template::Custom {
+            self.profiles_dir().join(format!("{}.toml", profile.name))
+        } else {
+            self.custom_profiles_dir().join(format!("{}.toml", profile.name))
+        };
+        let _ = fs::remove_file(&stale);
         atomic_write(&path, profile.to_toml().as_bytes()).map_err(|error| blocked(&path, &error))
     }
 
@@ -569,6 +607,21 @@ fn read_workspace_at(paths: &WorkspacePaths) -> Result<WorkspaceFile, Diagnostic
 }
 
 /// The diagnostic for a path the file system would not let this program use.
+/// The definition files in `folder`; none for a folder that is not there, which means no profiles
+/// of its kind.
+fn definition_files(folder: &Path) -> Result<Vec<PathBuf>, Diagnostic> {
+    let entries = match fs::read_dir(folder) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(blocked(folder, &error)),
+    };
+    Ok(entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "toml"))
+        .collect())
+}
+
 fn blocked(path: &Path, error: &io::Error) -> Diagnostic {
     Diagnostic::error(None, format!("{}: {error}", path.display()))
 }
@@ -576,7 +629,7 @@ fn blocked(path: &Path, error: &io::Error) -> Diagnostic {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profile::{AccountKind, HarnessKind, MountAccess, NetworkMode, SafeName, Template};
+    use crate::profile::{AccountKind, Extra, HarnessKind, MountAccess, NetworkMode, SafeName, Template};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// A directory of this test's own, removed first so a crashed run cannot poison the next.
@@ -641,6 +694,33 @@ mod tests {
         let loaded = store.profiles();
         assert_eq!(loaded.value.len(), 1, "the readable profile is kept: {:?}", loaded.value);
         assert!(!loaded.is_clean(), "the broken one is reported");
+        let _ = fs::remove_dir_all(store.root());
+    }
+
+    #[test]
+    fn a_custom_profile_is_written_where_a_qcode_from_before_them_does_not_look() {
+        let store = Store::new(scratch("custom-folder"));
+        let mut custom = profile("claude-own");
+        custom.template = Template::Custom;
+        custom.without = vec![Extra::Graphify];
+        store.write_profile(&custom).expect("the store can be written");
+        let file = store.profile_file(&custom);
+        assert_eq!(file, store.custom_profiles_dir().join("claude-own.toml"));
+        assert!(file.is_file(), "the file is there");
+        let loaded = store.profiles();
+        assert!(loaded.is_clean(), "{:?}", loaded.diagnostics);
+        assert_eq!(loaded.value, vec![custom.clone()]);
+
+        // A ready-made set's file is where every profile's file has always been, and a change of
+        // kind takes the other one away, so a profile is never listed twice.
+        let mut ready = profile("claude-own");
+        ready.template = Template::High;
+        store.write_profile(&ready).expect("the store can be written");
+        assert!(store.profile_file(&ready).is_file(), "in the folder every profile's file is in");
+        assert!(!file.exists(), "and the custom one is gone: {:?}", store.profiles());
+        let loaded = store.profiles();
+        assert!(loaded.is_clean(), "{:?}", loaded.diagnostics);
+        assert_eq!(loaded.value, vec![ready.clone()], "listed once, under the set it is now");
         let _ = fs::remove_dir_all(store.root());
     }
 

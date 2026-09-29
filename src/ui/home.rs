@@ -3,7 +3,6 @@
 use qframe::prelude::*;
 
 use crate::Msg as AppMsg;
-use crate::ui::keys::Wrapping;
 use crate::ui::logo::Logo;
 
 /// Width of the menu. Wide enough for the longest label with a workspace name beside it, narrow
@@ -146,12 +145,11 @@ pub fn view(home: &Home, ui: &mut View<'_, AppMsg>) {
             _ => item,
         }
     });
-    let rows = entries.len();
     let menu = List::new(items)
         .selected(Some(home.selected))
         .on_select(|index| AppMsg::Home(Msg::Select(index)))
         .on_activate(move |index| AppMsg::Open(entries[index.min(entries.len() - 1)]));
-    let menu = Wrapping::new(menu, Some(home.selected), rows);
+    let menu = menu.wrap(true);
 
     ui.column(|ui| {
         ui.add(Logo::new()).width(Length::Cells(Logo::WIDTH));

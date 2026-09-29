@@ -340,6 +340,17 @@ impl HarnessKind {
         }
     }
 
+    /// Whether a profile whose containers reach no network is offered for this harness.
+    ///
+    /// Antigravity IDE is not: it does not open without signing in to Google, and every answer it
+    /// gives comes from Google's servers, so a container without the network holds a window that
+    /// can do nothing. Every other harness here can at least be pointed at a provider on this
+    /// machine, or carries a login made once and kept.
+    #[must_use]
+    pub fn offered_offline(self) -> bool {
+        !matches!(self, Self::AntigravityIde)
+    }
+
     /// The harness written as `id`, if there is one.
     #[must_use]
     pub fn parse(id: &str) -> Option<Self> {

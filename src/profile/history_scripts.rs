@@ -96,14 +96,11 @@ fn ids(found: &[Conversation]) -> Vec<&str> {
     found.iter().map(|conversation| conversation.id.as_str()).collect()
 }
 
-/// Whether this machine has a Node to run the scripts with. Without one the checks below say so
-/// and pass: the scripts themselves are Node's business and the base image carries it.
+/// Whether this machine has a Node to run the scripts with. Without one the checks below fail
+/// and say how to go on, unless the machine is said to have none knowingly: a check that passes
+/// without running a script would read as checked.
 fn node_is_here() -> bool {
-    let found = Command::new("node").arg("--version").output().is_ok();
-    if !found {
-        eprintln!("no node on this machine: the history scripts were not run");
-    }
-    found
+    crate::testing::node("running the history scripts").is_some()
 }
 
 /// Claude Code's folder per workspace, its name made from the path.

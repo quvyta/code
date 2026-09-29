@@ -221,6 +221,8 @@ fn nothing_reaches_the_network_until_the_button_is_pressed_and_the_page_says_whe
     let screen = harness.screen();
     // Where it will go, before it goes.
     assert!(screen.contains("GET http://192.168.122.1:11434/api/version"), "{screen}");
+    let said = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(said.contains("nothing else here goes out"), "and that nothing else does:\n{screen}");
     assert_eq!(seen.lock().expect("the list").len(), 0, "nothing has gone out yet");
 
     harness.click_text("Try the connection").render();
@@ -325,8 +327,11 @@ fn a_free_model_that_is_rate_limited_is_said_to_be_asking_for_a_wait_not_to_have
     harness.click_text("Ask what it offers").render();
     harness.click_text("Measure the real window").render();
     let screen = harness.screen().split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(screen.contains("too many requests right now"), "the person is told what 429 means:\n{screen}");
-    assert!(screen.contains("Wait a minute"), "and what to do meanwhile:\n{screen}");
+    assert!(
+        screen.contains("is rate-limited (429): free models are shared"),
+        "the person is told what 429 means:\n{screen}"
+    );
+    assert!(screen.contains("wait a minute and press again"), "and what to do meanwhile:\n{screen}");
     assert!(!screen.contains("refused with"), "a service asking for a wait did not refuse anything:\n{screen}");
     // The provider's own sentence, not the "Provider returned error" in front of it.
     assert!(screen.contains("temporarily rate-limited upstream"), "{screen}");
@@ -704,4 +709,122 @@ fn a_ready_made_service_is_not_added_without_a_key_and_says_whose_key_is_missing
     harness.render();
     assert!(harness.screen().contains("Kimi Code is reached with a key."), "{}", harness.screen());
     assert!(!path.exists(), "nothing was written");
+}
+
+/// Whether any text of `screen` above its footer bar reaches past the column `right`.
+fn reaches_past(screen: &str, right: usize) -> bool {
+    let lines: Vec<&str> = screen.lines().collect();
+    let body = &lines[..lines.len().saturating_sub(1)];
+    body.iter().any(|line| line.trim_end().chars().count() > right)
+}
+
+#[test]
+fn the_page_stands_in_the_middle_at_a_readable_width() {
+    let path = file("page");
+    let (web, _) = canned(Vec::new());
+    let mut harness = opened(&path, web);
+    add(&mut harness, "ollama", "orchard", "http://192.168.122.1:11434", None);
+    harness.resize(200, 40).render();
+    let screen = harness.screen();
+    // The heading at the page's left edge, the row just inside it, the row's kind and address at
+    // the page's right edge, and nothing further right than that, on a terminal twice as wide.
+    let left = (200 - i32::from(crate::ui::page::WIDTH)) / 2;
+    let right = left + i32::from(crate::ui::page::WIDTH);
+    let (heading, _) = harness.find("Providers").expect("the heading is drawn");
+    assert!(heading.abs_diff(left) <= 1, "the heading is not at the page's edge ({heading}):\n{screen}");
+    let (row, _) = harness.find("orchard").expect("the provider is listed");
+    // A chosen row carries its mark in the cells in front of its name.
+    assert!((left..=left + 3).contains(&row), "the row is not at the page's edge ({row}):\n{screen}");
+    let address = "http://192.168.122.1:11434";
+    let (at, _) = harness.find(address).expect("the address is on the row");
+    let end = at + i32::try_from(address.len()).expect("a length");
+    assert_eq!(end, right - 1, "the address does not end at the page's edge:\n{screen}");
+    assert!(!reaches_past(&screen, usize::try_from(right).expect("a column")), "text past the page:\n{screen}");
+
+    // Narrower than the page, the page takes the terminal and every label stays whole.
+    harness.resize(70, 40).render();
+    let screen = harness.screen();
+    assert!(screen.contains("orchard") && screen.contains(address), "{screen}");
+    let (heading, _) = harness.find("Providers").expect("the heading is drawn");
+    assert!(heading < 4, "a narrow terminal keeps the page at its edge:\n{screen}");
+    let _ = std::fs::remove_dir_all(path.parent().expect("its folder"));
+}
+
+#[test]
+fn the_page_says_each_thing_in_few_words() {
+    let path = file("few-words");
+    let (web, _) = canned(Vec::new());
+    let mut harness = opened(&path, web);
+    harness.resize(120, 40).render();
+    add(&mut harness, "ollama", "orchard", "http://192.168.122.1:11434", None);
+    harness.render();
+    let screen = harness.screen().split_whitespace().collect::<Vec<_>>().join(" ");
+    for said in ["Keys are in plain text in", "a backup carries them.", "nothing else here goes out."] {
+        assert!(screen.contains(said), "`{said}` is missing:\n{screen}");
+    }
+    for gone in ["A backup of your home folder carries them with it", "Nothing else on this page reaches the network"] {
+        assert!(!screen.contains(gone), "`{gone}` is still said:\n{screen}");
+    }
+    let _ = std::fs::remove_dir_all(path.parent().expect("its folder"));
+}
+
+#[test]
+fn free_models_qcode_saw_work_come_first_with_a_mark_and_those_it_saw_fail_come_last_with_why() {
+    let path = file("tried");
+    // OpenRouter's own order, which puts a model that answers Claude Code with nothing on top.
+    let (web, _) = canned(vec![(
+        "/api/v1/models",
+        r#"{"data":[
+            {"id":"cohere/north-mini-code:free","context_length":256000},
+            {"id":"acme/untried-7b:free","context_length":131072},
+            {"id":"nex-agi/nex-n2.5-mini:free","context_length":262144},
+            {"id":"acme/untried-70b:free","context_length":65536}
+        ]}"#,
+    )]);
+    let mut harness = opened(&path, web);
+    harness.resize(120, 40).render();
+    add(&mut harness, "OpenRouter", "yol", "https://openrouter.ai", Some(MADE_UP));
+    harness.render();
+    harness.click_text("Ask what it offers").render();
+    let screen = harness.screen();
+    let row = |id: &str| screen.lines().position(|line| line.contains(id)).unwrap_or_else(|| panic!("{id}:\n{screen}"));
+    let (tried, first, second, broken) = (
+        row("nex-agi/nex-n2.5-mini:free"),
+        row("acme/untried-7b:free"),
+        row("acme/untried-70b:free"),
+        row("cohere/north-mini-code:free"),
+    );
+    assert!(
+        tried < first && first < second && second < broken,
+        "tried first, the rest as listed, broken last:\n{screen}"
+    );
+    let lines: Vec<&str> = screen.lines().collect();
+    assert!(lines[tried].contains('✓'), "the tried model is marked:\n{screen}");
+    assert!(!lines[first].contains('✓'), "a model nobody tried is not:\n{screen}");
+    assert!(lines[broken].contains("Claude Code gets an empty answer"), "why it fails, on its row:\n{screen}");
+    // The first row is the one chosen, and the line under the list says in which harnesses.
+    assert!(screen.contains("Tried in Claude Code, opencode"), "{screen}");
+    // A model the record knows but the service no longer offers is not made up.
+    assert!(!screen.contains("dots-studio"), "{screen}");
+    let _ = std::fs::remove_dir_all(path.parent().expect("its folder"));
+}
+
+#[test]
+fn a_providers_file_written_before_the_record_of_tried_models_opens_in_the_same_order() {
+    let path = file("tried-file");
+    std::fs::create_dir_all(path.parent().expect("its folder")).expect("a folder");
+    let text = "[[provider]]\ntag = \"yol\"\nkind = \"openrouter\"\nbase = \"https://openrouter.ai\"\n\
+                [[model]]\ntag = \"yol\"\nid = \"qwen/qwen3.8-27b:free\"\n\
+                [[model]]\ntag = \"yol\"\nid = \"acme/untried-7b:free\"\n\
+                [[model]]\ntag = \"yol\"\nid = \"poolside/laguna-s-2.1:free\"\n";
+    std::fs::write(&path, text).expect("a file");
+    let (web, seen) = canned(Vec::new());
+    let harness = opened(&path, web);
+    let screen = harness.screen();
+    let row = |id: &str| screen.lines().position(|line| line.contains(id)).unwrap_or_else(|| panic!("{id}:\n{screen}"));
+    assert!(row("poolside/laguna-s-2.1:free") < row("acme/untried-7b:free"), "{screen}");
+    assert!(row("acme/untried-7b:free") < row("qwen/qwen3.8-27b:free"), "{screen}");
+    assert!(screen.contains("refuses Claude Code's tools"), "{screen}");
+    assert_eq!(seen.lock().expect("the list").len(), 0, "the order is QCode's own, asked of nobody");
+    let _ = std::fs::remove_dir_all(path.parent().expect("its folder"));
 }

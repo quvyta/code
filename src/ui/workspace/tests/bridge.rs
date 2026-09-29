@@ -23,7 +23,7 @@ use super::*;
 use crate::bridge::protocol::{Answer, Kind, Malformed, Question, Request, To};
 use crate::bridge::rules::{MOST_HOPS, MOST_PER_WINDOW};
 use crate::bridge::socket::Call;
-use crate::ui::workspace::bridge::{ASK_WAIT, QUIET, RETRY_EVERY};
+use crate::ui::workspace::bridge::{ASK_WAIT, QUIET, RETRY_EVERY, RETURN_EVERY};
 use crate::ui::workspace::{Letter, Undelivered};
 
 /// The workspace screen, with one more way in: a call as the workspace's socket would bring it.
@@ -654,6 +654,23 @@ fn deliver_at(harness: &mut Harness<Bridged>, now: Instant) {
     harness.send(Test::Deliver(now)).render();
 }
 
+/// Lets the screen's own timers come round until no tab owes a Return any more, which is what
+/// sends a message that has already been typed in. The screen writes each Return when its rule
+/// allows, so the wait is the screen's and the test only gives it time.
+fn returns_go(harness: &mut Harness<Bridged>) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while tab_owes(harness) && Instant::now() < deadline {
+        harness.advance(RETURN_EVERY * 2).render();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!tab_owes(harness), "the Return a tab owed never went");
+}
+
+/// Whether any tab still owes the Return a message it has taken is waiting for.
+fn tab_owes(harness: &Harness<Bridged>) -> bool {
+    harness.app().0.workspaces.iter().flat_map(|workspace| workspace.tabs.iter()).any(|tab| tab.owed().is_some())
+}
+
 /// Reads `file` until it holds `wanted`, and gives up only after a wait long enough for a loaded
 /// machine: a short bound would buy no correctness and fail on a busy one.
 fn written(file: &Path, wanted: &str) -> String {
@@ -701,6 +718,7 @@ fn a_message_goes_in_when_the_tab_falls_quiet_and_never_while_its_tool_is_still_
     assert!(settled(&file).is_empty(), "nothing reached the tool: {:?}", settled(&file));
 
     deliver_at(&mut harness, spoke + QUIET);
+    returns_go(&mut harness);
     let read = written(&file, "parse()");
     assert!(read.contains("Through QCode, from tab 1 «claude-sub» (Claude Code) of this workspace:"), "{read:?}");
     assert!(read.contains("Please write the test for parse()."), "{read:?}");
@@ -740,6 +758,7 @@ fn a_message_waits_while_the_person_has_a_line_of_their_own_started_however_long
     harness.press("enter");
     let sent = session.last_input();
     deliver_at(&mut harness, sent + QUIET);
+    returns_go(&mut harness);
     let read = written(&file, "Run the tests.");
     assert!(read.starts_with("half a line and more\n"), "the person's line went out alone: {read:?}");
     assert!(read.contains("Through QCode, from tab 1 «claude-sub» (Claude Code) of this workspace:"), "{read:?}");
@@ -783,6 +802,7 @@ fn a_message_stays_in_the_tab_when_its_tool_has_ended_and_goes_in_once_it_is_sta
     let again = scratch.0.join("codex-read-again.txt");
     let session = harness_in(&mut harness, &scratch, 2, &again, "");
     deliver_at(&mut harness, session.last_output() + QUIET);
+    returns_go(&mut harness);
     assert!(written(&again, "issue 12").contains("Look at issue 12."), "{:?}", std::fs::read_to_string(&again));
     assert!(tab(&harness, 2).letters().is_empty());
     assert!(tab(&harness, 2).undelivered().is_none());
@@ -801,6 +821,7 @@ fn paste_markers_inside_a_message_cannot_escape_into_the_receiving_terminal() {
     let sneaky = "first\u{1b}[201~rm -rf /\u{1b}[200~second";
     assert!(answered(&to_codex(&mut harness, sneaky)).ok);
     deliver_at(&mut harness, session.last_output() + QUIET);
+    returns_go(&mut harness);
     let read = written(&file, "second");
     assert!(read.contains("first") && read.contains("rm -rf /") && read.contains("second"), "{read:?}");
     assert_eq!(read.matches("\u{1b}[200~").count(), 1, "one paste, opened once: {read:?}");
@@ -808,6 +829,167 @@ fn paste_markers_inside_a_message_cannot_escape_into_the_receiving_terminal() {
     assert!(read.starts_with("\u{1b}[200~"), "the whole message is inside the paste: {read:?}");
     let inside = read.trim_start_matches("\u{1b}[200~");
     assert!(inside.find("\u{1b}[201~") > inside.find("second"), "nothing ends the paste early: {read:?}");
+}
+
+/// Each read the program in the tab at `index` makes, as `(when in nanoseconds, bytes)`, in the
+/// order it made them: a stand-in for a line editor that takes input as it comes (raw, bracketed
+/// paste on) and draws something after each read, the way a harness shows what it took. Every
+/// read is kept in a file of its own under `folder`, beside the moment it was made.
+fn reads_in(harness: &mut Harness<Bridged>, scratch: &Scratch, index: usize, folder: &Path) -> TerminalSession {
+    std::fs::create_dir_all(folder).expect("a folder for the reads");
+    let script = format!(
+        "stty raw -echo; printf '\\033[?2004h'; n=10; while :; do n=$((n+1)); \
+         dd bs=65536 count=1 of={dir}/$n 2>/dev/null; date +%s%N > {dir}/$n.t; printf '.'; done",
+        dir = folder.display()
+    );
+    let session = TerminalSession::spawn(OsStr::new("/bin/sh"), &["-c", script.as_str()], &scratch.0)
+        .expect("a pseudo-terminal for the tab");
+    harness.send(Test::Attach(index, session.clone()));
+    session
+}
+
+/// Whether the program in the tab wrote every character of `keys` somewhere under `folder`, in
+/// any read: the person's keys arrive one read at a time, so which read holds which is the
+/// program's business and not the test's.
+fn keys_reached(folder: &Path, keys: &str) -> bool {
+    let mut seen = String::new();
+    for (_, bytes) in reads(folder) {
+        seen.push_str(&String::from_utf8_lossy(&bytes));
+    }
+    keys.chars().all(|key| seen.contains(key))
+}
+
+fn reads(folder: &Path) -> Vec<(u128, Vec<u8>)> {
+    let mut names: Vec<u32> = std::fs::read_dir(folder)
+        .map(|entries| entries.filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok()).collect())
+        .unwrap_or_default();
+    names.sort_unstable();
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let when = std::fs::read_to_string(folder.join(format!("{name}.t"))).ok()?.trim().parse().ok()?;
+            Some((when, std::fs::read(folder.join(name.to_string())).ok()?))
+        })
+        .collect()
+}
+
+#[test]
+fn a_messages_return_reaches_the_tool_on_its_own_and_well_after_the_tool_took_the_paste() {
+    // Gemini CLI reads a Return within 40 ms of a paste as a new line in the pasted text: typed in
+    // straight after the paste, 17 messages of 20 stood unsent in its prompt (2026-09-29).
+    let scratch = Scratch::new("bridge-return-after-paste");
+    let mut harness = two_agents(&scratch, ONLINE, ONLINE);
+    allow_pair(&mut harness);
+    let folder = scratch.0.join("codex-reads");
+    let session = reads_in(&mut harness, &scratch, 2, &folder);
+    while session.watch().next() != TerminalEvent::Output {}
+
+    assert!(answered(&to_codex(&mut harness, "Start with the parser.")).ok);
+    deliver_at(&mut harness, session.last_output() + QUIET);
+    // The Return is the screen's own work now: the test gives it time and reads what reached the
+    // tool, and the gap between the two reads is the rule's own.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !reads(&folder).iter().any(|(_, bytes)| bytes.contains(&b'\r')) && Instant::now() < deadline {
+        returns_go(&mut harness);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let taken = reads(&folder);
+    let returned = taken.iter().position(|(_, bytes)| bytes.contains(&b'\r')).expect("a Return reached the tool");
+    let shown: Vec<String> = taken.iter().map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned()).collect();
+    assert_eq!(taken[returned].1, b"\r", "the Return came on its own, not inside the paste's read: {shown:?}");
+    let pasted = taken[..returned]
+        .iter()
+        .rposition(|(_, bytes)| String::from_utf8_lossy(bytes).contains("Start with the parser."))
+        .expect("the paste reached the tool before its Return");
+    let gap = Duration::from_nanos(u64::try_from(taken[returned].0 - taken[pasted].0).unwrap_or(u64::MAX));
+    assert!(gap >= Duration::from_millis(40), "the Return came {gap:?} after the paste was taken");
+    assert!(tab(&harness, 2).letters().is_empty(), "it went in");
+}
+
+#[test]
+fn a_delivery_waiting_for_its_return_leaves_the_screen_free_to_take_a_key_and_draw_again() {
+    // Typing a message in and waiting for the harness to take the paste held the whole screen
+    // still, for up to PASTE_TAKEN + AFTER_PASTE per message; a message to every tab held it once
+    // per tab. The wait is the Return's, and the Return is written from the screen's own timer.
+    let scratch = Scratch::new("bridge-return-does-not-freeze");
+    let mut harness = two_agents(&scratch, ONLINE, ONLINE);
+    allow_pair(&mut harness);
+    let folder = scratch.0.join("codex-reads");
+    let session = reads_in(&mut harness, &scratch, 2, &folder);
+    while session.watch().next() != TerminalEvent::Output {}
+    // The person is looking at the tab the message is going to, with the keyboard in its terminal.
+    harness.click_text("codex-main").render();
+    harness.click(i32::from(SIZE.0 / 2), i32::from(SIZE.1 / 2)).render();
+
+    assert!(answered(&to_codex(&mut harness, "Start with the parser.")).ok);
+    deliver_at(&mut harness, session.last_output() + QUIET);
+
+    // The person's own hand, while the Return that sends the message is still owed: the keys
+    // reach the tool and the screen draws it. Each read is a file of its own, so the two keys are
+    // looked for wherever they landed.
+    harness.type_text("ok");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !keys_reached(&folder, "ok") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let shown: Vec<String> =
+        reads(&folder).iter().map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned()).collect();
+    assert!(keys_reached(&folder, "ok"), "the keys were taken while the Return waited: {shown:?}");
+    assert!(
+        !shown.iter().any(|read| read.contains('\r')),
+        "the Return went out before the person's keys could be: {shown:?}"
+    );
+
+    // And the Return comes on its own after that, in a read of its own, after the paste.
+    returns_go(&mut harness);
+    let taken = reads(&folder);
+    let returned = taken.iter().position(|(_, bytes)| bytes.contains(&b'\r')).expect("a Return reached the tool");
+    let pasted = taken[..returned]
+        .iter()
+        .rposition(|(_, bytes)| String::from_utf8_lossy(bytes).contains("Start with the parser."))
+        .expect("the paste reached the tool before its Return");
+    assert!(returned > pasted, "the Return came after the paste, not before it");
+    let gap = Duration::from_nanos(u64::try_from(taken[returned].0 - taken[pasted].0).unwrap_or(u64::MAX));
+    assert!(gap >= Duration::from_millis(40), "the Return came {gap:?} after the paste was taken");
+}
+
+#[test]
+fn a_message_still_owed_its_return_is_sent_as_the_tab_closes_and_the_person_is_asked_first() {
+    // The tab closes between the paste and the Return: the message is in the tool's prompt, the
+    // agent that sent it was told the tool had it, and nothing is left to wait for once the
+    // program is gone. The person is asked, and the Return goes with the tab rather than the
+    // message going with it unsent.
+    let scratch = Scratch::new("bridge-close-owed");
+    let mut harness = two_agents(&scratch, ONLINE, ONLINE);
+    allow_pair(&mut harness);
+    let folder = scratch.0.join("codex-reads");
+    let session = reads_in(&mut harness, &scratch, 2, &folder);
+    while session.watch().next() != TerminalEvent::Output {}
+
+    assert!(answered(&to_codex(&mut harness, "Start with the parser.")).ok);
+    deliver_at(&mut harness, session.last_output() + QUIET);
+    assert!(tab_owes(&harness), "the Return is still owed");
+
+    click_close(&mut harness, "codex-main");
+    let screen = said(&harness);
+    assert!(screen.contains("Close codex-main?"), "{screen}");
+    assert!(screen.contains("stands in this tab’s prompt"), "the person is told what is at stake: {screen}");
+
+    // The person keeps the tab: the message is sent the ordinary way, a moment from now.
+    harness.click_text("Keep the tab").render();
+    assert_eq!(harness.app().0.workspace().expect("a workspace").tabs().len(), 3, "the tab stays");
+    returns_go(&mut harness);
+    let taken = reads(&folder);
+    assert!(taken.iter().any(|(_, bytes)| bytes.contains(&b'\r')), "keeping the tab sent the message: {taken:?}");
+
+    // With nothing owed there is no message to ask about: the question is the one about the agent
+    // that is still running, as it was before any of this.
+    click_close(&mut harness, "codex-main");
+    let screen = said(&harness);
+    assert!(screen.contains("End Codex in this tab?"), "{screen}");
+    assert!(!screen.contains("stands in this tab’s prompt"), "nothing was owed: {screen}");
+    harness.press("esc").render();
+    assert_eq!(harness.app().0.workspace().expect("a workspace").tabs().len(), 3, "the tab stays");
 }
 
 #[test]
@@ -823,6 +1005,7 @@ fn the_sender_is_told_whether_its_message_went_in_or_is_still_waiting() {
     let answer = answered(&to_codex(&mut harness, "Start with the parser."));
     assert!(answer.ok && answer.text.starts_with("Delivered."), "{answer:?}");
     assert!(answer.text.contains("Codex · codex-main"), "{}", answer.text);
+    returns_go(&mut harness);
     assert!(written(&file, "Start with the parser.").contains("Start with the parser."));
     assert!(tab(&harness, 2).letters().is_empty());
 
@@ -836,6 +1019,7 @@ fn the_sender_is_told_whether_its_message_went_in_or_is_still_waiting() {
     // must be, the next goes in, without the half minute a person's line is given.
     let session = tab(&harness, 2).session().cloned().expect("the tab runs");
     deliver_at(&mut harness, session.last_input().max(session.last_output()) + QUIET);
+    returns_go(&mut harness);
     assert!(written(&file, "Then the writer.").contains("Then the writer."));
     assert!(tab(&harness, 2).letters().is_empty());
 }
@@ -855,6 +1039,7 @@ fn a_tab_that_was_busy_is_looked_at_again_on_its_own_and_nothing_is_timed_while_
 
     std::thread::sleep(QUIET + Duration::from_millis(300));
     harness.advance(RETRY_EVERY).render();
+    returns_go(&mut harness);
     assert!(written(&file, "Read the note first.").contains("Read the note first."));
     assert!(tab(&harness, 2).letters().is_empty(), "the screen delivered it without being asked");
 }
@@ -870,6 +1055,7 @@ fn the_message_written_into_a_tab_names_its_sender_in_turkish_too() {
     let answer = answered(&to_codex(&mut harness, "parse() için testi yaz."));
     assert!(answer.text.starts_with("Alındı. Mesaj"), "{answer:?}");
     deliver_at(&mut harness, session.last_output() + QUIET);
+    returns_go(&mut harness);
     let read = written(&file, "parse()");
     assert!(
         read.contains("QCode aracılığıyla, bu çalışma alanının 1 numaralı sekmesinden «claude-sub» (Claude Code):"),
@@ -1143,6 +1329,7 @@ fn by_default_an_agent_sends_to_another_tab_without_asking_and_the_message_lands
     assert!(answer.ok && answer.text.starts_with("Delivered."), "no question stood in the way: {answer:?}");
     assert!(!said(&harness).contains("send messages to"), "nobody was asked:\n{}", harness.screen());
     assert!(!said(&harness).contains("Allow"), "{}", harness.screen());
+    returns_go(&mut harness);
     let read = written(&file, "parse()");
     assert!(read.contains("Through QCode, from tab 1 «claude-sub» (Claude Code) of this workspace:"), "{read:?}");
     assert!(read.contains("Please write the test for parse()."), "{read:?}");
@@ -1254,6 +1441,7 @@ fn a_question_arrives_under_a_header_naming_its_sender_its_kind_and_how_to_answe
     let question = Request::Send { to: To::Tab(codex), text: "Which test fails?".to_owned(), kind: Kind::Question };
     let answer = answered(&ask(&mut harness, 0, question));
     assert!(answer.ok && answer.text.starts_with("Delivered."), "{answer:?}");
+    returns_go(&mut harness);
     let read = written(&file, "Which test fails?");
     let expected = "Through QCode, from tab 1 «claude-sub» (Claude Code) of this workspace: a question, the sender \
                     waits for your answer.\nAnswer with send_message, tab \"1\", kind \"info\".\n\nWhich test fails?";

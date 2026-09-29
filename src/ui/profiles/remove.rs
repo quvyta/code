@@ -150,12 +150,18 @@ pub fn remove(store: &Store, engine: Option<&Engine>, survey: &Survey, homes: bo
             left.push(problem.to_string());
         }
     }
-    let file = store.profiles_dir().join(format!("{}.toml", survey.name));
-    if left.is_empty()
-        && let Err(error) = fs::remove_file(&file)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        left.push(format!("{}: {error}", file.display()));
+    // A profile's definition file is in the folder of its kind, so both are taken away: the one
+    // that is there, and the one a change of kind may have left behind.
+    for file in [
+        store.profiles_dir().join(format!("{}.toml", survey.name)),
+        store.custom_profiles_dir().join(format!("{}.toml", survey.name)),
+    ] {
+        if left.is_empty()
+            && let Err(error) = fs::remove_file(&file)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            left.push(format!("{}: {error}", file.display()));
+        }
     }
     if left.is_empty() { Outcome::Deleted } else { Outcome::Partly(left) }
 }

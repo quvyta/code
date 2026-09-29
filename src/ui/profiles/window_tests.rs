@@ -15,7 +15,7 @@ use qframe::runtime::{Harness, OpenOutcome};
 
 use super::*;
 use crate::desktop::login::{LOOK_EVERY, STORED};
-use crate::profile::{MountAccess, NetworkMode, Template};
+use crate::profile::{HarnessKind, MountAccess, NetworkMode, Template};
 
 /// The screen on its own.
 struct Host {
@@ -207,7 +207,7 @@ fn open_window(harness: &mut Harness<Host>) {
     harness.click_text("Sign in").render();
     let page = words(harness);
     assert!(page.contains("Antigravity IDE signs in with Google in its own window"), "{page}");
-    assert!(page.contains("every workspace that uses this profile opens Antigravity IDE already signed in"), "{page}");
+    assert!(page.contains("Every workspace then opens Antigravity IDE signed in"), "{page}");
     harness.click_text("Open the sign-in window").render();
     until(harness, "The Antigravity IDE window is open on your screen");
 }

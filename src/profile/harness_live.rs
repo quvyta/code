@@ -245,7 +245,7 @@ fn verify(harness: HarnessKind, more: impl Fn(&Lab, &Harness)) {
 
         // 6: every variable the record and the template set is set in the container and read by
         // the package.
-        for (key, value) in record.environment.iter().chain(profile.template.environment(harness)) {
+        for (key, value) in record.environment.iter().chain(profile.environment()) {
             assert_eq!(lab.ok(&format!("printf '%s' \"${key}\"")), *value, "{kind:?}: {key} is set in the image");
             lab.expect_in_package(key, "a variable the record sets");
         }

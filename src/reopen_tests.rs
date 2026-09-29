@@ -217,7 +217,7 @@ fn the_setup_wizard_is_asked_once_and_never_again() {
     let fresh = Gates { language: false, engine: EngineCheck::Working, location: LocationCheck::Usable };
     let mut harness = machine.open(&fresh);
     assert_eq!(harness.app().page(), Page::Setup, "a machine that was never set up asks:\n{}", harness.screen());
-    assert!(harness.screen().contains("Pick the language"), "{}", harness.screen());
+    assert!(harness.screen().contains("Chinese (Simplified)"), "{}", harness.screen());
 
     harness.click_text("Next").advance(MOMENT);
     harness.click_text("Next").advance(MOMENT);
@@ -228,7 +228,7 @@ fn the_setup_wizard_is_asked_once_and_never_again() {
     let again = machine.reopen();
     assert_eq!(again.app().page(), Page::Home, "nothing is asked a second time:\n{}", again.screen());
     let screen = again.screen();
-    for asked in ["Pick the language", "Container engine", "one store folder"] {
+    for asked in ["Chinese (Simplified)", "Container engine", "one store folder"] {
         assert!(!screen.contains(asked), "`{asked}` is asked again:\n{screen}");
     }
     let stored = machine.config();
@@ -250,7 +250,7 @@ fn a_gate_that_falls_after_the_setup_does_not_drag_the_person_through_it_again()
     let harness = machine.open(&broken);
     assert_eq!(harness.app().page(), Page::Home, "the wizard is not asked again:\n{}", harness.screen());
     let screen = harness.screen();
-    assert!(!screen.contains("Pick the language"), "{screen}");
+    assert!(!screen.contains("Chinese (Simplified)"), "{screen}");
     assert!(screen.contains("Repair"), "the one step that is needed is offered instead:\n{screen}");
 }
 
@@ -269,7 +269,7 @@ fn a_setup_that_was_through_but_left_no_store_asks_where_the_store_goes() {
     assert_eq!(harness.app().page(), Page::Setup, "{}", harness.screen());
     let screen = harness.screen();
     assert!(screen.contains("live in one folder"), "and on the step that places it:\n{screen}");
-    assert!(!screen.contains("Pick the language"), "no step before it is asked again:\n{screen}");
+    assert!(!screen.contains("Chinese (Simplified)"), "no step before it is asked again:\n{screen}");
 }
 
 #[test]
@@ -425,7 +425,11 @@ fn the_workspaces_their_order_and_the_one_that_was_open_come_back() {
     assert_eq!(again.app().page(), Page::Workspace, "{}", again.screen());
     assert_eq!(rail(&again), ["Gamma", "Beta"], "the rail keeps its order:\n{}", again.screen());
     let open = again.app().workspace.as_ref().and_then(WorkspaceScreen::workspace);
-    assert_eq!(open.map(crate::OpenWorkspace::name), Some("Beta"), "the workspace that was open is open again");
+    assert_eq!(
+        open.map(crate::ui::workspace::OpenWorkspace::name),
+        Some("Beta"),
+        "the workspace that was open is open again"
+    );
     assert!(
         open.is_some_and(|workspace| workspace.carries("claude-sub")),
         "the profile chosen for it is still its own"

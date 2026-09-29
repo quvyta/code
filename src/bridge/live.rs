@@ -15,7 +15,9 @@
 //! server and says whether it answered. The exception is the delivery into Claude Code, which
 //! draws no prompt without a model to speak to; it is given one through the provider relay and
 //! also needs `QCODE_PROVIDER_URL` and `QCODE_PROVIDER_MODEL`, as [`crate::provider::relay_live`]
-//! does.
+//! does. The deliveries into Kimi Code, Qwen Code and Codex go through the relay to a service with
+//! the owner's key (Codex also on a free OpenRouter model); the one into Gemini CLI, which has no
+//! road through the relay, to `fake_model.py` inside its own container, with a key nobody holds.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -35,6 +37,10 @@ use crate::ui::workspace::{ContainerPlan, MCP_DIR, ensure_running};
 
 /// The workspace the containers here belong to, which nobody has.
 const WORKSPACE: &str = "bridgetest";
+
+/// The stand-in model a harness that has no provider road of QCode's is pointed at, on the
+/// container's own loopback: it answers every harness's shape and writes down what it was sent.
+const FAKE_MODEL: &str = include_str!("../profile/fake_model.py");
 
 /// The engines installed on this machine, or nothing at all when the tests are switched off.
 fn engines() -> Vec<Engine> {
@@ -274,7 +280,7 @@ fn verify(harness: HarnessKind) {
         assert!(after.contains("qcode-bridge.mjs"), "{kind:?} {harness:?}: {after}");
         // Claude Code's servers go into the file QCode's templates answer its first start in, so
         // the file is there before the bridge is, and every answer in it has to stay.
-        if let Some(template) = Template::Recommended.files(harness).into_iter().find(|file| file.path == settings) {
+        if let Some(template) = profile.files().into_iter().find(|file| file.path == settings) {
             assert_eq!(before, template.contents, "{kind:?} {harness:?}: the template's file was there first");
             match mcp.shape {
                 crate::profile::McpShape::Codex => assert!(after.starts_with(&before), "{after}"),
@@ -466,9 +472,9 @@ fn verify_delivery(harness: HarnessKind) {
         let drawn = until_prompt(&mut screen, &session, harness);
         assert!(drawn.contains(prompt_of(harness)), "{kind:?} {harness:?}: no prompt came up:\n{drawn}");
 
-        // What delivery does, byte for byte: the sender's name in front, then Return.
-        session.paste(&format!("{sent}\n\n{task}")).unwrap_or_else(|error| panic!("{kind:?}: the paste: {error}"));
-        session.write(b"\r").unwrap_or_else(|error| panic!("{kind:?}: the Return: {error}"));
+        // What delivery does, byte for byte and at its pace: the paste, then its Return.
+        crate::ui::workspace::type_in(&session, &format!("{sent}\n\n{task}"))
+            .unwrap_or_else(|error| panic!("{kind:?}: the delivery: {error}"));
         let drawn = until_shown(&mut screen, task);
         assert!(drawn.contains(task), "{kind:?} {harness:?}: the message never reached the prompt:\n{drawn}");
         assert!(drawn.contains("QCode"), "{kind:?} {harness:?}: the sender is not named:\n{drawn}");
@@ -577,9 +583,9 @@ fn a_message_delivered_into_claude_code_reaches_its_own_prompt() {
         let drawn = until_prompt(&mut screen, &session, harness);
         assert!(drawn.contains(prompt_of(harness)), "{kind:?} {harness:?}: no prompt came up:\n{drawn}");
 
-        // What delivery does, byte for byte: the sender's name in front, then Return.
-        session.paste(&format!("{sent}\n\n{task}")).unwrap_or_else(|error| panic!("{kind:?}: the paste: {error}"));
-        session.write(b"\r").unwrap_or_else(|error| panic!("{kind:?}: the Return: {error}"));
+        // What delivery does, byte for byte and at its pace: the paste, then its Return.
+        crate::ui::workspace::type_in(&session, &format!("{sent}\n\n{task}"))
+            .unwrap_or_else(|error| panic!("{kind:?}: the delivery: {error}"));
         let drawn = until_shown(&mut screen, task);
         assert!(drawn.contains(task), "{kind:?} {harness:?}: the message never reached the prompt:\n{drawn}");
         assert!(drawn.contains("QCode"), "{kind:?} {harness:?}: the sender is not named:\n{drawn}");
@@ -698,21 +704,33 @@ fn qwen_code_starts_the_bridge_and_reaches_qcode() {
 /// provider's arguments after the program, and the environment of
 /// [`crate::profile::ProviderChoice::environment`] — opens on its own prompt with not one key
 /// pressed, finds the bridge's server where it looks for servers, and takes a message from
-/// another tab into that prompt. The container has no network and never holds the key: QCode's
-/// relay adds it on the way out, from the owner's `~/.config/quvyta/mimo-key` (or `kimi-key`).
-fn delivered_on_a_provider(harness: HarnessKind) {
+/// another tab into that prompt and sends it off: the relay carries a request to the provider
+/// after the Return that it had not carried before. The container has no network and never holds
+/// the key: QCode's relay adds it on the way out, from the owner's `~/.config/quvyta/mimo-key`
+/// (or `kimi-key`, or `openrouter-key`, used only with a free model).
+///
+/// `service` is `"openrouter"`, `"kimi"` or `"mimo"`; `None` takes `QCODE_DELIVERY_PROVIDER`, and
+/// MiMo when that is not set.
+fn delivered_on_a_provider(harness: HarnessKind, service: Option<&str>) {
     use crate::provider::relay::{self, Listener as Relay, Upstream};
     use crate::provider::{Key, ProviderEntry, ProviderKind, Tag};
     use qframe::runtime::Harness as Screen;
     use qframe::widgets::TerminalSession;
 
-    // MiMo unless `QCODE_DELIVERY_PROVIDER=kimi` asks for Kimi Code, whose plan has a five-hour
-    // limit the other tests may already have spent.
-    let kimi = std::env::var("QCODE_DELIVERY_PROVIDER").is_ok_and(|asked| asked == "kimi");
-    let (key_file, variable, default_model, kind_of) = if kimi {
-        (".config/quvyta/kimi-key", "QCODE_KIMI_MODEL", "kimi-for-coding", ProviderKind::KimiCode)
-    } else {
-        (".config/quvyta/mimo-key", "QCODE_MIMO_MODEL", "mimo-v2.6-flash", ProviderKind::MimoTokenPlan)
+    // MiMo unless asked otherwise: Kimi Code's plan has a five-hour limit the other tests may
+    // already have spent, and OpenRouter is only ever asked for a free model.
+    let asked = service.map(str::to_owned).or_else(|| std::env::var("QCODE_DELIVERY_PROVIDER").ok());
+    let (key_file, variable, default_model, kind_of) = match asked.as_deref() {
+        Some("kimi") => (".config/quvyta/kimi-key", "QCODE_KIMI_MODEL", "kimi-for-coding", ProviderKind::KimiCode),
+        Some("openrouter") => (
+            ".config/quvyta/openrouter-key",
+            "QCODE_OPENROUTER_MODEL",
+            // `nex-agi/nex-n2.5-mini:free`, which answered in September, now says "This model is
+            // unavailable for free" (2026-09-29).
+            "dots-studio/dots-3-note-preview:free",
+            ProviderKind::OpenRouter,
+        ),
+        _ => (".config/quvyta/mimo-key", "QCODE_MIMO_MODEL", "mimo-v2.6-flash", ProviderKind::MimoTokenPlan),
     };
     let Some(key) = std::env::var_os("HOME")
         .and_then(|home| std::fs::read_to_string(PathBuf::from(home).join(key_file)).ok())
@@ -722,6 +740,10 @@ fn delivered_on_a_provider(harness: HarnessKind) {
         return;
     };
     let model = std::env::var(variable).unwrap_or_else(|_| default_model.to_owned());
+    assert!(
+        kind_of != ProviderKind::OpenRouter || model.ends_with(":free"),
+        "OpenRouter only with a free model: {model}"
+    );
     let profile = Profile {
         name: SafeName::parse(&format!("bridgetest-{}-provider", harness.record().id)).expect("the name is safe"),
         account: AccountKind::Provider,
@@ -748,11 +770,19 @@ fn delivered_on_a_provider(harness: HarnessKind) {
         let token = super::token();
         let mine = token.clone();
         let carried = entry.clone();
+        // Every request the relay carried to the provider, whatever it answered: a busy free
+        // model's 429 is still a message sent.
+        let forwarded = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = forwarded.clone();
         let relay = Relay::open(
             &paths.mcp(),
             move |asked| (asked == mine).then(|| carried.clone()),
             Upstream::network(),
-            |_| (),
+            move |event| {
+                if matches!(event, relay::Event::Forwarded { .. }) {
+                    counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            },
         )
         .expect("the workspace's relay socket opens");
         let user = HostUser::current().expect("the current user");
@@ -788,11 +818,28 @@ fn delivered_on_a_provider(harness: HarnessKind) {
         );
         eprintln!("{kind:?} {harness:?}: the prompt came up {} s after the start", started.elapsed().as_secs());
 
-        session.paste(&format!("{sent}\n\n{task}")).unwrap_or_else(|error| panic!("{kind:?}: the paste: {error}"));
-        session.write(b"\r").unwrap_or_else(|error| panic!("{kind:?}: the Return: {error}"));
+        let before = forwarded.load(std::sync::atomic::Ordering::SeqCst);
+        // What delivery does, byte for byte and at its pace: the paste, then its Return.
+        crate::ui::workspace::type_in(&session, &format!("{sent}\n\n{task}"))
+            .unwrap_or_else(|error| panic!("{kind:?}: the delivery: {error}"));
         let drawn = until_shown(&mut screen, task);
         assert!(drawn.contains(task), "{kind:?} {harness:?}: the message never reached the prompt:\n{drawn}");
         assert!(drawn.contains("QCode"), "{kind:?} {harness:?}: the sender is not named:\n{drawn}");
+        // Sent off, not left standing in the prompt: the harness asked its provider after the Return.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while forwarded.load(std::sync::atomic::Ordering::SeqCst) <= before && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        screen.render();
+        let after = screen.screen();
+        assert!(
+            forwarded.load(std::sync::atomic::Ordering::SeqCst) > before,
+            "{kind:?} {harness:?}: the message was never sent to the provider:\n{after}"
+        );
+        // Whatever the model made of it, which a free model may also answer with a wait.
+        std::thread::sleep(std::time::Duration::from_secs(20));
+        screen.render();
+        eprintln!("{kind:?} {harness:?}: after the Return:\n{}", screen.screen());
 
         session.kill();
         drop(relay);
@@ -805,19 +852,151 @@ fn delivered_on_a_provider(harness: HarnessKind) {
 #[test]
 #[ignore = "needs a container engine, the network, and the owner's MiMo key; run with QCODE_CONTAINER_TESTS=1"]
 fn a_message_delivered_into_kimi_code_on_a_provider_reaches_its_own_prompt() {
-    delivered_on_a_provider(HarnessKind::KimiCode);
+    delivered_on_a_provider(HarnessKind::KimiCode, None);
 }
 
 #[test]
 #[ignore = "needs a container engine, the network, and the owner's MiMo key; run with QCODE_CONTAINER_TESTS=1"]
 fn a_message_delivered_into_qwen_code_on_a_provider_reaches_its_own_prompt() {
-    delivered_on_a_provider(HarnessKind::QwenCode);
+    delivered_on_a_provider(HarnessKind::QwenCode, None);
 }
 
 #[test]
 #[ignore = "needs a container engine, the network, and the owner's MiMo key; run with QCODE_CONTAINER_TESTS=1"]
 fn a_message_delivered_into_codex_on_a_provider_reaches_its_own_prompt() {
-    delivered_on_a_provider(HarnessKind::Codex);
+    delivered_on_a_provider(HarnessKind::Codex, None);
+}
+
+/// The same for Codex on a free OpenRouter model, which needs no account of anybody's and no paid
+/// key: the delivery into Codex's own prompt and its sending off are what is proven. Whether the
+/// free model answers depends on OpenRouter's shared pool at that moment and is only printed.
+#[test]
+#[ignore = "needs a container engine, the network, and an OpenRouter key used with a free model; run with QCODE_CONTAINER_TESTS=1"]
+fn a_message_delivered_into_codex_on_a_free_openrouter_model_reaches_its_prompt_and_is_sent() {
+    delivered_on_a_provider(HarnessKind::Codex, Some("openrouter"));
+}
+
+/// A message delivered into a real Gemini CLI, which QCode cannot put on a provider of its own: it
+/// signs in with a Google account or a Gemini key. Neither is used. The tab is started exactly as
+/// the product starts one, with a stand-in key no account holds (`GEMINI_API_KEY=x`, the key the
+/// profile's image enforces) and Gemini CLI's own variable for the address it asks,
+/// `GOOGLE_GEMINI_BASE_URL`, pointed at `fake_model.py` on the container's loopback; the container
+/// has no network.
+///
+/// What it proves: Gemini CLI opens on its own prompt with that key (after the one question of its
+/// first start, how to sign in, answered with Return on the key it found), a message the screen
+/// types in (paste, then Return, as delivery does) shows in that prompt with its sender named, and
+/// the Return sends it: the text arrives in the body of the request Gemini CLI makes. Five
+/// messages are delivered one after the other, each once the one before was answered, because the
+/// sending is what fails now and then. What it does not prove: that a real Gemini model answers,
+/// or that a key typed into its sign-in dialog is kept, which needs a real key.
+///
+/// Each message goes in by delivery's own [`crate::ui::workspace::type_in`]. With the Return
+/// written straight after the paste (before 2026-09-29) Gemini CLI 0.61 sent 3 of 20 messages and
+/// left the others standing in its prompt until another Return came: it reads a Return within
+/// 40 ms of a paste as a new line.
+#[test]
+#[ignore = "needs a container engine and the network once for the image; run with QCODE_CONTAINER_TESTS=1"]
+fn a_message_delivered_into_gemini_cli_reaches_its_own_prompt_and_is_sent() {
+    use qframe::runtime::Harness as Screen;
+    use qframe::widgets::TerminalSession;
+
+    let harness = HarnessKind::GeminiCli;
+    let profile = profile(harness);
+    let sent = "Through QCode, from the Claude Code · claude-sub tab:";
+    let task = "please write the test for the parser and run it";
+    let port = crate::provider::relay::PORT;
+    for engine in engines() {
+        let kind = engine.kind();
+        let scratch = Scratch::new("gemini-cli-delivery");
+        let paths = scratch.paths();
+        let workspace = WorkspaceId::parse(WORKSPACE).expect("a workspace id");
+        let plan = ContainerPlan::profile(&workspace, &paths, &profile);
+        let home = Home::new(profile.name.clone(), workspace.clone());
+        let _ = capture(&engine.remove_container(&plan.name));
+        let _ = capture(&engine.remove_volume(&home.volume()));
+        build(&engine, &profile);
+        let user = HostUser::current().expect("the current user");
+        ensure_running(&engine, &plan, user).unwrap_or_else(|failure| panic!("{kind:?}: {failure:?}"));
+        let token = super::token();
+        config::register(&engine, &plan.name, harness, &token)
+            .unwrap_or_else(|trouble| panic!("{kind:?}: {trouble:?}"));
+        run(&engine, &plan.name, &format!("cat > /tmp/fake_model.py <<'PYTHON'\n{FAKE_MODEL}PYTHON"))
+            .expect("the stand-in is written");
+        run(
+            &engine,
+            &plan.name,
+            &format!("cd /tmp && (nohup python3 fake_model.py {port} > /tmp/fake-model.out 2>&1 &) && sleep 2"),
+        )
+        .expect("the stand-in starts");
+
+        let line = harness.command_line(None);
+        let parts: Vec<&str> = line.iter().map(String::as_str).collect();
+        let address = format!("http://127.0.0.1:{port}");
+        let command = plan.enter_with(
+            &engine,
+            &parts,
+            &[(super::TOKEN_VARIABLE, &token), ("GEMINI_API_KEY", "x"), ("GOOGLE_GEMINI_BASE_URL", &address)],
+        );
+        let session = TerminalSession::spawn(command.program.as_os_str(), &command.args, &scratch.0)
+            .expect("a pseudo-terminal for the tab");
+        let mut screen = Screen::new(Watched(session.clone()), 120, 36);
+        let started = std::time::Instant::now();
+        // Its first start asks how to sign in, with the key it found highlighted; Return takes it,
+        // as a person's first Return does.
+        let drawn = until_prompt(&mut screen, &session, harness);
+        assert!(drawn.contains(prompt_of(harness)), "{kind:?}: no prompt:\n{drawn}");
+        eprintln!("{kind:?} {harness:?}: the prompt came up {} s after the start", started.elapsed().as_secs());
+        // The prompt counts once the screen has settled on it, with no question over it.
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        screen.render();
+        let settled = screen.screen();
+        assert!(settled.contains(prompt_of(harness)), "{kind:?}: something came up over the prompt:\n{settled}");
+        let bodies = |engine: &Engine| {
+            run(engine, &plan.name, "cat /tmp/fake-model.bodies 2>/dev/null; true").unwrap_or_default()
+        };
+        assert!(!bodies(&engine).contains(task), "{kind:?}: the task was sent before it was delivered");
+
+        let mut unsent = Vec::new();
+        for round in 1..=5 {
+            let task = format!("{task}, round {round}");
+            // What delivery does, byte for byte and at its pace: the paste, then its Return.
+            crate::ui::workspace::type_in(&session, &format!("{sent}\n\n{task}"))
+                .unwrap_or_else(|error| panic!("{kind:?}: the delivery: {error}"));
+            let drawn = until_shown(&mut screen, &task);
+            assert!(drawn.contains(&task), "{kind:?}: the message never reached the prompt:\n{drawn}");
+            assert!(drawn.contains("QCode"), "{kind:?}: the sender is not named:\n{drawn}");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !bodies(&engine).contains(&task) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            if !bodies(&engine).contains(&task) {
+                screen.render();
+                eprintln!("{kind:?} {harness:?}: round {round} was not sent:\n{}", screen.screen());
+                unsent.push(round);
+                // The person's own Return, so the next round starts on an empty prompt.
+                let _ = session.write(b"\r");
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !bodies(&engine).contains(&task) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            }
+            assert!(
+                bodies(&engine).contains("Through QCode, from the Claude Code"),
+                "{kind:?}: the sender went missing on the way"
+            );
+            // The stand-in's answer is drawn before the next message comes.
+            std::thread::sleep(std::time::Duration::from_secs(10));
+        }
+        screen.render();
+        eprintln!("{kind:?} {harness:?}: after the last round:\n{}", screen.screen());
+
+        session.kill();
+        capture(&engine.remove_container(&plan.name)).expect("the container is removed");
+        capture(&engine.remove_volume(&home.volume())).expect("the home is removed");
+        clear(&engine, &profile, &plan.name);
+        assert!(unsent.is_empty(), "{kind:?}: rounds {unsent:?} stayed in the prompt after delivery's Return");
+    }
 }
 
 /// The pull a window's agent makes, made by a real agent: Claude Code on Xiaomi MiMo, in a

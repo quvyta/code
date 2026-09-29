@@ -12,17 +12,13 @@ use qframe::date::DateTime;
 use qframe::prelude::*;
 
 use crate::profile::history::Conversation;
-use crate::ui::keys::Wrapping;
+use crate::ui::page;
 
 use super::history::{self, HistoryKey, NEWEST, Shown};
 use super::{Msg, OpenWorkspace, TabKey, TabKind, WorkspaceScreen};
 
 /// The name the list of the page is focused by.
 pub(super) const CHOICES_ID: &str = "workspace-choices";
-
-/// The widest the list grows, so a detail on the right stays within reach of its label on a
-/// wide terminal.
-const READABLE_WIDTH: u16 = 72;
 
 /// What a blank tab can turn into.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,9 +123,21 @@ fn rows(screen: &WorkspaceScreen, workspace: &OpenWorkspace) -> Vec<Row> {
             Shown::Failed(reason) => rows.push(Row::Unread(reason.to_owned())),
             Shown::Conversations([]) => rows.push(Row::NoChats),
             Shown::Conversations(found) => {
+                // A conversation a tab of the workspace shows is left out: opening it again would
+                // give it a second tab typing into it, and the tab it is in is on the strip. That
+                // covers the one a shared server made for a tab that has not been written in yet,
+                // which goes away with its tab rather than being worth offering.
+                let found: Vec<&Conversation> =
+                    found.iter().filter(|conversation| !shown_in_a_tab(workspace, name, &conversation.id)).collect();
+                // Every one of them open is not "no chats yet": the section is its new chat alone.
+                if found.is_empty() {
+                    continue;
+                }
                 let key = HistoryKey { workspace: workspace.id().to_owned(), profile: name.to_owned() };
                 let count = if screen.expanded.contains(&key) { found.len() } else { found.len().min(NEWEST) };
-                rows.extend(found[..count].iter().map(|conversation| Row::Chat(name.to_owned(), conversation.clone())));
+                rows.extend(
+                    found[..count].iter().map(|conversation| Row::Chat(name.to_owned(), (*conversation).clone())),
+                );
                 if count < found.len() {
                     rows.push(Row::ShowAll(key, found.len() - count));
                 }
@@ -137,6 +145,14 @@ fn rows(screen: &WorkspaceScreen, workspace: &OpenWorkspace) -> Vec<Row> {
         }
     }
     rows
+}
+
+/// Whether a tab of `workspace` shows the conversation `id` of the profile `profile`.
+fn shown_in_a_tab(workspace: &OpenWorkspace, profile: &str, id: &str) -> bool {
+    workspace
+        .tabs()
+        .iter()
+        .any(|tab| matches!(tab.kind(), TabKind::Profile(name) if name == profile) && tab.conversation() == Some(id))
 }
 
 /// The row the keyboard rests on: `wanted` when a row can rest there, otherwise the shell, which
@@ -231,7 +247,8 @@ struct Look {
 }
 
 /// Draws the page of the blank tab `tab` of `workspace`: a question, and the list that answers it,
-/// at the top left where reading starts.
+/// on a page of the width Settings keeps, so a row's detail stays one glance from its label on a
+/// wide terminal.
 pub(super) fn view(screen: &WorkspaceScreen, workspace: &OpenWorkspace, tab: TabKey, ui: &mut View<'_, Msg>) {
     let ready = screen.engine().is_some();
     let rows = rows(screen, workspace);
@@ -239,30 +256,28 @@ pub(super) fn view(screen: &WorkspaceScreen, workspace: &OpenWorkspace, tab: Tab
         Look { dot: ui.env().icons().glyph("bullet").into_owned(), indent: indent(ui), now: DateTime::now_local() };
     let items: Vec<ListItem> = rows.iter().map(|row| item(workspace, row, &look, ready)).collect();
     let selected = resting_row(&rows, screen.blank_row);
-    let first = rows.iter().position(Row::selectable);
-    let last = rows.iter().rposition(Row::selectable);
-    ui.column(|ui| {
-        ui.add(Text::new(t!("workspace.choose.title")).role("title"));
-        if !ready {
-            ui.add(Text::new(t!("workspace.no-engine")).role("secondary"));
-        }
-        let list = List::new(items)
-            .selected(Some(selected))
-            .on_select(Msg::HighlightChoice)
-            // A row that only says how a section stands has nothing to choose; activating it
-            // leaves the keyboard on it, where the pointer or the keys put it. The list never
-            // activates a heading or a gap, since it does not let the keyboard rest there.
-            .on_activate(move |index| {
-                rows.get(index).and_then(|row| row.message(tab)).unwrap_or(Msg::HighlightChoice(index))
-            });
-        let edges = (first == Some(selected), last == Some(selected));
-        ui.add(Wrapping::new(list, Some(selected), 0).edges(edges.0, edges.1))
-            .id(CHOICES_ID)
-            .width(Length::Cells(READABLE_WIDTH))
-            .fill_height();
-    })
-    .gap(1)
-    .padding(Padding::symmetric(1, 2))
-    .fill()
-    .id("workspace-blank");
+    page::column(ui, page::WIDTH, |ui| {
+        ui.column(|ui| {
+            ui.add(Text::new(t!("workspace.choose.title")).role("title"));
+            if !ready {
+                ui.add(Text::new(t!("workspace.no-engine")).role("secondary"));
+            }
+            // A row is chosen by its name; the note beside it gives way first on a narrow middle.
+            let list = List::new(items)
+                .label_first(true)
+                .selected(Some(selected))
+                .on_select(Msg::HighlightChoice)
+                // A row that only says how a section stands has nothing to choose; activating it
+                // leaves the keyboard on it, where the pointer or the keys put it. The list never
+                // activates a heading or a gap, since it does not let the keyboard rest there.
+                .on_activate(move |index| {
+                    rows.get(index).and_then(|row| row.message(tab)).unwrap_or(Msg::HighlightChoice(index))
+                });
+            ui.add(list.wrap(true)).id(CHOICES_ID).fill();
+        })
+        .gap(1)
+        .padding(Padding::symmetric(1, 2))
+        .fill()
+        .id("workspace-blank");
+    });
 }

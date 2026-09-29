@@ -29,6 +29,7 @@ use super::plan::{CODE_DIR, SHELL};
 mod admin;
 mod backups;
 mod bridge;
+mod busy;
 mod close;
 mod closed_sign_in;
 mod desktop;
@@ -40,6 +41,7 @@ mod history;
 mod identity;
 mod missing_image;
 mod new_line;
+mod pages;
 mod rebuilt_image;
 mod registry;
 mod shared;
@@ -1190,7 +1192,7 @@ fn the_file_tree_reads_the_workspace_folder_and_opens_a_folder() {
     assert!(text.contains("src"), "{text}");
     assert!(!text.contains("main.rs"), "a closed folder shows nothing of itself:\n{text}");
 
-    harness.send(Msg::ExpandFile("src".to_owned(), true));
+    harness.click_text("src");
     let text = harness.screen();
     assert!(text.contains("main.rs"), "opening the folder reads it:\n{text}");
 }
@@ -1208,7 +1210,7 @@ fn an_unreadable_workspace_folder_says_why() {
     assert!(text.contains("The workspace folder"), "the panel says which folder it is about:\n{text}");
     let reason = harness.app().0.workspace().expect("a workspace").files().error().unwrap_or_default().to_owned();
     assert!(!reason.is_empty(), "and keeps what the system said");
-    assert!(text.contains("No such file"), "which is on screen too:\n{text}");
+    assert!(text.contains("This is not there any"), "which is on screen too, in the person's words:\n{text}");
 }
 
 #[test]

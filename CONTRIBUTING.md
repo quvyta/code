@@ -32,6 +32,10 @@ QCODE_CONTAINER_TESTS=1 cargo test -- --ignored --test-threads=1
 They create images, containers and volumes whose names start with `qcode`, and remove what they
 create.
 
+A few tests run the scripts QCode puts in its images under the Node of your machine, so `cargo test`
+needs `node` on the path. Without it those tests fail and say so; on a machine that has no Node on
+purpose, set `QCODE_SKIP_NODE=1` and they are skipped, each saying so in the log.
+
 ## Pull requests
 
 - Keep one change per pull request, and say in the description what it changes for the person

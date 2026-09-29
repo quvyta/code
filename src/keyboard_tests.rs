@@ -7,6 +7,7 @@ use qframe::runtime::Harness;
 
 use crate::QCode;
 use crate::engine::{Engine, EngineKind};
+use crate::profile::Extra;
 use crate::testing::{config, dirs, harness, highlighted, host, no_web, providers_file, settled};
 
 /// A folder of this test's own, empty.
@@ -83,11 +84,16 @@ fn a_profile_is_made_through_every_page_of_the_wizard_with_the_keyboard_alone() 
     assert!(harness.is_focused("wizard-next"), "Cancel, Back, then Next:\n{}", harness.screen());
     harness.press("enter");
 
-    // Template: QCode recommended stays; graphify is switched off with the keys.
+    // Template: Left on the picker's first row goes round to Custom, which switches everything
+    // off; Right goes round to QCode recommended again and on to QCode extra. In the list below,
+    // Space on oh-my-opencode-slim switches it on and oh-my-openagent off, and Space on the Rust
+    // toolchain adds what no ready-made set pairs with that team.
     assert!(harness.is_focused("profile-template"), "{}", harness.screen());
+    harness.press("left").press("right").press("right");
     harness.press("tab");
     assert!(harness.is_focused("profile-extras"), "{}", harness.screen());
-    harness.press("space");
+    harness.press("down").press("down").press("space");
+    harness.press("down").press("space");
     for _ in 0..16 {
         if harness.is_focused("wizard-next") {
             break;
@@ -115,14 +121,18 @@ fn a_profile_is_made_through_every_page_of_the_wizard_with_the_keyboard_alone() 
     assert!(harness.is_focused("wizard-next"), "{}", harness.screen());
     harness.press("enter");
 
-    let saved = std::fs::read_to_string(store.join("Profiles").join("keys.toml"))
+    // No ready-made set is that team with the toolchain, so the profile is a custom one, in the
+    // folder a QCode from before custom profiles does not read.
+    let saved = std::fs::read_to_string(store.join("Profiles").join("custom").join("keys.toml"))
         .unwrap_or_else(|trouble| panic!("the profile is saved: {trouble}\n{}", harness.screen()));
     let profile = crate::profile::Profile::parse("keys.toml", &saved).profile.expect("it reads back");
     assert_eq!(profile.harness, crate::profile::HarnessKind::OpenCode, "{saved}");
     assert_eq!(profile.account, crate::profile::AccountKind::Free, "{saved}");
     assert_eq!(profile.assets, crate::profile::MountAccess::ReadOnly, "{saved}");
     assert_eq!(profile.network, crate::profile::NetworkMode::ALL[crate::profile::NetworkMode::ALL.len() - 1]);
-    assert!(saved.contains("graphify = false"), "{saved}");
+    assert_eq!(profile.template, crate::profile::Template::Custom, "{saved}");
+    let parts = [Extra::Graphify, Extra::OhMyOpenCodeSlim, Extra::Rust, Extra::Settings];
+    assert_eq!(profile.parts(), parts, "{saved}");
     let _ = std::fs::remove_dir_all(&folder);
 }
 
@@ -287,7 +297,7 @@ fn the_first_start_is_finished_with_the_keyboard_alone() {
     harness.press("up");
     assert!(harness.screen().contains("Türkçe"), "{}", harness.screen());
     harness.press("down");
-    assert!(harness.screen().contains("Pick the language"), "and back round:\n{}", harness.screen());
+    assert!(harness.screen().contains("Chinese (Simplified)"), "and back round:\n{}", harness.screen());
     harness.press("tab");
     assert!(harness.is_focused("wizard-next"), "{}", harness.screen());
     harness.press("enter");

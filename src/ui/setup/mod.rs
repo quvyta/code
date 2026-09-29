@@ -30,7 +30,6 @@ use qframe::widgets::{
 
 use crate::engine::EngineKind;
 use crate::store::{Config, HostDirs, SetupStep};
-use crate::ui::keys::Wrapping;
 
 use gates::{EngineCheck, EngineProblem, Gates, LocationCheck, LocationProblem};
 use install::{InstallHost, Installer, Remedy};
@@ -649,15 +648,14 @@ fn pages(setup: &Setup, ui: &mut View<'_, Msg>) {
 
 /// The first step: the language, which changes as it is chosen.
 fn language_page(setup: &Setup, ui: &mut View<'_, Msg>) {
-    ui.add(Text::new(t!("setup.language-intro")).role("secondary")).fill_width();
-    ui.spacer().height(Length::Cells(1));
+    // The step's name and the list are the whole question; the screen answers in the language
+    // being walked onto, which says the rest.
     Form::new().label_width(LABEL_WIDTH).show(ui, |form| {
         form.field(Field::new(t!("setup.language")), |ui| {
             let options: Vec<String> =
                 setup.languages.codes().iter().map(|code| t!(&format!("setup.language-{code}"))).collect();
-            let count = options.len();
             let group = RadioGroup::new(options).selected(Some(setup.language)).on_select(Msg::Language);
-            ui.add(Wrapping::new(group, Some(setup.language), count)).id("setup-language");
+            ui.add(group.wrap(true)).id("setup-language");
         });
     });
 }
@@ -675,7 +673,7 @@ fn engine_page(setup: &Setup, ui: &mut View<'_, Msg>) {
             form.field(field, |ui| {
                 let options = ENGINES.map(|kind| t!(&format!("setup.engine-{}", kind.name())));
                 let group = RadioGroup::new(options).selected(Some(setup.engine)).on_select(Msg::Engine);
-                ui.add(Wrapping::new(group, Some(setup.engine), ENGINES.len())).id("setup-engine");
+                ui.add(group.wrap(true)).id("setup-engine");
             });
         });
         ui.add(Text::new(t!(&format!("setup.{}-note", setup.kind().name()))).role("faint")).fill_width();
@@ -849,12 +847,11 @@ fn location_page(setup: &Setup, ui: &mut View<'_, Msg>) {
                 None => t!("setup.location-default"),
             };
             let options = [default, t!("setup.location-custom")];
-            let count = options.len();
             let group = RadioGroup::new(options)
                 .selected(Some(setup.place))
                 .disabled(setup.default_path.is_none() && setup.place == DEFAULT_PLACE)
                 .on_select(Msg::Place);
-            ui.add(Wrapping::new(group, Some(setup.place), count)).id("setup-location");
+            ui.add(group.wrap(true)).id("setup-location");
         });
     });
     if setup.default_path.is_none() {
@@ -1049,7 +1046,7 @@ mod tests {
         let harness = wizard("", &gates, Some(temporary("home")));
         let screen = harness.screen();
         assert_eq!(harness.app().setup.step(), SetupStep::Language);
-        assert!(screen.contains("Pick the language"), "{screen}");
+        assert!(screen.contains("Chinese (Simplified)"), "{screen}");
         assert!(screen.contains("English"), "{screen}");
     }
 
@@ -1092,7 +1089,7 @@ mod tests {
         let mut harness = wizard("", &gates, Some(temporary("home")));
         harness.click_text("Turkish").render();
         let screen = harness.screen();
-        assert!(screen.contains("konuşacağı dili seç"), "the whole screen turns at once:\n{screen}");
+        assert!(screen.contains("Çince (Basitleştirilmiş)"), "the whole screen turns at once:\n{screen}");
         assert_eq!(harness.app().setup.language(), "tr");
     }
 
@@ -1263,6 +1260,26 @@ mod tests {
     }
 
     #[test]
+    fn the_wizard_says_each_thing_once_and_briefly() {
+        // The language step is its list and nothing more.
+        let fresh = Gates { language: false, engine: EngineCheck::Unknown, location: LocationCheck::Unknown };
+        let harness = sized("", &fresh, Some(temporary("home")), (120, 40));
+        let screen = harness.screen();
+        assert!(screen.contains("Chinese (Simplified)"), "{screen}");
+        assert!(!screen.contains("follows your choice"), "{screen}");
+
+        // A stopped daemon is said in one line, beside the one line about the chosen engine.
+        let config = "language = \"en\"\n\n[engine]\nkind = \"docker\"\n";
+        let problem = EngineProblem::DaemonStopped { output: "cannot connect to the docker daemon".to_owned() };
+        let harness = sized(config, &gates(EngineCheck::Broken(problem), LocationCheck::Unknown), None, (120, 40));
+        let screen = harness.screen();
+        assert!(screen.contains("Docker is installed; its daemon is off."), "{screen}");
+        assert!(screen.contains("Fully supported; its daemon has to be running."), "{screen}");
+        assert!(!screen.contains("only has to be started"), "{screen}");
+        assert!(!screen.contains("It talks to a daemon"), "{screen}");
+    }
+
+    #[test]
     fn a_stopped_docker_daemon_is_a_different_story_from_a_missing_docker() {
         let config = "language = \"en\"\n\n[engine]\nkind = \"docker\"\n";
         let problem = EngineProblem::DaemonStopped { output: "cannot connect to the docker daemon".to_owned() };
@@ -1281,7 +1298,7 @@ mod tests {
         let problem = EngineProblem::MachineStopped { output: "podman machine start".to_owned() };
         let mut harness = on_engine_tall("language = \"en\"\n", problem);
         let screen = harness.screen();
-        assert!(screen.contains("virtual machine"), "{screen}");
+        assert!(screen.contains("Podman is installed; its machine is off."), "{screen}");
         harness.click_text("I'll run it myself").render();
         assert!(harness.screen().contains("podman machine start"), "{}", harness.screen());
     }
@@ -1349,7 +1366,7 @@ mod tests {
     fn a_machine_with_no_documents_folder_asks_for_a_place_instead_of_inventing_one() {
         let harness = wizard("language = \"en\"\n", &gates(EngineCheck::Working, LocationCheck::Usable), None);
         let screen = harness.screen();
-        assert!(screen.contains("could not work out a documents folder"), "{screen}");
+        assert!(screen.contains("No documents folder found"), "{screen}");
         assert_eq!(harness.app().setup.folder_path(), None);
     }
 

@@ -196,6 +196,9 @@ pub struct Draft {
     pub problem: Option<Problem>,
     /// Whether the long work is running, which turns the dialog into its own progress.
     pub busy: bool,
+    /// Whether the folder browser is open in a dialog of its own, which is where it opens on a
+    /// terminal too short to hold it inside the form.
+    pub browsing: bool,
 }
 
 impl Draft {
@@ -211,6 +214,7 @@ impl Draft {
             place: Place::Copy,
             problem: None,
             busy: false,
+            browsing: false,
         }
     }
 

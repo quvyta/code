@@ -303,6 +303,15 @@ async function keep() {
     const exited = server.exitCode !== null || server.signalCode !== null;
     const silent = misses >= MISSES && (answered || Date.now() - started > START_WAIT_MS);
     if (exited || silent) {
+      // A server is started again only for a tab: with none attached or on its way back, one that
+      // will not stay up would otherwise be started over and over, with nobody left to end the
+      // keeper.
+      if (interfaces().length > 0 || expected.size > 0) {
+        lonely = Date.now();
+      } else if (Date.now() - Math.max(lonely, lastWanted()) > IDLE_MS) {
+        stopServer();
+        process.exit(0);
+      }
       if (!exited) {
         try {
           server.kill("SIGKILL");

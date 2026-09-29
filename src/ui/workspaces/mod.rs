@@ -31,7 +31,7 @@ use qframe::widgets::{
 
 use crate::engine::Engine;
 use crate::store::{Store, WorkspaceEntry, WorkspaceId};
-use crate::ui::keys::Wrapping;
+use crate::ui::page;
 
 pub use draft::{Place, Source};
 
@@ -45,6 +45,15 @@ const DIALOG_WIDTH: u16 = 68;
 
 /// Rows the folder browser gets inside the dialog.
 const PICKER_ROWS: u16 = 12;
+
+/// The fewest rows a terminal has for the folder browser to stand inside the form. The form's
+/// fields above it take most of a short terminal, and the browser's own path, filter and button
+/// take six of its rows, so on a shorter one the browser would show a folder or two at a time, or
+/// none; there it opens in a dialog of its own instead, which has the whole height for folders.
+const ROOMY_ROWS: u16 = 34;
+
+/// Rows the dialog of the folder browser keeps for its title, its buttons and its frame.
+const BROWSE_CHROME_ROWS: u16 = 8;
 
 /// Rows the live log gets while a workspace is being filled.
 const LOG_ROWS: u16 = 10;
@@ -88,6 +97,8 @@ pub enum Msg {
     Url(String),
     /// Something happened in the folder browser.
     Picker(FilePickerMsg),
+    /// The folder browser was opened in a dialog of its own, or that dialog was closed.
+    Browse(bool),
     /// Make the workspace.
     Submit,
     /// One line of the copy or the clone.
@@ -250,7 +261,18 @@ pub fn update(workspaces: &mut Workspaces, message: Msg) -> (Command<Msg>, Optio
         Msg::Source(index) => edit(workspaces, |draft| draft.source = Source::from_index(index)),
         Msg::Place(index) => edit(workspaces, |draft| draft.place = Place::from_index(index)),
         Msg::Url(text) => edit(workspaces, |draft| draft.url = text),
-        Msg::Picker(FilePickerMsg::Chosen(path)) => edit(workspaces, |draft| draft.folder = Some(path)),
+        Msg::Picker(FilePickerMsg::Chosen(path)) => {
+            let browsing = matches!(&workspaces.overlay, Some(Overlay::New(draft)) if draft.browsing);
+            let command = edit(workspaces, |draft| {
+                draft.folder = Some(path);
+                draft.browsing = false;
+            });
+            if browsing { Command::batch([command, Command::focus(BROWSE_BUTTON)]) } else { command }
+        }
+        Msg::Browse(open) => {
+            let command = edit(workspaces, |draft| draft.browsing = open);
+            Command::batch([command, Command::focus(if open { BROWSE_PICKER } else { BROWSE_BUTTON })])
+        }
         Msg::Picker(message) => match workspaces.overlay {
             Some(Overlay::New(ref mut draft)) => draft.browser.update(message, Msg::Picker),
             _ => Command::none(),
@@ -618,6 +640,12 @@ const SOURCE_GROUP: &str = "workspace-source";
 /// The name of the choice between copying a folder and using it where it stands.
 const PLACE_GROUP: &str = "workspace-place";
 
+/// The name of the button that opens the folder browser in a dialog of its own.
+const BROWSE_BUTTON: &str = "workspace-browse";
+
+/// The name of the folder browser in its own dialog.
+const BROWSE_PICKER: &str = "workspace-browse-picker";
+
 /// Where the folder browser starts: the person's home folder, or the store when there is no
 /// home folder to be had.
 fn start_folder(store: &Store) -> PathBuf {
@@ -626,12 +654,14 @@ fn start_folder(store: &Store) -> PathBuf {
 
 /// Draws the workspaces screen.
 pub fn view(workspaces: &Workspaces, ui: &mut View<'_, Msg>) {
-    ui.column(|ui| {
-        ui.add(Text::new(t!("workspaces.title")).bold().no_wrap());
-        body(workspaces, ui);
-    })
-    .fill()
-    .gap(1);
+    page::column(ui, page::WIDTH, |ui| {
+        ui.column(|ui| {
+            ui.add(Text::new(t!("workspaces.title")).bold().no_wrap());
+            body(workspaces, ui);
+        })
+        .fill()
+        .gap(1);
+    });
     overlay(workspaces, ui);
 }
 
@@ -670,11 +700,11 @@ fn body(workspaces: &Workspaces, ui: &mut View<'_, Msg>) {
     let items = std::iter::once(new).chain(workspaces.entries.iter().map(|entry| row(workspaces, entry)));
     let selected = if workspaces.on_new { 0 } else { workspaces.selected + 1 };
     let list = List::new(items)
+        .label_first(true)
         .selected(Some(selected))
         .on_select(|row| row.checked_sub(1).map_or(Msg::SelectNew, Msg::Select))
         .on_activate(|row| row.checked_sub(1).map_or(Msg::Start, Msg::Activate));
-    let rows = workspaces.entries.len() + 1;
-    ui.add(Wrapping::new(list, Some(selected), rows)).id(LIST).fill();
+    ui.add(list.wrap(true)).id(LIST).fill();
     ui.row(|ui| {
         ui.spacer();
         let mut delete = Button::new(t!("workspaces.removal.button")).variant("danger").loading(workspaces.deleting);
@@ -752,9 +782,8 @@ fn choose_doomed(workspaces: &Workspaces, chosen: usize, ui: &mut View<'_, Msg>)
     let rows = u16::try_from(items.len()).unwrap_or(u16::MAX).min(LOG_ROWS);
     ui.add_with(dialog, |ui| {
         ui.add(Text::new(t!("workspaces.removal.choose-message")).role("secondary")).fill_width();
-        let count = items.len();
         let list = List::new(items).selected(Some(chosen)).on_select(Msg::DeleteSelect).on_activate(Msg::DeletePick);
-        ui.add(Wrapping::new(list, Some(chosen), count)).id(DELETE_LIST).height(Length::Cells(rows)).fill_width();
+        ui.add(list.wrap(true)).id(DELETE_LIST).height(Length::Cells(rows)).fill_width();
     });
 }
 
@@ -780,6 +809,39 @@ fn new_workspace(workspaces: &Workspaces, draft: &Draft, ui: &mut View<'_, Msg>)
             form(workspaces, draft, ui);
         }
     });
+    if draft.browsing && !draft.busy && draft.source == Source::Folder && !roomy(ui) {
+        browse(draft, ui);
+    }
+}
+
+/// Whether the terminal is tall enough for the folder browser to stand inside the form.
+fn roomy(ui: &View<'_, Msg>) -> bool {
+    ui.size().height >= ROOMY_ROWS
+}
+
+/// The folder browser in a dialog of its own, over the form, with every row the terminal has.
+fn browse(draft: &Draft, ui: &mut View<'_, Msg>) {
+    let rows = ui.size().height.saturating_sub(BROWSE_CHROME_ROWS);
+    let dialog = Modal::new()
+        .title(folder_label(draft))
+        .width(DIALOG_WIDTH)
+        .on_close(Msg::Browse(false))
+        .action(Button::new(t!("workspaces.cancel")).on_press(Msg::Browse(false)));
+    ui.add_with(dialog, |ui| {
+        FilePicker::new(&draft.browser, Msg::Picker)
+            .show(ui)
+            .id(BROWSE_PICKER)
+            .height(Length::Cells(rows))
+            .fill_width();
+    });
+}
+
+/// The label of the folder field, which says what becomes of the folder chosen in it.
+fn folder_label(draft: &Draft) -> String {
+    match draft.place {
+        Place::Copy => t!("workspaces.folder-label"),
+        Place::InPlace => t!("workspaces.place-folder-label"),
+    }
 }
 
 /// The form of the dialog.
@@ -814,9 +876,7 @@ fn form(workspaces: &Workspaces, draft: &Draft, ui: &mut View<'_, Msg>) {
                 .horizontal(true)
                 .selected(Some(draft.source.index()))
                 .on_select(Msg::Source);
-            ui.add(Wrapping::new(group, Some(draft.source.index()), Source::ALL.len()).across(true))
-                .id(SOURCE_GROUP)
-                .fill_width();
+            ui.add(group.wrap(true)).id(SOURCE_GROUP).fill_width();
         });
         match draft.source {
             Source::Empty => {}
@@ -827,28 +887,37 @@ fn form(workspaces: &Workspaces, draft: &Draft, ui: &mut View<'_, Msg>) {
                 };
                 // Said where the folder is chosen: under "use it where it is", the agents change the
                 // person's real files, and that is the one thing they must not learn later.
-                let (label, hint) = match draft.place {
-                    Place::Copy => (t!("workspaces.folder-label"), t!("workspaces.folder-hint")),
-                    Place::InPlace => (t!("workspaces.place-folder-label"), t!("workspaces.place-in-place-hint")),
+                let hint = match draft.place {
+                    Place::Copy => t!("workspaces.folder-hint"),
+                    Place::InPlace => t!("workspaces.place-in-place-hint"),
                 };
-                let field = Field::new(label).hint(hint).error(errors.get(FOLDER_FIELD));
+                let roomy = roomy(fields.ui());
+                let field = Field::new(folder_label(draft)).hint(hint).error(errors.get(FOLDER_FIELD));
                 fields.field(field, |ui| {
-                    ui.add(Text::new(chosen).role(if draft.folder.is_some() { "body" } else { "secondary" }))
-                        .fill_width();
+                    ui.row(|ui| {
+                        ui.add(Text::new(chosen).role(if draft.folder.is_some() { "body" } else { "secondary" }))
+                            .fill_width();
+                        if !roomy {
+                            ui.add(Button::new(t!("workspaces.folder-browse")).on_press(Msg::Browse(true)))
+                                .id(BROWSE_BUTTON);
+                        }
+                    })
+                    .gap(2)
+                    .fill_width();
                 });
                 fields.field(Field::new(t!("workspaces.place-label")), |ui| {
                     let group = RadioGroup::new(Place::ALL.map(Place::label))
                         .horizontal(true)
                         .selected(Some(draft.place.index()))
                         .on_select(Msg::Place);
-                    ui.add(Wrapping::new(group, Some(draft.place.index()), Place::ALL.len()).across(true))
-                        .id(PLACE_GROUP)
-                        .fill_width();
+                    ui.add(group.wrap(true)).id(PLACE_GROUP).fill_width();
                 });
-                FilePicker::new(&draft.browser, Msg::Picker)
-                    .show(fields.ui())
-                    .height(Length::Cells(PICKER_ROWS))
-                    .fill_width();
+                if roomy {
+                    FilePicker::new(&draft.browser, Msg::Picker)
+                        .show(fields.ui())
+                        .height(Length::Cells(PICKER_ROWS))
+                        .fill_width();
+                }
             }
             Source::Git => {
                 let mut field = Field::new(t!("workspaces.url-label")).disabled(!engine).error(errors.get(URL_FIELD));

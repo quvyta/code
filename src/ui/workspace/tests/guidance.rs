@@ -266,7 +266,7 @@ fn a_file_whose_section_has_lost_a_marker_line_is_left_alone_and_the_person_is_t
     let shown = harness.screen();
     assert!(shown.contains("The instructions of Claude Code"), "{shown}");
     // The toast wraps its words, so they are looked for in parts.
-    assert!(shown.contains("CLAUDE.md has only one of the two lines"), "{shown}");
+    assert!(shown.contains("CLAUDE.md has only one of the lines"), "{shown}");
 }
 
 #[test]

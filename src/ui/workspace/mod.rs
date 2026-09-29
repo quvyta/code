@@ -17,8 +17,8 @@
 mod backups;
 mod blank;
 mod bridge;
+mod busy;
 mod desktop;
-mod file_ops;
 mod files;
 mod history;
 mod keep;
@@ -26,12 +26,11 @@ mod panel;
 mod plan;
 mod relay;
 mod rename;
-mod shared;
+pub(crate) mod shared;
 mod sound;
 mod strip;
 mod tab;
 mod viewer;
-mod watch;
 
 #[cfg(test)]
 mod live;
@@ -41,10 +40,11 @@ mod tests;
 pub(crate) use backups::bytes;
 pub use backups::{BackupOf, BackupTrouble, Farewell, Leaving, Part, leaving};
 pub use blank::Choice;
+#[cfg(test)]
+pub(crate) use bridge::type_in;
 pub use bridge::{Letter, Letters, Undelivered};
 pub use desktop::Opening;
-pub use file_ops::{Change, FileError, NameProblem};
-pub use files::{DocumentTrouble, FileEntry, FileMsg, FileTree, NameFor, Naming};
+pub use files::DocumentTrouble;
 pub use history::HistoryKey;
 pub use keep::{BASE_LABEL as WORKSPACE_BASE_LABEL, enter_admin, image as workspace_image};
 pub use panel::{Panel, PanelWidget};
@@ -65,10 +65,9 @@ use qframe::icons::Icons;
 use qframe::keymap::{Key, KeyChord};
 use qframe::prelude::*;
 use qframe::runtime::Task;
-use qframe::storage::FolderChange;
 use qframe::widgets::{
-    CollapsedMarker, ContextItem, EmptyState, LogView, Markdown, RailTab, ScrollView, ShimmerText, Side, SidePanel,
-    Spinner, TabEdit, TabRail, TabWidth, Terminal, TerminalEvent, TerminalSession, Toast,
+    CollapsedMarker, ContextItem, EmptyState, FileManagerMsg, FileManagerState, LogView, Markdown, RailTab, ScrollView,
+    ShimmerText, Side, SidePanel, Spinner, TabEdit, TabRail, TabWidth, Terminal, TerminalEvent, TerminalSession, Toast,
 };
 
 use std::path::{Path, PathBuf};
@@ -87,6 +86,7 @@ use crate::store::{
     Registry, Session, SessionTab, SessionTabKind, SessionWorkspace, Store, WorkspaceFile, WorkspaceId, WorkspacePaths,
     add_profile,
 };
+use crate::ui::page;
 use crate::ui::profiles::work::Problem;
 use crate::ui::settings::engine::{Help, help, name as engine_name};
 
@@ -223,18 +223,12 @@ pub enum Msg {
     AddWidget(PanelWidget),
     /// A widget was taken off the panel.
     RemoveWidget(PanelWidget),
-    /// The cursor of the file tree moved to an entry; what is selected comes as
-    /// [`FileMsg::Choose`].
-    SelectFile(String),
-    /// A folder of the file tree was opened or closed.
-    ExpandFile(String, bool),
-    /// A folder of a workspace's file tree was read.
-    FolderRead(String, String, Result<Vec<FileEntry>, String>),
-    /// Something happened to the files of the file tree.
-    Files(FileMsg),
-    /// Other programs changed folders a workspace's tree shows: the workspace's id, the number of
-    /// the watch that saw it, and what changed.
-    FilesChanged(String, u64, Vec<FolderChange>),
+    /// Something happened in the file manager of the workspace of this id: a click, a key, a
+    /// folder read, an operation done or a change another program made on disk.
+    Files(String, FileManagerMsg),
+    /// The entry of this key, with the rest of the selection when it is part of it, was asked to
+    /// be left out of the workspace's backup, or taken into it again when `false`.
+    LeaveOut(String, bool),
     /// A file of the file tree was opened: Enter or a click on it.
     OpenFile(String),
     /// A file was asked for in the editor, from the Markdown tab that shows it.
@@ -371,6 +365,10 @@ pub enum Msg {
     Letters(TabKey, Letters),
     /// Time to look again at the tabs that still hold messages for their agents.
     Deliver,
+    /// Time to look at the Return this tab owes a message it has already taken.
+    Return(TabKey),
+    /// Time to turn the mark of the working tabs, looking at them as of this moment.
+    Turn(std::time::Instant),
     /// The bridge could not be registered in the settings of a harness whose container came up;
     /// the message that came with the start follows.
     Unbridged(HarnessKind, Unregistered, Box<Msg>),
@@ -424,9 +422,8 @@ pub struct OpenWorkspace {
     /// The conversations of each profile, by the profile's name, as the blank tab's page last
     /// read them.
     history: HashMap<String, history::Shelf>,
-    files: FileTree,
-    /// Whether the folders the tree shows are watched for changes other programs make.
-    live: watch::Live,
+    /// The file manager of the workspace's own folder.
+    files: FileManagerState,
     containers: Vec<Container>,
     container_row: usize,
     container_error: Option<LaunchFailure>,
@@ -460,7 +457,9 @@ impl OpenWorkspace {
     /// edit to be used in it.
     #[must_use]
     pub fn new(file: &WorkspaceFile, paths: WorkspacePaths, profiles: Vec<Profile>) -> Self {
-        let files = FileTree::new(paths.code.clone());
+        // Kept inside the folder, links included, since the folder is all a workspace hands its
+        // containers; and every entry shown, since a workspace's dotfiles are its work too.
+        let files = FileManagerState::new(paths.code.clone()).confined().showing_hidden(true);
         let carried = file.profiles.iter().map(|profile| profile.name.clone()).collect();
         let mut workspace = Self {
             id: file.id.clone(),
@@ -472,7 +471,6 @@ impl OpenWorkspace {
             active_tab: 0,
             history: HashMap::new(),
             files,
-            live: watch::Live::Off,
             containers: Vec::new(),
             container_row: 0,
             container_error: None,
@@ -541,9 +539,9 @@ impl OpenWorkspace {
         self.tabs.get(self.active_tab)
     }
 
-    /// What the file tree knows about the workspace's own folder.
+    /// What the file manager knows about the workspace's own folder.
     #[must_use]
-    pub fn files(&self) -> &FileTree {
+    pub fn files(&self) -> &FileManagerState {
         &self.files
     }
 
@@ -746,8 +744,8 @@ pub struct WorkspaceScreen {
     next_key: u64,
     /// Whether the open workspace's folders are watched, so the tree follows the disk.
     live: bool,
-    /// The number the last folder watch was given.
-    last_watch: u64,
+    /// How long one wait for the disk may last, when it may not last until something changes.
+    patience: Option<std::time::Duration>,
     /// Where the containers this screen starts are noted, so they can be stopped once no QCode
     /// is open; `None` notes nothing.
     registry: Option<PathBuf>,
@@ -784,6 +782,13 @@ pub struct WorkspaceScreen {
     /// Whether a key on the tab strip or the rail is being handled, so that a switch it makes
     /// leaves the keyboard walking there instead of putting it in the tab.
     walking: bool,
+    /// The moment the tabs were last looked at to mark the working ones: the last turn of the
+    /// mark, or the last output of a tab since.
+    looked: std::time::Instant,
+    /// Whether the next turn of the mark is timed, so one is timed at a time.
+    turning: bool,
+    /// How many times the mark has turned, which picks its frame.
+    turn: usize,
 }
 
 impl WorkspaceScreen {
@@ -810,7 +815,7 @@ impl WorkspaceScreen {
             display: desktop::display(),
             next_key: 0,
             live: false,
-            last_watch: 0,
+            patience: None,
             registry: None,
             providers_path: crate::provider::Providers::file(),
             registry_told: false,
@@ -826,6 +831,9 @@ impl WorkspaceScreen {
             ask_first: false,
             renaming: None,
             walking: false,
+            looked: std::time::Instant::now(),
+            turning: false,
+            turn: 0,
         }
     }
 
@@ -834,10 +842,20 @@ impl WorkspaceScreen {
     ///
     /// It is off unless asked for because a watch waits for the disk on a background thread, and
     /// a test harness runs background work in line, where that wait would never end. Tests of
-    /// the watch take its batches by hand instead.
+    /// the watch bound each wait instead.
     #[must_use]
     pub fn watching(mut self, live: bool) -> Self {
         self.live = live;
+        self
+    }
+
+    /// The same screen following the disk, with each wait for a change lasting at most `bound`,
+    /// so a test harness that runs the wait in line always gets its turn back.
+    #[cfg(test)]
+    #[must_use]
+    pub fn watching_within(mut self, bound: std::time::Duration) -> Self {
+        self.live = true;
+        self.patience = Some(bound);
         self
     }
 
@@ -1197,7 +1215,8 @@ impl WorkspaceScreen {
 pub fn opened(screen: &mut WorkspaceScreen) -> Command<Msg> {
     relay::follow(screen);
     let command = Command::batch([load_root(screen), list_containers(screen), wake(screen), show_page(screen, true)]);
-    Command::batch([command, follow_disk(screen), backups::keep(screen), bridge::follow(screen)])
+    follow_disk(screen);
+    Command::batch([command, backups::keep(screen), bridge::follow(screen)])
 }
 
 /// Adds `workspace` to the rail and opens it, or only opens it when the rail has it already; the
@@ -1225,23 +1244,20 @@ pub fn update(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
     // Profiles read again may be new ones, whose conversations the page shown has not read.
     let profiles = matches!(message, Msg::Profiles(_));
     let command = apply(screen, message);
-    let kept = Command::batch([reread(screen), follow_disk(screen), backups::keep(screen), bridge::follow(screen)]);
+    follow_disk(screen);
+    let kept = Command::batch([reread(screen), backups::keep(screen), bridge::follow(screen), busy::follow(screen)]);
     Command::batch([command, wake(screen), show_page(screen, profiles), kept])
 }
 
-/// Keeps the open workspace's watch on the folders its tree shows, whatever the message changed
-/// about them, and lets the watches of the other workspaces go: their trees are not on screen, and
-/// they are read again when they are opened.
-fn follow_disk(screen: &mut WorkspaceScreen) -> Command<Msg> {
-    let mut commands = Vec::new();
+/// Lets the watches of the workspaces that are not open go: their trees are not on screen, and
+/// they are read again when they are opened. The open one's watch is the file manager's own, which
+/// keeps it on the folders the tree shows whatever a message changed about them.
+fn follow_disk(screen: &mut WorkspaceScreen) {
     for (index, workspace) in screen.workspaces.iter_mut().enumerate() {
-        if screen.live && index == screen.active {
-            commands.push(watch::follow(workspace, &mut screen.last_watch));
-        } else {
-            watch::stop(workspace);
+        if index != screen.active && workspace.files.follows_changes() {
+            workspace.files.set_following(false);
         }
     }
-    Command::batch(commands)
 }
 
 /// Applies a message to the screen, leaving the start of a waiting tab to [`update`].
@@ -1263,10 +1279,16 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
             };
             let silenced = Command::batch([silenced, shut]);
             let Some(workspace) = screen.workspaces.get_mut(index) else { return Command::none() };
+            // A message in any of these prompts is sent as the workspace goes: nothing is left to
+            // wait for, and the agents that sent them were told their tools had them.
+            let keys: Vec<TabKey> = workspace.tabs.iter().map(Tab::key).collect();
+            for key in &keys {
+                bridge::returning_on_close(screen, *key);
+            }
+            let Some(workspace) = screen.workspaces.get_mut(index) else { return Command::none() };
             for tab in &mut workspace.tabs {
                 tab.close_session();
             }
-            let keys: Vec<TabKey> = workspace.tabs.iter().map(Tab::key).collect();
             let tokens: Vec<String> = workspace.tabs.iter().map(|tab| tab.token().to_owned()).collect();
             relay::closed(workspace, &tokens);
             bridge::closed(screen, &keys);
@@ -1287,12 +1309,14 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
         }
         Msg::CloseTab(index) => {
             // Messages other agents left in the tab would go with it, and those agents were told
-            // their work was taken: the person decides that knowingly.
+            // their work was taken: the person decides that knowingly. So is a message already in
+            // the tab's prompt whose Return has not gone: closing now throws it away unsent, and
+            // the agent that sent it was told it had it.
             if let Some(tab) = screen.workspace().and_then(|workspace| workspace.tabs.get(index))
-                && !tab.letters().is_empty()
+                && (!tab.letters().is_empty() || tab.owed().is_some())
             {
                 let name = screen.workspace().map(|workspace| workspace.tab_label(index)).unwrap_or_default();
-                return bridge::ask_close(tab.key(), &name, tab.letters().len());
+                return bridge::ask_close(tab.key(), &name, tab.letters().len(), tab.owed().is_some());
             }
             // Closing ends the agent inside the container, so one in the middle of a task is cut
             // off: a stray `ctrl+w` or a click on the `×` costs a question, never that work.
@@ -1498,30 +1522,11 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
             screen.panel.remove(widget);
             Command::none()
         }
-        Msg::SelectFile(key) => {
-            if let Some(workspace) = screen.workspaces.get_mut(screen.active) {
-                workspace.files.move_cursor(&key);
-            }
-            Command::none()
+        Msg::Files(id, message) => files::update(screen, &id, message),
+        Msg::LeaveOut(key, out) => {
+            let Some(workspace) = screen.workspaces.get(screen.active) else { return Command::none() };
+            backups::leave_out(workspace, workspace.files.targets(&key), out)
         }
-        Msg::ExpandFile(key, open) => {
-            let Some(workspace) = screen.workspaces.get_mut(screen.active) else { return Command::none() };
-            if !workspace.files.expand(&key, open) {
-                return Command::none();
-            }
-            read_folder(workspace, &key)
-        }
-        Msg::FolderRead(workspace, key, entries) => {
-            if let Some(workspace) = screen.workspace_mut(&workspace) {
-                workspace.files.read(&key, entries);
-            }
-            Command::none()
-        }
-        Msg::Files(message) => files::update(screen, message),
-        Msg::FilesChanged(id, run, batch) => match screen.workspace_mut(&id) {
-            Some(workspace) => watch::changed(workspace, run, batch),
-            None => Command::none(),
-        },
         Msg::OpenFile(key) => open_file(screen, &key),
         Msg::EditFile(key) => {
             if !files::is_inside(&key) {
@@ -1663,6 +1668,11 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
         Msg::Deliver => {
             screen.delivering = false;
             bridge::deliver(screen, std::time::Instant::now())
+        }
+        Msg::Return(key) => bridge::returned(screen, key, std::time::Instant::now()),
+        Msg::Turn(now) => {
+            busy::turn(screen, now);
+            Command::none()
         }
         Msg::Unbridged(harness, trouble, message) => {
             Command::batch([bridge::unregistered(harness, &trouble), update(screen, *message)])
@@ -1926,6 +1936,11 @@ fn close_tab(screen: &mut WorkspaceScreen, index: usize) -> Command<Msg> {
         }
         None => Command::none(),
     };
+    // A message in this tab's prompt is sent as the tab goes, since nothing is left to wait for:
+    // the person is closing it, and the agent that sent the message was told its tool had it.
+    if let Some(key) = screen.workspace().and_then(|workspace| workspace.tabs.get(index)).map(Tab::key) {
+        bridge::returning_on_close(screen, key);
+    }
     let Some(workspace) = screen.workspaces.get_mut(screen.active) else { return Command::none() };
     let mut gone = Vec::new();
     let mut token = None;
@@ -2582,9 +2597,11 @@ fn output(screen: &mut WorkspaceScreen, key: TabKey, run: u64, event: TerminalEv
             let Some(session) = tab.session() else { return Command::none() };
             let watch = session.watch();
             let next = Command::perform(move || Msg::Output(key, run, watch.next()));
-            // The tab has just spoken, so the wait for its quiet starts again from here, and a
-            // message held for it is looked at once that wait is over.
-            Command::batch([next, bridge::deliver(screen, std::time::Instant::now())])
+            // The tab has just spoken, so the wait for its quiet starts again from here, a
+            // message held for it is looked at once that wait is over, and it is marked as working.
+            let now = std::time::Instant::now();
+            screen.looked = now;
+            Command::batch([next, bridge::deliver(screen, now)])
         }
         TerminalEvent::Exited(code) => {
             tab.settled(TabState::Ended { code });
@@ -2602,24 +2619,19 @@ fn output(screen: &mut WorkspaceScreen, key: TabKey, run: u64, event: TerminalEv
 }
 
 /// Reads the root of the open workspace's file tree the first time, and every folder it shows
-/// again after that: the files may have changed while the screen was away.
+/// again after that: the files may have changed while the screen was away. The open workspace
+/// follows the disk from here on when the screen does.
 fn load_root(screen: &mut WorkspaceScreen) -> Command<Msg> {
+    let (live, patience) = (screen.live, screen.patience);
     let Some(workspace) = screen.workspaces.get_mut(screen.active) else { return Command::none() };
-    if workspace.files.children(files::ROOT).is_some() {
-        return files::refresh(workspace);
+    match patience {
+        Some(bound) if !workspace.files.follows_changes() => {
+            let state = std::mem::replace(&mut workspace.files, FileManagerState::new(PathBuf::new()));
+            workspace.files = state.following_within(bound);
+        }
+        _ => workspace.files.set_following(live),
     }
-    if !workspace.files.start_reading(files::ROOT) {
-        return Command::none();
-    }
-    read_folder(workspace, files::ROOT)
-}
-
-/// Reads one folder of a workspace's file tree on a background thread.
-fn read_folder(workspace: &OpenWorkspace, key: &str) -> Command<Msg> {
-    let id = workspace.id.as_str().to_owned();
-    let key = key.to_owned();
-    let path = workspace.files.path(&key);
-    Command::perform(move || Msg::FolderRead(id, key, files::read_folder(&path)))
+    files::load(workspace)
 }
 
 /// Asks the engine which containers the open workspace has.
@@ -2754,7 +2766,8 @@ fn rail(screen: &WorkspaceScreen, ui: &mut View<'_, Msg>) {
 /// `+` follows the last tab while they fit and keeps its place at the right end once they scroll.
 fn header(screen: &WorkspaceScreen, ui: &mut View<'_, Msg>) {
     let Some(workspace) = screen.workspace() else { return };
-    let labels: Vec<String> = (0..workspace.tabs.len()).map(|index| workspace.tab_label(index)).collect();
+    let labels: Vec<String> =
+        (0..workspace.tabs.len()).map(|index| busy::label(screen, workspace, index, ui.env())).collect();
     let tabs = Tabs::new(labels)
         .active(workspace.active_tab)
         .tab_width(TabWidth::Fit)
@@ -2900,21 +2913,23 @@ fn no_image(screen: &WorkspaceScreen, tab: &Tab, ui: &mut View<'_, Msg>) {
         _ => String::new(),
     };
     let engine = screen.engine.as_ref().map(|engine| engine_name(engine.kind())).unwrap_or_default();
-    ui.column(|ui| {
-        ui.add(Text::new(t!("workspace.image.missing", profile = profile, engine = engine)).bold()).fill_width();
-        ui.add(Text::new(t!("workspace.image.missing-why")).role("secondary")).fill_width();
-        ui.row(|ui| {
-            ui.add(Button::new(t!("workspace.image.build")).variant("primary").on_press(Msg::BuildImage(key)))
-                .id("workspace-build-image");
-            ui.add(Button::new(t!("workspace.image.cancel")).on_press(Msg::CancelOpen(key)))
-                .id("workspace-cancel-open");
+    page::column(ui, page::WIDTH, |ui| {
+        ui.column(|ui| {
+            ui.add(Text::new(t!("workspace.image.missing", profile = profile, engine = engine)).bold()).fill_width();
+            ui.add(Text::new(t!("workspace.image.missing-why")).role("secondary")).fill_width();
+            ui.row(|ui| {
+                ui.add(Button::new(t!("workspace.image.build")).variant("primary").on_press(Msg::BuildImage(key)))
+                    .id("workspace-build-image");
+                ui.add(Button::new(t!("workspace.image.cancel")).on_press(Msg::CancelOpen(key)))
+                    .id("workspace-cancel-open");
+            })
+            .gap(2);
         })
-        .gap(2);
-    })
-    .gap(1)
-    .padding(Padding::symmetric(1, 2))
-    .fill()
-    .id("workspace-no-image");
+        .gap(1)
+        .padding(Padding::symmetric(1, 2))
+        .fill()
+        .id("workspace-no-image");
+    });
 }
 
 /// A profile's tab whose image is being built: the build as it speaks, and the way to stop it.
@@ -2924,19 +2939,22 @@ fn building(tab: &Tab, ui: &mut View<'_, Msg>) {
         TabKind::Profile(name) => name.clone(),
         _ => String::new(),
     };
-    ui.column(|ui| {
-        ui.row(|ui| {
-            ui.add(ShimmerText::new(t!("workspace.image.building", profile = profile)));
-            ui.spacer();
-            ui.add(Button::new(t!("workspace.image.stop")).on_press(Msg::StopBuild(key))).id("workspace-stop-build");
+    page::column(ui, page::WIDTH, |ui| {
+        ui.column(|ui| {
+            ui.row(|ui| {
+                ui.add(ShimmerText::new(t!("workspace.image.building", profile = profile)));
+                ui.spacer();
+                ui.add(Button::new(t!("workspace.image.stop")).on_press(Msg::StopBuild(key)))
+                    .id("workspace-stop-build");
+            })
+            .fill_width();
+            ui.add(LogView::new(tab.build_log())).fill().id("workspace-build-log");
         })
-        .fill_width();
-        ui.add(LogView::new(tab.build_log())).fill().id("workspace-build-log");
-    })
-    .gap(1)
-    .padding(Padding::symmetric(1, 2))
-    .fill()
-    .id("workspace-building");
+        .gap(1)
+        .padding(Padding::symmetric(1, 2))
+        .fill()
+        .id("workspace-building");
+    });
 }
 
 /// A picture drawn in the tab: what chafa drew, which stays when chafa is done, and under it a
@@ -3097,10 +3115,7 @@ pub fn agents_at_work(screen: &WorkspaceScreen) -> usize {
 /// way back. The last screen of the session stays above it while there is one.
 fn stopped(ui: &mut View<'_, Msg>, tab: &Tab, message: &str, detail: Option<&str>, again: String) {
     let key = tab.key();
-    ui.column(|ui| {
-        if let Some(session) = tab.session() {
-            terminal(ui, session);
-        }
+    let words = |ui: &mut View<'_, Msg>| {
         ui.column(|ui| {
             ui.add(Text::new(message.to_owned()).role("secondary"));
             if let Some(detail) = detail {
@@ -3111,28 +3126,43 @@ fn stopped(ui: &mut View<'_, Msg>, tab: &Tab, message: &str, detail: Option<&str
         .gap(1)
         .padding(Padding::symmetric(1, 2))
         .fill_width();
-    })
-    .fill()
-    .id("workspace-stopped");
+    };
+    match tab.session() {
+        // The last screen keeps every cell of the middle, as the terminal did; the words are its
+        // foot.
+        Some(session) => {
+            ui.column(|ui| {
+                terminal(ui, session);
+                words(ui);
+            })
+            .fill()
+            .id("workspace-stopped");
+        }
+        None => page::column(ui, page::WIDTH, |ui| {
+            ui.column(words).fill().id("workspace-stopped");
+        }),
+    }
 }
 
 /// A tab the engine refused for a reason QCode recognises: the plain sentence, the line to run
 /// when there is one, the engine's own words below them, and the way to try again.
 fn refused(ui: &mut View<'_, Msg>, tab: &Tab, help: &Help, detail: &str, again: String) {
     let key = tab.key();
-    ui.column(|ui| {
+    page::column(ui, page::WIDTH, |ui| {
         ui.column(|ui| {
-            help.show(ui);
-            ui.add(Button::new(again).variant("primary").on_press(Msg::Restart(key))).id("workspace-restart");
-            ui.add(Text::new(t!("known.said")).role("faint"));
-            ui.add(Text::new(detail.to_owned()).role("faint")).selectable(true);
+            ui.column(|ui| {
+                help.show(ui);
+                ui.add(Button::new(again).variant("primary").on_press(Msg::Restart(key))).id("workspace-restart");
+                ui.add(Text::new(t!("known.said")).role("faint"));
+                ui.add(Text::new(detail.to_owned()).role("faint")).selectable(true);
+            })
+            .gap(1)
+            .padding(Padding::symmetric(1, 2))
+            .fill_width();
         })
-        .gap(1)
-        .padding(Padding::symmetric(1, 2))
-        .fill_width();
-    })
-    .fill()
-    .id("workspace-stopped");
+        .fill()
+        .id("workspace-stopped");
+    });
 }
 
 /// The control that takes the keyboard when the screen opens: the terminal of the open tab, the
@@ -3175,11 +3205,14 @@ pub fn action(name: &str) -> Option<Msg> {
 }
 
 /// What Esc means on the workspace screen before it means leaving it: while an entry of the file
-/// tree is cut, Esc lets it stay where it is. The application asks this when Esc reaches it,
+/// tree is cut or copied, Esc lets it go, and it stays where it is. The application asks this when Esc reaches it,
 /// which is only after every nearer widget and dialog passed it on.
 #[must_use]
 pub fn escape(screen: &WorkspaceScreen) -> Option<Msg> {
-    screen.workspace().filter(|workspace| !workspace.files.cut().is_empty()).map(|_| Msg::Files(FileMsg::DropCut))
+    screen
+        .workspace()
+        .filter(|workspace| !workspace.files.pending().is_empty())
+        .map(|workspace| Msg::Files(workspace.id().to_owned(), FileManagerMsg::DropCut))
 }
 
 /// The keys of the workspace screen that are not in the keymap, for the key list.

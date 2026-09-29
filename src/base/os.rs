@@ -217,6 +217,21 @@ impl Os {
         }
     }
 
+    /// The packages a Python environment needs from the system: the interpreter, and where the system
+    /// keeps `ensurepip` out of the interpreter itself, the package that brings pip into it. All
+    /// four were measured on their own base image on 2026-09-29: Debian and Ubuntu ship
+    /// `python3-venv` apart from the interpreter, while Arch's and Alpine's `python` and `python3`
+    /// carry it. `pipx` is not among them: this is for an environment of our own making, which
+    /// brings its own pip.
+    #[must_use]
+    pub fn python_venv(self) -> &'static [&'static str] {
+        match self {
+            Self::Debian | Self::Ubuntu => &["python3", "python3-venv"],
+            Self::Arch => &["python"],
+            Self::Alpine => &["python3"],
+        }
+    }
+
     /// The packages building the Quvyta apps needs from the system, under Quvyta development: a C
     /// compiler and the tools around it, pkg-config, OpenSSL's headers, git, ssh, curl, jq, the
     /// process tools (`ps`, `pgrep`) and bash, under each system's own names. Arch's `base-devel`
@@ -396,6 +411,21 @@ mod tests {
         assert_eq!(Os::Alpine.install(&["python3", "pipx"]), "apk add --no-cache python3 pipx");
         for os in Os::ALL {
             assert!(os.containerfile().contains(os.install(&[]).split(' ').next().unwrap_or_default()), "{os:?}");
+        }
+    }
+
+    #[test]
+    fn every_system_carries_an_environment_of_its_own_where_the_interpreter_alone_is_not_enough() {
+        // Written out, so a package dropped from a list is a failing test rather than a build that
+        // cannot make the environment: without `ensurepip` the environment has no pip in it.
+        assert_eq!(Os::Debian.python_venv(), ["python3", "python3-venv"]);
+        assert_eq!(Os::Ubuntu.python_venv(), Os::Debian.python_venv());
+        assert_eq!(Os::Arch.python_venv(), ["python"]);
+        assert_eq!(Os::Alpine.python_venv(), ["python3"]);
+        for os in Os::ALL {
+            assert!(os.python_venv().contains(&os.python()[0]), "{os:?}: it is the interpreter's own name");
+            assert!(!os.python_venv().contains(&"pipx"), "{os:?}: nothing here installs with pipx");
+            assert!(os.install(os.python_venv()).contains(&os.python_venv().join(" ")), "{os:?}");
         }
     }
 

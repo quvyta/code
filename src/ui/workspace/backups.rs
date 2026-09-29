@@ -31,7 +31,6 @@ use crate::engine::{Engine, HostUser};
 use crate::profile::HarnessKind;
 use crate::profile::identity::Home;
 use crate::store::{WorkspacePaths, set_backup_assets, set_backup_skip};
-use crate::ui::keys::Wrapping;
 
 use super::{Msg, OpenWorkspace, TabKind, TabState, WorkspaceScreen};
 
@@ -456,7 +455,7 @@ pub(super) fn skip_written(
 /// named, or it is inside a folder that is.
 #[must_use]
 pub(super) fn is_left_out(skip: &[String], key: &str) -> bool {
-    skip.iter().any(|out| super::file_ops::is_within(key, out))
+    skip.iter().any(|out| qframe::widgets::is_within(key, out))
 }
 
 /// What the panel says the backup of `workspace` leaves out: the names, or that it takes
@@ -1086,10 +1085,7 @@ fn contents(listing: &Listing, entries: Option<&[Entry]>, row: usize, ui: &mut V
                 .empty_text(empty)
                 .on_select(Msg::HighlightBackup)
                 .on_activate(Msg::ChooseBackup);
-            ui.add(Wrapping::new(list, Some(row), entries.len()))
-                .id(LIST_ID)
-                .fill_width()
-                .height(Length::Cells(height));
+            ui.add(list.wrap(true)).id(LIST_ID).fill_width().height(Length::Cells(height));
         }
         _ if listing.slow => {
             ui.add(Spinner::new().label(t!("workspace.backup.reading")));
