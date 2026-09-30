@@ -37,13 +37,15 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use super::relay::{self, Listener, Upstream};
+use super::relay::{self, Listener, Route, Upstream};
 use super::{Key, ProviderEntry, ProviderKind, Tag};
 use crate::engine::run::capture;
 use crate::engine::{Engine, EngineKind, Exec, HostUser, detect};
 use crate::profile::harness_live::{build, clear};
 use crate::profile::identity::Home;
-use crate::profile::{AccountKind, HarnessKind, MountAccess, NetworkMode, Profile, ProviderChoice, SafeName, Template};
+use crate::profile::{
+    AccountKind, HarnessKind, MountAccess, NetworkMode, Pick, Profile, ProviderChoice, SafeName, Template,
+};
 use crate::store::{WorkspaceId, WorkspacePaths};
 use crate::ui::workspace::{ContainerPlan, ensure_running};
 
@@ -56,9 +58,12 @@ const TAG: &str = "olcum";
 /// Where the owner keeps the OpenRouter key these tests may use, outside every repository.
 const OPENROUTER_KEY_FILE: &str = ".config/quvyta/openrouter-key";
 
-/// The free OpenRouter model asked when `QCODE_OPENROUTER_MODEL` names none: of the free models
-/// tried on 2026-09-21 it answered plainly and called a tool, through Claude Code, in seconds.
-const OPENROUTER_MODEL: &str = "nex-agi/nex-n2.5-mini:free";
+/// The free OpenRouter model asked when `QCODE_OPENROUTER_MODEL` names none. Free models come and
+/// go: the one before this stopped being free, and of the free ones asked on 2026-09-30 several
+/// were rate-limited upstream while this one answered plainly. A test that fails on a `400` about
+/// a paid slug or a `429` from upstream is telling that this line needs another model, and says
+/// nothing about QCode.
+const OPENROUTER_MODEL: &str = "poolside/laguna-s-2.1:free";
 
 /// The engines installed on this machine, or nothing at all when the tests are switched off.
 /// `QCODE_CONTAINER_ENGINE` keeps one of them, because every image here is built once per engine
@@ -146,7 +151,7 @@ fn on(harness: HarnessKind, model: &str, os: crate::base::Os) -> Profile {
         harness,
         template: Template::Recommended,
         account: AccountKind::Provider,
-        provider: Some(ProviderChoice { tag: TAG.to_owned(), model: model.to_owned() }),
+        provider: Some(ProviderChoice::model(TAG, model)),
         assets: MountAccess::ReadOnly,
         network: NetworkMode::None,
         without: Vec::new(),
@@ -194,15 +199,27 @@ impl Road {
         let _ = capture(&engine.remove_volume(&home.volume()));
         build(&engine, profile);
 
-        // QCode's own side: the socket the container reaches, the entry the token resolves to,
+        // QCode's own side: the socket the container reaches, the route the token resolves to,
         // and the key added on the way out.
         let token = crate::bridge::token();
         let mine = token.clone();
         let events = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&events);
+        // The route the tab's token resolves to, the way the workspace's own relay resolves it: the
+        // one model a profile chose, or the steps of the lineup it chose, in the order written.
+        let (models, lineup) = match &profile.provider.as_ref().expect("a provider profile").pick {
+            Pick::Model(model) => (vec![model.clone()], None),
+            Pick::Lineup(name) => {
+                let steps = entry.lineup(name).map(|lineup| lineup.models.clone()).unwrap_or_default();
+                assert!(!steps.is_empty(), "{kind:?}: the lineup {name} has steps to ask");
+                (steps, Some(name.clone()))
+            }
+        };
         let listener = Listener::open(
             &paths.mcp(),
-            move |asked| (asked == mine).then(|| entry.clone()),
+            move |token| {
+                (token == mine).then(|| Route { entry: entry.clone(), models: models.clone(), lineup: lineup.clone() })
+            },
             upstream,
             move |event| seen.lock().expect("the events are not poisoned").push(event),
         )
@@ -512,6 +529,129 @@ fn opencode_answers_and_uses_a_tool_through_a_provider_of_this_machine() {
             "{kind:?}: nothing opencode asked for was refused: {events:?}"
         );
     }
+}
+
+/// The first step of the lineup the live tests run on: a model OpenRouter does not have. Asking
+/// for it costs nothing, and OpenRouter answers `400` naming it ("… is not a valid model ID"),
+/// which is the answer the relay falls back on. It ends in `:free` like every step here, so even
+/// a service that one day had a model of this name could not bill for it.
+const NO_SUCH_MODEL: &str = "qcode-test/no-such-model:free";
+
+/// The lineup's name, which is what the harness is told to ask for instead of any model.
+const LINEUP: &str = "yedek";
+
+/// `inner`, behind a guard that reads the model of every request before it leaves this machine.
+///
+/// Every model asked for is written into `asked`. A request for a model that is not one of
+/// `allowed` is never sent: it is written into `strays` and refused here, so a relay that let a
+/// harness's own choice through — Claude Code reaching for a model of its own for a small job —
+/// cannot spend anything, and the test that reads `strays` says so. A request with no model in
+/// it (a listing) goes through as it is.
+fn guarded(
+    inner: Upstream,
+    allowed: Vec<String>,
+    asked: Arc<Mutex<Vec<String>>>,
+    strays: Arc<Mutex<Vec<String>>>,
+) -> Upstream {
+    Upstream::new(move |mut ask| {
+        let mut body = Vec::new();
+        std::io::Read::read_to_end(&mut ask.body, &mut body)
+            .map_err(|error| relay::UpstreamError { url: ask.url.clone(), reason: error.to_string() })?;
+        let model = serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| value.get("model").and_then(serde_json::Value::as_str).map(str::to_owned));
+        if let Some(model) = model {
+            asked.lock().expect("the asks are not poisoned").push(model.clone());
+            if !allowed.contains(&model) {
+                strays.lock().expect("the strays are not poisoned").push(model);
+                return Err(relay::UpstreamError {
+                    url: ask.url.clone(),
+                    reason: "refused by the test: a model outside the lineup".to_owned(),
+                });
+            }
+        }
+        ask.body = Box::new(std::io::Cursor::new(body));
+        inner.call(ask)
+    })
+}
+
+/// `harness` on a lineup of OpenRouter whose first step does not exist and whose second is a free
+/// model, in a container with no network that never holds the key. What only a real run can say:
+/// that OpenRouter's own refusal of the first step is one the relay falls back on, that the
+/// harness gets the second step's answer as if nothing had happened, that the harness told only
+/// the lineup's name never gets a request to any other model out of this machine, and that the
+/// fall back is reported for the screen to say under the tab.
+///
+/// Every step is free, and the guard in front of the network refuses anything else before it is
+/// sent, so this test cannot spend from the account whatever the harness or the relay does.
+fn falls_back_on_openrouter_and_asks_nothing_outside_the_lineup(harness: HarnessKind) {
+    let Some(key) = openrouter_key() else {
+        println!("skipped: there is no key at ~/{OPENROUTER_KEY_FILE}");
+        return;
+    };
+    let model = std::env::var("QCODE_OPENROUTER_MODEL").unwrap_or_else(|_| OPENROUTER_MODEL.to_owned());
+    let steps = vec![NO_SUCH_MODEL.to_owned(), model.clone()];
+    assert!(steps.iter().all(|step| step.ends_with(":free")), "only free models are asked here: {steps:?}");
+    let mut profile = profile(harness, &model);
+    profile.provider = Some(ProviderChoice::lineup(TAG, LINEUP));
+    let mut entry = ProviderEntry::new(
+        Tag::parse(TAG).expect("a tag"),
+        ProviderKind::OpenRouter,
+        ProviderKind::OpenRouter.suggested_base(),
+    );
+    entry.key = Some(key.clone());
+    entry.lineups = vec![super::Lineup { name: Tag::parse(LINEUP).expect("a lineup name"), models: steps.clone() }];
+    for engine in engines() {
+        let kind = engine.kind();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let strays = Arc::new(Mutex::new(Vec::new()));
+        let upstream = guarded(Upstream::network(), steps.clone(), Arc::clone(&asked), Arc::clone(&strays));
+        let road = Road::open(engine, &profile, entry.clone(), upstream);
+
+        let started = std::time::Instant::now();
+        let answer = road.ask_once("Reply with just the digits: what is 2+2?");
+        // What went out and what the relay said are printed before anything is asserted, since
+        // they are what tells a free model that stopped answering from a relay that went wrong.
+        let asked = asked.lock().expect("the asks are not poisoned").clone();
+        let strays = strays.lock().expect("the strays are not poisoned").clone();
+        println!("{kind:?} {harness:?}: models asked, in order: {asked:?}");
+        println!("{kind:?} {harness:?}: relay events {:?}", road.events());
+        let said =
+            answer.unwrap_or_else(|trouble| panic!("{kind:?}: the harness said nothing: {}", without(&trouble, &key)));
+        assert!(said.contains('4'), "{kind:?}: the second step answered: {}", without(&said, &key));
+        println!("{kind:?} {harness:?}: lineup {LINEUP} answered 2+2 in {} s", started.elapsed().as_secs());
+
+        assert_eq!(strays, Vec::<String>::new(), "{kind:?}: no request left for a model outside the lineup");
+        assert_eq!(asked.first().map(String::as_str), Some(NO_SUCH_MODEL), "{kind:?}: the first step is asked first");
+        assert!(asked.contains(&model), "{kind:?}: and the second after it: {asked:?}");
+
+        let events = road.events();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                super::RelayEvent::FellBack { lineup: Some(name), from, to, status: Some(400), .. }
+                    if name == LINEUP && from == NO_SUCH_MODEL && *to == model
+            )),
+            "{kind:?}: the fall back was reported for the tab: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(event, super::RelayEvent::Forwarded { status: 200, .. })),
+            "{kind:?}: and the second step's answer was carried through: {events:?}"
+        );
+        road.assert_no_trace_of(&key);
+    }
+}
+
+#[test]
+#[ignore = "needs a container engine, the network, and the owner's OpenRouter key; run with QCODE_CONTAINER_TESTS=1"]
+fn claude_code_on_a_lineup_falls_back_on_openrouter_and_asks_nothing_outside_it() {
+    falls_back_on_openrouter_and_asks_nothing_outside_the_lineup(HarnessKind::ClaudeCode);
+}
+
+#[test]
+#[ignore = "needs a container engine, the network, and the owner's OpenRouter key; run with QCODE_CONTAINER_TESTS=1"]
+fn opencode_on_a_lineup_falls_back_on_openrouter_and_asks_nothing_outside_it() {
+    falls_back_on_openrouter_and_asks_nothing_outside_the_lineup(HarnessKind::OpenCode);
 }
 
 /// What a person sees in a Claude Code tab when the provider says too many requests: the relay

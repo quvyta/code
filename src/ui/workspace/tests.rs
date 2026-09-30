@@ -44,6 +44,7 @@ mod new_line;
 mod pages;
 mod rebuilt_image;
 mod registry;
+mod relay;
 mod shared;
 mod shine;
 mod sound;
@@ -335,7 +336,16 @@ fn a_tab_opens_inside_a_container_and_never_on_this_machine() {
 fn provider_profile(name: &str, tag: &str, model: &str) -> Profile {
     Profile {
         account: AccountKind::Provider,
-        provider: Some(crate::profile::ProviderChoice { tag: tag.to_owned(), model: model.to_owned() }),
+        provider: Some(crate::profile::ProviderChoice::model(tag, model)),
+        ..profile(name, HarnessKind::ClaudeCode)
+    }
+}
+
+/// A profile of [`AccountKind::Provider`] running on the lineup `name` of `tag`.
+fn lineup_profile(name: &str, tag: &str, lineup: &str) -> Profile {
+    Profile {
+        account: AccountKind::Provider,
+        provider: Some(crate::profile::ProviderChoice::lineup(tag, lineup)),
         ..profile(name, HarnessKind::ClaudeCode)
     }
 }
@@ -376,6 +386,38 @@ fn measured_providers_file(name: &str, tag: &str, model: &str, window: u64) -> P
     known.claimed = Some(262_144);
     known.measured = Some(crate::provider::Measured::About(window));
     entry.models = vec![known];
+    providers.add(entry).expect("the tag is free");
+    providers.at(&path).save().expect("the scratch file is written");
+    path
+}
+
+/// A `providers.toml` carrying one ollama provider tagged `tag` with the lineup `lineup` of the
+/// given steps in the given order, each measured to give the window beside it. An entry whose
+/// `lineup` is not one of these is a lineup removed on the Providers page, which is what a tab of a
+/// profile naming it has to notice.
+fn lineup_providers_file(name: &str, tag: &str, lineup: &str, steps: &[(&str, u64)]) -> PathBuf {
+    // A folder of its own: saving narrows the folder the file is in, and that must never be
+    // the machine's shared temporary folder.
+    let path = std::env::temp_dir().join(format!("qcode-workspace-providers-{name}")).join("providers.toml");
+    let mut providers = crate::provider::Providers::in_memory();
+    let mut entry = crate::provider::ProviderEntry::new(
+        crate::provider::Tag::parse(tag).expect("a tag"),
+        crate::provider::ProviderKind::Ollama,
+        "http://127.0.0.1:11434",
+    );
+    entry.models = steps
+        .iter()
+        .map(|(id, window)| {
+            let mut model = crate::provider::Model::new(*id);
+            model.claimed = Some(262_144);
+            model.measured = Some(crate::provider::Measured::About(*window));
+            model
+        })
+        .collect();
+    entry.lineups = vec![crate::provider::Lineup {
+        name: crate::provider::Tag::parse(lineup).expect("a name"),
+        models: steps.iter().map(|(id, _)| (*id).to_owned()).collect(),
+    }];
     providers.add(entry).expect("the tag is free");
     providers.at(&path).save().expect("the scratch file is written");
     path
@@ -476,6 +518,79 @@ fn a_tab_is_told_the_window_this_server_was_measured_to_give_rather_than_leaving
     let env = envs(&screen.launch_command(key(&screen, 0)).expect("a chosen tab has a command"));
     assert_eq!(env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS").map(String::as_str), Some("31512"), "{env:?}");
     let _ = std::fs::remove_file(&path);
+}
+
+/// A lineup's window is the smallest of the steps that are known, because a conversation runs on
+/// whichever step answers and what is promised has to hold for that one. Here the first step gives
+/// more than the second, so it is the second the harness is told: promising the larger of the two
+/// is what cuts a long conversation in half.
+#[test]
+fn a_tab_on_a_lineup_is_told_the_smallest_window_among_the_lineups_steps() {
+    let scratch = Scratch::new("lineup-window");
+    let path = lineup_providers_file("lineup-window", "ev1", "coder", &[("qwen3.8", 262_144), ("qwen3.8-32k", 31_512)]);
+    let profiles = vec![lineup_profile("ev-tab", "ev1", "coder")];
+    let mut screen = WorkspaceScreen::new(
+        Some(engine()),
+        HostUser::Ids { uid: 1000, gid: 1000 },
+        vec![workspace("firefly", "Firefly", scratch.paths(), profiles)],
+    )
+    .with_providers_path(Some(path.clone()));
+    apply(&mut screen, Msg::OpenWorkspace(0));
+    open(&mut screen, Choice::NewChat("ev-tab".to_owned()));
+
+    let env = envs(&screen.launch_command(key(&screen, 0)).expect("a chosen tab has a command"));
+    assert_eq!(env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS").map(String::as_str), Some("31512"), "{env:?}");
+    // The harness is told the lineup's own name, and the room of the step that would end up
+    // answering rather than of the one tried first.
+    assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("coder"), "{env:?}");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A tab of a profile that chose a lineup asks the relay for the lineup's own name and the relay
+/// carries the request on to that lineup's steps, in the order the person wrote them. A model of
+/// the lineup's own would be asked for instead of the lineup, so the harness would be told a name
+/// the provider does not have and every turn would come back as a model that is not there.
+#[test]
+fn a_lineup_tab_is_carried_to_the_lineups_steps_in_the_order_they_were_written() {
+    let scratch = Scratch::new("relay-lineup");
+    let path = lineup_providers_file("relay-lineup", "yol", "coder", &[("a/one", 262_144), ("b/two", 131_072)]);
+    let profiles = vec![lineup_profile("ev-tab", "yol", "coder")];
+    let mut screen = WorkspaceScreen::new(
+        Some(engine()),
+        HostUser::Ids { uid: 1000, gid: 1000 },
+        vec![workspace("firefly", "Firefly", scratch.paths(), profiles)],
+    )
+    .with_providers_path(Some(path.clone()));
+    apply(&mut screen, Msg::OpenWorkspace(0));
+    open(&mut screen, Choice::NewChat("ev-tab".to_owned()));
+
+    let token = envs(&screen.launch_command(key(&screen, 0)).expect("a chosen tab has a command"))
+        .get("QCODE_BRIDGE")
+        .cloned()
+        .expect("the tab's own token is what its requests carry");
+    let workspace = screen.workspace().expect("a workspace");
+    let route = route_of(workspace, &path, &token).expect("a tab's own token has a route");
+    assert_eq!(route.entry.tag.as_str(), "yol", "the provider the profile named");
+    assert_eq!(route.lineup.as_deref(), Some("coder"), "the relay is told which lineup this is");
+    assert_eq!(route.models, ["a/one", "b/two"], "the steps in the order the person wrote them");
+
+    // The steps are read from the file on every request, so a lineup deleted on the Providers page
+    // reaches the very next turn: a request with nothing to ask for is refused as an unknown tab
+    // is, rather than carried to a lineup that is not there.
+    let gone = lineup_providers_file("relay-lineup-gone", "yol", "geci", &[("a/one", 262_144)]);
+    fs::copy(&gone, &path).expect("the same file with another lineup's name in it");
+    assert!(route_of(workspace, &path, &token).is_none(), "a lineup the file no longer has is no route");
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&gone);
+}
+
+/// The route the workspace's own relay would carry a request carrying `token` to, read from `path`
+/// as the relay reads it: the very closure the listener was opened with.
+fn route_of(workspace: &OpenWorkspace, path: &Path, token: &str) -> Option<crate::provider::Route> {
+    let super::relay::Link::On { tokens, .. } = &workspace.relay else {
+        panic!("a workspace with a provider profile has a listening relay")
+    };
+    super::relay::resolve(tokens, Some(path), token)
 }
 
 #[test]
@@ -664,6 +779,34 @@ fn a_profile_whose_provider_tag_was_deleted_says_so_instead_of_starting() {
     let TabState::Failed(failure) = state else { panic!("a deleted tag cannot start a tab: {state:?}") };
     assert!(failure.output.contains("ev1"), "the tag it could not find is named: {failure:?}");
     assert_eq!(failure.command, "", "nothing was even tried against the engine");
+}
+
+/// A profile that chose a lineup whose name the Providers page no longer has is in the same
+/// position as one whose provider is gone: the relay would refuse every request with an unknown
+/// tab, which reads to the person as the harness itself being broken. Both names are said, so it
+/// is clear which of the two is missing and on which provider.
+#[test]
+fn a_profile_whose_lineup_was_deleted_names_the_lineup_and_its_provider_instead_of_starting() {
+    let scratch = Scratch::new("lineup-missing");
+    // The provider is there, under a lineup of another name: what is gone is the one the profile
+    // named, and the person has to be told which.
+    let path = lineup_providers_file("lineup-missing", "yol", "geci", &[("a/one", 262_144)]);
+    let profiles = vec![lineup_profile("ev-tab", "yol", "coder")];
+    let screen = WorkspaceScreen::new(
+        Some(engine()),
+        HostUser::Ids { uid: 1000, gid: 1000 },
+        vec![workspace("firefly", "Firefly", scratch.paths(), profiles)],
+    )
+    .with_providers_path(Some(path.clone()));
+    let mut harness = harness(screen, SIZE.0, SIZE.1);
+    open_in(&mut harness, Choice::NewChat("ev-tab".to_owned()));
+
+    let state = harness.app().0.workspace().expect("a workspace").tabs()[0].state().clone();
+    let TabState::Failed(failure) = state else { panic!("a deleted lineup cannot start a tab: {state:?}") };
+    assert!(failure.output.contains("coder"), "the lineup it could not find is named: {failure:?}");
+    assert!(failure.output.contains("yol"), "and the provider it was on: {failure:?}");
+    assert_eq!(failure.command, "", "nothing was even tried against the engine");
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]

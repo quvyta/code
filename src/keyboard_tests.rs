@@ -209,11 +209,17 @@ fn providers_are_added_and_walked_round_with_the_keyboard_alone() {
         harness.press("tab").press("tab").press("tab").press("enter");
         wait(&mut harness, "the dialog closes", |harness| !harness.screen().contains("New provider"));
         wait(&mut harness, "the keyboard is on the list it was added to", |harness| harness.is_focused("providers"));
-        // Below the list: Try, Ask, Delete, then the way to another one.
+        // Below the list: the buttons that ask this provider something and delete it, and the way
+        // to another one, which stands beside the page's name. Walked to by name, since how many
+        // buttons stand between is the page's own business.
         if tag != "dew" {
-            for _ in 0..4 {
+            for _ in 0..8 {
+                if harness.is_focused("provider-new") {
+                    break;
+                }
                 harness.press("tab");
             }
+            assert!(harness.is_focused("provider-new"), "the way to another provider:\n{}", harness.screen());
             harness.press("enter");
         }
     }

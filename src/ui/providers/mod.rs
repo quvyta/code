@@ -18,6 +18,7 @@
 //! about it on their own machine — guidance QCode prints and never something QCode does to them.
 
 mod draft;
+mod lineup;
 #[cfg(test)]
 mod tests;
 mod tried;
@@ -29,18 +30,21 @@ use qframe::prelude::*;
 use qframe::widgets::{EmptyState, Field, Modal, RadioGroup, TextInput};
 
 use crate::provider::{
-    Ask, AskError, CRAMPED, Key, Measured, Model, PermissionProblem, ProviderEntry, ProviderKind,
+    Ask, AskError, CRAMPED, Key, Measured, Model, PermissionProblem, Price, ProviderEntry, ProviderKind,
     Providers as ProviderFile, Reached, Web, Wire, ask, permission_problems,
 };
 use crate::store::Loaded;
 use crate::ui::page;
 
 pub use draft::{BASE_FIELD, Draft, KEY_FIELD, Problem, TAG_FIELD};
+pub use lineup::{Editor, Lineups, Refusal};
 
+use lineup::{FILTER_FIELD, LIST as LINEUPS, MODELS as LINEUP_MODELS, NAME_FIELD, STEPS as LINEUP_STEPS};
 use tried::{Reason, TRIED, Verdict};
 
-/// Width of the add dialog. Wide enough for an address to read as one line, the longest being a
-/// ready-made service's API root with the name of its shape in front of it.
+/// Width of the add dialog, and of the lineups dialog beside it. Wide enough for an address to
+/// read as one line, the longest being a ready-made service's API root with the name of its shape
+/// in front of it, and for a model's own name in a list of them.
 const DIALOG_WIDTH: u16 = 72;
 
 /// The name of the list of providers, for the focus and the tests.
@@ -48,6 +52,39 @@ const LIST: &str = "providers";
 
 /// The name of the list of models.
 const MODELS: &str = "provider-models";
+
+/// The rows the lineups dialog spends on its own frame: the title and the blank row under it, the
+/// row of buttons, the row of hints under them, the air above and below, and the row the
+/// framework leaves either side of the body. Inside a layer the view reports the size of the whole
+/// screen, so this and the rows below are measured against what the terminal is, not against what
+/// the dialog is given of it.
+const DIALOG_FRAME: u16 = 8;
+
+/// Rows the editor spends on everything that is not the list of the provider's models: the name
+/// with its label and the line of help under it, the filter with its label, the lineup's own
+/// steps, the two lines a warning about a price or a refusal takes, and the blank row between
+/// each pair. A dialog is measured to what is inside it, so a list left to itself is as tall as
+/// the one or two models in it and there is nothing to scroll in.
+const ROWS_AROUND_MODELS: u16 = 13;
+
+/// Fewest rows the list of the provider's models takes: a list of one row is no list to move
+/// through, and on the shortest terminal there is room for nothing more.
+const MODEL_ROWS_MIN: u16 = 2;
+
+/// Most: a list taller than this is further from the steps under it than the eye follows in one
+/// go, and the rows a tall terminal has spare are better left to the page behind.
+const MODEL_ROWS_MAX: u16 = 12;
+
+/// The rows the lineup's own steps take. An order is a handful of models: the list grows and
+/// scrolls rather than taking the row of buttons away.
+const STEP_ROWS: u16 = 2;
+
+/// The rows the list of the provider's models takes. The dialog's own rows come off the screen
+/// first, so however many models a provider offers, and however short the terminal is, the
+/// buttons under them stay where a hand can reach them.
+fn model_rows(ui: &View<'_, Msg>) -> u16 {
+    ui.size().height.saturating_sub(DIALOG_FRAME + ROWS_AROUND_MODELS).clamp(MODEL_ROWS_MIN, MODEL_ROWS_MAX)
+}
 
 /// What the screen is waiting for, so a button that has been pressed shows the work and takes no
 /// second press.
@@ -118,6 +155,40 @@ pub enum Msg {
     MeasureAsked,
     /// The measurement finished, for the model of that name.
     Measured(String, Box<Result<Measured, AskError>>),
+    /// Open the lineups of the chosen provider.
+    LineupsAsked,
+    /// The lineups dialog was closed, keeping whatever was already saved.
+    LineupsClosed,
+    /// A lineup of the list was chosen.
+    LineupChosen(usize),
+    /// Start a lineup that is not there yet.
+    LineupNew,
+    /// Start the chosen lineup for changing.
+    LineupEditAsked,
+    /// Deleting the chosen lineup was asked for.
+    LineupDeleteAsked,
+    /// The question was answered with yes.
+    LineupDeleteConfirmed,
+    /// The name of the lineup being written was typed.
+    LineupName(String),
+    /// The provider's models were filtered.
+    LineupFilter(String),
+    /// A model of the list was pointed at.
+    LineupLooked(String),
+    /// The model at that place of the filtered list was put at the end of the lineup.
+    LineupAdded(usize),
+    /// A step of the lineup was chosen.
+    LineupStep(usize),
+    /// The chosen step goes one place earlier.
+    LineupUp,
+    /// The chosen step goes one place later.
+    LineupDown,
+    /// The chosen step comes out of the lineup.
+    LineupRemove,
+    /// The lineup being written is kept.
+    LineupSave,
+    /// Leave the lineup being written, keeping nothing of it.
+    LineupCancel,
 }
 
 /// The providers screen's state.
@@ -131,6 +202,7 @@ pub struct Providers {
     selected: usize,
     model: usize,
     draft: Option<Draft>,
+    lineups: Option<Lineups>,
     web: Web,
     busy: Option<Busy>,
     notice: Option<Notice>,
@@ -152,6 +224,7 @@ impl Providers {
             selected: 0,
             model: 0,
             draft: None,
+            lineups: None,
             web,
             busy: None,
             notice: None,
@@ -201,6 +274,12 @@ impl Providers {
     #[must_use]
     pub fn draft(&self) -> Option<&Draft> {
         self.draft.as_ref()
+    }
+
+    /// The lineups dialog of the chosen provider, while one is open.
+    #[must_use]
+    pub fn lineups(&self) -> Option<&Lineups> {
+        self.lineups.as_ref()
     }
 
     /// What the screen is waiting for.
@@ -447,6 +526,178 @@ pub fn update(state: &mut Providers, message: Msg) -> Command<Msg> {
             }
             Command::none()
         }
+        Msg::LineupsAsked => {
+            let Some(entry) = state.selected() else { return Command::none() };
+            let mut dialog = Lineups::new();
+            dialog.open(entry);
+            state.lineups = Some(dialog);
+            // As the add dialog does, the keyboard goes back to what had it as this one opens, and
+            // on to the list inside it: both ways out of it leave the list of providers.
+            let back = if state.entries().is_empty() { Command::none() } else { Command::focus(LIST) };
+            Command::batch([back, Command::focus(LINEUPS)])
+        }
+        Msg::LineupsClosed => {
+            // A lineup left half-written is not kept: it reaches the file when it is saved, as
+            // every other thing on this page.
+            state.lineups = None;
+            back(state)
+        }
+        Msg::LineupChosen(index) => {
+            let chosen =
+                state.selected().and_then(|entry| entry.lineups.get(index)).map(|l| l.name.as_str().to_owned());
+            if let (Some(name), Some(dialog)) = (chosen, state.lineups.as_mut()) {
+                dialog.choose(&name);
+            }
+            Command::none()
+        }
+        Msg::LineupNew => {
+            if let Some(dialog) = state.lineups.as_mut() {
+                dialog.new_lineup();
+            }
+            Command::focus(NAME_FIELD)
+        }
+        Msg::LineupEditAsked => {
+            // The lineup is read out of the file before the dialog is touched: what is edited is
+            // what the file holds now, not what this screen last drew of it.
+            let editing = state
+                .lineups
+                .as_ref()
+                .and_then(|dialog| dialog.chosen.clone())
+                .and_then(|name| state.selected().and_then(|entry| entry.lineup(&name)).cloned());
+            if let (Some(lineup), Some(dialog)) = (editing, state.lineups.as_mut()) {
+                dialog.edit(&lineup);
+            }
+            Command::focus(NAME_FIELD)
+        }
+        Msg::LineupDeleteAsked => {
+            let chosen = state.lineups.as_ref().and_then(|dialog| dialog.chosen.clone());
+            let Some(name) = chosen else { return Command::none() };
+            Command::confirm(
+                Confirm::new(t!("provider.lineup-delete-title", name = name.as_str()), Msg::LineupDeleteConfirmed)
+                    .message(t!("provider.lineup-delete-message"))
+                    .confirm_label(t!("provider.lineup-delete"))
+                    .danger(),
+            )
+        }
+        Msg::LineupDeleteConfirmed => {
+            let chosen = state.lineups.as_ref().and_then(|dialog| dialog.chosen.clone());
+            let Some(name) = chosen else { return Command::none() };
+            let Some(tag) = state.selected().map(|entry| entry.tag.as_str().to_owned()) else {
+                return Command::none();
+            };
+            state.file.remove_lineup(&tag, &name);
+            state.save();
+            // The list under the hand has one row fewer: the lineup that was there keeps the
+            // choice if it is still there, and the first of what is left takes it when it is not.
+            let left = lineup_names(&state.file, &tag);
+            if let Some(dialog) = state.lineups.as_mut() {
+                dialog.kept(&left);
+            }
+            Command::none()
+        }
+        Msg::LineupName(text) => {
+            if let Some(dialog) = state.lineups.as_mut() {
+                dialog.name(text);
+            }
+            Command::none()
+        }
+        Msg::LineupFilter(text) => {
+            if let Some(dialog) = state.lineups.as_mut() {
+                dialog.filter_for(text);
+            }
+            Command::none()
+        }
+        Msg::LineupLooked(id) => {
+            if let Some(dialog) = state.lineups.as_mut() {
+                dialog.look_at(&id);
+            }
+            Command::none()
+        }
+        Msg::LineupAdded(index) => {
+            // The index is where the model stood in the list the filter leaves. The filter is
+            // written as it is typed, so the model is read out of that list by its place in it and
+            // the person is credited with the row they pointed at, not with a number.
+            let id = state
+                .lineups
+                .as_ref()
+                .zip(state.selected())
+                .and_then(|(dialog, entry)| dialog.shown(entry).get(index).map(|model| model.id.clone()));
+            if let (Some(id), Some(dialog)) = (id, state.lineups.as_mut()) {
+                dialog.add(&id);
+            }
+            Command::none()
+        }
+        Msg::LineupStep(index) => {
+            if let Some(dialog) = state.lineups.as_mut() {
+                dialog.pick_step(index);
+            }
+            Command::none()
+        }
+        Msg::LineupUp | Msg::LineupDown | Msg::LineupRemove => {
+            if let Some(dialog) = state.lineups.as_mut() {
+                match message {
+                    Msg::LineupUp => dialog.up(),
+                    Msg::LineupDown => dialog.down(),
+                    _ => dialog.remove(),
+                }
+            }
+            Command::none()
+        }
+        Msg::LineupSave => save_lineup(state),
+        Msg::LineupCancel => {
+            if let Some(dialog) = state.lineups.as_mut() {
+                dialog.cancelled();
+            }
+            Command::none()
+        }
+    }
+}
+
+/// Where the keyboard goes when a dialog over this page closes. The list is what both ways out of
+/// it mean to leave it, the chosen provider named or nothing changed.
+fn back(state: &Providers) -> Command<Msg> {
+    match entry(state) {
+        Some(control) => Command::focus(control),
+        None => Command::none(),
+    }
+}
+
+/// The names of the lineups the provider tagged `tag` has, in the order it has them.
+fn lineup_names(file: &ProviderFile, tag: &str) -> Vec<String> {
+    file.get(tag)
+        .map_or_else(Vec::new, |entry| entry.lineups.iter().map(|lineup| lineup.name.as_str().to_owned()).collect())
+}
+
+/// Keeps the lineup the editor describes, or leaves the editor open with the reason it cannot be
+/// kept. A lineup is written into the file as it is on any other change here, and the page shows
+/// it the moment it is saved.
+fn save_lineup(state: &mut Providers) -> Command<Msg> {
+    let (Some(tag), Some(dialog)) =
+        (state.selected().map(|entry| entry.tag.as_str().to_owned()), state.lineups.as_ref())
+    else {
+        return Command::none();
+    };
+    let file = &state.file;
+    let taken = |name: &str| file.get(&tag).and_then(|entry| entry.lineup(name)).is_some();
+    match dialog.build(taken) {
+        Ok(lineup) => {
+            let name = lineup.name.as_str().to_owned();
+            state.file.set_lineup(&tag, lineup);
+            state.save();
+            if let Some(dialog) = state.lineups.as_mut() {
+                dialog.saved(&name);
+            }
+            Command::focus(LINEUPS)
+        }
+        Err(refusal) => {
+            // The name is what a refusal about the name belongs beside, as in the add dialog; the
+            // steps are the only thing wrong otherwise, and the line about it stands under them.
+            let beside_name = matches!(refusal, Refusal::Name(_) | Refusal::Taken(_));
+            if let Some(editor) = state.lineups.as_mut().and_then(|dialog| dialog.editor.as_mut()) {
+                editor.refusal = Some(refusal);
+            }
+            if beside_name { Command::focus(NAME_FIELD) } else { Command::none() }
+        }
     }
 }
 
@@ -495,11 +746,14 @@ fn start(
     Command::perform(move || work(web, entry))
 }
 
-/// Draws the screen: the providers, or the add dialog over them.
+/// Draws the screen: the providers, with the add dialog or the lineups dialog over them.
 pub fn view(state: &Providers, ui: &mut View<'_, Msg>) {
     draw_list(state, ui);
     if let Some(draft) = state.draft() {
         draw_dialog(draft, ui);
+    }
+    if let (Some(dialog), Some(entry)) = (state.lineups(), state.selected()) {
+        draw_lineups(dialog, entry, ui);
     }
 }
 
@@ -507,7 +761,20 @@ pub fn view(state: &Providers, ui: &mut View<'_, Msg>) {
 fn draw_list(state: &Providers, ui: &mut View<'_, Msg>) {
     page::column(ui, page::WIDTH, |ui| {
         ui.column(|ui| {
-            ui.add(Text::new(t!("provider.title")).bold());
+            // The page's own name, and the one button that acts on the page rather than on a
+            // provider in it. They share a row because a page a provider is on has a row of facts,
+            // two lists and three rows of buttons under its name, and a terminal with few rows
+            // gives them away to the button that adds a provider: nothing else on the page adds
+            // one. An empty page has no providers to leave room for, and its own empty state says
+            // so with a button of its own.
+            ui.row(|ui| {
+                ui.add(Text::new(t!("provider.title")).bold());
+                if !state.entries().is_empty() {
+                    ui.spacer();
+                    ui.add(Button::new(t!("provider.new")).icon("add").on_press(Msg::New)).id("provider-new");
+                }
+            })
+            .fill_width();
             // Where the key is kept and what carries it, in a line of its own. This is not a
             // footnote and it is not behind anything: a person who shares a backup should know what
             // they are sharing before they do it.
@@ -553,11 +820,6 @@ fn draw_list(state: &Providers, ui: &mut View<'_, Msg>) {
             if let Some(entry) = state.selected() {
                 draw_chosen(state, entry, ui);
             }
-            ui.row(|ui| {
-                ui.add(Button::new(t!("provider.new")).icon("add").on_press(Msg::New)).id("provider-new");
-                ui.spacer();
-            })
-            .fill_width();
         })
         .fill()
         .gap(1);
@@ -567,7 +829,17 @@ fn draw_list(state: &Providers, ui: &mut View<'_, Msg>) {
 /// Everything about the provider the person is looking at.
 fn draw_chosen(state: &Providers, entry: &ProviderEntry, ui: &mut View<'_, Msg>) {
     let busy = state.busy();
-    ui.add(Text::new(key_line(entry)).role("secondary")).fill_width();
+    // What this provider is reached with, and what orders of its models it has: two lines of
+    // facts about this one provider, with no blank row between them, since a blank row of the
+    // page is a row of a twenty-four row terminal that one of the lists could have. A long order
+    // is cut to the width rather than wrapped over the rows below, since the dialog behind the
+    // button beside Try is where a long order is read.
+    ui.column(|ui| {
+        ui.add(Text::new(key_line(entry)).role("secondary")).fill_width();
+        ui.add(Text::new(lineups_line(entry)).role("secondary").no_wrap()).fill_width();
+    })
+    .fill_width()
+    .gap(0);
     if !entry.kind.regions().is_empty() {
         ui.column(|ui| draw_speaks(entry.kind, &entry.base, ui)).fill_width();
     }
@@ -632,9 +904,15 @@ fn draw_chosen(state: &Providers, entry: &ProviderEntry, ui: &mut View<'_, Msg>)
             );
             ui.add(measure).id("provider-measure");
         }
+        // A lineup is a decision about which of the models above to lean on, so its button stands
+        // with the other two that ask this provider something. The row wraps rather than cutting
+        // its last button off the edge: four labels do not fit a narrow terminal, and a button
+        // that is not on the screen is a button nobody can press.
+        ui.add(Button::new(t!("provider.lineup-button")).on_press(Msg::LineupsAsked)).id("provider-lineups");
         ui.spacer();
     })
     .fill_width()
+    .wrap(true)
     .gap(1);
     ui.row(|ui| {
         if entry.key.is_some() {
@@ -729,6 +1007,183 @@ fn draw_dialog(draft: &Draft, ui: &mut View<'_, Msg>) {
     });
 }
 
+/// The lineups of the chosen provider: their list, or the one being written in its place.
+fn draw_lineups(dialog: &Lineups, entry: &ProviderEntry, ui: &mut View<'_, Msg>) {
+    let title = t!("provider.lineup-title", tag = entry.tag.as_str());
+    let mut modal = Modal::new().title(title).width(DIALOG_WIDTH).on_close(Msg::LineupsClosed);
+    if dialog.editor.is_some() {
+        modal = modal
+            .action(Button::new(t!("provider.lineup-up")).on_press(Msg::LineupUp))
+            .action(Button::new(t!("provider.lineup-down")).on_press(Msg::LineupDown))
+            .action(Button::new(t!("provider.lineup-remove")).variant("danger").on_press(Msg::LineupRemove))
+            .action(Button::new(t!("provider.lineup-cancel")).on_press(Msg::LineupCancel))
+            .action(Button::new(t!("provider.lineup-save")).variant("primary").on_press(Msg::LineupSave));
+    } else {
+        modal = modal
+            .action(Button::new(t!("provider.lineup-new")).on_press(Msg::LineupNew))
+            .action(Button::new(t!("provider.lineup-edit")).on_press(Msg::LineupEditAsked))
+            .action(Button::new(t!("provider.lineup-delete")).variant("danger").on_press(Msg::LineupDeleteAsked))
+            .action(Button::new(t!("provider.lineup-close")).on_press(Msg::LineupsClosed));
+    }
+    ui.add_with(modal, |ui| {
+        // The body takes the whole of what the title and the buttons leave, so the two lists
+        // inside it have rows to scroll in rather than the height of the two or three models
+        // that happen to be in them.
+        ui.column(|ui| {
+            if let Some(editor) = &dialog.editor {
+                draw_editor(dialog, editor, entry, ui);
+            } else {
+                draw_list_of_lineups(dialog, entry, ui);
+            }
+        })
+        .fill_height()
+        .gap(1);
+    });
+}
+
+/// What this provider has named: each lineup with the models it tries, in that order.
+fn draw_list_of_lineups(dialog: &Lineups, entry: &ProviderEntry, ui: &mut View<'_, Msg>) {
+    ui.add(Text::new(t!("provider.lineup-lead")).role("secondary")).fill_width();
+    if entry.lineups.is_empty() {
+        ui.add(Text::new(t!("provider.lineup-empty")).role("secondary")).fill_width();
+        return;
+    }
+    let items = entry.lineups.iter().map(|lineup| {
+        let steps: Vec<&str> = lineup.models.iter().map(String::as_str).collect();
+        ListItem::new(lineup.name.as_str().to_owned()).detail(steps.join(" → "))
+    });
+    let chosen = dialog.chosen.as_deref().and_then(|name| entry.lineups.iter().position(|l| l.name.as_str() == name));
+    let list = List::new(items).selected(chosen).on_select(Msg::LineupChosen);
+    ui.add(list.wrap(true)).id(LINEUPS).fill();
+}
+
+/// The lineup being written: its name, the provider's models to pick from, and the order itself.
+///
+/// The two lists share whatever the dialog has left of the screen, so however many models the
+/// provider offers, and however long the order grows, the buttons under them stay where a hand
+/// can reach them.
+fn draw_editor(dialog: &Lineups, editor: &Editor, entry: &ProviderEntry, ui: &mut View<'_, Msg>) {
+    let refusal = editor.refusal.as_ref();
+    let name_error = name_refusal(refusal);
+    ui.add_with(
+        Field::new(t!("provider.lineup-name"))
+            .hint(t!("provider.lineup-name-hint"))
+            .error(name_error.clone())
+            .required(true),
+        |ui| {
+            ui.add(TextInput::new(editor.name.clone()).invalid(name_error.is_some()).on_change(Msg::LineupName))
+                .id(NAME_FIELD)
+                .fill_width();
+        },
+    )
+    .fill_width();
+    ui.add_with(Field::new(t!("provider.lineup-models")), |ui| {
+        ui.add(
+            TextInput::new(editor.filter.clone())
+                .placeholder(t!("provider.lineup-filter"))
+                .on_change(Msg::LineupFilter),
+        )
+        .id(FILTER_FIELD)
+        .fill_width();
+    })
+    .fill_width();
+
+    let shown = dialog.shown(entry);
+    let rows = model_rows(ui);
+    // A model is under the hand from the first moment: the first of the ones the filter leaves, or
+    // the one the person pointed at while it was still there. A list with nothing chosen in it
+    // would swallow every Return the person presses looking for the model they just typed.
+    let chosen = editor
+        .model
+        .as_deref()
+        .and_then(|id| shown.iter().position(|model| model.id == id))
+        .or((!shown.is_empty()).then_some(0));
+    // The model the person pointed at, by its place among the ones the filter leaves: the filter
+    // is written as it is typed, so a number the person chose an hour ago no longer means the
+    // same row, while a model's own name always does.
+    let ids: Vec<String> = shown.iter().map(|model| model.id.clone()).collect();
+    let items =
+        shown.iter().map(|model| ListItem::new(model.id.clone()).detail(price_words(model.price).unwrap_or_default()));
+    let list = List::new(items)
+        .empty_text(t!("provider.lineup-none-match"))
+        .selected(chosen)
+        .on_select(move |index| Msg::LineupLooked(ids.get(index).cloned().unwrap_or_default()))
+        .on_activate(Msg::LineupAdded);
+    ui.add(list.wrap(true)).id(LINEUP_MODELS).height(Length::Cells(rows));
+
+    let steps = dialog.steps();
+    let rows: Vec<ListItem> = steps
+        .iter()
+        .enumerate()
+        .map(|(at, id)| {
+            let price = entry.model(id).and_then(|model| price_words(model.price)).unwrap_or_default();
+            ListItem::new(format!("{}. {id}", at + 1)).detail(price)
+        })
+        .collect();
+    let step_list = List::new(rows)
+        .empty_text(t!("provider.lineup-none-yet"))
+        .selected((!steps.is_empty()).then(|| dialog.step().min(steps.len() - 1)))
+        .on_select(Msg::LineupStep);
+    ui.add(step_list.wrap(true)).id(LINEUP_STEPS).height(Length::Cells(STEP_ROWS));
+
+    // A step that costs money is said out loud where the order is chosen, not in a bill later.
+    let paid = dialog.paid(entry);
+    if !paid.is_empty() {
+        ui.add(Text::new(t!("provider.lineup-paid", models = paid.join(", ").as_str())).color("warning")).fill_width();
+    }
+    if let Some(Refusal::Empty) = refusal {
+        ui.add(Text::new(t!("provider.lineup-refused-empty")).color("warning")).fill_width();
+    }
+}
+
+/// One line naming the provider's lineups compactly, or that it has none.
+fn lineups_line(entry: &ProviderEntry) -> String {
+    if entry.lineups.is_empty() {
+        return t!("provider.lineup-none");
+    }
+    let named: Vec<String> = entry
+        .lineups
+        .iter()
+        .map(|lineup| {
+            let steps: Vec<&str> = lineup.models.iter().map(String::as_str).collect();
+            format!("{} ({})", lineup.name, steps.join(" → "))
+        })
+        .collect();
+    t!("provider.lineup-summary", lineups = named.join(", ").as_str())
+}
+
+/// What using a model costs, in one word, when the service says what it is.
+fn price_words(price: Option<Price>) -> Option<String> {
+    match price {
+        Some(Price::Free) => Some(t!("provider.price-free")),
+        Some(Price::Paid) => Some(t!("provider.price-paid")),
+        None => None,
+    }
+}
+
+/// What stopped the name being used, in the words the add dialog uses for a tag, since a lineup's
+/// name is checked by the same rules.
+fn name_refusal(refusal: Option<&Refusal>) -> Option<String> {
+    use crate::provider::TagError;
+
+    match refusal? {
+        Refusal::Name(TagError::Empty) => Some(t!("provider.tag-empty")),
+        Refusal::Name(TagError::TooLong { length }) => {
+            Some(t!("provider.tag-long", length = i64::try_from(*length).unwrap_or(i64::MAX)))
+        }
+        Refusal::Name(TagError::BadStart { character }) => {
+            Some(t!("provider.tag-start", character = character.to_string().as_str()))
+        }
+        Refusal::Name(TagError::Illegal { position, character }) => Some(t!(
+            "provider.tag-character",
+            character = character.to_string().as_str(),
+            position = i64::try_from(*position).unwrap_or(i64::MAX)
+        )),
+        Refusal::Taken(name) => Some(t!("provider.lineup-name-taken", name = name.as_str())),
+        Refusal::Empty => None,
+    }
+}
+
 /// What a ready-made kind fills in, said before the person types their key: where its
 /// subscription answers, where each shape is asked, the header the key goes in, and the models
 /// it offers.
@@ -800,14 +1255,26 @@ fn verdict(model: &Model, kind: ProviderKind) -> Option<Verdict> {
 
 /// A model's row: a mark for one seen working, and for one seen failing a faint row whose detail
 /// is the reason, since its windows do not matter to anyone who cannot use it.
+///
+/// What a model costs stands at the end of every row that knows it, next to the two windows: a
+/// person choosing models to lean on is choosing what a request that falls through them will cost,
+/// and a price nobody published is left off the row rather than guessed at.
 fn model_row(model: &Model, kind: ProviderKind) -> ListItem {
     let row = ListItem::new(model.id.clone());
     match verdict(model, kind) {
-        Some(Verdict::Works(_)) => row.icon("check", Some("success")).detail(windows(model, kind)),
+        Some(Verdict::Works(_)) => row.icon("check", Some("success")).detail(about_model(model, kind)),
         Some(Verdict::Fails(harness, reason)) => {
             row.icon("warning", Some("warning")).faint(true).detail(fails(harness, reason))
         }
-        None => row.detail(windows(model, kind)),
+        None => row.detail(about_model(model, kind)),
+    }
+}
+
+/// The two windows of a model and what it costs, in the order a person reads them.
+fn about_model(model: &Model, kind: ProviderKind) -> String {
+    match price_words(model.price) {
+        Some(price) => format!("{} · {price}", windows(model, kind)),
+        None => windows(model, kind),
     }
 }
 

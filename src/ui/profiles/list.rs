@@ -237,7 +237,7 @@ fn summary(profile: &Profile) -> String {
     });
     let account = match &profile.provider {
         Some(provider) => {
-            t!("profiles.account-provider-named", tag = provider.tag.as_str(), model = provider.model.as_str())
+            t!("profiles.account-provider-named", tag = provider.tag.as_str(), model = provider.asked())
         }
         None => account_word(profile.account),
     };

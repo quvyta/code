@@ -40,7 +40,7 @@ mod plugins_live;
 mod template;
 
 pub use definition::{
-    ASSUMED_CONTEXT_TOKENS, Loaded, MountAccess, NetworkMode, OPENCODE_CONFIG_CONTENT, Profile, ProviderChoice,
+    ASSUMED_CONTEXT_TOKENS, Loaded, MountAccess, NetworkMode, OPENCODE_CONFIG_CONTENT, Pick, Profile, ProviderChoice,
 };
 pub use harness::{
     AccountKind, Archive, ConfigFile, Desktop, Harness, HarnessKind, McpSettings, McpShape, Resume, Surface, SystemFile,

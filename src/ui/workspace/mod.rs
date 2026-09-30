@@ -81,7 +81,7 @@ use crate::bridge::socket::Call;
 use crate::engine::{Container, Engine, EngineCommand, EngineKind, Exec, HostUser};
 use crate::profile::guidance::Unguided;
 use crate::profile::history::Conversation;
-use crate::profile::{HarnessKind, Profile, ProviderChoice};
+use crate::profile::{HarnessKind, Pick, Profile, ProviderChoice};
 use crate::store::{
     Registry, Session, SessionTab, SessionTabKind, SessionWorkspace, Store, WorkspaceFile, WorkspaceId, WorkspacePaths,
     add_profile,
@@ -369,6 +369,12 @@ pub enum Msg {
     Return(TabKey),
     /// Time to turn the mark of the working tabs, looking at them as of this moment.
     Turn(std::time::Instant),
+    /// The relay of an open workspace reported something. A report is a closure on the relay's own
+    /// thread, so what it found arrives as a message like any other and is said in this update.
+    Reported(crate::provider::RelayEvent),
+    /// The line under a tab about a fall back has been said for its ten seconds: the token of the
+    /// tab it was under, and which fall back it was, so a line that came after it stays.
+    Silence(String, u64),
     /// The bridge could not be registered in the settings of a harness whose container came up;
     /// the message that came with the start follows.
     Unbridged(HarnessKind, Unregistered, Box<Msg>),
@@ -754,6 +760,10 @@ pub struct WorkspaceScreen {
     /// the profile once carried; `None` means this machine has no data folder to hold one, so no
     /// provider profile can ever start.
     providers_path: Option<PathBuf>,
+    /// How a provider is asked, which the network does for a person and a test answers for itself:
+    /// the relay of every open workspace is opened with this, so what a request of a test is
+    /// answered with is the test's own business and never the network's.
+    upstream: crate::provider::Upstream,
     /// Whether a problem with that list was said already: it is said once, not at every tab.
     registry_told: bool,
     /// How often the open workspaces are backed up.
@@ -818,6 +828,7 @@ impl WorkspaceScreen {
             patience: None,
             registry: None,
             providers_path: crate::provider::Providers::file(),
+            upstream: crate::provider::Upstream::network(),
             registry_told: false,
             backup_every: BackupEvery::default(),
             last_timer: 0,
@@ -885,6 +896,17 @@ impl WorkspaceScreen {
     #[must_use]
     pub fn with_providers_path(mut self, path: Option<PathBuf>) -> Self {
         self.providers_path = path;
+        self
+    }
+
+    /// The same screen, asking every provider of every open workspace with `upstream` rather than
+    /// over the network, which is what lets a test say what a provider answers without one.
+    ///
+    /// It is set before a workspace opens its relay, since that is the moment the relay is opened
+    /// with it; afterwards the listeners already running keep the upstream they were given.
+    #[must_use]
+    pub fn with_upstream(mut self, upstream: crate::provider::Upstream) -> Self {
+        self.upstream = upstream;
         self
     }
 
@@ -1213,10 +1235,10 @@ impl WorkspaceScreen {
 /// waiting to be shown, and reads the conversations a blank tab's page offers when the open tab
 /// is one.
 pub fn opened(screen: &mut WorkspaceScreen) -> Command<Msg> {
-    relay::follow(screen);
+    let relay = relay::follow(screen);
     let command = Command::batch([load_root(screen), list_containers(screen), wake(screen), show_page(screen, true)]);
     follow_disk(screen);
-    Command::batch([command, backups::keep(screen), bridge::follow(screen)])
+    Command::batch([command, backups::keep(screen), bridge::follow(screen), relay])
 }
 
 /// Adds `workspace` to the rail and opens it, or only opens it when the rail has it already; the
@@ -1240,13 +1262,13 @@ pub fn add(screen: &mut WorkspaceScreen, workspace: OpenWorkspace) -> Command<Ms
 pub fn update(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
     // Profiles read again may carry a provider a workspace's did not before, so this runs before
     // anything else has the chance to start a tab that needs the relay already open.
-    relay::follow(screen);
+    let relay = relay::follow(screen);
     // Profiles read again may be new ones, whose conversations the page shown has not read.
     let profiles = matches!(message, Msg::Profiles(_));
     let command = apply(screen, message);
     follow_disk(screen);
     let kept = Command::batch([reread(screen), backups::keep(screen), bridge::follow(screen), busy::follow(screen)]);
-    Command::batch([command, wake(screen), show_page(screen, profiles), kept])
+    Command::batch([command, relay, wake(screen), show_page(screen, profiles), kept])
 }
 
 /// Lets the watches of the workspaces that are not open go: their trees are not on screen, and
@@ -1674,6 +1696,11 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
             busy::turn(screen, now);
             Command::none()
         }
+        Msg::Reported(event) => relay::fell(screen, event),
+        Msg::Silence(token, run) => {
+            relay::silence(screen, &token, run);
+            Command::none()
+        }
         Msg::Unbridged(harness, trouble, message) => {
             Command::batch([bridge::unregistered(harness, &trouble), update(screen, *message)])
         }
@@ -1779,7 +1806,7 @@ fn choose(screen: &mut WorkspaceScreen, key: TabKey, choice: Choice) -> Command<
     if let Some(provider) = &provider
         && let Some(workspace) = screen.owner(key)
     {
-        relay::entered(workspace, asking(serving.as_ref(), &token), &provider.tag);
+        relay::entered(workspace, asking(serving.as_ref(), &token), provider);
     }
     // A window is not entered with a terminal, so it takes the window's own path and the keyboard
     // goes to the tab's one action rather than to a terminal that is not there.
@@ -1864,9 +1891,13 @@ impl WorkspaceScreen {
         shared::server_environment(&token, &provider)
     }
 
-    /// The window the model `provider` names is given on its server: what this machine measured,
-    /// or for a ready-made service what it says it gives ([`crate::provider::Model::window`]);
-    /// `None` when neither is known, or the provider is gone.
+    /// The window a tab of `provider` is told the model has: what this machine measured, or for a
+    /// ready-made service what it says it gives ([`crate::provider::Model::window`]); `None` when
+    /// neither is known, or the provider is gone.
+    ///
+    /// A lineup is promised the smallest window among its steps
+    /// ([`crate::provider::Lineup::window`]): a conversation runs on whichever step answers, so
+    /// what is promised has to hold for the one that ends up answering it.
     ///
     /// Read from `providers.toml` as a tab starts rather than carried on the profile: a window
     /// measured again on the Providers page must reach the next tab, not the tab after QCode is
@@ -1875,7 +1906,10 @@ impl WorkspaceScreen {
         let path = self.providers_path.as_ref()?;
         let providers = crate::provider::Providers::open(path).value;
         let entry = providers.get(&provider.tag)?;
-        entry.model(&provider.model)?.window(entry.kind)
+        match &provider.pick {
+            Pick::Model(id) => entry.model(id)?.window(entry.kind),
+            Pick::Lineup(name) => entry.lineup(name)?.window(entry),
+        }
     }
 }
 
@@ -2049,7 +2083,7 @@ fn wake(screen: &mut WorkspaceScreen) -> Command<Msg> {
     let (key, run) = (tab.key(), tab.run());
     let token = tab.token().to_owned();
     if let Some(provider) = &provider {
-        relay::entered(&*workspace, asking(serving.as_ref(), &token), &provider.tag);
+        relay::entered(&*workspace, asking(serving.as_ref(), &token), provider);
     }
     if serving.is_some() {
         let launch = Launch::new(key, run, token, provider, providers_path);
@@ -2215,7 +2249,7 @@ fn restart_tab(screen: &mut WorkspaceScreen, key: TabKey) -> Command<Msg> {
     if let Some(provider) = &provider
         && let Some(workspace) = screen.owner(key)
     {
-        relay::entered(workspace, asking(serving.as_ref(), &token), &provider.tag);
+        relay::entered(workspace, asking(serving.as_ref(), &token), provider);
     }
     let launch = Launch::new(key, run, token, provider, providers_path);
     if serving.is_some() {
@@ -2227,16 +2261,20 @@ fn restart_tab(screen: &mut WorkspaceScreen, key: TabKey) -> Command<Msg> {
 /// What has to be true of a provider profile's provider before its tab is trusted to speak for
 /// it, and the words to say when it is not: the provider it names, where its providers are read
 /// from, and, made here rather than on the background thread [`start`] runs on, what to say if
-/// it is gone. Translating needs the thread the person's own language is loaded on; `start` only
-/// reads the file and decides whether the words are needed. `None` for a tab of no provider.
+/// the provider or the lineup it runs on is gone. Translating needs the thread the person's own
+/// language is loaded on; `start` only reads the file and decides whether the words are needed.
+/// `None` for a tab of no provider.
 struct ProviderGate {
-    /// The provider and model the tab's profile runs on.
+    /// The provider and what the tab's profile runs on: a model of it, or one of its lineups.
     provider: ProviderChoice,
-    /// Where `providers.toml` is read from to check that provider still exists.
+    /// Where `providers.toml` is read from to check that provider and its lineup still exist.
     path: Option<PathBuf>,
-    /// What to say if it is gone, made in the person's language before this ever reaches a
-    /// background thread.
+    /// What to say if the provider is gone, made in the person's language before this ever reaches
+    /// a background thread.
     missing: String,
+    /// What to say if the lineup is gone while its provider is not, which is a different thing the
+    /// person has to be told: the provider is there, and the order of its models is not.
+    lineup_missing: String,
 }
 
 impl ProviderGate {
@@ -2244,7 +2282,33 @@ impl ProviderGate {
     fn of(provider: Option<ProviderChoice>, path: Option<PathBuf>) -> Option<Self> {
         let provider = provider?;
         let missing = t!("workspace.provider-missing", tag = provider.tag.as_str());
-        Some(Self { provider, path, missing })
+        let lineup_missing = match &provider.pick {
+            Pick::Model(_) => String::new(),
+            Pick::Lineup(lineup) => {
+                t!("workspace.provider-lineup-missing", lineup = lineup.as_str(), tag = provider.tag.as_str())
+            }
+        };
+        Some(Self { provider, path, missing, lineup_missing })
+    }
+
+    /// The reason this tab must not start, read against the file as it is right now: the provider
+    /// is gone, or the lineup its profile chose is not one the provider has any more. `None` when
+    /// the tab may start.
+    fn refusal(&self) -> Option<String> {
+        let providers = match &self.path {
+            Some(path) => crate::provider::Providers::open(path).value,
+            None => crate::provider::Providers::in_memory(),
+        };
+        let Some(entry) = providers.get(&self.provider.tag) else { return Some(self.missing.clone()) };
+        match &self.provider.pick {
+            Pick::Model(_) => None,
+            // A lineup that names no step is as good as gone: the relay would have nowhere to send
+            // the request, which reads to the person as the harness itself being broken.
+            Pick::Lineup(name) if entry.lineup(name).is_none_or(|lineup| lineup.models.is_empty()) => {
+                Some(self.lineup_missing.clone())
+            }
+            Pick::Lineup(_) => None,
+        }
     }
 }
 
@@ -2317,19 +2381,13 @@ fn start(
 ) -> Msg {
     // A profile whose provider tag was removed from the Providers page since it was chosen here
     // cannot be pointed anywhere: the relay would refuse every request with an unknown tab, which
-    // reads to the person as the harness itself being broken. Checked before anything is started,
-    // against the file as it is right now rather than a stale copy this profile once carried; the
-    // words for it were made before this thread was, because a background thread has no language
-    // of its own to translate them into.
-    if let Some(gate) = gate {
-        let providers = match &gate.path {
-            Some(path) => crate::provider::Providers::open(path).value,
-            None => crate::provider::Providers::in_memory(),
-        };
-        if providers.get(&gate.provider.tag).is_none() {
-            let message = gate.missing.clone();
-            return answer(Err(LaunchFailure { command: String::new(), output: message, image_missing: false }));
-        }
+    // reads to the person as the harness itself being broken. A profile that chose a lineup of that
+    // provider is in the same position once the lineup is gone, and is told so in its own words.
+    // Checked before anything is started, against the file as it is right now rather than a stale
+    // copy this profile once carried; the words for it were made before this thread was, because a
+    // background thread has no language of its own to translate them into.
+    if let Some(refusal) = gate.and_then(ProviderGate::refusal) {
+        return answer(Err(LaunchFailure { command: String::new(), output: refusal, image_missing: false }));
     }
     let noted_start = plan::ensure_running_noting(engine, plan, user);
     let behind = noted_start.as_ref().ok().cloned().flatten();
@@ -2782,19 +2840,21 @@ fn header(screen: &WorkspaceScreen, ui: &mut View<'_, Msg>) {
 }
 
 /// What the middle shows: the open tab, or why there is nothing to show, and under a tab the
-/// messages other tabs' agents left waiting in it and whether the loop limit ended its exchange.
+/// messages other tabs' agents left waiting in it, whether the loop limit ended its exchange, and
+/// which model of its lineup a request of it fell back to.
 fn center(screen: &WorkspaceScreen, ui: &mut View<'_, Msg>) {
-    let waiting = screen
-        .workspace()
-        .and_then(OpenWorkspace::active_tab)
-        .filter(|tab| !tab.letters().is_empty() || tab.stopped().is_some());
     // The same shape whether or not anything waits: a line appearing under the tab must not
     // rebuild the tab's terminal as another widget, or the keyboard the person is typing with is
     // taken from it the moment a message arrives.
     ui.column(|ui| {
         ui.column(|ui| tab_body(screen, ui)).fill().id(BODY_ID);
-        if let Some(tab) = waiting {
-            bridge::view(tab, ui);
+        if let Some(workspace) = screen.workspace()
+            && let Some(tab) = workspace.active_tab()
+        {
+            if !tab.letters().is_empty() || tab.stopped().is_some() {
+                bridge::view(tab, ui);
+            }
+            relay::view(workspace, tab, ui);
         }
     })
     .fill();

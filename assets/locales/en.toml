@@ -211,6 +211,9 @@ sign-out-message = "The login kept for this profile is deleted. Workspaces that 
 signed-out = "The login was deleted"
 sign-out-failed = "The login could not be deleted"
 
+[profile]
+lineup-paid = "This costs money: {models}. A request that lands on one of them is paid from your OpenRouter balance."
+
 [profiles.wizard]
 step-harness = "Harness"
 step-system = "System"
@@ -250,7 +253,11 @@ high-offline = "This profile's containers have no network. graphify works withou
 account-lead = "What this profile signs in with."
 account-free-detail = "{harness} runs its free models with no account, so there is no sign-in step."
 provider-lead = "Which of your providers it asks."
-provider-model-lead = "Which model of it."
+provider-lineups = "Lineups"
+provider-models = "Models"
+provider-lineup-unmeasured = "Claude Code assumes {tokens} tokens for {models} of {lineup} until they are measured on the Providers page."
+provider-model-filter = "Filter"
+provider-model-filter-none = "Nothing of this provider matches that."
 provider-none = "No provider yet. Add one on the Providers page, then come back."
 provider-model-none = "No models listed yet. List them on the Providers page, then come back."
 provider-model-unmeasured = "Claude Code assumes {tokens} tokens for {model} until it is measured on the Providers page."
@@ -295,6 +302,7 @@ login-again = "Try again"
 
 [workspace]
 provider-missing = "The provider tagged {tag} is no longer on the Providers page, so this tab has nothing to ask. Add it back, or change the profile to another provider."
+provider-lineup-missing = "The provider tagged {tag} no longer has a lineup called {lineup}, or it has none left in it, so this tab has nothing to ask. Write the lineup again on the Providers page, or change the profile to another model or lineup."
 new-tab = "New tab"
 no-profiles = "No profile yet"
 make-profile = "New profile"
@@ -765,6 +773,36 @@ ready-made-models = "Models: {models}"
 key-needed-for = "{kind} is reached with a key."
 claims-published = "its maker publishes {claimed}"
 published-at = "{model}: the window its maker publishes at {source}; the service does not say."
+price-free = "free"
+price-paid = "paid"
+
+# a provider's lineups: named orders of its own models
+lineup-button = "Lineups…"
+lineup-none = "No lineups yet"
+lineup-summary = "Lineups: {lineups}"
+lineup-title = "Lineups of {tag}"
+lineup-lead = "A lineup is an order of this provider's own models: the first that answers is the one that runs."
+lineup-empty = "This provider has no lineups yet. New makes one."
+lineup-new = "New lineup"
+lineup-edit = "Edit"
+lineup-delete = "Delete"
+lineup-close = "Close"
+lineup-delete-title = "Delete the lineup {name}?"
+lineup-delete-message = "A profile that uses it will not open until it is given another order to run."
+lineup-name = "Name"
+lineup-name-hint = "The word you pick it by. A harness is told this, not a model name."
+lineup-name-taken = "This provider already has a lineup called {name}."
+lineup-models = "This provider's models"
+lineup-filter = "part of a model's name"
+lineup-none-match = "No model of this provider matches what you wrote."
+lineup-none-yet = "Nothing in it yet: a model above, with Enter or a click, is put at the end."
+lineup-refused-empty = "There is nothing in it. A lineup needs at least one model."
+lineup-paid = "These steps cost money: {models}. A request that falls back to one of them spends your OpenRouter balance."
+lineup-up = "Up"
+lineup-down = "Down"
+lineup-remove = "Remove"
+lineup-save = "Save"
+lineup-cancel = "Cancel"
 
 [known]
 image-missing = "{engine} does not have the image this needs. It was most likely built with the other engine, or removed; building it again puts it back."
@@ -1039,3 +1077,9 @@ discard = "Discard it"
 
 [workspace.busy]
 timing = "Marking the tabs that are working"
+
+[workspace.relay]
+listening = "Waiting to hear which model answered for a tab"
+fell-back = "{what}: {from} answered {status}, now {to}"
+fell-back-unreachable = "{what}: {from} could not be reached, now {to}"
+telling = "Taking back the line under a tab that fell back"

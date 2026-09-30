@@ -350,7 +350,41 @@ impl Measured {
 /// about 2 050 and 3 012 input tokens.
 pub const CRAMPED: u64 = 16_384;
 
-/// One model of a provider, with both of its context figures.
+/// What a model costs: nothing to use, or money out of the account it is reached with.
+///
+/// Nobody saying is an answer of its own and is kept as the absence of this rather than as a
+/// third value: an ollama server runs on the person's own machine and Xiaomi's and Kimi's are
+/// part of a subscription they already pay for, so no model of theirs has a price to record,
+/// and a price invented for one would be the one number on the page nobody can check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Price {
+    /// OpenRouter lists the model at nothing for what goes in and for what comes back.
+    Free,
+    /// Either half of the price is above zero, so a request that lands here spends money.
+    Paid,
+}
+
+impl Price {
+    /// Every price, in the order the file writes them.
+    pub const ALL: [Self; 2] = [Self::Free, Self::Paid];
+
+    /// How the price is written in the providers file.
+    #[must_use]
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Free => "free",
+            Self::Paid => "paid",
+        }
+    }
+
+    /// The price written as `id`, if there is one.
+    #[must_use]
+    pub fn parse(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|price| price.id() == id)
+    }
+}
+
+/// One model of a provider, with both of its context figures and what it costs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Model {
     /// The model's name as the provider writes it, which is what a harness is given.
@@ -359,13 +393,15 @@ pub struct Model {
     pub claimed: Option<u64>,
     /// The window this server was seen to accept, when it has been measured.
     pub measured: Option<Measured>,
+    /// What using it costs, when the service says.
+    pub price: Option<Price>,
 }
 
 impl Model {
     /// A model nothing has been asked about yet.
     #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
-        Self { id: id.into(), claimed: None, measured: None }
+        Self { id: id.into(), claimed: None, measured: None, price: None }
     }
 
     /// The window a harness on this model is told of: what this server was measured giving, or,
@@ -397,6 +433,58 @@ impl Model {
     }
 }
 
+/// A named order of one provider's models: which one to try first, and what to fall back to.
+///
+/// The name is the person's own word for it — `coder` — because that is what they pick and what a
+/// harness is told instead of a model nobody would recognise. It follows the same rules as a
+/// provider's tag, so it can never read as a model name or collide with a key of the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lineup {
+    /// The name this order is chosen and shown by.
+    pub name: Tag,
+    /// The models in the order they are tried.
+    pub models: Vec<String>,
+}
+
+impl Lineup {
+    /// The window to promise a harness that runs on this order: the smallest of the steps whose
+    /// window is known.
+    ///
+    /// The smallest, because the conversation may go on on any step of the order and what is
+    /// promised has to hold for the one that ends up answering. `None` when no step's window is
+    /// known, which is not the same as a small one: the harness is then left to its own
+    /// assumption rather than cut off by a figure nobody measured.
+    #[must_use]
+    pub fn window(&self, entry: &ProviderEntry) -> Option<u64> {
+        self.models.iter().filter_map(|id| entry.model(id)?.window(entry.kind)).min()
+    }
+
+    /// The steps a request spends money on when it lands on one, so that the person hears it
+    /// while they are choosing the order rather than from a bill afterwards. A step whose price
+    /// nobody published is not named here: nothing is claimed about a price that was not read.
+    #[must_use]
+    pub fn paid<'a>(&self, entry: &'a ProviderEntry) -> Vec<&'a str> {
+        self.models
+            .iter()
+            .filter_map(|id| entry.model(id))
+            .filter(|model| model.price == Some(Price::Paid))
+            .map(|model| model.id.as_str())
+            .collect()
+    }
+
+    /// The steps whose window is not known, which the person is told about rather than left to
+    /// discover as a conversation cut in half. A step naming a model this provider was not last
+    /// seen to have is in here too: nothing is known about a window, for exactly that reason.
+    #[must_use]
+    pub fn unknown_window(&self, entry: &ProviderEntry) -> Vec<&str> {
+        self.models
+            .iter()
+            .filter(|id| entry.model(id).and_then(|model| model.window(entry.kind)).is_none())
+            .map(String::as_str)
+            .collect()
+    }
+}
+
 /// A provider as the file holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderEntry {
@@ -412,6 +500,9 @@ pub struct ProviderEntry {
     pub models: Vec<Model>,
     /// The key it is reached with, for a provider that needs one.
     pub key: Option<Key>,
+    /// The named orders of its models. Empty until the person has written one: an order is their
+    /// own decision about which of the models to lean on, and no service publishes one.
+    pub lineups: Vec<Lineup>,
 }
 
 impl ProviderEntry {
@@ -424,9 +515,14 @@ impl ProviderEntry {
         let models = kind
             .published()
             .iter()
-            .map(|published| Model { id: published.id.to_owned(), claimed: Some(published.window), measured: None })
+            .map(|published| Model {
+                id: published.id.to_owned(),
+                claimed: Some(published.window),
+                measured: None,
+                price: None,
+            })
             .collect();
-        Self { tag, kind, base: trim_base(base), wire: kind.wire(), models, key: None }
+        Self { tag, kind, base: trim_base(base), wire: kind.wire(), models, key: None, lineups: Vec::new() }
     }
 
     /// The address `path` sits at under this provider's base, which is what the page shows
@@ -454,6 +550,13 @@ impl ProviderEntry {
     #[must_use]
     pub fn model(&self, id: &str) -> Option<&Model> {
         self.models.iter().find(|model| model.id == id)
+    }
+
+    /// The lineup called `name`, when this provider has one. A name is a person's own word, so
+    /// it is looked up as it is written rather than parsed into a tag first.
+    #[must_use]
+    pub fn lineup(&self, name: &str) -> Option<&Lineup> {
+        self.lineups.iter().find(|lineup| lineup.name.as_str() == name)
     }
 }
 
@@ -524,9 +627,71 @@ mod tests {
         for measured in [Measured::About(7), Measured::AtLeast(7)] {
             assert_eq!(Measured::parse(measured.id(), 7), Some(measured));
         }
+        for price in Price::ALL {
+            assert_eq!(Price::parse(price.id()), Some(price));
+        }
         assert_eq!(ProviderKind::parse("ollamaa"), None);
         assert_eq!(Wire::parse("anthropics"), None);
         assert_eq!(Measured::parse("exactly", 7), None);
+        assert_eq!(Price::parse("cheaper"), None);
+    }
+
+    /// A provider whose listing carries windows a harness is given, which is what a ready-made
+    /// kind does, and the three steps an order of them is measured against: two with windows and
+    /// one the listing never said anything about.
+    fn with_windows() -> ProviderEntry {
+        let mut entry =
+            ProviderEntry::new(tag("mimo"), ProviderKind::MimoTokenPlan, "https://token-plan-sgp.xiaomimimo.com");
+        entry.models = vec![
+            Model { id: "mimo-v2.6-pro".to_owned(), claimed: Some(131_072), measured: None, price: None },
+            Model { id: "mimo-v2.5".to_owned(), claimed: Some(32_768), measured: None, price: None },
+            Model { id: "mimo-v2.5-asr".to_owned(), claimed: None, measured: None, price: None },
+        ];
+        entry
+    }
+
+    #[test]
+    fn an_order_is_promised_the_smallest_window_of_its_steps_because_a_conversation_may_go_on_on_any_of_them() {
+        let entry = with_windows();
+        let lineup = Lineup {
+            name: tag("kisa"),
+            models: vec!["mimo-v2.6-pro".to_owned(), "mimo-v2.5".to_owned(), "mimo-v2.5-asr".to_owned()],
+        };
+        assert_eq!(lineup.window(&entry), Some(32_768), "what is promised has to hold for the step that answers");
+        assert_eq!(lineup.unknown_window(&entry), ["mimo-v2.5-asr"], "and the one nobody knows a window for is named");
+
+        let unknown = Lineup { name: tag("geci"), models: vec!["mimo-v2.5-asr".to_owned(), "yok".to_owned()] };
+        assert_eq!(unknown.window(&entry), None, "no step with a known window is no window at all");
+        assert_eq!(
+            unknown.unknown_window(&entry),
+            ["mimo-v2.5-asr", "yok"],
+            "a step naming an unknown model is one too"
+        );
+    }
+
+    #[test]
+    fn an_order_names_exactly_the_steps_that_spend_money_and_says_nothing_about_a_price_it_did_not_read() {
+        let mut entry = ProviderEntry::new(tag("yol"), ProviderKind::OpenRouter, "https://openrouter.ai");
+        entry.models = vec![
+            Model { id: "z-ai/glm-4.6".to_owned(), claimed: None, measured: None, price: Some(Price::Paid) },
+            Model { id: "z-ai/glm-4.6:free".to_owned(), claimed: None, measured: None, price: Some(Price::Free) },
+            Model { id: "sirala".to_owned(), claimed: None, measured: None, price: None },
+        ];
+        let lineup = Lineup {
+            name: tag("coder"),
+            models: vec!["z-ai/glm-4.6:free".to_owned(), "z-ai/glm-4.6".to_owned(), "sirala".to_owned()],
+        };
+        assert_eq!(lineup.paid(&entry), ["z-ai/glm-4.6"], "only the step that costs, not the free one beside it");
+    }
+
+    #[test]
+    fn an_order_is_found_under_the_name_it_was_given_and_a_provider_of_no_orders_has_none() {
+        let mut entry = with_windows();
+        let lineup = Lineup { name: tag("coder"), models: vec!["mimo-v2.5".to_owned()] };
+        entry.lineups.push(lineup.clone());
+        assert_eq!(entry.lineup("coder"), Some(&lineup));
+        assert_eq!(entry.lineup("yok"), None, "a name nobody gave");
+        assert!(ProviderEntry::new(tag("ev"), ProviderKind::Ollama, "http://h:1").lineups.is_empty());
     }
 
     #[test]
@@ -540,9 +705,15 @@ mod tests {
     #[test]
     fn a_server_giving_far_less_than_the_model_claims_is_what_the_person_is_told() {
         // The numbers are the ones measured against the owner's own server.
-        let short = Model { id: "qwen3.8".to_owned(), claimed: Some(262_144), measured: Some(Measured::About(3_012)) };
+        let short = Model {
+            id: "qwen3.8".to_owned(),
+            claimed: Some(262_144),
+            measured: Some(Measured::About(3_012)),
+            price: None,
+        };
         assert!(short.is_short_changed());
-        let honest = Model { id: "q".to_owned(), claimed: Some(32_768), measured: Some(Measured::AtLeast(32_768)) };
+        let honest =
+            Model { id: "q".to_owned(), claimed: Some(32_768), measured: Some(Measured::AtLeast(32_768)), price: None };
         assert!(!honest.is_short_changed());
         assert!(!Model::new("q").is_short_changed(), "nothing is claimed about a model nobody asked about");
     }
@@ -634,7 +805,7 @@ mod tests {
 
     #[test]
     fn a_harness_is_told_a_claimed_window_only_where_the_claim_is_what_is_served() {
-        let claimed = Model { id: "m".to_owned(), claimed: Some(262_144), measured: None };
+        let claimed = Model { id: "m".to_owned(), claimed: Some(262_144), measured: None, price: None };
         // An ollama server's record said 262 144 while it cut prompts at three thousand.
         assert_eq!(claimed.window(ProviderKind::Ollama), None);
         assert_eq!(claimed.window(ProviderKind::OpenRouter), None);

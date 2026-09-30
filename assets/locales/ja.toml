@@ -212,6 +212,9 @@ sign-out-message = "このプロファイルのために保存したログイン
 signed-out = "ログイン情報を削除しました"
 sign-out-failed = "ログイン情報を削除できませんでした"
 
+[profile]
+lineup-paid = "これは有料です: {models}。リクエストがこれらのどれかに当たると、OpenRouter の残高から引かれます。"
+
 [profiles.wizard]
 step-harness = "ツール"
 step-system = "システム"
@@ -251,7 +254,11 @@ high-offline = "このプロファイルのコンテナにはネットワーク�
 account-lead = "このプロファイルが何でサインインするか。"
 account-free-detail = "{harness} はアカウントなしで無料モデルを使うので、サインインの手順はありません。"
 provider-lead = "どのプロバイダーに問い合わせるか。"
-provider-model-lead = "そのどのモデルか。"
+provider-lineups = "並び"
+provider-models = "モデル"
+provider-lineup-unmeasured = "プロバイダーのページで測るまで、Claude Code は {lineup} の {models} を {tokens} トークンとみなします。"
+provider-model-filter = "絞り込み"
+provider-model-filter-none = "このプロバイダーに一致するものはありません。"
 provider-none = "プロバイダーがまだありません。プロバイダーのページで追加してから戻ってください。"
 provider-model-none = "モデルがまだ一覧にありません。プロバイダーのページで一覧にしてから戻ってください。"
 provider-model-unmeasured = "プロバイダーのページで測るまで、Claude Code は {model} を {tokens} トークンとみなします。"
@@ -295,6 +302,7 @@ login-again = "もう一度試す"
 
 
 [workspace]
+provider-lineup-missing = "タグ {tag} のプロバイダーに {lineup} という並びはもうなく、入っているものもないため、このタブには尋ねる相手がありません。その並びをプロバイダーのページに書き直すか、プロファイルを別のモデルや並びに変えてください。"
 provider-missing = "タグ {tag} のプロバイダーはもうプロバイダーのページにないため、このタブには尋ねる相手がありません。もう一度追加するか、プロファイルを別のプロバイダーに変えてください。"
 new-tab = "新しいタブ"
 no-profiles = "プロファイルがまだありません"
@@ -764,6 +772,36 @@ ready-made-models = "モデル: {models}"
 key-needed-for = "{kind} にはキーでつながります。"
 claims-published = "開発元が公開しているのは {claimed}"
 published-at = "{model}：開発元が {source} で公開している窓の大きさです。サービスは明かしていません。"
+price-free = "無料"
+price-paid = "有料"
+
+# プロバイダーの並び順：自身のモデルに名を付けた順番
+lineup-button = "並び順…"
+lineup-none = "並び順はまだない"
+lineup-summary = "並び順: {lineups}"
+lineup-title = "{tag} の並び順"
+lineup-lead = "並び順とは、このプロバイダー自身のモデルを試す順番です。最初に答えたものが動きます。"
+lineup-empty = "このプロバイダーにはまだ並び順がありません。新しい並び順で作ります。"
+lineup-new = "新しい並び順"
+lineup-edit = "編集"
+lineup-delete = "削除"
+lineup-close = "閉じる"
+lineup-delete-title = "並び順 {name} を削除しますか？"
+lineup-delete-message = "それを使うプロファイルは、実行する別の並び順を与えられるまで開きません。"
+lineup-name = "名前"
+lineup-name-hint = "あなたがそれで呼ぶときの呼び名です。harness に渡されるのはこの名前で、モデルの名前ではありません。"
+lineup-name-taken = "このプロバイダーには {name} という並び順がすでにあります。"
+lineup-models = "このプロバイダーのモデル"
+lineup-filter = "モデル名の一部"
+lineup-none-match = "このプロバイダーのモデルのうち、あなたが書いたものに合うものはありません。"
+lineup-none-yet = "まだ中身がありません。上部のモデルを Enter かクリックで選ぶと最後に追加されます。"
+lineup-refused-empty = "中身がありません。並び順にはモデルが少なくとも一つ必要です。"
+lineup-paid = "これらの手順にはお金が掛かります: {models}。どれかに落ちたリクエストは OpenRouter の残高を使います。"
+lineup-up = "上へ"
+lineup-down = "下へ"
+lineup-remove = "外す"
+lineup-save = "保存"
+lineup-cancel = "取り消し"
 
 # ready-made providers
 
@@ -1040,3 +1078,9 @@ discard = "捨てる"
 
 [workspace.busy]
 timing = "作業中のタブに印を付けています"
+
+[workspace.relay]
+listening = "タブの代わりにどのモデルが答えたかを待っています"
+fell-back = "{what}: {from} が {status} と答え、{to} に切り替わりました"
+fell-back-unreachable = "{what}: {from} に到達できなかったので、{to} に切り替わりました"
+telling = "次のモデルに回り込んだタブの下の行を取り消しています"

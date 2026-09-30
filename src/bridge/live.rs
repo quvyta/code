@@ -508,7 +508,7 @@ fn provider_profile_under(model: &str, template: Template) -> Profile {
         harness: HarnessKind::ClaudeCode,
         template,
         account: AccountKind::Provider,
-        provider: Some(crate::profile::ProviderChoice { tag: PROVIDER_TAG.to_owned(), model: model.to_owned() }),
+        provider: Some(crate::profile::ProviderChoice::model(PROVIDER_TAG, model)),
         assets: MountAccess::ReadOnly,
         network: NetworkMode::None,
         without: Vec::new(),
@@ -525,7 +525,7 @@ fn provider_profile_under(model: &str, template: Template) -> Profile {
 #[test]
 #[ignore = "needs a container engine, the network once for the image, and a model service; run with QCODE_CONTAINER_TESTS=1, QCODE_PROVIDER_URL and QCODE_PROVIDER_MODEL"]
 fn a_message_delivered_into_claude_code_reaches_its_own_prompt() {
-    use crate::provider::relay::{self, Listener as Relay, Upstream};
+    use crate::provider::relay::{self, Listener as Relay, Route, Upstream};
     use crate::provider::{ProviderEntry, ProviderKind, Tag};
     use qframe::runtime::Harness as Screen;
     use qframe::widgets::TerminalSession;
@@ -555,9 +555,12 @@ fn a_message_delivered_into_claude_code_reaches_its_own_prompt() {
         let token = super::token();
         let mine = token.clone();
         let carried = entry.clone();
+        let asked = choice.asked().to_owned();
         let relay = Relay::open(
             &paths.mcp(),
-            move |asked| (asked == mine).then(|| carried.clone()),
+            move |token| {
+                (token == mine).then(|| Route { entry: carried.clone(), models: vec![asked.clone()], lineup: None })
+            },
             Upstream::network(),
             |_| (),
         )
@@ -604,7 +607,7 @@ fn a_message_delivered_into_claude_code_reaches_its_own_prompt() {
 /// under the cursor, where a person pressing Return leaves. It is watched for the prompt only; a
 /// question on the screen means the prompt never comes and the test shows what was drawn instead.
 fn claude_code_opens_on_its_prompt(template: Template) {
-    use crate::provider::relay::{self, Listener as Relay, Upstream};
+    use crate::provider::relay::{self, Listener as Relay, Route, Upstream};
     use crate::provider::{ProviderEntry, ProviderKind, Tag};
     use qframe::runtime::Harness as Screen;
     use qframe::widgets::TerminalSession;
@@ -630,9 +633,12 @@ fn claude_code_opens_on_its_prompt(template: Template) {
         let token = super::token();
         let mine = token.clone();
         let carried = entry.clone();
+        let asked = choice.asked().to_owned();
         let relay = Relay::open(
             &paths.mcp(),
-            move |asked| (asked == mine).then(|| carried.clone()),
+            move |token| {
+                (token == mine).then(|| Route { entry: carried.clone(), models: vec![asked.clone()], lineup: None })
+            },
             Upstream::network(),
             |_| (),
         )
@@ -712,7 +718,7 @@ fn qwen_code_starts_the_bridge_and_reaches_qcode() {
 /// `service` is `"openrouter"`, `"kimi"` or `"mimo"`; `None` takes `QCODE_DELIVERY_PROVIDER`, and
 /// MiMo when that is not set.
 fn delivered_on_a_provider(harness: HarnessKind, service: Option<&str>) {
-    use crate::provider::relay::{self, Listener as Relay, Upstream};
+    use crate::provider::relay::{self, Listener as Relay, Route, Upstream};
     use crate::provider::{Key, ProviderEntry, ProviderKind, Tag};
     use qframe::runtime::Harness as Screen;
     use qframe::widgets::TerminalSession;
@@ -747,7 +753,7 @@ fn delivered_on_a_provider(harness: HarnessKind, service: Option<&str>) {
     let profile = Profile {
         name: SafeName::parse(&format!("bridgetest-{}-provider", harness.record().id)).expect("the name is safe"),
         account: AccountKind::Provider,
-        provider: Some(crate::profile::ProviderChoice { tag: PROVIDER_TAG.to_owned(), model }),
+        provider: Some(crate::profile::ProviderChoice::model(PROVIDER_TAG, model)),
         ..self::profile(harness)
     };
     let choice = profile.provider.clone().expect("the profile names a provider");
@@ -770,13 +776,16 @@ fn delivered_on_a_provider(harness: HarnessKind, service: Option<&str>) {
         let token = super::token();
         let mine = token.clone();
         let carried = entry.clone();
+        let asked = choice.asked().to_owned();
         // Every request the relay carried to the provider, whatever it answered: a busy free
         // model's 429 is still a message sent.
         let forwarded = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counting = forwarded.clone();
         let relay = Relay::open(
             &paths.mcp(),
-            move |asked| (asked == mine).then(|| carried.clone()),
+            move |token| {
+                (token == mine).then(|| Route { entry: carried.clone(), models: vec![asked.clone()], lineup: None })
+            },
             Upstream::network(),
             move |event| {
                 if matches!(event, relay::Event::Forwarded { .. }) {
@@ -1008,7 +1017,7 @@ fn a_message_delivered_into_gemini_cli_reaches_its_own_prompt_and_is_sent() {
 #[test]
 #[ignore = "needs a container engine, the network, and the owner's MiMo key; run with QCODE_CONTAINER_TESTS=1"]
 fn an_agent_takes_a_message_from_its_inbox_through_the_real_server() {
-    use crate::provider::relay::{self, Listener as Relay, Upstream};
+    use crate::provider::relay::{self, Listener as Relay, Route, Upstream};
     use crate::provider::{Key, ProviderEntry, ProviderKind, Tag};
 
     let Some(key) = std::env::var_os("HOME")
@@ -1023,7 +1032,7 @@ fn an_agent_takes_a_message_from_its_inbox_through_the_real_server() {
     let profile = Profile {
         name: SafeName::parse("bridgetest-inbox").expect("the name is safe"),
         account: AccountKind::Provider,
-        provider: Some(crate::profile::ProviderChoice { tag: PROVIDER_TAG.to_owned(), model }),
+        provider: Some(crate::profile::ProviderChoice::model(PROVIDER_TAG, model)),
         ..self::profile(harness)
     };
     let choice = profile.provider.clone().expect("the profile names a provider");
@@ -1048,9 +1057,12 @@ fn an_agent_takes_a_message_from_its_inbox_through_the_real_server() {
         let token = super::token();
         let mine = token.clone();
         let carried = entry.clone();
+        let asked = choice.asked().to_owned();
         let relay = Relay::open(
             &paths.mcp(),
-            move |asked| (asked == mine).then(|| carried.clone()),
+            move |token| {
+                (token == mine).then(|| Route { entry: carried.clone(), models: vec![asked.clone()], lineup: None })
+            },
             Upstream::network(),
             |_| (),
         )

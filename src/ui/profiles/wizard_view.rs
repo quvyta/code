@@ -10,13 +10,13 @@ use crate::base::{Gap, Os, Refusal};
 use crate::desktop::callback;
 use crate::engine::Engine;
 use crate::profile::{
-    ASSUMED_CONTEXT_TOKENS, AccountKind, Extra, HarnessKind, MountAccess, NetworkMode, SafeName, Template,
+    ASSUMED_CONTEXT_TOKENS, AccountKind, Extra, HarnessKind, MountAccess, NetworkMode, Pick, SafeName, Template,
 };
 use crate::ui::settings::engine::help;
 
 use super::list::{access_word, account_word, network_word, no_login_detail, template_word};
 use super::{
-    Blocked, Build, CHROME_ROWS, Draft, Login, Msg, PAGE_WIDTH, Page, Problem, Profiles, Stage, Unfinished,
+    Blocked, Build, CHROME_ROWS, Draft, Login, Msg, PAGE_WIDTH, Page, PickRow, Problem, Profiles, Stage, Unfinished,
     VIEWPORT_ROWS, WIZARD_ROWS, WindowBack, WindowLogin, shell_page,
 };
 
@@ -407,9 +407,17 @@ fn draw_account(draft: &Draft, ui: &mut View<'_, Msg>) {
     }
 }
 
-/// The provider and model a profile of [`AccountKind::Provider`] runs on: the person's own
-/// providers first, then the models of whichever one is chosen. Offering nothing but their own
-/// providers and that provider's own models is the point — a list borrowed from nowhere else.
+/// The provider and what a profile of [`AccountKind::Provider`] runs on: the person's own
+/// providers first, then one list holding the chosen provider's lineups and its models, each
+/// under a heading of its own. Offering nothing but their own providers and that provider's own
+/// lineups and models is the point — a list borrowed from nowhere else.
+///
+/// A provider can offer hundreds of models, so they are a filtered list and not a group of
+/// choices: a group taller than the page takes the wizard's buttons off the screen, and the
+/// wizard cannot go on. The provider itself has a handful and stays a group. One list rather than
+/// two, so that a lineup and a model of the same provider are chosen in the same place with the
+/// same keys and the same filter, and the page's height does not depend on whether the provider
+/// happens to have lineups.
 fn draw_provider_choice(draft: &Draft, ui: &mut View<'_, Msg>) {
     if draft.providers.is_empty() {
         ui.add(Text::new(t!("profiles.wizard.provider-none")).role("secondary")).fill_width();
@@ -423,36 +431,99 @@ fn draw_provider_choice(draft: &Draft, ui: &mut View<'_, Msg>) {
         .selected(chosen_tag)
         .on_select(Msg::PickProvider);
     ui.add(group.wrap(true)).id("profile-provider");
-    let models = draft.provider_models();
-    if models.is_empty() {
+    if draft.provider_models().is_empty() {
         ui.add(Text::new(t!("profiles.wizard.provider-model-none")).role("secondary")).fill_width();
         ui.add(Button::new(t!("profiles.wizard.provider-manage")).on_press(Msg::ManageProviders))
             .id("profile-provider-model-manage");
         return;
     }
-    let chosen_model = models.iter().position(|model| Some(model.id.as_str()) == draft.provider_model.as_deref());
-    ui.add(Text::new(t!("profiles.wizard.provider-model-lead")).role("secondary")).fill_width();
-    let group = RadioGroup::new(models.iter().map(|model| model.id.clone()))
-        .selected(chosen_model)
-        .on_select(Msg::PickProviderModel);
-    ui.add(group.wrap(true)).id("profile-provider-model");
+    let kind = draft.provider_tag.as_deref().and_then(|tag| draft.provider_entry(tag)).map(|entry| entry.kind);
+    ui.add(
+        TextInput::new(draft.model_filter.clone())
+            .placeholder(t!("profiles.wizard.provider-model-filter"))
+            .on_change(Msg::ModelFilter),
+    )
+    .id("profile-provider-model-filter")
+    .fill_width();
+    // The rows the list takes are the ones the page's other lines and the wizard's buttons leave
+    // of the screen, so however many models a provider offers the way on stays where a hand can
+    // reach it.
+    let rows = model_rows(ui);
+    let shown = draft.pick_rows();
+    // A lineup's row carries its steps, the way the person wrote them, so an order of three models
+    // is one row rather than three to read through; a model's own row carries the window its
+    // server gives, which is what the harness is told and why the line under the list is silent
+    // about it.
+    let items = shown.iter().map(|row| match row {
+        PickRow::LineupHeading => ListItem::header(t!("profiles.wizard.provider-lineups")),
+        PickRow::ModelHeading => ListItem::header(t!("profiles.wizard.provider-models")),
+        PickRow::Gap => ListItem::gap(),
+        PickRow::Lineup(lineup) => ListItem::new(lineup.name.as_str()).detail(lineup.models.join(STEP_ARROW)),
+        PickRow::Model(model) => match kind.and_then(|kind| model.window(kind)) {
+            Some(window) => ListItem::new(model.id.clone()).detail(window.to_string()),
+            None => ListItem::new(model.id.clone()),
+        },
+    });
+    // The label of a row is what the person chooses by, so it is the detail that is cut when the
+    // row is too narrow: a lineup's steps are read off its row, a model's window is read beside
+    // every other model of the same provider.
+    let list = List::new(items)
+        .empty_text(t!("profiles.wizard.provider-model-filter-none"))
+        .selected(draft.chosen_row())
+        .label_first(true)
+        .on_select(Msg::PickProviderModel)
+        .on_activate(Msg::PickProviderModel);
+    ui.add(list.wrap(true)).id("profile-provider-model").height(Length::Cells(rows));
+    // Money spent without being asked for is said where it is chosen, not in a bill afterwards:
+    // a step that costs is one the relay will fall back to on a turn that could have gone free.
+    let paid = draft.paid_steps();
+    if !paid.is_empty() {
+        ui.add(Text::new(t!("profile.lineup-paid", models = paid.join(", "))).color("warning")).fill_width();
+    }
     // Only a window QCode measured, or one a ready-made service gives for its own models, is
     // handed to Claude Code; without one it works to the room of its own models and prints a
     // warning at every start. Measuring is left to the person on the Providers page, because it
     // loads the model on their server.
-    let kind = draft.provider_tag.as_deref().and_then(|tag| draft.provider_entry(tag)).map(|entry| entry.kind);
-    let unmeasured = models.iter().find(|model| Some(model.id.as_str()) == draft.provider_model.as_deref());
-    if draft.harness == HarnessKind::ClaudeCode
-        && let Some(model) = unmeasured.filter(|model| kind.is_none_or(|kind| model.window(kind).is_none()))
-    {
-        let said = t!(
-            "profiles.wizard.provider-model-unmeasured",
-            model = model.id.as_str(),
-            tokens = ASSUMED_CONTEXT_TOKENS.to_string()
-        );
-        ui.add(Text::new(said).role("secondary")).fill_width();
+    if draft.harness == HarnessKind::ClaudeCode {
+        let unmeasured = draft.unknown_windows();
+        if !unmeasured.is_empty() {
+            let tokens = ASSUMED_CONTEXT_TOKENS.to_string();
+            let said = match &draft.provider_pick {
+                Some(Pick::Lineup(lineup)) => t!(
+                    "profiles.wizard.provider-lineup-unmeasured",
+                    lineup = lineup.as_str(),
+                    models = unmeasured.join(", "),
+                    tokens = tokens
+                ),
+                _ => t!("profiles.wizard.provider-model-unmeasured", model = unmeasured.join(", "), tokens = tokens),
+            };
+            ui.add(Text::new(said).role("secondary")).fill_width();
+        }
     }
 }
+
+/// Between one step of a lineup and the next, on its row: what the relay asks in that order.
+const STEP_ARROW: &str = " → ";
+
+/// Rows the model list takes: what the page's other lines and the wizard's own frame leave of the
+/// screen, so the way on is on the screen however many models a provider offers.
+fn model_rows(ui: &View<'_, Msg>) -> u16 {
+    ui.size().height.saturating_sub(ROWS_AROUND_MODELS).clamp(MODEL_ROWS_MIN, MODEL_ROWS_MAX)
+}
+
+/// Rows the account page spends around the model list: its own question, the account and provider
+/// rows, the filter field and the sentences under the list — what a lineup or a model costs, and
+/// the room a model nobody measured is given — and the wizard's steps and buttons with the row the
+/// application's foot takes. A sentence is two rows on a narrow terminal, which is where this is
+/// the one to be wrong.
+const ROWS_AROUND_MODELS: u16 = 17;
+
+/// Most rows the model list takes, so the account page stays within the height the wizard keeps
+/// for its tallest page ([`WIZARD_ROWS`]) on a screen with rows to spare.
+const MODEL_ROWS_MAX: u16 = 12;
+
+/// Fewest rows the model list takes: a list of one row is no list to move through.
+const MODEL_ROWS_MIN: u16 = 3;
 
 /// What the container may see and reach.
 fn draw_permissions(draft: &Draft, ui: &mut View<'_, Msg>) {

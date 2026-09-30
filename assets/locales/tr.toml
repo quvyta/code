@@ -212,6 +212,9 @@ sign-out-message = "Bu profil için tutulan giriş silinir. Kendi kopyasını al
 signed-out = "Giriş silindi"
 sign-out-failed = "Giriş silinemedi"
 
+[profile]
+lineup-paid = "Bunlar para eder: {models}. Bir istek bunlardan birine düşerse OpenRouter bakiyenden ödenir."
+
 [profiles.wizard]
 step-harness = "Düzenek"
 step-system = "Sistem"
@@ -251,7 +254,11 @@ high-offline = "Bu profilin kapsayıcılarının ağı yok. graphify ağsız da 
 account-lead = "Bu profilin neyle giriş yaptığı."
 account-free-detail = "{harness} ücretsiz modelleriyle hesapsız çalışır; giriş adımı yoktur."
 provider-lead = "Hangi sağlayıcına soracağı."
-provider-model-lead = "Onun hangi modelini."
+provider-lineups = "Sıralar"
+provider-models = "Modeller"
+provider-lineup-unmeasured = "Sağlayıcılar sayfasında ölçülene kadar Claude Code, {lineup} sırasındaki {models} için {tokens} belirteç varsayar."
+provider-model-filter = "Süz"
+provider-model-filter-none = "Bunu tutan bir şey yok."
 provider-none = "Henüz sağlayıcı yok. Sağlayıcılar sayfasından bir tane ekle, sonra geri dön."
 provider-model-none = "Henüz model listelenmedi. Sağlayıcılar sayfasında listele, sonra geri dön."
 provider-model-unmeasured = "Sağlayıcılar sayfasında ölçülene kadar Claude Code, {model} için {tokens} belirteç varsayar."
@@ -296,6 +303,7 @@ login-again = "Yeniden dene"
 
 [workspace]
 provider-missing = "{tag} etiketli sağlayıcı artık Sağlayıcılar sayfasında yok, bu yüzden bu sekmenin soracağı kimse kalmadı. Onu yeniden ekle, ya da profili başka bir sağlayıcıya çevir."
+provider-lineup-missing = "{tag} etiketli sağlayıcıda artık {lineup} adında bir sıra yok, ya da içinde model kalmadı; bu yüzden bu sekmenin isteği gidecek bir yer yok. Sırayı Sağlayıcılar sayfasında yeniden yaz, ya da profili başka bir modele ya da sıraya çevir."
 new-tab = "Yeni sekme"
 no-profiles = "Henüz profil yok"
 make-profile = "Yeni profil"
@@ -766,6 +774,36 @@ ready-made-models = "Modeller: {models}"
 key-needed-for = "{kind} hizmetine bir anahtarla ulaşılır."
 claims-published = "yapımcısı {claimed} yayımlıyor"
 published-at = "{model}: yapımcısının {source} adresinde yayımladığı pencere; servis söylemiyor."
+price-free = "bedava"
+price-paid = "ücretli"
+
+# sağlayıcının sıraları: kendi modellerinin adlandırılmış düzenleri
+lineup-button = "Sıralar…"
+lineup-none = "Henüz sıra yok"
+lineup-summary = "Sıralar: {lineups}"
+lineup-title = "{tag} sıraları"
+lineup-lead = "Sıra, bu sağlayıcının kendi modellerinin bir düzenidir: ilk yanıt veren çalışan odur."
+lineup-empty = "Bu sağlayıcının henüz sırası yok. Yeni sıra bir tane yapar."
+lineup-new = "Yeni sıra"
+lineup-edit = "Düzenle"
+lineup-delete = "Sil"
+lineup-close = "Kapat"
+lineup-delete-title = "{name} sırası silinsin mi?"
+lineup-delete-message = "Bunu kullanan bir profil, başka bir düzen verilene kadar açılmaz."
+lineup-name = "Ad"
+lineup-name-hint = "Onu seçtiğin kelime. Model adı değil, bu ad harness'a verilir."
+lineup-name-taken = "Bu sağlayıcının {name} diye bir sırası var."
+lineup-models = "Bu sağlayıcının modelleri"
+lineup-filter = "model adının bir parçası"
+lineup-none-match = "Bu sağlayıcının hiçbir modeli yazdığınla tutmuyor."
+lineup-none-yet = "İçi henüz boş: yukarıdan bir model, Enter ya da tıklayınca sona eklenir."
+lineup-refused-empty = "İçi boş. Bir sıranın en az bir modeli olmalı."
+lineup-paid = "Bu adımlar para eder: {models}. Bunlardan birine düşen istek OpenRouter bakiyenden harcar."
+lineup-up = "Yukarı"
+lineup-down = "Aşağı"
+lineup-remove = "Çıkar"
+lineup-save = "Kaydet"
+lineup-cancel = "Vazgeç"
 
 [known]
 image-missing = "{engine} içinde bunun için gereken imaj yok. Büyük olasılıkla öbür motorla kuruldu ya da silindi; yeniden kurmak onu geri getirir."
@@ -1040,3 +1078,9 @@ discard = "Yapılanları at"
 
 [workspace.busy]
 timing = "Çalışan sekmeler işaretleniyor"
+
+[workspace.relay]
+listening = "Bir sekme için hangi modelin cevap verdiği bekleniyor"
+fell-back = "{what}: {from} {status} verdi, şimdi {to}"
+fell-back-unreachable = "{what}: {from} ulaşılamaz, şimdi {to}"
+telling = "Sıra değiştiren sekmenin altındaki satır kaldırılıyor"

@@ -122,7 +122,7 @@ fn profile(template: Template, network: NetworkMode, without: Vec<Extra>) -> Pro
         harness: HarnessKind::ClaudeCode,
         template,
         account: AccountKind::Provider,
-        provider: Some(ProviderChoice { tag: "bellek".to_owned(), model: "m".to_owned() }),
+        provider: Some(ProviderChoice::model("bellek", "m")),
         assets: MountAccess::ReadOnly,
         network,
         without,

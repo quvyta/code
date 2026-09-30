@@ -52,7 +52,7 @@ use crate::store::Store;
 pub use list::{closed_sign_in, entry, hints, view};
 pub use shell_page::{ShellMsg, ShellPage, Side as ShellSide, Stage as ShellStage};
 pub use status::{Readiness, Revision, Row, Status};
-pub use wizard::{Blocked, Build, Draft, Login, Page, Stage, Unfinished, WindowBack, WindowLogin};
+pub use wizard::{Blocked, Build, Draft, Login, Page, PickRow, Stage, Unfinished, WindowBack, WindowLogin};
 pub use work::Problem;
 
 use actions::{
@@ -162,8 +162,11 @@ pub enum Msg {
     PickAccount(usize),
     /// A provider was chosen, on the account page's own list.
     PickProvider(usize),
-    /// A model of the chosen provider was chosen.
+    /// A model of the chosen provider, or one of its lineups, was chosen by its place in the list
+    /// the filter leaves.
     PickProviderModel(usize),
+    /// The filter of the model list was typed.
+    ModelFilter(String),
     /// The person asked to go to the Providers page, because the harness they chose can be
     /// pointed at one but they have not added any yet.
     ManageProviders,
@@ -553,10 +556,13 @@ pub fn update(state: &mut Profiles, message: Msg) -> Command<Msg> {
         }
         Msg::PickProviderModel(index) => {
             if let Some(draft) = &mut state.draft {
-                let chosen = draft.provider_models().get(index).map(|model| model.id.clone());
-                if let Some(id) = chosen {
-                    draft.choose_provider_model(&id);
-                }
+                draft.choose_pick_row(index);
+            }
+            Command::none()
+        }
+        Msg::ModelFilter(query) => {
+            if let Some(draft) = &mut state.draft {
+                draft.model_filter = query;
             }
             Command::none()
         }

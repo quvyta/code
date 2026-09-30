@@ -306,3 +306,34 @@ fn what_claude_code_assumes_of_an_unmeasured_model_is_said_in_each_language() {
         }
     }
 }
+
+#[test]
+fn what_a_lineup_would_cost_and_what_it_is_assumed_to_hold_is_said_in_each_language() {
+    // A lineup's two lines name a lineup, its steps and a number. A file that kept the English
+    // words around them would still pass the completeness gate.
+    let mut catalog = catalog();
+    let unmeasured: Vec<(&str, Arg)> =
+        vec![("lineup", Arg::from("coder")), ("models", Arg::from("a/one, b/two")), ("tokens", Arg::from("200000"))];
+    let paid: Vec<(&str, Arg)> = vec![("models", Arg::from("b/two"))];
+    catalog.set_active("en");
+    let sentences = [
+        (
+            catalog.translate("profiles.wizard.provider-lineup-unmeasured", &unmeasured),
+            vec!["coder", "a/one", "b/two", "200000", "Claude Code"],
+        ),
+        (catalog.translate("profile.lineup-paid", &paid), vec!["b/two", "OpenRouter"]),
+    ];
+    for code in CODES.iter().filter(|code| **code != "en") {
+        catalog.set_active(code);
+        for (key, (english, values)) in
+            ["profiles.wizard.provider-lineup-unmeasured", "profile.lineup-paid"].iter().zip(sentences.iter())
+        {
+            let said = catalog.translate(key, if *key == "profile.lineup-paid" { &paid } else { &unmeasured });
+            assert!(!said.starts_with('⟦') && !said.is_empty(), "{code} has no words for {key}");
+            assert_ne!(&said, english, "{code} still says {key} in English");
+            for value in values {
+                assert!(said.contains(value), "{code} loses {value} from {key}: {said}");
+            }
+        }
+    }
+}

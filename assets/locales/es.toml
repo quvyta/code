@@ -212,6 +212,9 @@ sign-out-message = "La sesión guardada para este perfil se elimina. Los espacio
 signed-out = "La sesión se eliminó"
 sign-out-failed = "No se pudo eliminar la sesión"
 
+[profile]
+lineup-paid = "Esto cuesta dinero: {models}. Una petición que aterrice en una de ellas se paga de tu saldo de OpenRouter."
+
 [profiles.wizard]
 step-harness = "Herramienta"
 step-system = "Sistema"
@@ -251,7 +254,11 @@ high-offline = "Los contenedores de este perfil no tienen red. graphify funciona
 account-lead = "Con qué inicia sesión este perfil."
 account-free-detail = "{harness} usa sus modelos gratuitos sin cuenta, así que no hay paso de inicio de sesión."
 provider-lead = "A cuál de tus proveedores pregunta."
-provider-model-lead = "Qué modelo de él."
+provider-lineups = "Secuencias"
+provider-models = "Modelos"
+provider-lineup-unmeasured = "Claude Code supone {tokens} tokens para {models} de la secuencia {lineup} hasta que se midan en la página de Proveedores."
+provider-model-filter = "Filtrar"
+provider-model-filter-none = "Nada de este proveedor coincide con eso."
 provider-none = "Aún no hay proveedor. Añade uno en la página de Proveedores y vuelve."
 provider-model-none = "Aún no hay modelos listados. Lístalos en la página de Proveedores y vuelve."
 provider-model-unmeasured = "Claude Code supone {tokens} tokens para {model} hasta que se mida en la página de Proveedores."
@@ -295,6 +302,7 @@ login-again = "Intentarlo de nuevo"
 
 
 [workspace]
+provider-lineup-missing = "El proveedor etiquetado {tag} ya no tiene una secuencia llamada {lineup}, o la tiene vacía, así que esta pestaña no tiene a quién preguntar. Vuelve a escribir esa secuencia en la página de Proveedores, o cambia el perfil a otro modelo u otra secuencia."
 provider-missing = "El proveedor etiquetado {tag} ya no está en la página de Proveedores, así que esta pestaña no tiene a quién preguntar. Vuelve a añadirlo, o cambia el perfil a otro proveedor."
 new-tab = "Pestaña nueva"
 no-profiles = "Todavía sin perfil"
@@ -764,6 +772,36 @@ ready-made-models = "Modelos: {models}"
 key-needed-for = "A {kind} se accede con una clave."
 claims-published = "su fabricante publica {claimed}"
 published-at = "{model}: la ventana que publica su fabricante en {source}; el servicio no la indica."
+price-free = "gratis"
+price-paid = "de pago"
+
+# las secuencias de un proveedor: órdenes con nombre de sus propios modelos
+lineup-button = "Secuencias…"
+lineup-none = "Todavía no hay secuencias"
+lineup-summary = "Secuencias: {lineups}"
+lineup-title = "Secuencias de {tag}"
+lineup-lead = "Una secuencia es un orden de los modelos de este proveedor: el primero que responde es el que funciona."
+lineup-empty = "Este proveedor todavía no tiene secuencias. Una secuencia nueva hace una."
+lineup-new = "Nueva secuencia"
+lineup-edit = "Editar"
+lineup-delete = "Eliminar"
+lineup-close = "Cerrar"
+lineup-delete-title = "¿Eliminar la secuencia {name}?"
+lineup-delete-message = "Un perfil que la use no abrirá hasta que se le dé otro orden que ejecutar."
+lineup-name = "Nombre"
+lineup-name-hint = "La palabra con la que la eliges. Un harness recibe esta, no un nombre de modelo."
+lineup-name-taken = "Este proveedor ya tiene una secuencia llamada {name}."
+lineup-models = "Los modelos de este proveedor"
+lineup-filter = "una parte del nombre de un modelo"
+lineup-none-match = "Ningún modelo de este proveedor coincide con lo que escribiste."
+lineup-none-yet = "Todavía no hay nada dentro: un modelo de arriba, con Intro o un clic, se añade al final."
+lineup-refused-empty = "No hay nada dentro. Una secuencia necesita al menos un modelo."
+lineup-paid = "Estos pasos cuestan dinero: {models}. Una petición que cae en uno de ellos gasta tu saldo de OpenRouter."
+lineup-up = "Subir"
+lineup-down = "Bajar"
+lineup-remove = "Quitar"
+lineup-save = "Guardar"
+lineup-cancel = "Cancelar"
 
 # ready-made providers
 
@@ -1040,3 +1078,9 @@ discard = "Desecharla"
 
 [workspace.busy]
 timing = "Marcando las pestañas que están trabajando"
+
+[workspace.relay]
+listening = "Esperando a saber qué modelo respondió por una pestaña"
+fell-back = "{what}: {from} respondió {status}, ahora {to}"
+fell-back-unreachable = "{what}: {from} no se pudo contactar, ahora {to}"
+telling = "Se retira la línea bajo la pestaña que pasó al siguiente modelo"

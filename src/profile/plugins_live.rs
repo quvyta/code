@@ -180,7 +180,7 @@ fn recommended() -> Profile {
         harness: HarnessKind::ClaudeCode,
         template: Template::Recommended,
         account: AccountKind::Provider,
-        provider: Some(ProviderChoice { tag: "guvenlik".to_owned(), model: "m".to_owned() }),
+        provider: Some(ProviderChoice::model("guvenlik", "m")),
         assets: MountAccess::ReadOnly,
         network: NetworkMode::None,
         without: Vec::new(),

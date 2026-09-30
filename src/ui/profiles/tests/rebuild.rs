@@ -279,6 +279,76 @@ fn edit_on(harness: &mut Harness<Host>, pages: usize) {
     }
 }
 
+/// A provider entry with the lineup `lineup` of `steps` in the given order, the second of which
+/// costs money, and `models` as its own models: what the Providers page leaves a provider it has
+/// been asked about.
+fn lineup_entry(tag: &str, lineup: &str, steps: &[(&str, bool)], models: &[&str]) -> ProviderEntry {
+    let mut entry = ProviderEntry::new(
+        crate::provider::Tag::parse(tag).expect("a tag"),
+        crate::provider::ProviderKind::OpenRouter,
+        "https://openrouter.ai/api/v1",
+    );
+    entry.models = steps
+        .iter()
+        .map(|(id, paid)| {
+            let mut model = crate::provider::Model::new(*id);
+            model.price = Some(if *paid { crate::provider::Price::Paid } else { crate::provider::Price::Free });
+            model
+        })
+        .chain(models.iter().map(|id| {
+            let mut model = crate::provider::Model::new(*id);
+            model.price = Some(crate::provider::Price::Free);
+            model
+        }))
+        .collect();
+    entry.lineups = vec![crate::provider::Lineup {
+        name: crate::provider::Tag::parse(lineup).expect("a name"),
+        models: steps.iter().map(|(id, _)| (*id).to_owned()).collect(),
+    }];
+    entry
+}
+
+/// What a profile runs on is the containers', not the image's: opening a profile of a lineup on the
+/// account page stands on the lineup it had, and choosing one of the provider's own models instead
+/// writes `model` and builds nothing at all.
+#[test]
+fn editing_a_profile_of_a_lineup_and_choosing_a_model_saves_a_model_and_builds_nothing() {
+    let engine = Rebuilt::new("edit-lineup");
+    let mut chosen = profile("claude-sub", HarnessKind::ClaudeCode);
+    chosen.account = AccountKind::Provider;
+    chosen.provider = Some(crate::profile::ProviderChoice::lineup("yol", "coder"));
+    let mut harness = engine.screen(chosen.clone());
+    harness
+        .send(Msg::ProvidersLoaded(vec![lineup_entry(
+            "yol",
+            "coder",
+            &[("a/one", false), ("b/two", true)],
+            &["c/three", "d/four"],
+        )]))
+        .render();
+    edit(&mut harness, 3);
+    // Opened on the profile, the pick it had stands where it was rather than the first of the list.
+    let screen = harness.screen();
+    assert!(screen.contains("Lineups") && screen.contains("a/one → b/two"), "{screen}");
+    let draft = harness.app().state.draft().expect("open");
+    assert_eq!(draft.provider_pick, Some(crate::profile::Pick::Lineup("coder".to_owned())), "{screen}");
+    assert!(!draft.rebuilds(), "what a tab runs on is not in the image");
+
+    // A model of the same provider instead: still the containers', not the image's.
+    harness.click_text("c/three").render();
+    let draft = harness.app().state.draft().expect("open");
+    assert_eq!(draft.provider_pick, Some(crate::profile::Pick::Model("c/three".to_owned())));
+    assert!(!draft.rebuilds(), "choosing what a tab runs on does not reach the image");
+    // Account, permissions, then the image page, which saves without building.
+    edit_on(&mut harness, 2);
+    assert!(engine.builds().is_empty(), "nothing the image is built from changed: {:#?}", engine.calls());
+    let written = definition(&engine, "claude-sub");
+    assert!(written.contains("model = \"c/three\""), "{written}");
+    assert!(!written.contains("lineup ="), "and no lineup beside it: {written}");
+    let read = Profile::parse("claude-sub.toml", &written).profile.expect("saved");
+    assert_eq!(read, Profile { provider: Some(crate::profile::ProviderChoice::model("yol", "c/three")), ..chosen });
+}
+
 #[test]
 fn a_rebuild_that_fails_says_the_old_image_is_kept_and_removes_nothing() {
     let engine = Rebuilt::new("rebuild-failed");

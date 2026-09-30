@@ -47,7 +47,7 @@ fn profile(name: &str, harness: HarnessKind, tag: &str, model: &str) -> Profile 
         harness,
         template: Template::Recommended,
         account: AccountKind::Provider,
-        provider: Some(ProviderChoice { tag: tag.to_owned(), model: model.to_owned() }),
+        provider: Some(ProviderChoice::model(tag, model)),
         assets: MountAccess::ReadOnly,
         network: NetworkMode::None,
         without: Vec::new(),

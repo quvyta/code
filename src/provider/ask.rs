@@ -8,11 +8,11 @@
 //!
 //! Three things are asked here.
 //!
-//! **What models there are**, and **what window each of them claims** — both from the
-//! provider's own API, never guessed and never scraped: ollama answers `/api/tags` and
-//! `/api/show`, OpenRouter answers `/api/v1/models`. A ready-made provider answers its own
-//! `/v1/models`; where that names a model without its window, the window its maker publishes is
-//! kept, and the page says where it was read.
+//! **What models there are**, **what window each of them claims** and **what each of them costs**
+//! — all from the provider's own API, never guessed and never scraped: ollama answers
+//! `/api/tags` and `/api/show`, OpenRouter answers `/api/v1/models` with a price beside every
+//! model. A ready-made provider answers its own `/v1/models`; where that names a model without its
+//! window, the window its maker publishes is kept, and the page says where it was read.
 //!
 //! **What window the server really gives**, which is the one that matters and the one nobody
 //! tells you. A model's record can say 262 144 while the endpoint a harness actually uses pins
@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::record::Published;
-use super::{Key, Measured, Model, ProviderEntry, ProviderKind, Wire};
+use super::{Key, Measured, Model, Price, ProviderEntry, ProviderKind, Wire};
 
 /// How long a single request may take before it is given up on. Generous rather than tight: a
 /// large probe on a loaded machine makes the server load a model first, and a short limit would
@@ -330,7 +330,8 @@ pub fn secret_of(entry: &ProviderEntry) -> Option<Secret> {
     entry.key.clone().map(|key| Secret { header: header.to_owned(), prefix: prefix.to_owned(), key })
 }
 
-/// What a provider offers, with the window each model claims.
+/// What a provider offers, with the window each model claims and, where the service publishes
+/// one, what each of them costs.
 ///
 /// The claimed window is asked for, not assumed: OpenRouter gives it with the listing, and an
 /// ollama server is asked about each model in turn. A model whose record cannot be read keeps
@@ -363,7 +364,7 @@ pub fn list_models(web: &Web, entry: &ProviderEntry) -> Result<Vec<Model>, AskEr
                 .into_iter()
                 .map(|id| {
                     let claimed = claimed_by_ollama(web, entry, &id);
-                    Model { id, claimed, measured: None }
+                    Model { id, claimed, measured: None, price: None }
                 })
                 .collect())
         }
@@ -383,16 +384,46 @@ pub fn list_models(web: &Web, entry: &ProviderEntry) -> Result<Vec<Model>, AskEr
                         .get("context_length")
                         .and_then(serde_json::Value::as_u64)
                         .or_else(|| published.iter().find(|known| known.id == id).map(|known| known.window));
-                    Some(Model { id, claimed, measured: None })
+                    // Only OpenRouter publishes a price per model. The others are the person's
+                    // own server or a subscription they already hold, where a model that comes
+                    // with the month costs nothing extra and there is no figure to record.
+                    let price = match entry.kind {
+                        ProviderKind::OpenRouter => openrouter_price(model, &id),
+                        _ => None,
+                    };
+                    Some(Model { id, claimed, measured: None, price })
                 })
                 .collect())
         }
     }
 }
 
+/// What OpenRouter says a model costs: free only when both halves of its price are zero.
+///
+/// A listing with no price to read falls back on the `:free` ending OpenRouter gives the models
+/// it runs for nothing, which is the one thing such a model still says about itself; anything
+/// else is left unpriced rather than guessed, because a price nobody published is what a person
+/// spends money on by believing it.
+fn openrouter_price(model: &serde_json::Value, id: &str) -> Option<Price> {
+    let halves = model.get("pricing").and_then(|pricing| {
+        // Anything but a plain zero counts as a price: OpenRouter writes `"-1"` for a router whose
+        // cost is settled per request by the model it picks, which may be any model at all.
+        let above_zero = |key: &str| {
+            let written = pricing.get(key)?.as_str()?;
+            written.parse::<f64>().ok()?.partial_cmp(&0.0).map(std::cmp::Ordering::is_ne)
+        };
+        Some((above_zero("prompt")?, above_zero("completion")?))
+    });
+    match halves {
+        Some((prompt, completion)) => Some(if prompt || completion { Price::Paid } else { Price::Free }),
+        _ if id.ends_with(":free") => Some(Price::Free),
+        _ => None,
+    }
+}
+
 /// A model as its maker publishes it.
 fn published_model(published: &Published) -> Model {
-    Model { id: published.id.to_owned(), claimed: Some(published.window), measured: None }
+    Model { id: published.id.to_owned(), claimed: Some(published.window), measured: None, price: None }
 }
 
 /// The window `model`'s own record claims on an ollama server, or `None` when the server would

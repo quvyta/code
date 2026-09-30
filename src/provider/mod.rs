@@ -39,6 +39,8 @@ mod tests;
 pub use ask::{Answer, Ask, AskError, Method, Reached, Secret, Web};
 pub use file::{AddError, PermissionProblem, Providers, permission_problems};
 pub use key::Key;
-pub use record::{CRAMPED, Measured, Model, ProviderEntry, ProviderKind, Published, Region, Wire, trim_base};
-pub use relay::{Event as RelayEvent, Listener as RelayListener, Upstream};
+pub use record::{
+    CRAMPED, Lineup, Measured, Model, Price, ProviderEntry, ProviderKind, Published, Region, Wire, trim_base,
+};
+pub use relay::{Event as RelayEvent, Listener as RelayListener, Route, Upstream};
 pub use tag::{Tag, TagError};

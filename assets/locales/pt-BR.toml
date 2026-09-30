@@ -212,6 +212,9 @@ sign-out-message = "O login guardado para este perfil é excluído. Os espaços 
 signed-out = "O login foi excluído"
 sign-out-failed = "O login não pôde ser excluído"
 
+[profile]
+lineup-paid = "Isto custa dinheiro: {models}. Um pedido que cair em um deles é pago do seu saldo do OpenRouter."
+
 [profiles.wizard]
 step-harness = "Ferramenta"
 step-system = "Sistema"
@@ -251,7 +254,11 @@ high-offline = "Os contêineres deste perfil não têm rede. O graphify funciona
 account-lead = "Com o que este perfil faz login."
 account-free-detail = "{harness} usa seus modelos gratuitos sem conta, então não há passo de login."
 provider-lead = "A qual dos seus provedores ele pergunta."
-provider-model-lead = "Qual modelo dele."
+provider-lineups = "Sequências"
+provider-models = "Modelos"
+provider-lineup-unmeasured = "O Claude Code supõe {tokens} tokens para {models} da sequência {lineup} até que sejam medidos na página Provedores."
+provider-model-filter = "Filtrar"
+provider-model-filter-none = "Nada deste provedor corresponde a isso."
 provider-none = "Ainda não há provedor. Adicione um na página Provedores e volte."
 provider-model-none = "Ainda não há modelos listados. Liste-os na página Provedores e volte."
 provider-model-unmeasured = "O Claude Code supõe {tokens} tokens para {model} até que seja medido na página Provedores."
@@ -295,6 +302,7 @@ login-again = "Tentar de novo"
 
 
 [workspace]
+provider-lineup-missing = "O provedor marcado como {tag} não tem mais uma sequência chamada {lineup}, ou ela está vazia, então esta aba não tem a quem perguntar. Escreva essa sequência de novo na página Provedores, ou mude o perfil para outro modelo ou outra sequência."
 provider-missing = "O provedor marcado como {tag} não está mais na página Provedores, então esta aba não tem a quem perguntar. Adicione-o de volta, ou mude o perfil para outro provedor."
 new-tab = "Nova aba"
 no-profiles = "Ainda sem perfil"
@@ -764,6 +772,36 @@ ready-made-models = "Modelos: {models}"
 key-needed-for = "{kind} é acessado com uma chave."
 claims-published = "o fabricante publica {claimed}"
 published-at = "{model}: a janela que o fabricante publica em {source}; o serviço não informa."
+price-free = "grátis"
+price-paid = "pago"
+
+# as ordens de um provedor: sequências com nome dos modelos dele próprio
+lineup-button = "Ordens…"
+lineup-none = "Ainda não há ordens"
+lineup-summary = "Ordens: {lineups}"
+lineup-title = "Ordens de {tag}"
+lineup-lead = "Uma ordem é uma sequência dos modelos deste provedor: o primeiro que responde é o que roda."
+lineup-empty = "Este provedor ainda não tem ordens. Uma ordem nova cria uma."
+lineup-new = "Nova ordem"
+lineup-edit = "Editar"
+lineup-delete = "Excluir"
+lineup-close = "Fechar"
+lineup-delete-title = "Excluir a ordem {name}?"
+lineup-delete-message = "Um perfil que a usa não abre até receber outra ordem para rodar."
+lineup-name = "Nome"
+lineup-name-hint = "A palavra pela qual você a escolhe. É essa palavra que um harness recebe, não o nome de um modelo."
+lineup-name-taken = "Este provedor já tem uma ordem chamada {name}."
+lineup-models = "Os modelos deste provedor"
+lineup-filter = "uma parte do nome de um modelo"
+lineup-none-match = "Nenhum modelo deste provedor combina com o que você escreveu."
+lineup-none-yet = "Ainda não há nada dentro: um modelo acima, com Enter ou um clique, entra no fim."
+lineup-refused-empty = "Não há nada dentro. Uma ordem precisa de pelo menos um modelo."
+lineup-paid = "Estes passos custam dinheiro: {models}. Uma requisição que cai em um deles gasta o seu saldo do OpenRouter."
+lineup-up = "Subir"
+lineup-down = "Descer"
+lineup-remove = "Remover"
+lineup-save = "Salvar"
+lineup-cancel = "Cancelar"
 
 # ready-made providers
 
@@ -1040,3 +1078,9 @@ discard = "Descartá-lo"
 
 [workspace.busy]
 timing = "Marcando as abas que estão trabalhando"
+
+[workspace.relay]
+listening = "Esperando saber qual modelo respondeu por uma aba"
+fell-back = "{what}: {from} respondeu {status}, agora {to}"
+fell-back-unreachable = "{what}: não foi possível falar com {from}, agora {to}"
+telling = "Retirando a linha embaixo da aba que passou para o próximo modelo"

@@ -30,8 +30,8 @@ pub enum NetworkMode {
     None,
 }
 
-/// The provider and model a profile of [`AccountKind::Provider`] runs on: the person's own tag
-/// from the Providers page, and one of that provider's models.
+/// The provider and what a profile of [`AccountKind::Provider`] runs on: the person's own tag
+/// from the Providers page, and either one of that provider's models or one of its lineups.
 ///
 /// The tag is kept as the text it was written with rather than a checked
 /// [`crate::provider::Tag`]: a profile is read long after the provider it names may have been
@@ -41,8 +41,18 @@ pub enum NetworkMode {
 pub struct ProviderChoice {
     /// The provider's tag, as the Providers page names it.
     pub tag: String,
-    /// The model asked for, as the provider itself names it.
-    pub model: String,
+    /// What the tab asks for: a model, or a lineup of the provider's own models.
+    pub pick: Pick,
+}
+
+/// What a provider profile is run on: one model, or a lineup the relay asks in the order the
+/// person wrote it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pick {
+    /// One model, by the name the provider itself gives it.
+    Model(String),
+    /// One of the provider's lineups, by the person's own name for it.
+    Lineup(String),
 }
 
 /// The environment variable Claude Code reads for another endpoint's address in place of the
@@ -54,6 +64,43 @@ pub const ANTHROPIC_BASE_URL: &str = "ANTHROPIC_BASE_URL";
 pub const ANTHROPIC_AUTH_TOKEN: &str = "ANTHROPIC_AUTH_TOKEN";
 /// The environment variable Claude Code reads for which model to ask for.
 pub const ANTHROPIC_MODEL: &str = "ANTHROPIC_MODEL";
+/// The environment variable Claude Code reads for the model its `opus` name stands for.
+///
+/// The three `ANTHROPIC_DEFAULT_*_MODEL` here and below are all set to the same name, which is
+/// what a person wants: the one choice on the profile page is the one every turn goes to, and the
+/// relay pins each request to it whatever the harness names. Claude Code resolves each of its own
+/// names in `uu()`, `Kf()` and `u1()` — it returns the variable when it is set and its own model
+/// of that name otherwise — so a harness told one name and nothing else would print Claude Code's
+/// own models in the screen and would ask for one of them on some turns.
+///
+/// All four are read in the program's own text: `@anthropic-ai/claude-code` 2.1.283, in the image
+/// the profile containers are built from.
+pub const ANTHROPIC_DEFAULT_OPUS_MODEL: &str = "ANTHROPIC_DEFAULT_OPUS_MODEL";
+/// The environment variable Claude Code reads for the model its `sonnet` name stands for; see
+/// [`ANTHROPIC_DEFAULT_OPUS_MODEL`]. Read in the same program's text (2.1.283), which carries all
+/// three names in one list of what it resolves.
+pub const ANTHROPIC_DEFAULT_SONNET_MODEL: &str = "ANTHROPIC_DEFAULT_SONNET_MODEL";
+/// The environment variable Claude Code reads for the model its `haiku` name stands for, which is
+/// the one it reaches for its own small work; see [`ANTHROPIC_DEFAULT_OPUS_MODEL`]. Read in the
+/// same program's text (2.1.283), which also says of it: "`ANTHROPIC_DEFAULT_HAIKU_MODEL` is set".
+pub const ANTHROPIC_DEFAULT_HAIKU_MODEL: &str = "ANTHROPIC_DEFAULT_HAIKU_MODEL";
+/// The environment variable Claude Code reads for the model a subagent — a background task of its
+/// own — is run on. Read in the same program's text (2.1.283), which reads it in `Noe()`: the
+/// value unless it is `inherit`, and `inherit` otherwise. Left at its own default, such a task
+/// would be run on a model of Claude Code's own instead of the person's choice.
+pub const CLAUDE_CODE_SUBAGENT_MODEL: &str = "CLAUDE_CODE_SUBAGENT_MODEL";
+
+/// Every name Claude Code is told the chosen model in: the model itself, the three names Claude
+/// Code's own `opus`, `sonnet` and `haiku` stand for, and the one its background tasks run on. A
+/// profile names one thing, so all five are that one name; see [`ANTHROPIC_DEFAULT_OPUS_MODEL`].
+pub const CLAUDE_CODE_MODEL_VARIABLES: [&str; 5] = [
+    ANTHROPIC_MODEL,
+    ANTHROPIC_DEFAULT_OPUS_MODEL,
+    ANTHROPIC_DEFAULT_SONNET_MODEL,
+    ANTHROPIC_DEFAULT_HAIKU_MODEL,
+    CLAUDE_CODE_SUBAGENT_MODEL,
+];
+
 /// The environment variable Claude Code reads for how much room the model really has.
 pub const MAX_CONTEXT_TOKENS: &str = "CLAUDE_CODE_MAX_CONTEXT_TOKENS";
 /// The room Claude Code assumes a model it has never heard of has, when `CLAUDE_CODE_MAX_CONTEXT_TOKENS`
@@ -88,9 +135,33 @@ pub const OPENAI_API_KEY: &str = "OPENAI_API_KEY";
 pub const OPENAI_MODEL: &str = "OPENAI_MODEL";
 
 impl ProviderChoice {
+    /// A profile that runs on one model of `tag`, the way every profile before a lineup existed is
+    /// written.
+    #[must_use]
+    pub fn model(tag: impl Into<String>, id: impl Into<String>) -> Self {
+        Self { tag: tag.into(), pick: Pick::Model(id.into()) }
+    }
+
+    /// A profile that runs on the lineup `name` of `tag`, whose steps the relay asks in order.
+    #[must_use]
+    pub fn lineup(tag: impl Into<String>, name: impl Into<String>) -> Self {
+        Self { tag: tag.into(), pick: Pick::Lineup(name.into()) }
+    }
+
+    /// The name a harness is told to ask for: the model's own, or the lineup's, which the relay
+    /// turns into that lineup's steps. A harness is told one name whatever it runs on, so the name
+    /// is the choice the person made rather than a step of it they never saw.
+    #[must_use]
+    pub fn asked(&self) -> &str {
+        match &self.pick {
+            Pick::Model(model) => model,
+            Pick::Lineup(name) => name,
+        }
+    }
+
     /// The environment a tab of `harness` on this provider is started with, so the harness
     /// speaks to the workspace's relay at `http://127.0.0.1:<`[`crate::provider::relay::PORT`]`>`
-    /// instead of the provider's own address, asking for [`ProviderChoice::model`]. Empty for a
+    /// instead of the provider's own address, asking for [`ProviderChoice::asked`]. Empty for a
     /// harness that is not offered a provider of one's own.
     ///
     /// `window` is what QCode measured this server really gives for that model, when it has been
@@ -135,7 +206,7 @@ impl ProviderChoice {
         );
         [
             format!("model_provider={}", toml_string(CODEX_PROVIDER)),
-            format!("model={}", toml_string(&self.model)),
+            format!("model={}", toml_string(self.asked())),
             provider,
             format!("web_search={}", toml_string("disabled")),
         ]
@@ -161,11 +232,15 @@ impl ProviderChoice {
     /// Claude Code speaks the Anthropic message shape and is pointed at another endpoint by
     /// three variables it reads once, as it starts.
     fn claude_code(&self, token: &str, window: Option<u64>) -> Vec<(String, String)> {
+        // The same name in all five of the places Claude Code looks for one, so no turn of a tab —
+        // not a background one, not a small one — can be spent on a model of Claude Code's own
+        // that the person never chose.
+        let asked = self.asked().to_owned();
         let mut environment = vec![
             (ANTHROPIC_BASE_URL.to_owned(), Self::endpoint(Wire::Anthropic)),
             (ANTHROPIC_AUTH_TOKEN.to_owned(), token.to_owned()),
-            (ANTHROPIC_MODEL.to_owned(), self.model.clone()),
         ];
+        environment.extend(CLAUDE_CODE_MODEL_VARIABLES.map(|name| (name.to_owned(), asked.clone())));
         // A model a harness has never heard of is assumed to have the room the harness's own
         // models have, which for Claude Code is 200 000 tokens. A server that really gives
         // thirty thousand then loses the front of every larger prompt without a word, and the
@@ -188,7 +263,8 @@ impl ProviderChoice {
     /// merges it over the settings the image and the bridge wrote, which keep their permission
     /// and their MCP server.
     fn opencode(&self, token: &str, window: Option<u64>) -> String {
-        let mut model = serde_json::json!({ "name": self.model });
+        let asked = self.asked();
+        let mut model = serde_json::json!({ "name": asked });
         // opencode compacts a conversation before it outgrows the window it was told of; told of
         // none, it never does, and a server that cuts the front of a long prompt cuts it in
         // silence. Only a measured window is handed over. Its configuration will not take a
@@ -198,14 +274,14 @@ impl ProviderChoice {
         if let Some(window) = window {
             model["limit"] = serde_json::json!({ "context": window, "output": 0 });
         }
-        let chosen = format!("{}/{}", self.tag, self.model);
+        let chosen = format!("{}/{}", self.tag, asked);
         serde_json::json!({
             "provider": {
                 self.tag.as_str(): {
                     "npm": "@ai-sdk/openai-compatible",
                     "name": self.tag,
                     "options": { "baseURL": Self::endpoint(Wire::OpenAi), "apiKey": token },
-                    "models": { self.model.as_str(): model },
+                    "models": { asked: model },
                 },
             },
             "model": chosen,
@@ -223,7 +299,7 @@ impl ProviderChoice {
     /// `KIMI_MODEL_MAX_CONTEXT_SIZE`), so a known window is handed over as it is to the others.
     fn kimi_code(&self, token: &str, window: Option<u64>) -> Vec<(String, String)> {
         let mut environment = vec![
-            (KIMI_MODEL_NAME.to_owned(), self.model.clone()),
+            (KIMI_MODEL_NAME.to_owned(), self.asked().to_owned()),
             (KIMI_MODEL_PROVIDER_TYPE.to_owned(), "openai".to_owned()),
             (KIMI_MODEL_BASE_URL.to_owned(), Self::endpoint(Wire::OpenAi)),
             (KIMI_MODEL_API_KEY.to_owned(), token.to_owned()),
@@ -242,7 +318,7 @@ impl ProviderChoice {
         vec![
             (OPENAI_BASE_URL.to_owned(), Self::endpoint(Wire::OpenAi)),
             (OPENAI_API_KEY.to_owned(), token.to_owned()),
-            (OPENAI_MODEL.to_owned(), self.model.clone()),
+            (OPENAI_MODEL.to_owned(), self.asked().to_owned()),
         ]
     }
 }
@@ -286,7 +362,7 @@ pub struct Profile {
     pub template: Template,
     /// What the profile signs in with.
     pub account: AccountKind,
-    /// The provider and model this profile runs on, when [`Profile::account`] is
+    /// The provider and what this profile runs on, when [`Profile::account`] is
     /// [`AccountKind::Provider`]; `None` otherwise.
     pub provider: Option<ProviderChoice>,
     /// How `Assets/` is mounted.
@@ -420,6 +496,24 @@ impl Profile {
         let provider_table = root.table(PROVIDER);
         let provider_tag = provider_table.and_then(|table| table.text(PROVIDER_TAG)).map(str::to_owned);
         let provider_model = provider_table.and_then(|table| table.text(PROVIDER_MODEL)).map(str::to_owned);
+        let provider_lineup = provider_table.and_then(|table| table.text(PROVIDER_LINEUP)).map(str::to_owned);
+        // One model or one lineup, never both: a file naming the two says it does not know which
+        // of the two the person meant, and picking one of them silently would be a guess about what
+        // their tab runs on. So it is said where the second one is and the file is not read.
+        let pick = match (provider_model, provider_lineup) {
+            (Some(model), None) => Some(Pick::Model(model)),
+            (None, Some(name)) => Some(Pick::Lineup(name)),
+            (Some(model), Some(_)) => {
+                let message = format!(
+                    "`{PROVIDER}.{PROVIDER_MODEL}` is `{model}` and `{PROVIDER}.{PROVIDER_LINEUP}` is named \
+                     as well; a profile runs on one model or on one lineup, not on both"
+                );
+                let at = provider_table.and_then(|table| table.value_location(PROVIDER_LINEUP).cloned());
+                diagnostics.push(Diagnostic::error(at, message));
+                return Loaded { profile: None, diagnostics };
+            }
+            (None, None) => None,
+        };
 
         let (Some(name), Some(harness), Some(account)) = (name, harness, account) else {
             return Loaded { profile: None, diagnostics };
@@ -430,11 +524,11 @@ impl Profile {
             diagnostics.push(Diagnostic::error(root.value_location(ACCOUNT).cloned(), message));
             return Loaded { profile: None, diagnostics };
         }
-        // A profile without a provider and model to run on cannot be told which container to
-        // point where; that is not a value to fall back on, it is the whole of what the profile
-        // is for.
+        // A profile without a provider and a model or lineup to run on cannot be told which
+        // container to point where; that is not a value to fall back on, it is the whole of what
+        // the profile is for.
         let provider = if account == AccountKind::Provider {
-            let (Some(tag), Some(model)) = (provider_tag, provider_model) else {
+            let (Some(tag), Some(pick)) = (provider_tag, pick) else {
                 let message = format!(
                     "`{ACCOUNT}` is `provider`, but no `{PROVIDER}.{PROVIDER_TAG}` and \
                                         `{PROVIDER}.{PROVIDER_MODEL}` are named"
@@ -442,7 +536,7 @@ impl Profile {
                 diagnostics.push(Diagnostic::error(root.value_location(ACCOUNT).cloned(), message));
                 return Loaded { profile: None, diagnostics };
             };
-            Some(ProviderChoice { tag, model })
+            Some(ProviderChoice { tag, pick })
         } else {
             None
         };
@@ -526,7 +620,16 @@ impl Profile {
         settings.set(&format!("{NETWORK}.{MODE}"), self.network.id().to_owned());
         if let Some(provider) = &self.provider {
             settings.set(&format!("{PROVIDER}.{PROVIDER_TAG}"), provider.tag.clone());
-            settings.set(&format!("{PROVIDER}.{PROVIDER_MODEL}"), provider.model.clone());
+            // One of the two keys, and where the model is written is where the lineup is: a file
+            // written before a lineup existed is written back byte for byte as it was read.
+            match &provider.pick {
+                Pick::Model(model) => {
+                    settings.set(&format!("{PROVIDER}.{PROVIDER_MODEL}"), model.clone());
+                }
+                Pick::Lineup(name) => {
+                    settings.set(&format!("{PROVIDER}.{PROVIDER_LINEUP}"), name.clone());
+                }
+            }
         }
         for extra in &self.without {
             settings.set(&format!("{ADDITIONS}.{}", extra.id()), false);
@@ -665,12 +768,18 @@ const MODE: &str = "mode";
 /// The table of a QCode template's additions: each part by its id, `false` where the person switched it
 /// off. A part not named is on.
 const ADDITIONS: &str = "additions";
-/// The table naming the provider and model a profile of [`AccountKind::Provider`] runs on.
+/// The table naming the provider and the model or lineup a profile of [`AccountKind::Provider`]
+/// runs on.
 const PROVIDER: &str = "provider";
 /// The key, below `[provider]`, of the provider's tag.
 const PROVIDER_TAG: &str = "tag";
-/// The key, below `[provider]`, of the model asked for.
+/// The key, below `[provider]`, of the model asked for. It is one of two: a file names either
+/// this or [`PROVIDER_LINEUP`], never both.
 const PROVIDER_MODEL: &str = "model";
+/// The key, below `[provider]`, of the lineup asked for, by the person's own name for it. The
+/// relay asks that lineup's steps in the order the provider file holds them, so what the harness
+/// is told is the lineup's name rather than any one of its models.
+const PROVIDER_LINEUP: &str = "lineup";
 
 /// What a definition file may hold. The keys a profile cannot be guessed for are required, so
 /// a missing or wrong one is an error; the rest are choices that fall back to the safer of the
@@ -685,7 +794,10 @@ fn shape() -> Shape {
         .optional(LEGACY_CODE, ValueKind::choice([Profile::CODE_MOUNT.id()]))
         .optional(ASSETS, ValueKind::choice(MountAccess::ALL.map(MountAccess::id)));
     let network = Shape::new().optional(MODE, ValueKind::choice(NetworkMode::ALL.map(NetworkMode::id)));
-    let provider = Shape::new().optional(PROVIDER_TAG, ValueKind::text()).optional(PROVIDER_MODEL, ValueKind::text());
+    let provider = Shape::new()
+        .optional(PROVIDER_TAG, ValueKind::text())
+        .optional(PROVIDER_MODEL, ValueKind::text())
+        .optional(PROVIDER_LINEUP, ValueKind::text());
     let additions =
         Extra::all().into_iter().fold(Shape::new(), |shape, extra| shape.optional(extra.id(), ValueKind::flag()));
     Shape::new()
@@ -960,9 +1072,43 @@ mode = \"full\"
         let profile = loaded.profile.expect("tag and model are both named");
         let provider = profile.provider.as_ref().expect("a provider profile carries one");
         assert_eq!(provider.tag, "ev1");
-        assert_eq!(provider.model, "qwen3.8");
+        assert_eq!(provider.asked(), "qwen3.8");
         assert!(profile.to_toml().contains("[provider]"), "{}", profile.to_toml());
         assert_eq!(Profile::parse("ev.toml", &profile.to_toml()).profile, Some(profile));
+    }
+
+    /// A profile that runs on a lineup of its provider's models: the file names the lineup rather
+    /// than a model, the harness is told the lineup's own name, and nothing else is written beside
+    /// it — a file carrying both keys says two different things about the same tab.
+    #[test]
+    fn a_profile_runs_on_a_lineup_by_its_name_and_writes_no_model() {
+        let text = "name = \"ev\"\nharness = \"claude-code\"\naccount = \"provider\"\n\n\
+                     [provider]\ntag = \"yol\"\nlineup = \"coder\"\n";
+        let loaded = Profile::parse("ev.toml", text);
+        assert_eq!(loaded.diagnostics, []);
+        let profile = loaded.profile.expect("tag and lineup are both named");
+        let provider = profile.provider.as_ref().expect("a provider profile carries one");
+        assert_eq!(provider.tag, "yol");
+        assert_eq!(provider.asked(), "coder", "a harness is told the lineup's name, not a step of it");
+        assert_eq!(provider.pick, Pick::Lineup("coder".to_owned()));
+        let written = profile.to_toml();
+        assert!(written.contains("lineup = \"coder\""), "{written}");
+        assert!(!written.contains("model ="), "no model beside the lineup: {written}");
+        assert_eq!(Profile::parse("ev.toml", &written).profile, Some(profile));
+    }
+
+    /// A file written by hand that names a model and a lineup says it does not know which of the
+    /// two the person meant; choosing one of them for them would be a guess about what their tab
+    /// runs on, so the file is not read and the second key is pointed at.
+    #[test]
+    fn a_file_naming_both_a_model_and_a_lineup_is_refused_with_the_place_of_the_second() {
+        let text = "name = \"ev\"\nharness = \"claude-code\"\naccount = \"provider\"\n\n\
+                     [provider]\ntag = \"yol\"\nmodel = \"qwen3.8\"\nlineup = \"coder\"\n";
+        let loaded = Profile::parse("ev.toml", text);
+        assert_eq!(loaded.profile, None);
+        let refused = loaded.diagnostics.iter().find(|d| d.severity == Severity::Error).expect("the reason is given");
+        assert!(refused.message.contains("model") && refused.message.contains("lineup"), "{}", refused.message);
+        assert_eq!(refused.location.as_ref().map(ToString::to_string).as_deref(), Some("ev.toml:8:10"));
     }
 
     /// A file written before this release names no provider at all, and still loads: the field
@@ -1062,6 +1208,24 @@ mode = \"full\"
 
     /// A profile written before a QCode template's parts could be switched off holds no choice, and
     /// reads as having every one of them: the same file, the same profile, the same image.
+    /// A profile file written by QCode 0.1.20, before a profile could choose a lineup. It is read
+    /// as it is and written back byte for byte, so no profile on anybody's disk changes by being
+    /// opened and saved again after this release.
+    #[test]
+    fn a_file_qcode_0_1_20_wrote_is_written_back_byte_for_byte() {
+        let text = "name = \"coder\"\nharness = \"claude-code\"\ntemplate = \"recommended\"\n\
+                    account = \"provider\"\nimage = \"qcode/profile/coder\"\n\n\
+                    [mounts]\ncode = \"rw\"\nassets = \"ro\"\n\n\
+                    [network]\nmode = \"full\"\n\n\
+                    [provider]\ntag = \"yol\"\nmodel = \"z-ai/glm-4.6:free\"\n";
+        let loaded = Profile::parse("coder.toml", text);
+        assert_eq!(loaded.diagnostics, [], "an older file is not a broken one");
+        let profile = loaded.profile.expect("the older file is complete");
+        let provider = profile.provider.as_ref().expect("a provider profile carries one");
+        assert_eq!(provider.pick, Pick::Model("z-ai/glm-4.6:free".to_owned()));
+        assert_eq!(profile.to_toml(), text, "and no `lineup` key is added to it");
+    }
+
     #[test]
     fn a_qcode_high_file_without_the_choice_has_everything_and_is_written_back_unchanged() {
         let text = COMPLETE.replace("template = \"recommended\"", "template = \"high\"");
@@ -1146,7 +1310,7 @@ mode = \"full\"
 
     #[test]
     fn a_providers_environment_carries_the_relay_and_the_model_and_never_a_key() {
-        let provider = ProviderChoice { tag: "ev1".to_owned(), model: "qwen3.8".to_owned() };
+        let provider = ProviderChoice::model("ev1", "qwen3.8");
         let env = provider.environment(HarnessKind::ClaudeCode, "tab-token-abc", None);
         let get = |env: &Vec<(String, String)>, name: &str| {
             env.iter().find(|(key, _)| key == name).map(|(_, value)| value.to_owned())
@@ -1155,7 +1319,11 @@ mode = \"full\"
         assert_eq!(get(&env, ANTHROPIC_MODEL).as_deref(), Some("qwen3.8"));
         assert_eq!(get(&env, ANTHROPIC_AUTH_TOKEN).as_deref(), Some("tab-token-abc"));
         assert_eq!(crate::provider::relay::PORT, 41417, "the address above must track the relay's real port");
-        assert_eq!(env.len(), 3, "a window nobody measured is not invented: nothing else is set");
+        assert_eq!(
+            env.len(),
+            7,
+            "the model and its four aliases, and nothing else: a window nobody measured is not invented"
+        );
 
         // A window that was measured is handed over, because a harness that has never heard of
         // this model assumes its own models' room and loses the front of every larger prompt.
@@ -1163,9 +1331,37 @@ mode = \"full\"
         assert_eq!(get(&measured, MAX_CONTEXT_TOKENS).as_deref(), Some("31512"));
     }
 
+    /// A profile that runs on a lineup is told the lineup's own name, in every place a harness is
+    /// told a model: Claude Code's five names, opencode's configuration, Kimi's and Qwen's, and
+    /// Codex's command line. Anything else would be a place where a tab asks for a model the person
+    /// did not choose.
+    #[test]
+    fn a_lineup_is_told_to_every_harness_under_its_own_name() {
+        let choice = ProviderChoice::lineup("yol", "coder");
+        assert_eq!(choice.asked(), "coder", "not a step of the lineup, and not the tag");
+        let get = |env: &Vec<(String, String)>, name: &str| {
+            env.iter().find(|(key, _)| key == name).map(|(_, value)| value.to_owned())
+        };
+        for name in CLAUDE_CODE_MODEL_VARIABLES {
+            let env = choice.environment(HarnessKind::ClaudeCode, "tab-token-abc", None);
+            assert_eq!(get(&env, name).as_deref(), Some("coder"), "{name} is told the lineup's name");
+        }
+        let env = choice.environment(HarnessKind::OpenCode, "tab-token-abc", None);
+        let config: serde_json::Value = serde_json::from_str(&env[0].1).expect("JSON");
+        assert_eq!(config["model"], "yol/coder", "opencode names the provider and the lineup");
+        assert_eq!(config["small_model"], "yol/coder", "its titles go to the same, not elsewhere");
+        assert!(config["provider"]["yol"]["models"]["coder"].is_object(), "{config}");
+        let env = choice.environment(HarnessKind::KimiCode, "tab-token-abc", None);
+        assert_eq!(get(&env, KIMI_MODEL_NAME).as_deref(), Some("coder"));
+        let env = choice.environment(HarnessKind::QwenCode, "tab-token-abc", None);
+        assert_eq!(get(&env, OPENAI_MODEL).as_deref(), Some("coder"));
+        let arguments = choice.arguments(HarnessKind::Codex);
+        assert_eq!(arguments[3], "model=\"coder\"", "{arguments:?}");
+    }
+
     #[test]
     fn opencode_is_told_of_the_relay_as_an_openai_provider_named_after_the_tag() {
-        let provider = ProviderChoice { tag: "ev1".to_owned(), model: "qwen3-coder:30b".to_owned() };
+        let provider = ProviderChoice::model("ev1", "qwen3-coder:30b");
         let env = provider.environment(HarnessKind::OpenCode, "tab-token-abc", None);
         assert_eq!(env.len(), 1, "one variable, the whole of it: {env:?}");
         assert_eq!(env[0].0, OPENCODE_CONFIG_CONTENT);
@@ -1188,7 +1384,7 @@ mode = \"full\"
 
     #[test]
     fn kimi_code_makes_an_openai_provider_of_the_relay_from_its_own_variables() {
-        let provider = ProviderChoice { tag: "ev1".to_owned(), model: "mimo-v2.6-flash".to_owned() };
+        let provider = ProviderChoice::model("ev1", "mimo-v2.6-flash");
         let env = provider.environment(HarnessKind::KimiCode, "tab-token-abc", None);
         let get = |env: &Vec<(String, String)>, name: &str| {
             env.iter().find(|(key, _)| key == name).map(|(_, value)| value.to_owned())
@@ -1204,7 +1400,7 @@ mode = \"full\"
 
     #[test]
     fn qwen_code_is_pointed_at_the_relays_openai_root() {
-        let provider = ProviderChoice { tag: "ev1".to_owned(), model: "kimi-for-coding".to_owned() };
+        let provider = ProviderChoice::model("ev1", "kimi-for-coding");
         let env = provider.environment(HarnessKind::QwenCode, "tab-token-abc", Some(31_512));
         assert_eq!(
             env,
@@ -1218,7 +1414,7 @@ mode = \"full\"
 
     #[test]
     fn a_harness_offered_no_provider_is_given_no_environment_for_one() {
-        let provider = ProviderChoice { tag: "ev1".to_owned(), model: "m".to_owned() };
+        let provider = ProviderChoice::model("ev1", "m");
         for harness in [HarnessKind::GeminiCli, HarnessKind::AntigravityIde] {
             assert!(!harness.supports(AccountKind::Provider), "{harness:?}");
             assert!(provider.environment(harness, "t", None).is_empty(), "{harness:?}");
@@ -1228,7 +1424,7 @@ mode = \"full\"
 
     #[test]
     fn codex_is_told_of_the_relay_on_its_command_line_in_the_responses_shape() {
-        let provider = ProviderChoice { tag: "ev1".to_owned(), model: "kimi-for-coding".to_owned() };
+        let provider = ProviderChoice::model("ev1", "kimi-for-coding");
         assert!(
             provider.environment(HarnessKind::Codex, "tab-token-abc", None).is_empty(),
             "nothing in the environment"
@@ -1257,7 +1453,7 @@ mode = \"full\"
 
     #[test]
     fn a_model_name_is_one_toml_string_whatever_it_holds() {
-        let provider = ProviderChoice { tag: "ev1".to_owned(), model: "a\"b\\c".to_owned() };
+        let provider = ProviderChoice::model("ev1", "a\"b\\c");
         let arguments = provider.arguments(HarnessKind::Codex);
         assert_eq!(arguments[3], "model=\"a\\\"b\\\\c\"");
         let parsed = toml::de::DeTable::parse(&arguments[3]).expect("TOML");

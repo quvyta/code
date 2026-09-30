@@ -38,12 +38,18 @@ fn canned(answers: Vec<(&'static str, &'static str)>) -> (Web, Arc<Mutex<Vec<Ask
     (web, seen)
 }
 
-/// An application on its home screen whose providers screen reads `path` and asks through `web`.
-fn app(path: &std::path::Path, web: Web) -> Harness<QCode> {
+/// An application on its home screen whose providers screen reads `path` and asks through `web`,
+/// on a terminal of this test's own size.
+fn sized(path: &std::path::Path, web: Web, size: (u16, u16)) -> Harness<QCode> {
     let store = testing::scratch("providers-store");
     let app = testing::app(testing::config(&store, &[]), &testing::settled(), None)
         .with_providers(Some(path.to_path_buf()), web);
-    testing::harness(app, SIZE.0, SIZE.1)
+    testing::harness(app, size.0, size.1)
+}
+
+/// The same, on the terminal these tests are read at.
+fn app(path: &std::path::Path, web: Web) -> Harness<QCode> {
+    sized(path, web, SIZE)
 }
 
 /// The same, already on the providers page, reached the way a person reaches it.
@@ -80,6 +86,91 @@ fn add(harness: &mut Harness<QCode>, kind: &str, tag: &str, base: &str, key: Opt
         harness.type_text(key);
     }
     press_add(harness);
+}
+
+/// A providers file of this test's own holding one OpenRouter provider with forty models, some
+/// free and some paid, as the service's own listing leaves them.
+///
+/// The three at the top are the ones the lineup tests reach for by writing a part of their name.
+/// The rest stand in for the hundreds a real listing carries, so that both the filter and the
+/// scrolling list are needed to get at one, and two of every three carry a price, because that
+/// is what a listing that publishes prices looks like.
+fn openrouter(what: &str) -> std::path::PathBuf {
+    openrouter_with(what, &[])
+}
+
+/// The same, with the lineups the file already holds: each one named, and given its steps in the
+/// order they are tried.
+fn openrouter_with(what: &str, lineups: &[(&str, &[&str])]) -> std::path::PathBuf {
+    let path = file(what);
+    let folder = path.parent().expect("its folder");
+    std::fs::create_dir_all(folder).expect("a folder");
+    let mut text = String::from(
+        "[[provider]]\ntag = \"yol\"\nkind = \"openrouter\"\nbase = \"https://openrouter.ai\"\nwire = \"openai\"\n",
+    );
+    let mut row = |id: String, price: Option<&str>| {
+        text.push_str("\n[[model]]\ntag = \"yol\"\n");
+        text.push_str(&format!("id = \"{id}\"\nclaimed-context = 262144\n"));
+        if let Some(price) = price {
+            text.push_str(&format!("price = \"{price}\"\n"));
+        }
+    };
+    for (id, price) in
+        [("qwen/qwen3-coder:free", Some("free")), ("z-ai/glm-4.6:free", Some("free")), ("z-ai/glm-4.6", Some("paid"))]
+    {
+        row(id.to_owned(), price);
+    }
+    for n in 4..=40 {
+        row(
+            format!("vendor/model-{n:02}"),
+            match n % 3 {
+                1 => Some("paid"),
+                2 => Some("free"),
+                _ => None,
+            },
+        );
+    }
+    for (name, steps) in lineups {
+        for step in *steps {
+            text.push_str("\n[[lineup]]\ntag = \"yol\"\n");
+            text.push_str(&format!("name = \"{name}\"\nmodel = \"{step}\"\n"));
+        }
+    }
+    std::fs::write(&path, text).expect("a file");
+    // As QCode itself leaves it: the two permission warnings the page carries for a folder and a
+    // file others can read would take four rows of a twenty-four row terminal away from the very
+    // buttons these tests are about.
+    #[cfg(unix)]
+    {
+        set_mode(folder, 0o700);
+        set_mode(&path, 0o600);
+    }
+    path
+}
+
+/// The same, on the page, with the lineups of that provider open, the way a person opens them.
+fn lineups(harness: &mut Harness<QCode>) {
+    harness.click_text("Lineups…").render();
+    assert!(harness.screen().contains("Lineups of yol"), "the dialog names the provider:\n{}", harness.screen());
+}
+
+/// The `[[lineup]]` rows of the file at `path`, in the order they stand in it: the name each row
+/// is for and the model of that step, read off the disk.
+fn lineups_in(path: &std::path::Path) -> Vec<(String, String)> {
+    let written = std::fs::read_to_string(path).expect("the file is there");
+    let value = |block: &str, key: &str| -> Option<String> {
+        let prefix = format!("{key} = \"");
+        block
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix.as_str()))
+            .and_then(|rest| rest.strip_suffix('"'))
+            .map(str::to_owned)
+    };
+    written
+        .split("\n[[lineup]]\n")
+        .skip(1)
+        .filter_map(|block| Some((value(block, "name")?, value(block, "model")?)))
+        .collect()
 }
 
 /// Clicks the dialog's own button, the lowest `Add` standing as a word of its own: the page's
@@ -579,14 +670,328 @@ fn a_provider_with_many_models_keeps_its_buttons_and_its_answer_on_the_screen() 
 }
 
 #[test]
+fn a_lineup_written_in_the_dialog_lands_in_the_file_in_the_order_the_person_chose() {
+    let path = openrouter("lineup-new");
+    let (web, seen) = canned(Vec::new());
+    let mut harness = opened(&path, web);
+    assert!(harness.screen().contains("No lineups yet"), "the page says it has none:\n{}", harness.screen());
+    lineups(&mut harness);
+    assert!(harness.screen().contains("no lineups yet"), "and so does the dialog:\n{}", harness.screen());
+
+    harness.click_text("New lineup").render();
+    harness.type_text("coder");
+    // The keyboard walks from the name on to the filter and on to the models, the way Tab walks
+    // it for anyone.
+    harness.press("tab");
+    harness.type_text("qwen");
+    harness.press("tab");
+    assert!(harness.is_focused("lineup-models"), "the models are under the keyboard:\n{}", harness.screen());
+    harness.press("enter");
+    let screen = harness.screen();
+    assert!(screen.contains("1. qwen/qwen3-coder:free"), "the model went in at the end:\n{screen}");
+
+    // A second one, found by clearing the filter and writing another part of a name, and put in
+    // by a click on its row.
+    harness.press("shift+tab");
+    for _ in 0..4 {
+        harness.press("backspace");
+    }
+    harness.type_text("glm");
+    harness.click_text("z-ai/glm-4.6:free").render();
+    let screen = harness.screen();
+    assert!(screen.contains("2. z-ai/glm-4.6:free"), "the row under the pointer went in too:\n{screen}");
+
+    // The step that fell back is the one that goes first, so the second step is put above the
+    // first and the person sees the order change where they chose it.
+    harness.click_text("2. z-ai/glm-4.6:free").render();
+    harness.click_text("Up").render();
+    let screen = harness.screen();
+    let step = |n: u8| {
+        screen.lines().find(|line| line.contains(&format!("{n}. "))).unwrap_or_else(|| panic!("step {n}:\n{screen}"))
+    };
+    assert!(step(1).contains("z-ai/glm-4.6:free"), "the one chosen is first:\n{screen}");
+    assert!(step(2).contains("qwen/qwen3-coder:free"), "and the one it was put above is second:\n{screen}");
+
+    harness.click_text("Save").render();
+    let written = lineups_in(&path);
+    assert_eq!(
+        written,
+        [
+            ("coder".to_owned(), "z-ai/glm-4.6:free".to_owned()),
+            ("coder".to_owned(), "qwen/qwen3-coder:free".to_owned())
+        ],
+        "two rows in the file, in the order they are tried:"
+    );
+    let text = std::fs::read_to_string(&path).expect("the file is there");
+    assert_eq!(text.matches("[[lineup]]").count(), 2, "and no other block of them: {text}");
+    assert!(harness.screen().contains("coder"), "the dialog shows what was saved:\n{}", harness.screen());
+    harness.press("esc").render();
+    let screen = harness.screen();
+    assert!(
+        screen.contains("Lineups: coder (z-ai/glm-4.6:free → qwen/qwen3-coder:free)"),
+        "the page names it and the models it tries:\n{screen}"
+    );
+    assert_eq!(seen.lock().expect("the list").len(), 0, "writing a lineup reached nothing");
+    let _ = std::fs::remove_dir_all(path.parent().expect("its folder"));
+}
+
+#[test]
+fn a_step_taken_out_of_a_lineup_in_the_editor_is_one_row_shorter_in_the_file() {
+    let path = openrouter_with("lineup-edit", &[("coder", &["qwen/qwen3-coder:free", "z-ai/glm-4.6:free"])]);
+    let (web, _) = canned(Vec::new());
+    let mut harness = opened(&path, web);
+    assert!(
+        harness.screen().contains("Lineups: coder (qwen/qwen3-coder:free → z-ai/glm-4.6:free)"),
+        "the page reads the order out of the file:\n{}",
+        harness.screen()
+    );
+
+    lineups(&mut harness);
+    harness.click_text("Edit").render();
+    let screen = harness.screen();
+    assert!(screen.contains("1. qwen/qwen3-coder:free") && screen.contains("2. z-ai/glm-4.6:free"), "{screen}");
+    harness.click_text("2. z-ai/glm-4.6:free").render();
+    harness.click_text("Remove").render();
+    let screen = harness.screen();
+    assert!(screen.contains("1. qwen/qwen3-coder:free"), "what is left is the first row now:\n{screen}");
+    assert!(!screen.contains("2. z-ai"), "and the one that was taken out is gone:\n{screen}");
+
+    harness.click_text("Save").render();
+    assert_eq!(
+        lineups_in(&path),
+        [("coder".to_owned(), "qwen/qwen3-coder:free".to_owned())],
+        "one row left in the file"
+    );
+    let _ = std::fs::remove_dir_all(path.parent().expect("its folder"));
+}
+
+#[test]
+fn a_lineup_is_not_saved_without_a_name_it_can_hold_a_name_taken_or_a_model_in_it() {
+    let path = openrouter_with("lineup-refused", &[("coder", &["qwen/qwen3-coder:free"])]);
+    let (web, _) = canned(Vec::new());
+    let mut harness = opened(&path, web);
+    lineups(&mut harness);
+    harness.click_text("New lineup").render();
+
+    // A name that could stand in front of a model is no use as a name a harness is told.
+    harness.type_text("2coder");
+    harness.press("tab");
+    harness.press("tab");
+    harness.press("enter");
+    harness.click_text("Save").render();
+    let screen = harness.screen();
+    assert!(screen.contains("not with 2"), "the reason is beside the name field:\n{screen}");
+    assert!(screen.contains("Name"), "which is still the field the editor opens on:\n{screen}");
+
+    // A name this provider already answers to would leave nothing to tell two orders apart.
+    harness.click_text("Name").render();
+    for _ in 0..8 {
+        harness.press("backspace");
+    }
+    harness.type_text("coder");
+    harness.click_text("Save").render();
+    let screen = harness.screen();
+    assert!(screen.contains("already has a lineup called coder"), "and that one says which:\n{screen}");
+
+    // Nothing in it is not an order: a request that failed on the first model would have nothing
+    // to fall back to. The lineup is left and a new one started, so there is nothing in this one
+    // either.
+    harness.click_text("Cancel").render();
+    harness.click_text("New lineup").render();
+    harness.type_text("yeni");
+    harness.click_text("Save").render();
+    let screen = harness.screen();
+    assert!(screen.contains("There is nothing in it"), "an empty one is refused in words:\n{screen}");
+    assert!(!screen.contains("New lineup"), "and the editor is still open:\n{screen}");
+    assert!(screen.contains("yeni"), "with what was written in the name field:\n{screen}");
+
+    assert_eq!(lineups_in(&path), [("coder".to_owned(), "qwen/qwen3-coder:free".to_owned())], "nothing was written:");
+    let _ = std::fs::remove_dir_all(path.parent().expect("its folder"));
+}
+
+#[test]
+fn a_step_that_costs_money_is_said_where_the_order_is_chosen_and_stops_being_said_when_it_is_taken_out() {
+    let path = openrouter("lineup-paid");
+    let (web, _) = canned(Vec::new());
+    let mut harness = opened(&path, web);
+    lineups(&mut harness);
+    harness.click_text("New lineup").render();
+    harness.type_text("mali");
+    harness.press("tab");
+    harness.type_text("glm");
+    harness.press("tab");
+    // The paid model of a name stands under its free twin, so the row is the one below it.
+    let (x, y) = harness.find("z-ai/glm-4.6:free").expect("the free twin is listed first");
+    harness.click(x, y + 1).render();
+    let screen = harness.screen();
+    // The paid step beside the free one of the same name, and what a request that falls back to
+    // it costs.
+    assert!(screen.contains("paid"), "the row of the model says what it costs:\n{screen}");
+    assert!(screen.contains("These steps cost money: z-ai/glm-4.6"), "and the warning names it:\n{screen}");
+    assert!(screen.contains("OpenRouter balance"), "and what is spent:\n{screen}");
+
+    // A free step beside it, so the order can still be saved once the paid one is taken out.
+    harness.press("shift+tab");
+    for _ in 0..3 {
+        harness.press("backspace");
+    }
+    harness.type_text("qwen");
+    harness.press("tab");
+    harness.press("enter");
+    let screen = harness.screen();
+    assert!(screen.contains("These steps cost money: z-ai/glm-4.6"), "and it is the only one named:\n{screen}");
+
+    harness.click_text("1. z-ai/glm-4.6").render();
+    harness.click_text("Remove").render();
+    let screen = harness.screen();
+    assert!(!screen.contains("These steps cost money"), "nothing in the order costs money now:\n{screen}");
+    harness.click_text("Save").render();
+    assert_eq!(
+        lineups_in(&path),
+        [("mali".to_owned(), "qwen/qwen3-coder:free".to_owned())],
+        "and what was kept is what is left of it:"
+    );
+    let _ = std::fs::remove_dir_all(path.parent().expect("its folder"));
+}
+
+#[test]
+fn deleting_a_lineup_asks_first_and_takes_its_rows_out_of_the_file() {
+    let path = openrouter_with(
+        "lineup-delete",
+        &[("coder", &["qwen/qwen3-coder:free", "z-ai/glm-4.6:free"]), ("fast", &["vendor/model-04"])],
+    );
+    let (web, _) = canned(Vec::new());
+    let mut harness = opened(&path, web);
+    lineups(&mut harness);
+    harness.click_text("Delete").render();
+    let screen = harness.screen();
+    assert!(screen.contains("Delete the lineup coder?"), "the question is asked first:\n{screen}");
+    // A profile that runs on this order would have nothing to run on, and the person is told it
+    // before the rows go rather than when a tab refuses to open. The question is a window over the
+    // list it was asked from, so it is read in the two halves its own width gives it.
+    assert!(screen.contains("A profile that uses it will not open until it is"), "{screen}");
+    assert!(screen.contains("given another order to run."), "{screen}");
+    harness.press("esc").render();
+    assert_eq!(lineups_in(&path).len(), 3, "the answer was no, so every row is where it was:\n{}", harness.screen());
+
+    harness.click_text("coder").render();
+    harness.click_text("Delete").render();
+    harness.press("tab").press("enter").render();
+    assert_eq!(
+        lineups_in(&path),
+        [("fast".to_owned(), "vendor/model-04".to_owned())],
+        "the rows of that lineup are gone and the other one is not:"
+    );
+    let screen = harness.screen();
+    // The page names what this provider has left, and the one that was deleted is not in it. Read
+    // by its own beginning rather than by a word of it: a model of a provider may well be called
+    // qwen3-coder.
+    assert!(screen.contains("Lineups: fast (vendor/model-04)"), "and the page names what is left:\n{screen}");
+    assert!(!screen.contains("Lineups: coder"), "the deleted one is not named:\n{screen}");
+    let _ = std::fs::remove_dir_all(path.parent().expect("its folder"));
+}
+
+/// Whether a model row says what the service published for it, and what a model it published
+/// nothing for says instead.
+#[test]
+fn every_model_row_says_what_the_service_says_it_costs() {
+    let path = openrouter("prices");
+    let (web, _) = canned(Vec::new());
+    let harness = opened(&path, web);
+    let screen = harness.screen();
+    // The row of one model, read by its own name and by where that name ends: `z-ai/glm-4.6` is
+    // also the beginning of `z-ai/glm-4.6:free`, which is another model at another price.
+    let row = |id: &str| {
+        screen
+            .lines()
+            .find(|line| line.match_indices(id).any(|(at, _)| line[at + id.len()..].starts_with(' ')))
+            .unwrap_or_else(|| panic!("the row of {id} is not on the screen:\n{screen}"))
+            .to_owned()
+    };
+    assert!(row("qwen/qwen3-coder:free").contains("free"), "a free model says so:\n{screen}");
+    assert!(row("z-ai/glm-4.6:free").contains("free"), "and the free one beside it too:\n{screen}");
+    assert!(row("z-ai/glm-4.6").contains("paid"), "a paid one says what it is:\n{screen}");
+    // A model the service published no price for is not given one, and its row is left as it was.
+    let unpriced = row("vendor/model-06");
+    assert!(!unpriced.contains("free") && !unpriced.contains("paid"), "{unpriced}");
+    let _ = std::fs::remove_dir_all(path.parent().expect("its folder"));
+}
+
+#[test]
+fn the_lineups_dialog_keeps_its_buttons_and_scrolls_at_eighty_by_twenty_four() {
+    use qframe::event::MouseKind;
+
+    let path = openrouter("lineup-small");
+    let (web, _) = canned(Vec::new());
+    let mut harness = sized(&path, web, (80, 24));
+    harness.click_text("Providers").render();
+    lineups(&mut harness);
+    harness.click_text("New lineup").render();
+    harness.type_text("coder");
+    let screen = harness.screen();
+    for label in ["Up", "Down", "Remove", "Cancel", "Save"] {
+        assert!(screen.contains(label), "80x24: `{label}` is on the screen:\n{screen}");
+    }
+
+    // The keyboard walks on to the filter the way Tab walks it for anyone, and what the filter
+    // leaves is the list of models, not however many the provider offers.
+    harness.press("tab");
+    harness.type_text("model");
+    let screen = harness.screen();
+    assert!(screen.contains("vendor/model-04"), "80x24: the models it keeps are in the list:\n{screen}");
+    assert!(!screen.contains("z-ai/glm-4.6"), "and the ones it does not are not:\n{screen}");
+
+    // The wheel moves that list inside the dialog, and a model at the far end of forty comes into
+    // it: a person who cannot see a model cannot pick it.
+    let (x, y) = harness.find("vendor/model-04").expect("the row of a model");
+    for _ in 0..40 {
+        harness.mouse(MouseKind::ScrollDown, x, y);
+    }
+    let screen = harness.screen();
+    assert!(screen.contains("vendor/model-40"), "80x24: the list scrolled to the end of them:\n{screen}");
+    assert!(!screen.contains("vendor/model-04"), "and the first is out of it:\n{screen}");
+
+    // The last of them is what Return puts in the lineup, the one the list has under the keyboard.
+    harness.press("tab");
+    assert!(harness.is_focused("lineup-models"), "80x24: the models are under the keyboard:\n{}", harness.screen());
+    harness.press("end").press("enter");
+    let screen = harness.screen();
+    assert!(screen.contains("1. vendor/model-40"), "80x24: and it went in at the end:\n{screen}");
+
+    // The lineup it is in scrolls as it grows, and the buttons under it are still on the screen.
+    for _ in 0..8 {
+        harness.press("down");
+        harness.press("enter");
+    }
+    let screen = harness.screen();
+    for label in ["Up", "Down", "Remove", "Cancel", "Save"] {
+        assert!(screen.contains(label), "80x24: `{label}` is still on the screen:\n{screen}");
+    }
+    // A step of the order is told from a model of the provider by the number in front of it, so
+    // the two rows the list has are the only lines on the screen that carry one.
+    let steps: Vec<&str> = screen.lines().filter(|line| line.contains(". vendor/model-")).collect();
+    assert_eq!(steps.len(), 2, "80x24: the order takes the rows the list has and scrolls:\n{screen}");
+    assert!(steps[1].contains("9. vendor/model-11"), "80x24: with the last step under the hand in them:\n{screen}");
+    let _ = std::fs::remove_dir_all(path.parent().expect("its folder"));
+}
+
+#[test]
 fn turkish_reads_as_turkish() {
-    let path = file("turkish");
+    let path = openrouter("turkish");
     let (web, _) = canned(Vec::new());
     let mut harness = opened(&path, web);
     harness.set_locale("tr").render();
     let screen = harness.screen();
     assert!(screen.contains("Sağlayıcılar"), "{screen}");
     assert!(screen.contains("düz metin"), "the key-file line is Turkish too:\n{screen}");
+    // A lineup is called a sıra in Turkish, the word the owner used for it, and the dialog speaks
+    // of the same thing rather than of a line of models.
+    assert!(screen.contains("Sıralar"), "and the lineups are sıralar:\n{screen}");
+    harness.click_text("Sıralar…").render();
+    let screen = harness.screen();
+    assert!(screen.contains("Henüz sıra yok"), "{screen}");
+    assert!(screen.contains("Yeni sıra"), "and the button makes one:\n{screen}");
+    let _ = std::fs::remove_dir_all(path.parent().expect("its folder"));
 }
 
 #[test]

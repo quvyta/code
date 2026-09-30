@@ -10,8 +10,8 @@ use qframe::diagnostics::Severity;
 
 use super::ask::{self, Reached, listing, probing, trial};
 use super::{
-    AddError, Answer, Ask, AskError, Key, Measured, Model, PermissionProblem, ProviderEntry, ProviderKind, Providers,
-    Tag, Web, Wire, permission_problems,
+    AddError, Answer, Ask, AskError, Key, Lineup, Measured, Model, PermissionProblem, Price, ProviderEntry,
+    ProviderKind, Providers, Tag, Web, Wire, permission_problems,
 };
 
 /// Not anyone's key: the characters say so.
@@ -43,6 +43,60 @@ measured = \"about\"
 tag = \"yol\"
 id = \"nex-agi/nex-n2.5-mini:free\"
 claimed-context = 131072
+
+";
+
+/// One provider with two lineups under it, of three steps and of two, and a model of each price
+/// the listing gave.
+const TWO_LINEUPS: &str = "\
+[[provider]]
+tag = \"yol\"
+kind = \"openrouter\"
+base = \"https://openrouter.ai\"
+wire = \"anthropic\"
+
+[[model]]
+tag = \"yol\"
+id = \"z-ai/glm-4.6:free\"
+claimed-context = 131072
+price = \"free\"
+
+[[model]]
+tag = \"yol\"
+id = \"qwen/qwen3-coder:free\"
+claimed-context = 32768
+price = \"free\"
+
+[[model]]
+tag = \"yol\"
+id = \"z-ai/glm-4.6\"
+claimed-context = 262144
+price = \"paid\"
+
+[[lineup]]
+tag = \"yol\"
+name = \"coder\"
+model = \"z-ai/glm-4.6:free\"
+
+[[lineup]]
+tag = \"yol\"
+name = \"coder\"
+model = \"qwen/qwen3-coder:free\"
+
+[[lineup]]
+tag = \"yol\"
+name = \"coder\"
+model = \"z-ai/glm-4.6\"
+
+[[lineup]]
+tag = \"yol\"
+name = \"geci\"
+model = \"qwen/qwen3-coder:free\"
+
+[[lineup]]
+tag = \"yol\"
+name = \"geci\"
+model = \"z-ai/glm-4.6\"
 
 ";
 
@@ -156,6 +210,102 @@ fn a_window_that_is_not_a_count_of_tokens_is_reported_and_left_out() {
     let loaded = Providers::parse("providers.toml", text);
     assert_eq!(loaded.value.get("ev").expect("the provider").models[0].claimed, None);
     assert!(loaded.diagnostics.iter().any(|d| d.message.contains("-5")), "{:?}", loaded.diagnostics);
+}
+
+#[test]
+fn the_lineups_of_a_provider_read_back_in_the_order_they_are_tried_in() {
+    let providers = read(TWO_LINEUPS);
+    let road = providers.get("yol").expect("the provider");
+    let names: Vec<&str> = road.lineups.iter().map(|lineup| lineup.name.as_str()).collect();
+    assert_eq!(names, ["coder", "geci"], "which lineup comes first is the file's own");
+    let steps: Vec<Vec<&str>> =
+        road.lineups.iter().map(|lineup| lineup.models.iter().map(String::as_str).collect()).collect();
+    assert_eq!(
+        steps,
+        [
+            vec!["z-ai/glm-4.6:free", "qwen/qwen3-coder:free", "z-ai/glm-4.6"],
+            vec!["qwen/qwen3-coder:free", "z-ai/glm-4.6"],
+        ],
+        "three steps and then two, in the order they were written"
+    );
+    assert_eq!(providers.to_toml(), TWO_LINEUPS);
+    assert_eq!(read(&providers.to_toml()).entries(), providers.entries(), "and writing it back changes nothing");
+    assert_eq!(road.model("z-ai/glm-4.6").expect("its model").price, Some(Price::Paid));
+}
+
+#[test]
+fn a_step_of_a_provider_nobody_read_is_reported_and_dropped_while_the_rest_of_the_file_is_read() {
+    let text = "[[provider]]\ntag = \"ev\"\nkind = \"ollama\"\nbase = \"http://h:1\"\n\n\
+                [[lineup]]\ntag = \"yok\"\nname = \"coder\"\nmodel = \"q\"\n\n\
+                [[lineup]]\ntag = \"ev\"\nname = \"coder\"\nmodel = \"q\"\n";
+    let loaded = Providers::parse("providers.toml", text);
+    let warned: Vec<_> = loaded.diagnostics.iter().filter(|d| d.severity == Severity::Warning).collect();
+    assert_eq!(warned.len(), 1, "{:?}", loaded.diagnostics);
+    assert_eq!(warned[0].location.as_ref().map(ToString::to_string).as_deref(), Some("providers.toml:7:7"));
+    assert!(warned[0].message.contains("yok"), "{}", warned[0].message);
+    assert_eq!(
+        loaded.value.get("ev").expect("the provider").lineup("coder").expect("its lineup").models,
+        ["q"],
+        "the step below it is still read"
+    );
+}
+
+#[test]
+fn a_lineup_name_that_would_read_as_something_else_is_named_where_it_stands() {
+    let text = "[[provider]]\ntag = \"ev\"\nkind = \"ollama\"\nbase = \"http://h:1\"\n\n\
+                [[lineup]]\ntag = \"ev\"\nname = \"coder/ekip\"\nmodel = \"q\"\n\n\
+                [[lineup]]\ntag = \"ev\"\nname = \"coder\"\nmodel = \"q\"\n";
+    let loaded = Providers::parse("providers.toml", text);
+    let refused = loaded.diagnostics.iter().find(|d| d.severity == Severity::Warning).expect("the reason is given");
+    assert_eq!(refused.location.as_ref().map(ToString::to_string).as_deref(), Some("providers.toml:8:8"));
+    assert!(refused.message.contains("coder/ekip"), "{}", refused.message);
+    let entry = loaded.value.get("ev").expect("the provider");
+    assert_eq!(entry.lineup("coder/ekip"), None, "a name that is not a tag is not kept");
+    assert_eq!(entry.lineup("coder").expect("the lineup that does").models, ["q"]);
+}
+
+#[test]
+fn a_model_twice_in_one_lineup_is_kept_once_and_the_second_step_is_reported_where_it_stands() {
+    let text = "[[provider]]\ntag = \"ev\"\nkind = \"ollama\"\nbase = \"http://h:1\"\n\n\
+                [[lineup]]\ntag = \"ev\"\nname = \"coder\"\nmodel = \"q\"\n\n\
+                [[lineup]]\ntag = \"ev\"\nname = \"coder\"\nmodel = \"q\"\n";
+    let loaded = Providers::parse("providers.toml", text);
+    let warned: Vec<_> = loaded.diagnostics.iter().filter(|d| d.severity == Severity::Warning).collect();
+    assert_eq!(warned.len(), 1, "{:?}", loaded.diagnostics);
+    assert_eq!(warned[0].location.as_ref().map(ToString::to_string).as_deref(), Some("providers.toml:14:9"));
+    assert_eq!(
+        loaded.value.get("ev").expect("the provider").lineup("coder").expect("its lineup").models,
+        ["q"],
+        "the same model twice in a lineup would send the same request twice"
+    );
+}
+
+#[test]
+fn a_step_of_a_model_the_provider_is_not_listing_is_kept_because_the_listing_may_be_the_older_of_the_two() {
+    let text = "[[provider]]\ntag = \"ev\"\nkind = \"ollama\"\nbase = \"http://h:1\"\n\n\
+                [[lineup]]\ntag = \"ev\"\nname = \"coder\"\nmodel = \"qwen3.8:latest\"\n";
+    let loaded = Providers::parse("providers.toml", text);
+    assert_eq!(loaded.diagnostics, [], "a step is never judged against the listing");
+    assert_eq!(
+        loaded.value.get("ev").expect("the provider").lineup("coder").expect("its lineup").models,
+        ["qwen3.8:latest"]
+    );
+}
+
+#[test]
+fn a_lineup_edited_under_its_own_name_keeps_where_it_stands_and_a_removed_one_says_so() {
+    let mut providers = read(TWO_LINEUPS);
+    providers.set_lineup("yol", Lineup { name: tag("coder"), models: vec!["qwen/qwen3-coder:free".to_owned()] });
+    providers.set_lineup("yol", Lineup { name: tag("ilk"), models: vec!["z-ai/glm-4.6:free".to_owned()] });
+    let road = providers.get("yol").expect("the provider");
+    let names: Vec<&str> = road.lineups.iter().map(|lineup| lineup.name.as_str()).collect();
+    assert_eq!(names, ["coder", "geci", "ilk"], "an edited lineup keeps its place and a new one goes last");
+    assert_eq!(road.lineup("coder").expect("the edited lineup").models, ["qwen/qwen3-coder:free"]);
+
+    assert!(providers.remove_lineup("yol", "coder"), "there was a lineup of that name");
+    assert_eq!(providers.get("yol").expect("the provider").lineup("coder"), None);
+    assert!(!providers.remove_lineup("yol", "coder"), "and none of that name the second time");
+    assert!(!providers.remove_lineup("yok", "geci"), "another provider is another list of lineups");
 }
 
 #[test]
@@ -574,6 +724,49 @@ fn a_file_written_before_the_ready_made_kinds_reads_and_writes_back_unchanged() 
     );
 }
 
+/// A providers file exactly as QCode wrote it at 0.1.20: every provider first, then every model,
+/// with no price on a model and no lineup anywhere — the two things the file learned to hold
+/// afterwards. A file written then must not move a byte when it is saved again.
+const WRITTEN_BY_0_1_20: &str = "\
+[[provider]]
+tag = \"ev\"
+kind = \"ollama\"
+base = \"http://192.168.122.1:11434\"
+wire = \"anthropic\"
+
+[[provider]]
+tag = \"mimo\"
+kind = \"mimo-token-plan\"
+base = \"https://token-plan-sgp.xiaomimimo.com\"
+wire = \"anthropic\"
+key = \"not-a-real-key-0000-wxyz\"
+
+[[model]]
+tag = \"ev\"
+id = \"qwen3.8:latest\"
+claimed-context = 262144
+measured-context = 31512
+measured = \"about\"
+
+[[model]]
+tag = \"mimo\"
+id = \"mimo-v2.6-flash\"
+claimed-context = 1048576
+
+";
+
+#[test]
+fn a_file_written_before_prices_and_lineups_existed_reads_and_writes_back_unchanged() {
+    let providers = read(WRITTEN_BY_0_1_20);
+    assert_eq!(providers.to_toml(), WRITTEN_BY_0_1_20, "not a byte of an older file moves when it is saved again");
+    let home = providers.get("ev").expect("the ollama server");
+    assert_eq!(home.model("qwen3.8:latest").expect("its model").price, None, "and no price is invented for one");
+    assert_eq!(home.lineups, [], "a file with no lineup in it has none");
+    let plan = providers.get("mimo").expect("the ready-made kind");
+    assert_eq!(plan.models[0].claimed, Some(1_048_576));
+    assert_eq!(plan.lineups, []);
+}
+
 #[test]
 fn a_ready_made_provider_is_written_with_its_kind_and_reads_back_as_itself() {
     let mut providers = Providers::in_memory();
@@ -626,6 +819,56 @@ fn kimi_gives_each_models_window_with_its_listing_and_that_is_taken_over_the_pub
     let asked = seen.lock().expect("the list");
     assert_eq!(asked[0].line(), "GET https://api.kimi.com/coding/v1/models");
     assert_eq!(asked[0].secret.as_ref().expect("with the key").header, "x-api-key");
+}
+
+#[test]
+fn openrouter_says_what_each_model_costs_and_a_model_it_says_nothing_about_is_left_unpriced() {
+    // The four shapes a listing really has: two prices read, and two models with no `pricing` at
+    // all, one of which still ends in the `:free` OpenRouter gives what it runs for nothing.
+    let body = r#"{"data":[
+        {"id":"z-ai/glm-4.6:free","context_length":131072,"pricing":{"prompt":"0","completion":"0"}},
+        {"id":"z-ai/glm-4.6","context_length":262144,"pricing":{"prompt":"0.000002","completion":"0.000008"}},
+        {"id":"x/y:free","context_length":32768},
+        {"id":"x/z","context_length":1048576}
+    ]}"#;
+    let (web, _) = canned(vec![("/api/v1/models", body)]);
+    let mut entry = ProviderEntry::new(tag("yol"), ProviderKind::OpenRouter, "https://openrouter.ai");
+    entry.key = Key::new(MADE_UP);
+    let models = ask::list_models(&web, &entry).expect("the service answered");
+    let prices: Vec<Option<Price>> = models.iter().map(|model| model.price).collect();
+    assert_eq!(
+        prices,
+        [Some(Price::Free), Some(Price::Paid), Some(Price::Free), None],
+        "both halves at zero is free, either above zero is paid, and a name ending in `:free` is all a model without a price still says"
+    );
+}
+
+#[test]
+fn a_price_openrouter_only_settles_per_request_is_never_called_free() {
+    // OpenRouter's own router lists `"-1"` for both halves: what it costs is decided by whichever
+    // model it picks for a request. Read as a number that is below zero, and a model that can
+    // spend money must not be shown as one that cannot.
+    let body = r#"{"data":[
+        {"id":"openrouter/auto","context_length":2000000,"pricing":{"prompt":"-1","completion":"-1"}},
+        {"id":"odd/mix:free","context_length":8192,"pricing":{"prompt":"0","completion":"-1"}}
+    ]}"#;
+    let (web, _) = canned(vec![("/api/v1/models", body)]);
+    let mut entry = ProviderEntry::new(tag("yol"), ProviderKind::OpenRouter, "https://openrouter.ai");
+    entry.key = Key::new(MADE_UP);
+    let models = ask::list_models(&web, &entry).expect("the service answered");
+    let prices: Vec<Option<Price>> = models.iter().map(|model| model.price).collect();
+    assert_eq!(prices, [Some(Price::Paid), Some(Price::Paid)], "a price settled later may be any price");
+}
+
+#[test]
+fn a_price_belongs_to_whoever_sells_the_request_and_is_not_read_from_a_service_that_has_none() {
+    // Xiaomi's subscription gives nothing per model to record, so an answer that carried a price
+    // anyway would be a figure about somebody else's model rather than about this month's bill.
+    let (web, _) =
+        canned(vec![("/v1/models", r#"{"data":[{"id":"mimo-v2.5","pricing":{"prompt":"1","completion":"2"}}]}"#)]);
+    assert_eq!(ask::list_models(&web, &mimo()).expect("the service answered")[0].price, None);
+    let (web, _) = canned(vec![("/api/tags", r#"{"models":[{"name":"qwen3.8:latest"}]}"#)]);
+    assert_eq!(ask::list_models(&web, &ollama()).expect("the server answered")[0].price, None);
 }
 
 #[test]

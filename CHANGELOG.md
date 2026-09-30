@@ -5,6 +5,21 @@ Every release of quvyta-code, newest first. The format follows
 [Semantic Versioning](https://semver.org/); while the version starts with 0, a minor release may
 change files qcode writes, and the notes say so when it does.
 
+## 0.1.21 - 2026-09-30
+
+### Added
+
+- **Lineups.** A lineup is a named order of one provider's models, for example `coder`: first `z-ai/glm-4.6:free`, then `qwen/qwen3.8-27b:free`. **Lineups…** under a provider on the Providers page makes, edits and deletes them; deleting one asks first and says which profiles will not start without it.
+- **A profile runs on a lineup.** When a profile signs in with a provider of your own, one list offers the provider's lineups on top and its models below. The profile file says `lineup = "coder"`; profile files written before read and write back unchanged. A tab whose lineup is gone does not start and says which lineup of which provider is missing.
+- **The next step answers when one is busy.** When a model answers busy (429), out of credit (402), with a server error, not at all, or that it does not exist, the same message is asked of the lineup's next model and the failed one is skipped for a minute. A refused key or a malformed message is not carried on, since every step would answer the same.
+- **The tab says when it fell back.** A line under the tab names the model asked instead, for example `coder: z-ai/glm-4.6:free answered 429, now qwen/qwen3.8-27b:free`, and goes away after ten seconds.
+- **Free or paid, on every model row.** OpenRouter models are marked free or paid from the prices OpenRouter publishes; a model priced per request, such as OpenRouter's own router, counts as paid. A lineup or a chosen model with a paid step gets a warning line naming those steps.
+
+### Changed
+
+- **Every message goes to the model you chose.** A tab on a provider of your own sends each request to the profile's model, or to the current step of its lineup, whatever model the harness asks for. A harness asking for a small model of its own for background work can no longer reach one you did not pick, perhaps one that costs money. Claude Code is given that one name for every model it can ask for.
+- **The wizard's model list scrolls and filters.** A provider with hundreds of models no longer pushes the wizard's buttons off the screen; the list takes the room that is left and has a filter above it.
+
 ## 0.1.20 - 2026-09-29
 
 ### Added

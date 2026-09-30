@@ -212,6 +212,9 @@ sign-out-message = "为这个配置档保存的登录信息会被删除。已经
 signed-out = "登录信息已删除"
 sign-out-failed = "登录信息没能删除"
 
+[profile]
+lineup-paid = "这些要花钱：{models}。请求一旦落到其中一个，就从你的 OpenRouter 余额里扣。"
+
 [profiles.wizard]
 step-harness = "工具"
 step-system = "系统"
@@ -251,7 +254,11 @@ high-offline = "此配置的容器没有网络。graphify 无需网络即可工�
 account-lead = "这个配置档用什么登录。"
 account-free-detail = "{harness} 无需账户即可使用免费模型，所以没有登录步骤。"
 provider-lead = "它询问你的哪个提供方。"
-provider-model-lead = "它的哪个模型。"
+provider-lineups = "序列"
+provider-models = "模型"
+provider-lineup-unmeasured = "在“提供方”页面测出之前，Claude Code 假定 {lineup} 里的 {models} 有 {tokens} 个词元。"
+provider-model-filter = "筛选"
+provider-model-filter-none = "这个提供方没有匹配的东西。"
 provider-none = "还没有提供方。先在“提供方”页面添加一个，再回来。"
 provider-model-none = "还没有列出模型。先在“提供方”页面列出，再回来。"
 provider-model-unmeasured = "在“提供方”页面测出之前，Claude Code 假定 {model} 有 {tokens} 个词元。"
@@ -295,6 +302,7 @@ login-again = "再试一次"
 
 
 [workspace]
+provider-lineup-missing = "标签为 {tag} 的提供方已经没有一个叫 {lineup} 的序列了，或者里面已经空了，所以这个标签页没有可问的对象。把它在“提供方”页面上重新写出来，或者把这个档案换成另一个模型或另一个序列。"
 provider-missing = "标签为 {tag} 的提供方已经不在“提供方”页面上了，这个标签页没有可问的对象。把它重新添加回去，或者把这个档案换成另一个提供方。"
 new-tab = "新建标签页"
 no-profiles = "还没有配置档"
@@ -764,6 +772,36 @@ ready-made-models = "模型：{models}"
 key-needed-for = "访问 {kind} 需要密钥。"
 claims-published = "其厂商公布 {claimed}"
 published-at = "{model}：这是厂商在 {source} 公布的窗口；服务本身没有说明。"
+price-free = "免费"
+price-paid = "付费"
+
+# 提供方的顺序：给它自己的模型起名的先后次序
+lineup-button = "顺序…"
+lineup-none = "还没有顺序"
+lineup-summary = "顺序：{lineups}"
+lineup-title = "{tag} 的顺序"
+lineup-lead = "顺序是这个提供方自己的模型的先后次序：最先回答的那个来运行。"
+lineup-empty = "这个提供方还没有顺序。新建顺序会建一个。"
+lineup-new = "新建顺序"
+lineup-edit = "编辑"
+lineup-delete = "删除"
+lineup-close = "关闭"
+lineup-delete-title = "删除顺序 {name}？"
+lineup-delete-message = "使用它的配置档不会打开，直到给它另一个要运行的顺序。"
+lineup-name = "名称"
+lineup-name-hint = "你为它起的名字。harness 收到的是这个名字，不是模型名。"
+lineup-name-taken = "这个提供方已经有一个叫 {name} 的顺序。"
+lineup-models = "这个提供方的模型"
+lineup-filter = "模型名的一部分"
+lineup-none-match = "这个提供方没有哪个模型与你写下的相符。"
+lineup-none-yet = "里面还没有内容：上面一个模型，按回车或点一下，就加到最后。"
+lineup-refused-empty = "里面什么都没有。顺序至少要有一个模型。"
+lineup-paid = "这些步骤要花钱：{models}。回落到其中之一的请求会花掉你的 OpenRouter 余额。"
+lineup-up = "上移"
+lineup-down = "下移"
+lineup-remove = "移除"
+lineup-save = "保存"
+lineup-cancel = "取消"
 
 # ready-made providers
 
@@ -1040,3 +1078,9 @@ discard = "扔掉它"
 
 [workspace.busy]
 timing = "正在标记工作中的标签页"
+
+[workspace.relay]
+listening = "正在等待哪个模型替标签页作了回答"
+fell-back = "{what}: {from} 回答了 {status}，现在改用 {to}"
+fell-back-unreachable = "{what}: 联系不上 {from}，现在改用 {to}"
+telling = "取回退回下一个模型的标签页下面的那一行"

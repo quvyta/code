@@ -212,6 +212,9 @@ sign-out-message = "Die für dieses Profil gespeicherte Anmeldung wird gelöscht
 signed-out = "Die Anmeldung wurde gelöscht"
 sign-out-failed = "Die Anmeldung konnte nicht gelöscht werden"
 
+[profile]
+lineup-paid = "Das kostet Geld: {models}. Eine Anfrage, die auf einem davon landet, wird von deinem OpenRouter-Guthaben abgezogen."
+
 [profiles.wizard]
 step-harness = "Werkzeug"
 step-system = "System"
@@ -251,7 +254,11 @@ high-offline = "Die Container dieses Profils haben kein Netzwerk. graphify funkt
 account-lead = "Womit sich dieses Profil anmeldet."
 account-free-detail = "{harness} nutzt ohne Konto seine kostenlosen Modelle, daher gibt es keinen Anmeldeschritt."
 provider-lead = "Welchen deiner Anbieter es fragt."
-provider-model-lead = "Welches Modell davon."
+provider-lineups = "Reihenfolgen"
+provider-models = "Modelle"
+provider-lineup-unmeasured = "Claude Code nimmt für {models} in der Reihenfolge {lineup} {tokens} Token an, bis sie auf der Seite Anbieter gemessen sind."
+provider-model-filter = "Filtern"
+provider-model-filter-none = "Dazu passt nichts von diesem Anbieter."
 provider-none = "Noch kein Anbieter. Füge einen auf der Seite Anbieter hinzu und komm zurück."
 provider-model-none = "Noch keine Modelle aufgelistet. Liste sie auf der Seite Anbieter auf und komm zurück."
 provider-model-unmeasured = "Claude Code nimmt für {model} {tokens} Token an, bis es auf der Seite Anbieter gemessen ist."
@@ -295,6 +302,7 @@ login-again = "Noch einmal versuchen"
 
 
 [workspace]
+provider-lineup-missing = "Der Anbieter mit dem Namen {tag} hat auf der Anbieter-Seite keine Reihenfolge namens {lineup} mehr, oder sie ist leer, dieser Tab hat also niemanden zu fragen. Schreibe diese Reihenfolge dort neu auf, oder stelle das Profil auf ein anderes Modell oder eine andere Reihenfolge um."
 provider-missing = "Der Anbieter mit dem Namen {tag} steht nicht mehr auf der Anbieter-Seite, dieser Tab hat also niemanden zu fragen. Füge ihn wieder hinzu, oder stelle das Profil auf einen anderen Anbieter um."
 new-tab = "Neuer Tab"
 no-profiles = "Noch kein Profil"
@@ -764,6 +772,36 @@ ready-made-models = "Modelle: {models}"
 key-needed-for = "{kind} ist mit einem Key erreichbar."
 claims-published = "sein Anbieter veröffentlicht {claimed}"
 published-at = "{model}: das Fenster, das sein Anbieter bei {source} veröffentlicht; der Dienst nennt es nicht."
+price-free = "kostenlos"
+price-paid = "kostenpflichtig"
+
+# die Reihen eines Anbieters: benannte Ordnungen seiner eigenen Modelle
+lineup-button = "Reihen…"
+lineup-none = "Noch keine Reihen"
+lineup-summary = "Reihen: {lineups}"
+lineup-title = "Reihen von {tag}"
+lineup-lead = "Eine Reihe ist eine Ordnung der eigenen Modelle dieses Anbieters: Das erste, das antwortet, läuft."
+lineup-empty = "Dieser Anbieter hat noch keine Reihen. Eine neue Reihe legt eine an."
+lineup-new = "Neue Reihe"
+lineup-edit = "Bearbeiten"
+lineup-delete = "Löschen"
+lineup-close = "Schließen"
+lineup-delete-title = "Reihe {name} löschen?"
+lineup-delete-message = "Ein Profil, das sie benutzt, öffnet nicht, bis ihm eine andere Reihenfolge zum Laufen gegeben ist."
+lineup-name = "Name"
+lineup-name-hint = "Das Wort, unter dem du sie wählst. Das bekommt ein Harness, nicht ein Modellname."
+lineup-name-taken = "Dieser Anbieter hat schon eine Reihe namens {name}."
+lineup-models = "Die Modelle dieses Anbieters"
+lineup-filter = "ein Stück eines Modellnamens"
+lineup-none-match = "Kein Modell dieses Anbieters passt zu dem, was du geschrieben hast."
+lineup-none-yet = "Noch nichts drin: ein Modell oben, mit Enter oder einem Klick, kommt ans Ende."
+lineup-refused-empty = "Da ist nichts drin. Eine Reihe braucht mindestens ein Modell."
+lineup-paid = "Diese Schritte kosten Geld: {models}. Eine Anfrage, die auf einen davon zurückfällt, zahlt aus deinem OpenRouter-Guthaben."
+lineup-up = "Nach oben"
+lineup-down = "Nach unten"
+lineup-remove = "Herausnehmen"
+lineup-save = "Sichern"
+lineup-cancel = "Abbrechen"
 
 # ready-made providers
 
@@ -1040,3 +1078,9 @@ discard = "Verwerfen"
 
 [workspace.busy]
 timing = "Arbeitende Tabs werden markiert"
+
+[workspace.relay]
+listening = "Warten darauf, welches Modell für einen Tab geantwortet hat"
+fell-back = "{what}: {from} hat mit {status} geantwortet, jetzt {to}"
+fell-back-unreachable = "{what}: {from} war nicht erreichbar, jetzt {to}"
+telling = "Die Zeile unter einem Tab, das zurückgefallen ist, wird weggenommen"

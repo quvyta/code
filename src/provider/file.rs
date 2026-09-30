@@ -9,7 +9,9 @@
 //!
 //! Nothing here repairs the file and nothing panics over it. A provider that cannot be read is
 //! reported with the line and column where it went wrong and left out of the list; the providers
-//! around it are still returned.
+//! around it are still returned. A lineup is flat like the rest of the file — one row per step,
+//! naming the provider, the lineup and the model — so that a step which cannot be read falls on
+//! its own and the steps below it are read anyway.
 
 use std::path::{Path, PathBuf};
 
@@ -19,7 +21,7 @@ use qframe::storage::data_dir;
 
 use crate::store::Loaded;
 
-use super::{Key, Measured, Model, ProviderEntry, ProviderKind, Tag, Wire, record::trim_base};
+use super::{Key, Lineup, Measured, Model, Price, ProviderEntry, ProviderKind, Tag, Wire, record::trim_base};
 
 /// QCode's folder under the platform's data directory: `<XDG_DATA_HOME>/quvyta/code` on Linux.
 const APP: &str = "quvyta/code";
@@ -40,6 +42,9 @@ const PROVIDER: &str = "provider";
 /// The key of the array of models, which is flat and names its provider, so that a model of a
 /// provider that could not be read is simply left where it is.
 const MODEL: &str = "model";
+/// The key of the array of lineup steps. It is flat and names its provider too, and it is read
+/// after the models so that a step is not lost when a provider above it could not be read.
+const LINEUP: &str = "lineup";
 /// The key of a provider's tag, and of the tag a model belongs to.
 const TAG: &str = "tag";
 /// The key of a provider's kind.
@@ -58,6 +63,12 @@ const CLAIMED: &str = "claimed-context";
 const MEASURED: &str = "measured-context";
 /// The key of how that measurement ended: at the window's edge, or still growing.
 const MEASURED_KIND: &str = "measured";
+/// The key of what using a model costs, written only where the service says.
+const PRICE: &str = "price";
+/// The key of a lineup's name.
+const NAME: &str = "name";
+/// The key of the model one step of a lineup tries.
+const STEP: &str = "model";
 
 /// The providers a person has added, and where they are kept.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -155,7 +166,15 @@ impl Providers {
                 let message = format!("`{KEY}` of `{tag}` is not a key that fits a request header; it is not used");
                 diagnostics.push(Diagnostic::warning(at(KEY), message));
             }
-            entries.push(ProviderEntry { tag, kind, base: trim_base(base), wire, models: Vec::new(), key });
+            entries.push(ProviderEntry {
+                tag,
+                kind,
+                base: trim_base(base),
+                wire,
+                models: Vec::new(),
+                key,
+                lineups: Vec::new(),
+            });
         }
 
         for table in root.entries(MODEL) {
@@ -187,7 +206,45 @@ impl Providers {
                 }
                 (None, _) => None,
             };
-            entry.models.push(Model { id: id.to_owned(), claimed, measured });
+            // A price the service never gave is left out rather than filled in, so that a model
+            // of a provider that publishes no prices never carries one.
+            let price = table.text(PRICE).and_then(Price::parse);
+            entry.models.push(Model { id: id.to_owned(), claimed, measured, price });
+        }
+
+        // After the models, so that a step can already be read against the provider's own list —
+        // and read against it without judging it: a step naming a model the provider was not last
+        // seen to have is kept, because the listing may simply be older than the order.
+        for table in root.entries(LINEUP) {
+            let at = |key: &str| table.value_location(key).cloned();
+            let (Some(tag), Some(written), Some(step)) = (table.text(TAG), table.text(NAME), table.text(STEP)) else {
+                continue;
+            };
+            let Some(entry) = entries.iter_mut().find(|entry| entry.tag.as_str() == tag) else {
+                let message = format!("`{TAG}` is `{tag}`, and no provider of that tag was read; the step is dropped");
+                diagnostics.push(Diagnostic::warning(at(TAG), message));
+                continue;
+            };
+            let name = match Tag::parse(written) {
+                Ok(name) => name,
+                Err(problem) => {
+                    let message =
+                        format!("`{NAME}` is `{written}`, which is not a tag: {problem:?}; the step is dropped");
+                    diagnostics.push(Diagnostic::warning(at(NAME), message));
+                    continue;
+                }
+            };
+            let step = step.to_owned();
+            // A step whose model is already in this order would send the same request twice and
+            // fall back to it twice, so the second is dropped where it stands.
+            match entry.lineups.iter_mut().find(|lineup| lineup.name == name) {
+                Some(lineup) if lineup.models.contains(&step) => {
+                    let message = format!("`{STEP}` is `{step}`, and it is already in `{name}`; the step is dropped");
+                    diagnostics.push(Diagnostic::warning(at(STEP), message));
+                }
+                Some(lineup) => lineup.models.push(step),
+                None => entry.lineups.push(Lineup { name, models: vec![step] }),
+            }
         }
 
         Loaded { value: Self { path: None, entries }, diagnostics }
@@ -243,6 +300,30 @@ impl Providers {
         }
     }
 
+    /// Puts `lineup` on the provider tagged `tag`, in place of the lineup of the same name or at
+    /// the end of its list. Editing an order keeps it where it was, so that a list of orders does
+    /// not jump around under the person who is working through it.
+    pub fn set_lineup(&mut self, tag: &str, lineup: Lineup) {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.tag.as_str() == tag) else { return };
+        match entry.lineups.iter_mut().find(|already| already.name == lineup.name) {
+            Some(slot) => *slot = lineup,
+            None => entry.lineups.push(lineup),
+        }
+    }
+
+    /// Removes the lineup called `name` from the provider tagged `tag`. Whether anything was there
+    /// is the answer, which is what the page asks before it says the order is gone.
+    pub fn remove_lineup(&mut self, tag: &str, name: &str) -> bool {
+        match self.entries.iter_mut().find(|entry| entry.tag.as_str() == tag) {
+            Some(entry) => {
+                let before = entry.lineups.len();
+                entry.lineups.retain(|lineup| lineup.name.as_str() != name);
+                before != entry.lineups.len()
+            }
+            None => false,
+        }
+    }
+
     /// The file as it is written.
     #[must_use]
     pub fn to_toml(&self) -> String {
@@ -270,7 +351,23 @@ impl Providers {
                     text.push_str(&format!("{MEASURED} = {}\n", measured.tokens()));
                     text.push_str(&format!("{MEASURED_KIND} = {}\n", quote(measured.id())));
                 }
+                if let Some(price) = model.price {
+                    text.push_str(&format!("{PRICE} = {}\n", quote(price.id())));
+                }
                 text.push('\n');
+            }
+        }
+        // After the models, one block per step, so that the file reads the way the order does:
+        // which lineup a step belongs to is told by its name, and the names repeat down the file.
+        for entry in &self.entries {
+            for lineup in &entry.lineups {
+                for step in &lineup.models {
+                    text.push_str(&format!("[[{LINEUP}]]\n"));
+                    text.push_str(&format!("{TAG} = {}\n", quote(entry.tag.as_str())));
+                    text.push_str(&format!("{NAME} = {}\n", quote(lineup.name.as_str())));
+                    text.push_str(&format!("{STEP} = {}\n", quote(step)));
+                    text.push('\n');
+                }
             }
         }
         text
@@ -339,8 +436,13 @@ fn shape() -> Shape {
         .required(ID, ValueKind::text())
         .optional(CLAIMED, ValueKind::integer())
         .optional(MEASURED, ValueKind::integer())
-        .optional(MEASURED_KIND, ValueKind::choice(["about", "at-least"]));
-    Shape::new().entries(PROVIDER, provider).entries(MODEL, model)
+        .optional(MEASURED_KIND, ValueKind::choice(["about", "at-least"]))
+        .optional(PRICE, ValueKind::choice(Price::ALL.map(Price::id)));
+    let lineup = Shape::new()
+        .required(TAG, ValueKind::text())
+        .required(NAME, ValueKind::text())
+        .required(STEP, ValueKind::text());
+    Shape::new().entries(PROVIDER, provider).entries(MODEL, model).entries(LINEUP, lineup)
 }
 
 /// A TOML string, with what TOML cannot hold plain written the way TOML writes it.

@@ -1,6 +1,8 @@
 //! The wizard's pages in order: the name, the account and its provider, the permissions, the
 //! image and its build, and the sign-in, finished or not.
 
+use qframe::event::MouseKind;
+
 use super::*;
 
 #[test]
@@ -56,11 +58,151 @@ fn pressing_the_providers_own_row_and_its_models_row_makes_a_profile_that_runs_o
 
     let draft = harness.app().state.draft().expect("the wizard is open");
     assert_eq!(draft.provider_tag.as_deref(), Some("ev1"));
-    assert_eq!(draft.provider_model.as_deref(), Some("qwen3.8-32k"));
+    assert_eq!(draft.chosen_model().map(String::as_str), Some("qwen3.8-32k"));
     let profile = draft.profile().expect("a provider and a model are both chosen");
     let provider = profile.provider.expect("a provider profile carries one");
     assert_eq!(provider.tag, "ev1");
-    assert_eq!(provider.model, "qwen3.8-32k");
+    assert_eq!(provider.asked(), "qwen3.8-32k");
+}
+
+/// A provider entry with `count` models, the way a service that lists hundreds leaves it:
+/// `vendor/model-000` … `vendor/model-299`.
+fn many_models(tag: &str, count: usize) -> ProviderEntry {
+    let mut entry = ProviderEntry::new(
+        crate::provider::Tag::parse(tag).expect("a tag"),
+        crate::provider::ProviderKind::OpenRouter,
+        "https://openrouter.ai/api/v1",
+    );
+    entry.models = (0..count).map(|n| crate::provider::Model::new(format!("vendor/model-{n:03}"))).collect();
+    entry
+}
+
+/// The model the wizard has chosen, read off its draft.
+fn chosen_model(harness: &Harness<Host>) -> Option<String> {
+    harness.app().state.draft()?.chosen_model().cloned()
+}
+
+/// The wizard walked to the account page with the account row for a provider of one's own
+/// pressed, the way a person walks to it: three pages on, then the row.
+fn at_the_account_page(harness: &mut Harness<Host>, count: usize) {
+    harness.send(Msg::ProvidersLoaded(vec![many_models("openrouter", count)]));
+    harness.send(Msg::New).render();
+    // Claude Code is the harness offered first; System, Template and Account are next.
+    for _ in 0..3 {
+        next(harness);
+    }
+    assert!(harness.screen().contains("What this profile signs in with"), "{}", harness.screen());
+    harness.click_text("a provider of your own").render();
+}
+
+/// The provider's own row pressed, which is what brings up the models it offers.
+fn pick_the_provider(harness: &mut Harness<Host>) {
+    harness.click_text("openrouter").render();
+    assert!(harness.screen().contains("vendor/model-000"), "its models are offered:\n{}", harness.screen());
+}
+
+/// Puts the keyboard on the control named `id`, the way a person walks to it with Tab.
+fn focus(harness: &mut Harness<Host>, id: &str) {
+    for _ in 0..10 {
+        if harness.is_focused(id) {
+            return;
+        }
+        harness.press("tab");
+    }
+    assert!(harness.is_focused(id), "the keyboard never reached `{id}`:\n{}", harness.screen());
+}
+
+#[test]
+fn a_provider_with_more_models_than_a_page_holds_scrolls_and_filters_and_the_wizard_goes_on() {
+    let mut harness = loaded(Vec::new());
+    at_the_account_page(&mut harness, 300);
+    // A terminal of a laptop, on a service that offers more models than any page could hold.
+    harness.resize(80, 24).render();
+    pick_the_provider(&mut harness);
+    assert!(harness.find("Next").is_some(), "the way on is on the screen:\n{}", harness.screen());
+    let screen = harness.screen();
+    assert!(!screen.contains("vendor/model-030"), "so the list is nowhere near its end:\n{screen}");
+
+    // The wheel over the list moves it, as the wheel moves every list in QCode. How many rows a
+    // page holds is the page's business: what is checked is that the list goes down and comes back.
+    let (x, y) = harness.find("vendor/model-000").expect("the first model is drawn");
+    let top = harness.screen();
+    for _ in 0..8 {
+        harness.mouse(MouseKind::ScrollDown, x, y);
+    }
+    let down = harness.screen();
+    assert_ne!(down, top, "the wheel takes the list down:\n{down}");
+    for _ in 0..8 {
+        harness.mouse(MouseKind::ScrollUp, x, y);
+    }
+    assert_eq!(harness.screen(), top, "and the wheel takes it back:\n{}", harness.screen());
+
+    // And the arrow keys move it too, from the top of the list, with the keyboard on it.
+    focus(&mut harness, "profile-provider-model");
+    for _ in 0..30 {
+        harness.press("down");
+    }
+    let screen = harness.screen();
+    assert!(screen.contains("vendor/model-030"), "the down key takes it there too:\n{screen}");
+    assert_eq!(chosen_model(&harness).as_deref(), Some("vendor/model-030"), "and the row it passed chooses");
+
+    // The filter is how a list of hundreds becomes a list of one.
+    harness.click_text("Filter").render();
+    harness.type_text("model-287");
+    let screen = harness.screen();
+    assert!(screen.contains("vendor/model-287"), "the model asked for is the one shown:\n{screen}");
+    harness.click_text("vendor/model-287").render();
+    assert_eq!(chosen_model(&harness).as_deref(), Some("vendor/model-287"), "its row chooses it");
+
+    harness.click_text("Next").render();
+    let screen = harness.screen();
+    assert!(screen.contains("may see and reach"), "the wizard goes on:\n{screen}");
+    let profile = harness.app().state.draft().expect("the wizard is open").profile().expect("a profile");
+    let provider = profile.provider.expect("a provider profile carries one");
+    assert_eq!((provider.tag.as_str(), provider.asked()), ("openrouter", "vendor/model-287"));
+}
+
+#[test]
+fn a_model_at_the_end_of_a_long_list_is_chosen_with_the_keys_once_the_filter_finds_it() {
+    let mut harness = loaded(Vec::new());
+    at_the_account_page(&mut harness, 300);
+    pick_the_provider(&mut harness);
+    assert_eq!(chosen_model(&harness).as_deref(), Some("vendor/model-000"), "the first model comes with the provider");
+
+    harness.click_text("Filter").render();
+    harness.type_text("model-287");
+    assert!(harness.screen().contains("vendor/model-287"), "{}", harness.screen());
+    focus(&mut harness, "profile-provider-model");
+    harness.press("down");
+    harness.press("enter");
+    assert_eq!(chosen_model(&harness).as_deref(), Some("vendor/model-287"), "the keys choose the row they are on");
+
+    // The filter lets go of the model and the choice is still there, on the last row of the list.
+    harness.press("shift+tab");
+    for _ in 0..12 {
+        harness.press("backspace");
+    }
+    let chosen = harness.screen().lines().find(|line| line.contains("vendor/model-287")).unwrap_or_default().to_owned();
+    assert!(chosen.starts_with('▌'), "the chosen model is the row the list stands on:\n{}", harness.screen());
+    assert_eq!(chosen_model(&harness).as_deref(), Some("vendor/model-287"), "and the draft has it");
+
+    // A filter that leaves nothing says so, and takes the choice with it.
+    harness.type_text("zzz");
+    let screen = harness.screen();
+    assert!(screen.contains("Nothing of this provider matches that"), "{screen}");
+    assert_eq!(chosen_model(&harness).as_deref(), Some("vendor/model-287"), "a filter does not unchoose");
+}
+
+#[test]
+fn a_long_model_list_and_the_way_on_both_fit_a_terminal_twice_as_wide_as_the_page() {
+    let mut harness = loaded(Vec::new());
+    at_the_account_page(&mut harness, 300);
+    harness.resize(200, 50).render();
+    pick_the_provider(&mut harness);
+    let screen = harness.screen();
+    assert!(screen.contains("vendor/model-000") && screen.contains("vendor/model-010"), "the list is drawn:\n{screen}");
+    assert!(screen.contains("What this profile signs in with"), "the page keeps its own head:\n{screen}");
+    assert!(harness.find("Next").is_some(), "the way on is on the screen:\n{screen}");
 }
 
 #[test]
@@ -82,6 +224,7 @@ fn a_model_whose_window_was_never_measured_says_what_claude_code_will_assume() {
     assert!(read(&harness).contains(said), "the first model was never measured:\n{}", harness.screen());
     harness.click_text("qwen3.8-32k").render();
     let screen = harness.screen();
+    assert!(screen.contains("31512"), "the row of a measured model carries its window:\n{screen}");
     assert!(!screen.contains("will assume"), "a measured window is handed over, so nothing is said:\n{screen}");
     harness.click_text("qwen3.8").render();
     harness.set_locale("tr").render();
@@ -100,6 +243,175 @@ fn with_no_provider_added_the_account_page_says_so_and_offers_no_empty_list() {
     harness.click_text("Go to Providers").render();
     // The application, not this screen, opens the Providers page; this screen only asked.
     assert!(harness.app().state.draft().is_some(), "the wizard itself is not closed by asking");
+}
+
+/// A provider entry with the lineup `lineup` of `steps` in the given order, the second of which
+/// costs money, and `models` as its own models: what the Providers page leaves a provider it has
+/// been asked about.
+fn lineup_entry(tag: &str, lineup: &str, steps: &[(&str, bool)], models: &[&str]) -> ProviderEntry {
+    let mut entry = ProviderEntry::new(
+        crate::provider::Tag::parse(tag).expect("a tag"),
+        crate::provider::ProviderKind::OpenRouter,
+        "https://openrouter.ai/api/v1",
+    );
+    entry.models = steps
+        .iter()
+        .map(|(id, paid)| {
+            let mut model = crate::provider::Model::new(*id);
+            model.price = Some(if *paid { crate::provider::Price::Paid } else { crate::provider::Price::Free });
+            model
+        })
+        .chain(models.iter().map(|id| {
+            let mut model = crate::provider::Model::new(*id);
+            model.price = Some(crate::provider::Price::Free);
+            model
+        }))
+        .collect();
+    entry.lineups = vec![crate::provider::Lineup {
+        name: crate::provider::Tag::parse(lineup).expect("a name"),
+        models: steps.iter().map(|(id, _)| (*id).to_owned()).collect(),
+    }];
+    entry
+}
+
+/// The pick the wizard has chosen, read off its draft, as the pair the profile will be written as.
+fn chosen_pick(harness: &Harness<Host>) -> Option<crate::profile::Pick> {
+    harness.app().state.draft()?.provider_pick.clone()
+}
+
+/// The wizard walked to the account page of a provider `entry`, with the account row pressed and
+/// the provider's own row after it: three pages on, then the two rows, the way a person walks
+/// there.
+fn at_the_lineup(harness: &mut Harness<Host>, entry: ProviderEntry) {
+    harness.send(Msg::ProvidersLoaded(vec![entry]));
+    harness.send(Msg::New).render();
+    for _ in 0..3 {
+        next(harness);
+    }
+    assert!(harness.screen().contains("What this profile signs in with"), "{}", harness.screen());
+    harness.click_text("a provider of your own").render();
+    harness.click_text("yol").render();
+}
+
+#[test]
+fn a_lineup_is_chosen_from_the_account_page_and_the_profile_file_names_it_and_not_a_model() {
+    // The whole of it, from the person's own account row to the file on the disk: the lineup comes
+    // chosen with its provider, the warning about the step that costs is said while it is being
+    // chosen, and a model chosen and then a lineup again reaches the file as `lineup`.
+    let (folder, mut harness) = recording("lineup-profile");
+    at_the_lineup(
+        &mut harness,
+        lineup_entry(
+            "yol",
+            "coder",
+            &[("a/one:free", false), ("b/two", true)],
+            &["c/three", "d/four", "e/five", "f/six", "g/seven"],
+        ),
+    );
+
+    let screen = harness.screen();
+    assert!(screen.contains("Lineups") && screen.contains("Models"), "the two sections are named:\n{screen}");
+    assert!(screen.contains("a/one:free → b/two"), "the row carries the steps in order:\n{screen}");
+    assert_eq!(
+        chosen_pick(&harness),
+        Some(crate::profile::Pick::Lineup("coder".to_owned())),
+        "the first lineup comes with the provider, before any row is pressed"
+    );
+    // Read across the rows the sentences wrap onto, the way a person reads them. Nothing about
+    // money is said without being asked for it, and this is where it is asked for.
+    let read = harness.screen().split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(read.contains("This costs money: b/two."), "the step that costs is named:\n{screen}");
+    assert!(read.contains("paid from your OpenRouter balance."), "and what landing on it spends:\n{screen}");
+
+    // A model is chosen instead: it is one step and nothing to fall back to, so there is nothing
+    // left that could cost money.
+    harness.click_text("c/three").render();
+    assert_eq!(chosen_pick(&harness), Some(crate::profile::Pick::Model("c/three".to_owned())));
+    assert!(!harness.screen().contains("This costs money"), "a free model spends nothing:\n{}", harness.screen());
+
+    // And the lineup again, which is what the profile is finished with.
+    harness.click_text("coder").render();
+    assert_eq!(chosen_pick(&harness), Some(crate::profile::Pick::Lineup("coder".to_owned())));
+    assert!(harness.screen().contains("This costs money"), "the warning comes back with it:\n{}", harness.screen());
+
+    // Walked to the end and finished, the file on the disk names the lineup and no model.
+    for _ in 0..2 {
+        next(&mut harness);
+    }
+    harness.click_text("Finish").render();
+    let written =
+        std::fs::read_to_string(folder.join("Profiles").join("claude-code.toml")).expect("the profile is written");
+    assert!(written.contains("lineup = \"coder\""), "{written}");
+    assert!(!written.contains("model ="), "and no model beside it: {written}");
+    let read = crate::profile::Profile::parse("claude-code.toml", &written).profile.expect("the file reads");
+    assert_eq!(read.provider, Some(crate::profile::ProviderChoice::lineup("yol", "coder")), "{written}");
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+#[test]
+fn a_lineup_whose_steps_nobody_measured_says_what_claude_code_will_assume_for_each_of_them() {
+    let mut harness = loaded(Vec::new());
+    at_the_lineup(&mut harness, lineup_entry("yol", "coder", &[("a/one", false), ("b/two", false)], &["c/three"]));
+    let read = |harness: &Harness<Host>| harness.screen().split_whitespace().collect::<Vec<_>>().join(" ");
+    let said = "Claude Code assumes 200000 tokens for a/one, b/two of coder until they are measured";
+    assert!(read(&harness).contains(said), "the steps of the lineup nobody measured:\n{}", harness.screen());
+    harness.set_locale("tr").render();
+    assert!(
+        read(&harness).contains("Claude Code, coder sırasındaki a/one, b/two için 200000 belirteç varsayar"),
+        "{}",
+        harness.screen()
+    );
+}
+
+#[test]
+fn one_filter_leaves_both_a_lineup_and_the_models_around_it() {
+    let mut harness = loaded(Vec::new());
+    at_the_lineup(
+        &mut harness,
+        lineup_entry("yol", "coder", &[("a/one", false), ("b/two", false)], &["vendor/model-287", "vendor/model-288"]),
+    );
+    // Nothing typed: the whole list, both sections of it.
+    assert!(
+        harness.screen().contains("coder") && harness.screen().contains("vendor/model-287"),
+        "{}",
+        harness.screen()
+    );
+
+    harness.click_text("Filter").render();
+    harness.type_text("model-28").render();
+    let screen = harness.screen();
+    assert!(
+        screen.contains("vendor/model-287") && screen.contains("vendor/model-288"),
+        "the models it matches:\n{screen}"
+    );
+    // The arrow is on a lineup's row and nowhere else, so it is what says whether one is drawn.
+    assert!(!screen.contains('→'), "and only they, for a lineup is a name of its own: {screen}");
+
+    // The same box finds a lineup by its own name, which is a word of the person's rather than of
+    // any model: without it, a lineup they heard of would read as one that is not there.
+    for _ in 0..9 {
+        harness.press("backspace");
+    }
+    harness.type_text("cod").render();
+    let screen = harness.screen();
+    assert!(screen.contains('→'), "the lineup is found by its name:\n{screen}");
+    assert!(!screen.contains("vendor/model-287"), "and the models that do not match it are not drawn: {screen}");
+    harness.click_text("coder").render();
+    assert_eq!(chosen_pick(&harness), Some(crate::profile::Pick::Lineup("coder".to_owned())));
+
+    // A filter that matches nothing says so, and takes the standing choice with it.
+    focus(&mut harness, "profile-provider-model-filter");
+    for _ in 0..9 {
+        harness.press("backspace");
+    }
+    harness.type_text("zzz").render();
+    let screen = harness.screen();
+    assert!(screen.contains("Nothing of this provider matches that"), "{screen}");
+    assert_eq!(
+        chosen_pick(&harness),
+        Some(crate::profile::Pick::Lineup("coder".to_owned())),
+        "a filter does not unchoose"
+    );
 }
 
 #[test]
@@ -122,7 +434,7 @@ fn opencode_offers_a_provider_of_ones_own_from_the_rows_a_person_presses() {
     assert_eq!(profile.harness, HarnessKind::OpenCode);
     assert_eq!(profile.account, AccountKind::Provider);
     let provider = profile.provider.expect("a provider profile carries one");
-    assert_eq!((provider.tag.as_str(), provider.model.as_str()), ("ev1", "qwen3-coder:30b"));
+    assert_eq!((provider.tag.as_str(), provider.asked()), ("ev1", "qwen3-coder:30b"));
 }
 
 #[test]

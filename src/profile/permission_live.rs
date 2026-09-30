@@ -132,7 +132,7 @@ fn profile(harness: HarnessKind, template: Template) -> Profile {
         harness,
         template,
         account: if offered { AccountKind::Provider } else { AccountKind::ApiKey },
-        provider: offered.then(|| ProviderChoice { tag: "izin".to_owned(), model: "m".to_owned() }),
+        provider: offered.then(|| ProviderChoice::model("izin", "m")),
         assets: MountAccess::ReadOnly,
         network: NetworkMode::None,
         without: Vec::new(),

@@ -213,6 +213,9 @@ sign-out-message = "La connexion gardée pour ce profil est supprimée. Les espa
 signed-out = "La connexion a été supprimée"
 sign-out-failed = "La connexion n’a pas pu être supprimée"
 
+[profile]
+lineup-paid = "Cela coûte de l’argent : {models}. Une requête qui tombe sur l’une d’elles est payée sur votre solde OpenRouter."
+
 [profiles.wizard]
 step-harness = "Outil"
 step-system = "Système"
@@ -252,7 +255,11 @@ high-offline = "Les conteneurs de ce profil n’ont pas de réseau. graphify fon
 account-lead = "Avec quoi ce profil se connecte."
 account-free-detail = "{harness} utilise ses modèles gratuits sans compte, il n’y a donc pas d’étape de connexion."
 provider-lead = "Lequel de vos fournisseurs il interroge."
-provider-model-lead = "Quel modèle de celui-ci."
+provider-lineups = "Séquences"
+provider-models = "Modèles"
+provider-lineup-unmeasured = "Claude Code suppose {tokens} jetons pour {models} de la séquence {lineup} tant qu’ils n’y sont pas mesurés sur la page Fournisseurs."
+provider-model-filter = "Filtrer"
+provider-model-filter-none = "Rien de ce fournisseur ne correspond à cela."
 provider-none = "Pas encore de fournisseur. Ajoutez-en un sur la page Fournisseurs, puis revenez."
 provider-model-none = "Aucun modèle listé. Listez-les sur la page Fournisseurs, puis revenez."
 provider-model-unmeasured = "Claude Code suppose {tokens} jetons pour {model} tant qu’il n’est pas mesuré sur la page Fournisseurs."
@@ -296,6 +303,7 @@ login-again = "Réessayer"
 
 
 [workspace]
+provider-lineup-missing = "Le fournisseur étiqueté {tag} n’a plus de séquence nommée {lineup}, ou elle est vide : cet onglet n’a donc personne à interroger. Réécrivez cette séquence sur la page Fournisseurs, ou changez le profil pour un autre modèle ou une autre séquence."
 provider-missing = "Le fournisseur étiqueté {tag} n’est plus sur la page Fournisseurs, cet onglet n’a donc personne à interroger. Ajoutez-le à nouveau, ou changez le profil pour un autre fournisseur."
 new-tab = "Nouvel onglet"
 no-profiles = "Pas encore de profil"
@@ -765,6 +773,36 @@ ready-made-models = "Modèles : {models}"
 key-needed-for = "{kind} s’atteint avec une clé."
 claims-published = "son éditeur publie {claimed}"
 published-at = "{model} : la fenêtre que son éditeur publie sur {source} ; le service ne la donne pas."
+price-free = "gratuit"
+price-paid = "payant"
+
+# les ordres d’un fournisseur : des suites nommées de ses propres modèles
+lineup-button = "Ordres…"
+lineup-none = "Aucun ordre pour l’instant"
+lineup-summary = "Ordres : {lineups}"
+lineup-title = "Ordres de {tag}"
+lineup-lead = "Un ordre est une suite des modèles de ce fournisseur : le premier qui répond est celui qui tourne."
+lineup-empty = "Ce fournisseur n’a pas encore d’ordre. Un nouvel ordre en fait un."
+lineup-new = "Nouvel ordre"
+lineup-edit = "Modifier"
+lineup-delete = "Supprimer"
+lineup-close = "Fermer"
+lineup-delete-title = "Supprimer l’ordre {name} ?"
+lineup-delete-message = "Un profil qui s’en sert ne s’ouvrira pas avant qu’on lui donne un autre ordre à exécuter."
+lineup-name = "Nom"
+lineup-name-hint = "Le mot par lequel vous la choisissez. C’est ce mot qu’un harness reçoit, pas un nom de modèle."
+lineup-name-taken = "Ce fournisseur a déjà un ordre qui s’appelle {name}."
+lineup-models = "Les modèles de ce fournisseur"
+lineup-filter = "un bout du nom d’un modèle"
+lineup-none-match = "Aucun modèle de ce fournisseur ne correspond à ce que vous avez écrit."
+lineup-none-yet = "Rien dedans pour l’instant : un modèle au-dessus, avec Entrée ou un clic, est ajouté à la fin."
+lineup-refused-empty = "Il n’y a rien dedans. Un ordre a besoin d’au moins un modèle."
+lineup-paid = "Ces étapes coûtent de l’argent : {models}. Une requête qui tombe sur l’une d’elles dépense votre solde OpenRouter."
+lineup-up = "Monter"
+lineup-down = "Descendre"
+lineup-remove = "Retirer"
+lineup-save = "Enregistrer"
+lineup-cancel = "Annuler"
 
 # ready-made providers
 
@@ -1041,3 +1079,9 @@ discard = "Le jeter"
 
 [workspace.busy]
 timing = "Marquage des onglets en cours de travail"
+
+[workspace.relay]
+listening = "Attendre de savoir quel modèle a répondu pour un onglet"
+fell-back = "{what}: {from} a répondu {status}, maintenant {to}"
+fell-back-unreachable = "{what}: {from} est injoignable, maintenant {to}"
+telling = "Reprise de la ligne sous l’onglet qui est passé au modèle suivant"

@@ -8,13 +8,14 @@
 use std::sync::Arc;
 
 use qframe::runtime::TaskId;
+use qframe::text::fuzzy;
 use qframe::widgets::{LogBuffer, TerminalSession};
 
 use crate::base::{Os, Refusal};
 use crate::profile::{
-    AccountKind, Extra, HarnessKind, MountAccess, NetworkMode, Profile, ProviderChoice, SafeName, Template,
+    AccountKind, Extra, HarnessKind, MountAccess, NetworkMode, Pick, Profile, ProviderChoice, SafeName, Template,
 };
-use crate::provider::{Model, ProviderEntry};
+use crate::provider::{Lineup, Model, Price, ProviderEntry};
 
 use crate::desktop::callback;
 use crate::desktop::login::SignIn;
@@ -233,8 +234,12 @@ pub struct Draft {
     pub providers: Vec<ProviderEntry>,
     /// The tag of the chosen provider, while `account` is [`AccountKind::Provider`].
     pub provider_tag: Option<String>,
-    /// The model asked for, while `account` is [`AccountKind::Provider`].
-    pub provider_model: Option<String>,
+    /// What is asked for of the chosen provider: one of its models, or one of its lineups, while
+    /// `account` is [`AccountKind::Provider`].
+    pub provider_pick: Option<Pick>,
+    /// What has been typed into the model list's filter, which is what a provider offering
+    /// hundreds of models is read by.
+    pub model_filter: String,
     /// How `Assets/` is mounted.
     pub assets: MountAccess,
     /// What the container may reach.
@@ -256,6 +261,23 @@ pub struct Draft {
     /// The profile as it stood when the person asked to change it, while the draft changes one
     /// that exists: what tells a change of the image, or of the sign-in, from one that is not.
     editing: Option<Profile>,
+}
+
+/// One row of the account page's list of what a profile runs on: a heading, a gap, or something
+/// the person can choose. The list holds both of the provider's lineups and all of its models,
+/// so a row's place in it is not the place of a model in a list of models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickRow<'a> {
+    /// The heading over the chosen provider's lineups, which is there only when it has any.
+    LineupHeading,
+    /// The heading over the chosen provider's models.
+    ModelHeading,
+    /// An empty row between the two sections.
+    Gap,
+    /// One of the provider's lineups, by the person's own name for it.
+    Lineup(&'a Lineup),
+    /// One of the provider's models, by the name the provider itself gives it.
+    Model(&'a Model),
 }
 
 /// Why a step cannot be left yet.
@@ -291,7 +313,8 @@ impl Draft {
             account: first_account(harness),
             providers,
             provider_tag: None,
-            provider_model: None,
+            provider_pick: None,
+            model_filter: String::new(),
             // The assets folder is where the person keeps what the harness is meant to use and
             // add to, so a new profile may write there unless the person narrows it.
             assets: MountAccess::ReadWrite,
@@ -323,7 +346,8 @@ impl Draft {
             account: profile.account,
             providers: Vec::new(),
             provider_tag: profile.provider.as_ref().map(|provider| provider.tag.clone()),
-            provider_model: profile.provider.as_ref().map(|provider| provider.model.clone()),
+            provider_pick: profile.provider.as_ref().map(|provider| provider.pick.clone()),
+            model_filter: String::new(),
             assets: profile.assets,
             network: profile.network,
             os: profile.os,
@@ -522,17 +546,174 @@ impl Draft {
         self.provider_tag.as_deref().and_then(|tag| self.provider_entry(tag)).map_or(&[], |entry| &entry.models)
     }
 
-    /// Chooses the provider tagged `tag`, and with it the first model it is known to offer, so
-    /// that picking a provider that already has one model chose it for the person rather than
-    /// leaving a second, empty choice behind it.
+    /// The lineups of the chosen provider, or none while no provider is chosen. A lineup is the
+    /// person's own order of that provider's models, written on the Providers page; a provider
+    /// that has none is a provider that is simply not given one.
+    #[must_use]
+    pub fn provider_lineups(&self) -> &[Lineup] {
+        self.provider_tag.as_deref().and_then(|tag| self.provider_entry(tag)).map_or(&[], |entry| &entry.lineups)
+    }
+
+    /// The chosen provider's own entry, which is where its lineups and its prices are read from.
+    fn chosen_entry(&self) -> Option<&ProviderEntry> {
+        self.provider_tag.as_deref().and_then(|tag| self.provider_entry(tag))
+    }
+
+    /// The model the account page has chosen, when what it has chosen is a model rather than a
+    /// lineup. The list's rows are models as well as lineups, so this is only what a caller that
+    /// asks about the model has an answer for.
+    #[must_use]
+    pub fn chosen_model(&self) -> Option<&String> {
+        match &self.provider_pick {
+            Some(Pick::Model(model)) => Some(model),
+            Some(Pick::Lineup(_)) | None => None,
+        }
+    }
+
+    /// The rows of the account page's list: the chosen provider's lineups first and under a
+    /// heading of their own, then its models under a heading of their own, with a gap between
+    /// them. A provider with no lineup of its own is not given a heading for one, so its list is
+    /// the models alone as it was.
+    ///
+    /// One filter leaves both, because one box on the page filters both: a person who has heard of
+    /// `qwen3-coder` and of the lineup `coder` is looking for either, and a box that found only
+    /// one of them would read as the other not being there. What the filter leaves out is not
+    /// unchosen: the chosen pick is a name, and it stays what it is until another row is pressed.
+    ///
+    /// Nothing at all when the filter leaves neither, so the list says so in its own words rather
+    /// than showing a heading over nothing.
+    #[must_use]
+    pub fn pick_rows(&self) -> Vec<PickRow<'_>> {
+        let Some(entry) = self.chosen_entry() else { return Vec::new() };
+        let wanted = self.model_filter.trim();
+        let keeps = |text: &str| wanted.is_empty() || fuzzy(wanted, text).is_some();
+        let lineups: Vec<&Lineup> = entry.lineups.iter().filter(|lineup| keeps(lineup.name.as_str())).collect();
+        let models: Vec<&Model> = entry.models.iter().filter(|model| keeps(&model.id)).collect();
+        if lineups.is_empty() && models.is_empty() {
+            return Vec::new();
+        }
+        let mut rows = Vec::new();
+        if !lineups.is_empty() {
+            rows.push(PickRow::LineupHeading);
+            rows.extend(lineups.into_iter().map(PickRow::Lineup));
+            rows.push(PickRow::Gap);
+        }
+        rows.push(PickRow::ModelHeading);
+        rows.extend(models.into_iter().map(PickRow::Model));
+        rows
+    }
+
+    /// The row of the list the page stands on: the one the chosen pick is on, while the filter
+    /// leaves it there. A pick the filter hides is on no row, which is not a row selected.
+    #[must_use]
+    pub fn chosen_row(&self) -> Option<usize> {
+        let pick = self.provider_pick.as_ref()?;
+        let rows = self.pick_rows();
+        rows.iter().position(|row| match (row, pick) {
+            (PickRow::Lineup(lineup), Pick::Lineup(name)) => lineup.name.as_str() == name,
+            (PickRow::Model(model), Pick::Model(id)) => model.id == *id,
+            _ => false,
+        })
+    }
+
+    /// The pick the row at `index` stands for, and `None` for a heading, a gap, or a row that is
+    /// not there: none of those is something to choose, and a person clicking past the end of a
+    /// list expects nothing to change.
+    #[must_use]
+    pub fn pick_at(&self, index: usize) -> Option<Pick> {
+        match self.pick_rows().get(index)? {
+            PickRow::Lineup(lineup) => Some(Pick::Lineup(lineup.name.to_string())),
+            PickRow::Model(model) => Some(Pick::Model(model.id.clone())),
+            PickRow::LineupHeading | PickRow::ModelHeading | PickRow::Gap => None,
+        }
+    }
+
+    /// The steps a request on the chosen pick would spend money on if it landed on one: a lineup's
+    /// own paid steps, or the one model itself when it is a paid one. Empty for a pick nobody has
+    /// made yet, and for a step whose price nobody published, which is not the same as a free one.
+    #[must_use]
+    pub fn paid_steps(&self) -> Vec<String> {
+        let Some(entry) = self.chosen_entry() else { return Vec::new() };
+        match &self.provider_pick {
+            Some(Pick::Model(id)) => match entry.model(id) {
+                Some(model) if model.price == Some(Price::Paid) => vec![id.clone()],
+                _ => Vec::new(),
+            },
+            Some(Pick::Lineup(name)) => entry
+                .lineup(name)
+                .map_or_else(Vec::new, |lineup| lineup.paid(entry).into_iter().map(str::to_owned).collect()),
+            None => Vec::new(),
+        }
+    }
+
+    /// The steps of the chosen pick whose window nobody has measured, so a harness told nothing
+    /// works to a figure of its own and may lose the front of a long prompt without a word. The
+    /// one model of a single-model pick, or the steps of a lineup no step of which is known.
+    #[must_use]
+    pub fn unknown_windows(&self) -> Vec<String> {
+        let Some(entry) = self.chosen_entry() else { return Vec::new() };
+        match &self.provider_pick {
+            Some(Pick::Model(id)) => match entry.model(id) {
+                Some(model) if model.window(entry.kind).is_none() => vec![id.clone()],
+                _ => Vec::new(),
+            },
+            Some(Pick::Lineup(name)) => entry
+                .lineup(name)
+                .map_or_else(Vec::new, |lineup| lineup.unknown_window(entry).into_iter().map(str::to_owned).collect()),
+            None => Vec::new(),
+        }
+    }
+
+    /// The models of the chosen provider that the filter keeps, in the provider's own order.
+    ///
+    /// A service such as OpenRouter offers hundreds of models and a page holds a handful, so the
+    /// list shows what is asked for. What the filter hides is not unchosen: the chosen model is a
+    /// name, and it stays what it is until another one is chosen.
+    #[must_use]
+    pub fn matching_models(&self) -> Vec<&Model> {
+        let models = self.provider_models();
+        let wanted = self.model_filter.trim();
+        if wanted.is_empty() {
+            return models.iter().collect();
+        }
+        models.iter().filter(|model| fuzzy(wanted, &model.id).is_some()).collect()
+    }
+
+    /// Chooses the provider tagged `tag`, and with it the first lineup it is known to offer, or
+    /// the first model it offers when it has no lineup, so that picking a provider that already has
+    /// something to run on chose it for the person rather than leaving a second, empty choice
+    /// behind it. What was asked for in the provider left behind is of no use here, and a filter
+    /// matching none of this provider's models would show an empty list.
     pub fn choose_provider(&mut self, tag: &str) {
         self.provider_tag = Some(tag.to_owned());
-        self.provider_model =
-            self.provider_entry(tag).and_then(|entry| entry.models.first()).map(|model| model.id.clone());
+        self.provider_pick = self.first_pick(tag);
+        self.model_filter.clear();
+    }
+
+    /// What a provider offers first: its first lineup, or the first of its models when it has no
+    /// lineup. A lineup comes first because it is the order the person wrote on the Providers
+    /// page — the choice they made about how their money is spent — where a model is one of the
+    /// things it is made of.
+    fn first_pick(&self, tag: &str) -> Option<Pick> {
+        let entry = self.provider_entry(tag)?;
+        match entry.lineups.first() {
+            Some(lineup) => Some(Pick::Lineup(lineup.name.to_string())),
+            None => entry.models.first().map(|model| Pick::Model(model.id.clone())),
+        }
+    }
+
+    /// Whether the provider `tag` still offers `pick`: a model it is last seen to have, or a lineup
+    /// of its own. What a profile chose is a name, and a name the file no longer carries cannot
+    /// be kept — the tab would have nothing to ask.
+    fn offers(&self, tag: &str, pick: &Pick) -> bool {
+        self.provider_entry(tag).is_some_and(|entry| match pick {
+            Pick::Model(id) => entry.models.iter().any(|model| model.id == *id),
+            Pick::Lineup(name) => entry.lineup(name).is_some(),
+        })
     }
 
     /// Offers `providers` from now on, as the file has them after the person was away on the
-    /// Providers page. A provider account keeps the provider and model it had where they are
+    /// Providers page. A provider account keeps the provider and what it runs on where they are
     /// still there, and otherwise takes the first of what is offered now, the way picking the
     /// account does: the page told the person to add one and come back, so the one they added is
     /// the one they meant.
@@ -544,23 +725,31 @@ impl Draft {
         let kept = self.provider_tag.clone().filter(|tag| self.provider_entry(tag).is_some());
         match kept.or_else(|| self.providers.first().map(|entry| entry.tag.to_string())) {
             Some(tag) => {
-                let model = self.provider_model.clone();
+                let pick = self.provider_pick.clone();
                 self.choose_provider(&tag);
-                let offered = self.provider_models();
-                if let Some(model) = model.filter(|id| offered.iter().any(|offered| offered.id == *id)) {
-                    self.provider_model = Some(model);
+                if let Some(pick) = pick.filter(|pick| self.offers(&tag, pick)) {
+                    self.provider_pick = Some(pick);
                 }
             }
             None => {
                 self.provider_tag = None;
-                self.provider_model = None;
+                self.provider_pick = None;
             }
         }
     }
 
     /// Chooses the model `id` of the provider already chosen.
     pub fn choose_provider_model(&mut self, id: &str) {
-        self.provider_model = Some(id.to_owned());
+        self.provider_pick = Some(Pick::Model(id.to_owned()));
+    }
+
+    /// Chooses what the row at `index` of the account page's list stands for: one of the chosen
+    /// provider's lineups, or one of its models. A row that is not there, a heading and a gap
+    /// choose nothing, as a person clicking past the end of a list expects.
+    pub fn choose_pick_row(&mut self, index: usize) {
+        if let Some(pick) = self.pick_at(index) {
+            self.provider_pick = Some(pick);
+        }
     }
 
     /// The pages this draft goes through. A profile that signs in to nothing has no sign-in
@@ -584,7 +773,7 @@ impl Draft {
     pub fn profile(&self) -> Option<Profile> {
         let provider = match self.account {
             AccountKind::Provider => {
-                Some(ProviderChoice { tag: self.provider_tag.clone()?, model: self.provider_model.clone()? })
+                Some(ProviderChoice { tag: self.provider_tag.clone()?, pick: self.provider_pick.clone()? })
             }
             _ => None,
         };
@@ -731,7 +920,7 @@ impl Draft {
     /// The provider and model the account page has chosen so far, when both are there.
     #[must_use]
     fn profile_provider(&self) -> Option<ProviderChoice> {
-        Some(ProviderChoice { tag: self.provider_tag.clone()?, model: self.provider_model.clone()? })
+        Some(ProviderChoice { tag: self.provider_tag.clone()?, pick: self.provider_pick.clone()? })
     }
 
     /// Whether the wizard should show its buttons as working and ignore them.
@@ -942,6 +1131,89 @@ mod tests {
         entry
     }
 
+    /// `entry` with the lineup `lineup` of `steps` in the given order beside it.
+    fn with_lineup(mut entry: ProviderEntry, lineup: &str, steps: &[&str]) -> ProviderEntry {
+        entry.lineups = vec![crate::provider::Lineup {
+            name: crate::provider::Tag::parse(lineup).expect("a name"),
+            models: steps.iter().map(|step| (*step).to_owned()).collect(),
+        }];
+        entry
+    }
+
+    /// The row of the list the account page shows that the model `id` is on, which is not its
+    /// place among the models: the list holds the provider's lineups and a heading or two as well.
+    fn row_of_model(draft: &Draft, id: &str) -> usize {
+        draft
+            .pick_rows()
+            .iter()
+            .position(|row| matches!(row, PickRow::Model(model) if model.id == id))
+            .unwrap_or_else(|| panic!("{id} has a row"))
+    }
+
+    /// The row of the list that the lineup `name` is on.
+    fn row_of_lineup(draft: &Draft, name: &str) -> usize {
+        draft
+            .pick_rows()
+            .iter()
+            .position(|row| matches!(row, PickRow::Lineup(lineup) if lineup.name.as_str() == name))
+            .unwrap_or_else(|| panic!("{name} has a row"))
+    }
+
+    /// A provider with a lineup chooses it rather than one of its models, and the list is the
+    /// lineups, a gap, and then the models. A heading and a gap are rows, but nothing to choose.
+    #[test]
+    fn a_provider_with_a_lineup_chooses_its_first_one_and_its_list_holds_both_sections() {
+        let mut draft =
+            Draft::new([], vec![with_lineup(entry("yol", &["c/three", "d/four"]), "coder", &["a/one", "b/two"])]);
+        draft.account = AccountKind::Provider;
+        draft.choose_provider("yol");
+        assert_eq!(draft.provider_pick, Some(Pick::Lineup("coder".to_owned())), "the lineup comes with the provider");
+        assert_eq!(
+            draft.pick_rows(),
+            [
+                PickRow::LineupHeading,
+                PickRow::Lineup(&draft.provider_lineups()[0]),
+                PickRow::Gap,
+                PickRow::ModelHeading,
+                PickRow::Model(&draft.provider_models()[0]),
+                PickRow::Model(&draft.provider_models()[1]),
+            ],
+            "the lineups first, then a gap, then the models"
+        );
+        assert_eq!(draft.chosen_row(), Some(1), "the lineup is the row the page stands on");
+        assert_eq!(draft.choose_provider("yol"), (), "choosing the same provider again");
+        assert_eq!(draft.pick_at(0), None, "a heading chooses nothing");
+        assert_eq!(draft.pick_at(2), None, "a gap chooses nothing");
+        assert_eq!(draft.pick_at(99), None, "a row that is not there chooses nothing");
+        assert_eq!(draft.pick_at(row_of_model(&draft, "d/four")), Some(Pick::Model("d/four".to_owned())));
+        assert_eq!(draft.pick_at(row_of_lineup(&draft, "coder")), Some(Pick::Lineup("coder".to_owned())));
+
+        draft.choose_pick_row(row_of_model(&draft, "c/three"));
+        assert_eq!(draft.chosen_row(), Some(row_of_model(&draft, "c/three")), "a model row is stood on as it is");
+    }
+
+    /// A lineup that is a paid step, and a model that is, are what the warning is about; a price
+    /// nobody published is not a free one and is not named either.
+    #[test]
+    fn a_lineup_or_a_model_with_a_step_that_costs_is_what_the_warning_names() {
+        // A lineup's steps are models of its own provider, so they are in its list too: what they
+        // cost is what the provider published for them.
+        let mut entry =
+            with_lineup(entry("yol", &["a/one", "b/two", "c/three", "d/four"]), "coder", &["a/one", "b/two"]);
+        for (index, price) in [crate::provider::Price::Free, crate::provider::Price::Paid].into_iter().enumerate() {
+            entry.models[index].price = Some(price);
+        }
+        entry.models[2].price = Some(crate::provider::Price::Paid);
+        let mut draft = Draft::new([], vec![entry]);
+        draft.account = AccountKind::Provider;
+        draft.choose_provider("yol");
+        assert_eq!(draft.paid_steps(), ["b/two"], "a lineup's own paid steps, in its own order");
+        draft.choose_pick_row(row_of_model(&draft, "c/three"));
+        assert_eq!(draft.paid_steps(), ["c/three"], "a single paid model");
+        draft.choose_pick_row(row_of_model(&draft, "d/four"));
+        assert_eq!(draft.paid_steps(), Vec::<String>::new(), "a model whose price nobody published is not a free one");
+    }
+
     #[test]
     fn choosing_a_provider_account_page_cannot_be_left_until_a_provider_and_model_are_chosen() {
         let mut draft = Draft::new([], vec![entry("ev1", &["qwen3.8"])]);
@@ -951,7 +1223,11 @@ mod tests {
         assert_eq!(draft.blocked(), Some(Blocked::NoProvider));
         draft.choose_provider("ev1");
         assert_eq!(draft.provider_tag.as_deref(), Some("ev1"));
-        assert_eq!(draft.provider_model.as_deref(), Some("qwen3.8"), "the first model is chosen along with it");
+        assert_eq!(
+            draft.chosen_model().map(String::as_str),
+            Some("qwen3.8"),
+            "the first model is chosen along with it"
+        );
         assert_eq!(draft.blocked(), None);
     }
 
@@ -961,7 +1237,7 @@ mod tests {
         draft.account = AccountKind::Provider;
         draft.stage = Stage::Account;
         draft.choose_provider("ev1");
-        assert_eq!(draft.provider_model, None, "nothing to choose from yet");
+        assert_eq!(draft.provider_pick, None, "nothing to choose from yet");
         assert_eq!(draft.blocked(), Some(Blocked::NoProvider));
         assert!(draft.provider_models().is_empty());
     }
@@ -971,8 +1247,57 @@ mod tests {
         let mut draft = Draft::new([], vec![entry("ev1", &["qwen3.8", "qwen3.8-32k"])]);
         draft.choose_provider("ev1");
         draft.choose_provider_model("qwen3.8-32k");
-        assert_eq!(draft.provider_model.as_deref(), Some("qwen3.8-32k"));
+        assert_eq!(draft.chosen_model().map(String::as_str), Some("qwen3.8-32k"));
         assert_eq!(draft.provider_models().len(), 2);
+    }
+
+    #[test]
+    fn the_filter_leaves_the_models_it_matches_and_the_chosen_one_is_chosen_by_its_place_in_them() {
+        let models: Vec<String> = (0..300).map(|n| format!("vendor/model-{n:03}")).collect();
+        let names: Vec<&str> = models.iter().map(String::as_str).collect();
+        let mut draft = Draft::new([], vec![entry("ev1", &names)]);
+        draft.choose_provider("ev1");
+        assert_eq!(draft.matching_models().len(), 300, "an empty filter leaves every model");
+        draft.model_filter = "model-287".to_owned();
+        let shown: Vec<&str> = draft.matching_models().iter().map(|model| model.id.as_str()).collect();
+        assert_eq!(shown, ["vendor/model-287"], "only the model asked for is shown");
+        draft.choose_pick_row(row_of_model(&draft, "vendor/model-287"));
+        assert_eq!(draft.chosen_model().map(String::as_str), Some("vendor/model-287"));
+
+        // What the filter hides is not unchosen: a filter that matches nothing leaves the choice
+        // standing, so a person who looked at another model and came back has not lost the one
+        // they had.
+        draft.model_filter = "nothing here".to_owned();
+        assert!(draft.matching_models().is_empty());
+        assert_eq!(
+            draft.chosen_model().map(String::as_str),
+            Some("vendor/model-287"),
+            "the choice is the name, not a row"
+        );
+        assert!(draft.pick_rows().is_empty(), "nothing at all is shown, so the list says so");
+        assert_eq!(draft.chosen_row(), None, "and the choice is on no row");
+        draft.choose_pick_row(0);
+        assert_eq!(
+            draft.chosen_model().map(String::as_str),
+            Some("vendor/model-287"),
+            "a row that is not there chooses nothing"
+        );
+    }
+
+    #[test]
+    fn another_provider_starts_with_a_filter_of_its_own_and_keeps_the_model_it_also_offers() {
+        let mut draft = Draft::new([], vec![entry("ev1", &["qwen3.8", "qwen3.8-32k"]), entry("ev2", &["llama"])]);
+        draft.choose_provider("ev1");
+        draft.model_filter = "32k".to_owned();
+        draft.choose_pick_row(row_of_model(&draft, "qwen3.8-32k"));
+        assert_eq!(draft.chosen_model().map(String::as_str), Some("qwen3.8-32k"));
+        draft.choose_provider("ev2");
+        assert_eq!(draft.model_filter, "", "a filter of another provider's models is of no use here");
+        assert_eq!(draft.chosen_model().map(String::as_str), Some("llama"), "and its first model is chosen with it");
+        // What the Providers page brings back later keeps the model that is still offered, and
+        // takes the filter with it.
+        draft.offer_providers(vec![entry("ev1", &["qwen3.8", "qwen3.8-32k"]), entry("ev2", &["llama", "mistral"])]);
+        assert_eq!(draft.chosen_model().map(String::as_str), Some("llama"), "a model the new file has is kept");
     }
 
     #[test]
@@ -985,7 +1310,7 @@ mod tests {
         let profile = draft.profile().expect("a provider and a model are both chosen");
         let provider = profile.provider.expect("a provider profile carries one");
         assert_eq!(provider.tag, "ev1");
-        assert_eq!(provider.model, "qwen3.8");
+        assert_eq!(provider.asked(), "qwen3.8");
     }
 
     #[test]

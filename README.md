@@ -51,7 +51,9 @@ source under the MIT licence.
   providers has nothing to sign in to.
 - **Providers of your own.** An ollama server on your network, an OpenRouter account, or a Xiaomi
   MiMo or Kimi Code subscription can stand in for a harness's own account, for every harness but
-  Gemini CLI. The provider's key stays on your machine and never enters a container. See [Providers of your own](#providers-of-your-own).
+  Gemini CLI. A profile runs on one model or on a lineup: models tried in order, the next one
+  asked when one is busy. The provider's key stays on your machine and never enters a container.
+  See [Providers of your own](#providers-of-your-own).
 - **Workspaces.** A workspace starts empty, from a folder, or from a git address (the clone
   runs inside a container, so git does not have to be installed on your machine). A folder is
   either copied into the QCode folder, links included, or used where it is: then nothing is
@@ -575,8 +577,19 @@ while the server quietly keeps three thousand and drops the front of everything 
 shows both numbers. Each of these goes out only when you press its button; see
 [what goes over the network](#no-telemetry-and-what-goes-over-the-network).
 
+The list of models scrolls and has a filter above it, so a provider with hundreds of models stays
+usable on a small terminal. For OpenRouter each row says whether the model is free or costs money,
+read from the prices OpenRouter publishes.
+
+**Lineups…** under a provider makes, edits and deletes its lineups. A lineup is a named order of
+that provider's models, for example `coder`: first `z-ai/glm-4.6:free`, then
+`qwen/qwen3.8-27b:free` when the first is busy. A lineup or a chosen model with a step that costs
+money gets a warning line saying which steps those are. Deleting a lineup asks first and says that
+the profiles using it will not start; such a tab says which lineup of which provider is missing.
+
 A Claude Code, opencode, Codex, Kimi Code CLI or Qwen Code profile can then sign in with **a
-provider of your own** and one of its models. Its tab talks to a small relay that runs inside the
+provider of your own** and one of its lineups or models, chosen from one list with the lineups on
+top. Its tab talks to a small relay that runs inside the
 container, on the container's own loopback address; the relay hands each request to qcode through
 a socket in the workspace's `Containers/MCP/` folder, and qcode sends it on to the provider with
 the key added. So the container never holds the key and needs no network of its own, and the
@@ -586,6 +599,15 @@ request are carried: a message and the list of models. Codex speaks OpenAI's new
 shape to a provider, which ollama, OpenRouter, Xiaomi MiMo and Kimi Code all answer; its web
 search, which only OpenAI's own servers run, is turned off in such a tab. Gemini CLI does not offer
 a provider yet, because pointing it at another address has not been checked.
+
+Every message a tab sends goes to the model the profile chose, or to the current step of its
+lineup, whatever model the harness asks for: a harness that asks for a small model of its own for
+background work cannot reach one you did not pick, perhaps one that costs money. When a step
+answers busy (429), out of credit (402), with a server error, not at all, or that the model does
+not exist, qcode asks the next step of the lineup with the same message and skips the failed one
+for a minute; a line under the tab says so for ten seconds, for example
+`coder: z-ai/glm-4.6:free answered 429, now qwen/qwen3.8-27b:free`. A refused key or a malformed
+message is not carried on, since every step would answer the same.
 
 ## When QCode closes
 
