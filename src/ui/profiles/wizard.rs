@@ -6,6 +6,7 @@
 //! test without a container engine anywhere near it.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use qframe::runtime::TaskId;
 use qframe::text::fuzzy;
@@ -16,6 +17,7 @@ use crate::profile::{
     AccountKind, Extra, HarnessKind, MountAccess, NetworkMode, Pick, Profile, ProviderChoice, SafeName, Template,
 };
 use crate::provider::{Lineup, Model, Price, ProviderEntry};
+use crate::ui::stalling;
 
 use crate::desktop::callback;
 use crate::desktop::login::SignIn;
@@ -250,6 +252,12 @@ pub struct Draft {
     pub build: Build,
     /// Every line the build has printed.
     pub log: LogBuffer,
+    /// When the build last said something, or when it started: what the silence the page warns
+    /// about is measured from.
+    said: Instant,
+    /// Whether that silence has lasted as long as the rule asks, which is what the page says
+    /// under the sentence about the build. Never true of a build that has ended.
+    stuck: bool,
     /// How far the login has got.
     pub login: Login,
     /// The names already taken, so a clash is caught before anything is built.
@@ -322,6 +330,8 @@ impl Draft {
             os: Os::Debian,
             build: Build::Waiting,
             log: LogBuffer::new(LOG_LINES),
+            said: Instant::now(),
+            stuck: false,
             login: Login::Waiting,
             taken: taken.into_iter().collect(),
             only_login: false,
@@ -353,6 +363,8 @@ impl Draft {
             os: profile.os,
             build: Build::Done,
             log: LogBuffer::new(LOG_LINES),
+            said: Instant::now(),
+            stuck: false,
             login: Login::Waiting,
             taken: Vec::new(),
             only_login: true,
@@ -415,33 +427,48 @@ impl Draft {
         self.account.needs_login() && (self.account != before.account || self.harness != before.harness)
     }
 
+    /// Whether the build failed because a step of `template`'s set could not download what it
+    /// installs: the step said so in `words`, or it was graphify's step, which says so in words of
+    /// its own whatever the set ([`recipe::GRAPHIFY_FAILED`]) and is read as the failure of the set
+    /// this draft is of.
+    fn download_failed(&self, words: &str, template: Template) -> bool {
+        if !matches!(self.build, Build::Failed(_)) {
+            return false;
+        }
+        // The set the image was built for, which is the one to name: a draft whose switches were
+        // changed builds a set of its own whatever row the picker last rested on.
+        let ours = self.profile().is_some_and(|profile| profile.template == template);
+        self.log
+            .iter()
+            .any(|line| line.text().contains(words) || (ours && line.text().contains(recipe::GRAPHIFY_FAILED)))
+    }
+
     /// Whether the build failed because a step of QCode extra could not download what it
     /// installs, which the step says in words of its own (`recipe::EXTRA_FAILED`) in the log.
     #[must_use]
     pub fn extra_download_failed(&self) -> bool {
-        matches!(self.build, Build::Failed(_)) && self.log.iter().any(|line| line.text().contains(recipe::EXTRA_FAILED))
+        self.download_failed(recipe::EXTRA_FAILED, Template::High)
     }
 
     /// Whether the build failed because a step of Quvyta development could not download what it
     /// installs, which the step says in words of its own (`recipe::DEV_FAILED`) in the log.
     #[must_use]
     pub fn dev_download_failed(&self) -> bool {
-        matches!(self.build, Build::Failed(_)) && self.log.iter().any(|line| line.text().contains(recipe::DEV_FAILED))
+        self.download_failed(recipe::DEV_FAILED, Template::QuvytaDev)
     }
 
     /// Whether the build failed because a step of QCode recommended could not download what it
     /// installs, which the step says in words of its own (`recipe::RECOMMENDED_FAILED`) in the log.
     #[must_use]
     pub fn recommended_download_failed(&self) -> bool {
-        matches!(self.build, Build::Failed(_))
-            && self.log.iter().any(|line| line.text().contains(recipe::RECOMMENDED_FAILED))
+        self.download_failed(recipe::RECOMMENDED_FAILED, Template::Recommended)
     }
 
     /// Whether the build failed because a step of oh my opencode slim could not download what it
     /// installs, which the step says in words of its own (`recipe::SLIM_FAILED`) in the log.
     #[must_use]
     pub fn slim_download_failed(&self) -> bool {
-        matches!(self.build, Build::Failed(_)) && self.log.iter().any(|line| line.text().contains(recipe::SLIM_FAILED))
+        self.download_failed(recipe::SLIM_FAILED, Template::Slim)
     }
 
     /// Whether the build failed because a step of a profile whose parts are its own could not
@@ -449,8 +476,7 @@ impl Draft {
     /// (`recipe::CUSTOM_FAILED`) in the log.
     #[must_use]
     pub fn custom_download_failed(&self) -> bool {
-        matches!(self.build, Build::Failed(_))
-            && self.log.iter().any(|line| line.text().contains(recipe::CUSTOM_FAILED))
+        self.download_failed(recipe::CUSTOM_FAILED, Template::Custom)
     }
 
     /// Whether this draft is only a login for a profile that already exists.
@@ -927,6 +953,48 @@ impl Draft {
     #[must_use]
     pub fn is_busy(&self) -> bool {
         matches!(self.build, Build::Running(_)) || self.login.is_busy()
+    }
+
+    /// The build has started in `task`, so the silence the page warns about begins now: a build
+    /// that has only just begun has said nothing, and nothing yet.
+    pub fn building(&mut self, task: TaskId) {
+        self.build = Build::Running(task);
+        self.said = Instant::now();
+        self.stuck = false;
+    }
+
+    /// Whether the image build is running.
+    #[must_use]
+    pub fn is_building(&self) -> bool {
+        matches!(self.build, Build::Running(_))
+    }
+
+    /// Whether the build has said nothing for longer than `quiet` as of `now`, which is what the
+    /// page says under its own words about the build. A draft that is not building says no
+    /// whatever its silence is: there is no build to be stuck.
+    pub fn build_looked(&mut self, now: Instant, quiet: Duration) {
+        self.stuck = self.is_building() && stalling::quiet_for(self.said, now, quiet);
+    }
+
+    /// Whether the build has been quiet long enough to be said to be stuck, which is never said of
+    /// a build that has ended.
+    #[must_use]
+    pub fn is_stuck(&self) -> bool {
+        self.stuck
+    }
+
+    /// Notes that the build has said something, so that the silence is counted from this moment and
+    /// the warning under the page's own words goes away.
+    pub fn build_said(&mut self) {
+        self.said = Instant::now();
+        self.stuck = false;
+    }
+
+    /// The build has ended, so there is no build left to be stuck: the warning goes with it here
+    /// rather than standing until the next look noticed, since the page stays up to say how the
+    /// build ended.
+    pub fn build_ended(&mut self) {
+        self.stuck = false;
     }
 
     /// Moves to the next page, unless the current one is blocked or something is running.

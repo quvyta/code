@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::engine::known::{self, Known};
-use crate::engine::{EngineKind, Unavailable, detect};
+use crate::engine::{Engine, EngineKind, Unavailable, detect};
 
 use super::install::IdRanges;
 use crate::store::{Config, SetupStep, Store};
@@ -180,26 +180,51 @@ impl Gates {
     /// Blocks on both, so it belongs on a background thread, never in `view`.
     #[must_use]
     pub fn probe(config: &Config) -> Self {
+        Self::probe_with(config, &detect).0
+    }
+
+    /// The same gates, with the engine that answered handed back beside them, and every engine
+    /// question put to `detect` rather than to the machine.
+    ///
+    /// The engine itself is what every screen that reaches into a container needs, and asking
+    /// for it separately is a second `podman info` on the way to the first frame: podman asks the
+    /// package manager about netavark, aardvark-dns, pasta, crun and conmon before it answers,
+    /// so the question costs about 0.4 s and a start is half a second longer for having asked it
+    /// twice. So the one question is asked once and its answer kept, by
+    /// [`check_engine_found`] and here.
+    ///
+    /// `detect` is a parameter for the reason [`Installer`](super::install::Installer) is one: a test counts what the gates
+    /// ask of the engines without either engine installed.
+    #[must_use]
+    pub fn probe_with(
+        config: &Config,
+        detect: &dyn Fn(EngineKind) -> Result<Engine, Unavailable>,
+    ) -> (Self, Option<Engine>) {
         let mut gates = Self {
             language: config.settings().language().is_some(),
             engine: EngineCheck::Unknown,
             location: LocationCheck::Unknown,
         };
         if !gates.language {
-            return gates;
+            return (gates, None);
         }
+        let mut found = None;
         gates.engine = match config.engine_kind().and_then(EngineKind::from_name) {
-            Some(kind) => check_engine(kind),
+            Some(kind) => {
+                let (check, engine) = check_engine_found(kind, detect);
+                found = engine;
+                check
+            }
             None => EngineCheck::Unknown,
         };
         if gates.engine != EngineCheck::Working {
-            return gates;
+            return (gates, found);
         }
         gates.location = match config.folder_path() {
             Some(path) => check_location(&path),
             None => LocationCheck::Broken(LocationProblem::Unset),
         };
-        gates
+        (gates, found)
     }
 }
 
@@ -208,12 +233,28 @@ impl Gates {
 /// Blocks on starting the engine, so it belongs on a background thread.
 #[must_use]
 pub fn check_engine(kind: EngineKind) -> EngineCheck {
+    check_engine_found(kind, &detect).0
+}
+
+/// The same question as [`check_engine`], with the engine that answered handed back beside the
+/// answer and `detect` put in place of the machine.
+///
+/// The engine is kept rather than looked up again, for the reason [`Gates::probe_with`] gives.
+/// An engine that cannot be used has none to hand back, so the answer there is
+/// [`Broken`](EngineCheck::Broken) with nothing beside it.
+///
+/// Blocks on starting the engine, so it belongs on a background thread.
+#[must_use]
+pub fn check_engine_found(
+    kind: EngineKind,
+    detect: &dyn Fn(EngineKind) -> Result<Engine, Unavailable>,
+) -> (EngineCheck, Option<Engine>) {
     match detect(kind) {
-        Ok(_) => EngineCheck::Working,
+        Ok(engine) => (EngineCheck::Working, Some(engine)),
         Err(unavailable) => {
             let group = std::fs::read_to_string("/etc/group").unwrap_or_default();
             let user = IdRanges::here().user;
-            EngineCheck::Broken(refine(EngineProblem::from(unavailable), &group, &user))
+            (EngineCheck::Broken(refine(EngineProblem::from(unavailable), &group, &user)), None)
         }
     }
 }
@@ -356,6 +397,18 @@ mod tests {
     }
 
     #[test]
+    fn a_probe_whose_engine_cannot_be_used_says_the_same_thing_as_asking_that_engine_alone() {
+        // What the gates say is unchanged by being asked through a detector of their own: only
+        // the engine that answered is new, and an engine that refused has none to hand back.
+        let config = Config::parse_str("code.conf", "language = \"tr\"\n\n[engine]\nkind = \"podman\"\n");
+        let refused = |_kind: EngineKind| Err::<Engine, Unavailable>(Unavailable::NotInstalled);
+        let (gates, found) = Gates::probe_with(&config, &refused);
+        assert_eq!(gates.engine, EngineCheck::Broken(EngineProblem::NotInstalled), "{:?}", gates.engine);
+        assert_eq!(gates.engine, check_engine_found(EngineKind::Podman, &refused).0);
+        assert_eq!(found, None, "an engine that cannot be used is none to keep");
+    }
+
+    #[test]
     fn probing_a_config_without_an_engine_stops_at_the_engine_gate() {
         let gates = Gates::probe(&Config::parse_str("code.conf", "language = \"tr\"\n"));
         assert!(gates.language);
@@ -433,6 +486,7 @@ mod tests {
     fn a_working_podman_on_an_account_without_id_ranges_is_not_ready_yet() {
         let ranges = |subuid: &str| super::IdRanges {
             user: "ada".to_owned(),
+            from_env: true,
             uid: 1001,
             subuid: subuid.to_owned(),
             subgid: subuid.to_owned(),

@@ -654,6 +654,12 @@ fn opencode_on_a_lineup_falls_back_on_openrouter_and_asks_nothing_outside_it() {
     falls_back_on_openrouter_and_asks_nothing_outside_the_lineup(HarnessKind::OpenCode);
 }
 
+#[test]
+#[ignore = "needs a container engine, the network, and the owner's OpenRouter key; run with QCODE_CONTAINER_TESTS=1"]
+fn codex_on_a_lineup_falls_back_on_openrouter_and_asks_nothing_outside_it() {
+    falls_back_on_openrouter_and_asks_nothing_outside_the_lineup(HarnessKind::Codex);
+}
+
 /// What a person sees in a Claude Code tab when the provider says too many requests: the relay
 /// carries the status and the provider's own words through rather than turning them into a
 /// failure of its own, so Claude Code can say what happened. The provider here is a stand-in

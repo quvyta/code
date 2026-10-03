@@ -435,7 +435,10 @@ fn containers_widget(screen: &WorkspaceScreen, workspace: &OpenWorkspace, ui: &m
             let short = container.name.strip_prefix(&prefix).unwrap_or(&container.name);
             ListItem::new(short.to_owned())
                 .icon("dot", Some(tone(&container.state)))
-                .detail(state_text(&container.state))
+                // A container QCode froze is shown as frozen rather than as the engine's `paused`:
+                // the person did not pause it and cannot unpause it, and QCode wakes it by itself
+                // the moment it is needed.
+                .detail(state_text(&container.state, screen.freezing.frozen.contains(&container.name)))
         });
         let list = List::new(rows).selected(Some(workspace.container_row)).on_select(Msg::SelectContainer);
         ui.add(list.wrap(true)).fill().id("workspace-containers");
@@ -443,13 +446,16 @@ fn containers_widget(screen: &WorkspaceScreen, workspace: &OpenWorkspace, ui: &m
 
     let selected = workspace.containers().get(workspace.container_row);
     let name = selected.map(|container| container.name.clone());
-    let running = selected.is_some_and(|container| container.state.is_running());
+    // What the buttons act on is a container that is up, whether or not it is frozen: a tab cannot
+    // be entered while it is frozen, but stopping it, starting it again and asking for a root shell
+    // in it all wake it on the way, which is what those commands do.
+    let up = selected.is_some_and(|container| container.state.is_up());
     let busy = workspace.busy;
     let labels =
         [t!("workspace.containers.stop"), t!("workspace.containers.restart"), t!("workspace.containers.refresh")];
     let buttons = |ui: &mut View<'_, Msg>| {
         let stop = name.clone().map(Msg::StopContainer);
-        let mut button = Button::new(labels[0].clone()).disabled(!running || busy);
+        let mut button = Button::new(labels[0].clone()).disabled(!up || busy);
         if let Some(message) = stop {
             button = button.on_press(message);
         }
@@ -474,13 +480,13 @@ fn containers_widget(screen: &WorkspaceScreen, workspace: &OpenWorkspace, ui: &m
         ui.column(buttons).fill_width();
     }
     // Root in a profile's container, for what its system lacks; what it installs stays in this
-    // workspace. Offered for a profile's own container only, and only while it runs.
+    // workspace. Offered for a profile's own container only, and only while it is up.
     let profile = workspace.profiles.iter().find(|profile| {
         name.as_deref() == Some(crate::engine::names::profile_container(workspace.id(), profile.name.as_str()).as_str())
     });
     if let Some(profile) = profile {
-        let mut admin = Button::new(t!("workspace.admin.open")).disabled(!running);
-        if running {
+        let mut admin = Button::new(t!("workspace.admin.open")).disabled(!up);
+        if up {
             admin = admin.on_press(Msg::OpenAdmin(profile.name.to_string()));
         }
         ui.add(admin).id("workspace-container-admin");
@@ -508,7 +514,16 @@ fn tone(state: &ContainerState) -> &'static str {
 
 /// A container's state in the person's language; a word this version does not know is shown as
 /// the engine wrote it rather than hidden.
-fn state_text(state: &ContainerState) -> String {
+///
+/// A paused container QCode froze reads as frozen: it is asleep because nothing of it is on screen
+/// and it has done nothing for a while, and the person neither paused it nor can unpause it, since
+/// QCode wakes it by itself the moment one of its tabs is needed. A paused container QCode did not
+/// freeze — one a crash left behind, or one the person paused by hand — reads as paused, which is
+/// what the engine says of it and the only word that tells the person how to undo it.
+fn state_text(state: &ContainerState, frozen: bool) -> String {
+    if frozen && matches!(state, ContainerState::Paused) {
+        return t!("workspace.state.frozen");
+    }
     let key = match state {
         ContainerState::Created => "created",
         ContainerState::Running => "running",

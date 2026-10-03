@@ -1,7 +1,7 @@
 //! One tab of the workspace screen: what it opens, where it stands, and the session it draws.
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use qframe::runtime::TaskId;
 use qframe::widgets::{LogBuffer, LogLevel, LogLine, TerminalSession};
@@ -9,6 +9,7 @@ use qframe::widgets::{LogBuffer, LogLevel, LogLine, TerminalSession};
 use crate::base::apps::Quiet;
 use crate::bridge;
 use crate::desktop::callback::{Ending, Stop};
+use crate::ui::stalling;
 
 use super::bridge::{Letter, Pasted, Undelivered};
 use super::plan::LaunchFailure;
@@ -266,6 +267,12 @@ pub struct Tab {
     stopped: Option<String>,
     /// What the build of the profile's image said, when this tab built it.
     build_log: LogBuffer,
+    /// When the build last said something, or when it started: what the silence the page warns
+    /// about is measured from.
+    build_said: Instant,
+    /// Whether that silence has lasted as long as the rule asks, which is what the page says
+    /// beside the build. Never true of a build that has ended.
+    build_stuck: bool,
 }
 
 impl Tab {
@@ -299,6 +306,8 @@ impl Tab {
             own_input: None,
             stopped: None,
             build_log: LogBuffer::new(BUILD_LINES),
+            build_said: Instant::now(),
+            build_stuck: false,
         }
     }
 
@@ -654,22 +663,52 @@ impl Tab {
         self.run += 1;
     }
 
-    /// The tab builds its profile's image in `task`; the log starts empty.
+    /// The tab builds its profile's image in `task`; the log starts empty and the silence starts
+    /// now, since a build that has just begun has said something.
     pub fn building(&mut self, task: TaskId) {
         self.build_log.clear();
         self.state = TabState::Building(task);
+        self.spoke();
     }
 
-    /// Adds a line the image build said to the tab's log.
+    /// Adds a line the image build said to the tab's log, which is also what ends the silence: a
+    /// build that is saying things is not one to warn about.
     pub fn build_line(&mut self, text: &str, failed: bool) {
         let level = if failed { LogLevel::Error } else { LogLevel::Info };
         self.build_log.push(LogLine::new(level, text));
+        self.spoke();
     }
 
     /// What the image build said so far.
     #[must_use]
     pub fn build_log(&self) -> &LogBuffer {
         &self.build_log
+    }
+
+    /// Whether the tab is building its profile's image.
+    #[must_use]
+    pub fn is_building(&self) -> bool {
+        matches!(self.state, TabState::Building(_))
+    }
+
+    /// Whether the build has said nothing for longer than `quiet` as of `now`, which is what the
+    /// page says beside it. A tab that is not building says no whatever its silence is: there is
+    /// no build to be stuck.
+    pub fn build_looked(&mut self, now: Instant, quiet: Duration) {
+        self.build_stuck = self.is_building() && stalling::quiet_for(self.build_said, now, quiet);
+    }
+
+    /// Whether the build has been quiet long enough to be said to be stuck.
+    #[must_use]
+    pub fn is_stuck(&self) -> bool {
+        self.build_stuck
+    }
+
+    /// Notes that the build has said something, so that the silence is counted from this moment and
+    /// the warning beside it goes away.
+    fn spoke(&mut self) {
+        self.build_said = Instant::now();
+        self.build_stuck = false;
     }
 
     /// Starts a tab that was waiting to be shown: it now waits for its container instead.

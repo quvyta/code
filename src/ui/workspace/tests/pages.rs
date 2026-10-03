@@ -125,7 +125,7 @@ fn pages(scratch: &Scratch, size: (u16, u16)) -> Vec<(&'static str, &'static str
     open(&mut screen, Choice::Window(WINDOW.to_owned()));
     let (key, run) = open_tab(&screen);
     apply(&mut screen, Msg::WindowOpened(key, run, Ok(crate::ui::workspace::Opening::Up)));
-    out.push(("desktop", "Bring to front", harness(screen, size.0, size.1)));
+    out.push(("desktop", "Ask it to come forward", harness(screen, size.0, size.1)));
 
     let mut missing = harness(two_kinds(scratch, Some(engine())), size.0, size.1);
     missing.send(Msg::OpenFile("gone.md".to_owned()));

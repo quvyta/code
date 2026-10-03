@@ -269,8 +269,9 @@ pub fn rebuild(
     rebuild_from(engine, &profile.image(), &recipe::image(profile), Some(&additions), cancel, line)
 }
 
-/// Builds `image` again from `recipe`, from its first step, and lets the image it replaces go
-/// when nothing is made from it; the whole of [`rebuild`] but the base image.
+/// Builds `image` again from `recipe`, from its first step, lets the image it replaces go when
+/// nothing is made from it, and takes away the images of ours that earlier rebuilds left behind;
+/// the whole of [`rebuild`] but the base image.
 ///
 /// # Errors
 ///
@@ -294,7 +295,32 @@ pub(crate) fn rebuild_from(
     {
         let _ = capture(&engine.remove_unused_image(before));
     }
+    // A build is the moment images of ours pile up: every one a rebuild replaced kept its gigabytes
+    // under no name, and the ones this build could not account for — a container still holding
+    // them, a QCode closed mid-build — are what it leaves. So it asks which of ours are left and
+    // takes them away, and only those: a build that failed or was stopped above returned already.
+    let _ = clear_leftovers(engine);
     Ok(())
+}
+
+/// Takes away the profile images of ours that a rebuild left without a name, and answers how many
+/// of them went.
+///
+/// Only untagged images carrying [`PROFILE_LABEL`](crate::engine::names::PROFILE_LABEL) are ever
+/// asked about, and each is removed without a `--force`: the engine refuses the one a container is
+/// still made from, and that refusal is the answer wanted, since the container goes on running and
+/// the image goes with the last of them. A refusal is otherwise not worth a word, so it is
+/// ignored; an engine that cannot say which images are ours at all is asked nothing else either,
+/// because there is no wider question to fall back on.
+#[must_use]
+pub fn clear_leftovers(engine: &Engine) -> usize {
+    let Ok(listed) = capture(&engine.our_leftover_images()) else { return 0 };
+    listed
+        .lines()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .filter(|id| capture(&engine.remove_unused_image(id)).is_ok())
+        .count()
 }
 
 /// Makes sure the base image of the profile's system is there and current, telling
@@ -525,5 +551,69 @@ mod tests {
     fn the_base_image_is_what_a_profile_image_is_built_on() {
         // The name is a contract with the engine layer; a profile image cannot exist without it.
         assert_eq!(BASE_IMAGE, "qcode/base");
+    }
+
+    /// A stand-in engine that writes every call down, answers `listed` when it is asked for the
+    /// images of ours that carry no name, and refuses each call in `refused` the way an engine
+    /// refuses an image a container is made from.
+    ///
+    /// The refusal is the whole rule: the image stays, the call fails, and the one beside it goes.
+    fn recording(name: &str, listed: &str, refused: &[&str]) -> (Engine, PathBuf, PathBuf) {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let folder = std::env::temp_dir().join(format!("qcode-work-{name}-{stamp}"));
+        std::fs::create_dir_all(&folder).expect("a folder");
+        let (binary, calls) = (folder.join("engine"), folder.join("calls"));
+        let refusing = refused
+            .iter()
+            .map(|call| format!("  '{call}'*) printf 'Error: the image is in use by a container\\n' >&2; exit 125 ;;"))
+            .collect::<Vec<String>>()
+            .join("\n");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{calls}'\ncase \"$1 $2 $3\" in\n{refusing}\nesac\n\
+             case \"$1 $2\" in\n  'images --quiet') printf '{listed}';;\nesac\nexit 0\n",
+            calls = calls.display(),
+        );
+        std::fs::write(&binary, script).expect("the stand-in engine");
+        std::fs::set_permissions(&binary, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("runnable");
+        (Engine::new(crate::engine::EngineKind::Podman, &binary), calls, folder)
+    }
+
+    /// Every call the stand-in engine was given, in order.
+    fn asked(calls: &Path) -> Vec<String> {
+        std::fs::read_to_string(calls).unwrap_or_default().lines().map(str::to_owned).collect()
+    }
+
+    /// The whole rule in one sweep: an image of ours with no name and no container made from it
+    /// goes, the one a container holds stays, and nothing but those two images is ever touched.
+    #[test]
+    fn an_image_of_ours_goes_only_while_no_container_is_made_from_it() {
+        let (engine, calls, folder) = recording("leftovers", "sha-one\\nsha-two\\n", &["image rm sha-two"]);
+        assert_eq!(clear_leftovers(&engine), 1, "one of the two went");
+        assert_eq!(
+            asked(&calls),
+            [
+                "images --quiet --no-trunc --filter dangling=true --filter label=qcode.profile",
+                "image rm sha-one",
+                "image rm sha-two",
+            ],
+            "the listing and one plain removal each: {:#?}",
+            asked(&calls)
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// An engine that cannot say which images are ours is asked nothing else: there is no wider
+    /// question behind this one, and a person who never made an image should never feel one.
+    #[test]
+    fn an_engine_that_cannot_list_the_leftovers_is_asked_to_take_nothing_away() {
+        let (engine, calls, folder) = recording("no-leftovers", "", &["images --quiet"]);
+        assert_eq!(clear_leftovers(&engine), 0);
+        assert_eq!(
+            asked(&calls),
+            ["images --quiet --no-trunc --filter dangling=true --filter label=qcode.profile"],
+            "{:#?}",
+            asked(&calls)
+        );
+        let _ = std::fs::remove_dir_all(&folder);
     }
 }

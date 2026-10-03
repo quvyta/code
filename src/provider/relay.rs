@@ -59,9 +59,19 @@
 //! stream that breaks halfway is passed on as it broke.
 //!
 //! The last step's answer is the harness's whatever it is, body intact, so a tab shows the
-//! provider's own error instead of one QCode made up. A step that was given up on is not asked
-//! again for a minute, so a busy free model stops costing a round trip per turn; that order is
-//! kept in this listener, behind one lock its connections share.
+//! provider's own error instead of one QCode made up — unless every step of the request failed for
+//! good while an earlier one failed only for now. A `408`, a `429`, a `5xx` or a provider that
+//! could not be reached tells the person to wait; a model that does not exist, or a key the
+//! provider will not take, tells them to change the lineup. When one request produced both, the
+//! reason to wait is the true story of it: a person told that the last model of their lineup does
+//! not exist goes looking for a lineup that is not broken, while a minute of waiting would have
+//! answered. So the first passing answer of the request is shown instead, with the status and the
+//! body the provider sent, and a lasting answer that was never a failure of the lineup — a `2xx`, a
+//! `401`, a `400` about the request itself — goes on exactly as it always did.
+//!
+//! A step that was given up on is not asked again for a minute, so a busy free model stops costing
+//! a round trip per turn; that order is kept in this listener, behind one lock its connections
+//! share.
 //!
 //! Which of the two message paths a request takes is the harness's to say, not the provider
 //! entry's. Nothing translates between the shapes, so the only shape that can work is the one
@@ -71,6 +81,13 @@
 //! since one service answers the two shapes under different roots ([`crate::provider::
 //! ProviderKind::api_root`]), and the key goes in the header the entry's kind reads
 //! ([`crate::provider::ProviderKind::key_header`]).
+//!
+//! # What is being served
+//!
+//! The relay is the only side of a request that can say whether one is on its way to a model: the
+//! script in the container hands it over and gets the answer back, so nothing between the harness
+//! and the provider is left holding a moment in time. [`Activity`] is what a screen reads for
+//! that — per token, how many of its requests are being served and when the last one finished.
 
 use std::collections::HashMap;
 use std::io::{self, Read};
@@ -157,9 +174,11 @@ const MOST_CONNECTIONS: usize = 16;
 /// against a real one.
 const MOST_BODY: usize = 64 * 1024 * 1024;
 
-/// How much of an error body is read to decide whether it names the model that was asked. Wide
-/// enough for the sentence any provider has been seen to put in one, and a bound rather than a
-/// policy: what is not in the first 64 KiB of a complaint is not in the complaint.
+/// How much of an answer's body is read before its head is decided on: enough of a `400` or a `404`
+/// to see whether it names the model that was asked, and as much of a passing answer as is kept in
+/// case that one is the answer the harness is shown. Wide enough for the sentence any provider has
+/// been seen to put in one, and a bound rather than a policy: what is not in the first 64 KiB of a
+/// complaint is not in the complaint.
 const MOST_SAID: usize = 64 * 1024;
 
 /// How long a step that answered with a reason to fall back is not asked again. Long enough that
@@ -175,6 +194,12 @@ const COOLING: Duration = Duration::from_secs(60);
 /// given one of its own must not have it reach a provider beside the key QCode adds.
 const STRIPPED: [&str; 7] =
     ["authorization", "x-api-key", "api-key", "host", "content-length", "transfer-encoding", "connection"];
+
+/// The headers a replayed answer does not carry. Its body was read before the step was given up on
+/// and may have been cut at [`MOST_SAID`], so neither the length the provider measured nor a
+/// framing of its own goes with it: the script in the container writes the head and the bytes as
+/// they come, and a length that does not match is an answer the harness reads short.
+const REPLAYED_WITHOUT: [&str; 2] = ["content-length", "transfer-encoding"];
 
 /// One request read off the socket, before it is decided whether to carry it anywhere.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -428,10 +453,82 @@ pub enum Event {
     },
 }
 
+/// What one token's requests are doing at this moment: how many of them the relay is serving, and
+/// when the last of them finished.
+#[derive(Debug, Clone, Copy, Default)]
+struct Asking {
+    /// How many requests of this token are being served right now.
+    serving: usize,
+    /// When the last request of this token finished, however it ended.
+    last_finished: Option<Instant>,
+}
+
+/// What the relay is doing for each of a workspace's tabs, read from anywhere and cheaply.
+///
+/// The screen has to be able to tell a tab that is waiting on a model from one that has been
+/// quiet for a while, and the relay is the only side of a request that knows: the container's
+/// script hands it over and gets the answer back, so nothing between the harness and the provider
+/// is left holding a moment in time. A clone is a second pointer at the same counts, so a screen
+/// and the relay share one truth rather than two copies that can drift apart.
+#[derive(Debug, Clone, Default)]
+pub struct Activity(Arc<Mutex<HashMap<String, Asking>>>);
+
+impl Activity {
+    /// Whether a request of `token` is on its way to a provider right now.
+    ///
+    /// A lock that cannot be taken says it is not. A screen reading this is answering a person who
+    /// is waiting, and waiting on a count that a poisoned lock would hold forever helps nobody.
+    #[must_use]
+    pub fn busy(&self, token: &str) -> bool {
+        self.0.lock().is_ok_and(|asking| asking.get(token).is_some_and(|asking| asking.serving > 0))
+    }
+
+    /// When the last request of `token` finished, or `None` when it has not finished one: a token
+    /// no tab has, and a token whose every request was refused before it reached a route, both
+    /// have no time.
+    #[must_use]
+    pub fn last_finished(&self, token: &str) -> Option<Instant> {
+        self.0.lock().ok()?.get(token)?.last_finished
+    }
+}
+
+/// One request being served, counted in for as long as it lasts and out again when it ends.
+///
+/// The count is taken out in [`Drop`], so it goes however the serving returns: an answer written,
+/// a refusal, an early return, or a panic on the way. A request left counted in would keep its tab
+/// busy for good, which is the one thing a screen reading [`Activity`] must never be told.
+struct Counting {
+    asking: Arc<Mutex<HashMap<String, Asking>>>,
+    token: String,
+}
+
+impl Counting {
+    /// Counts one request of `token` in, from now until what this returns is dropped.
+    fn serving(activity: &Activity, token: &str) -> Self {
+        let counting = Self { asking: Arc::clone(&activity.0), token: token.to_owned() };
+        // A lock that cannot be taken is not a reason to refuse the request: the request is served
+        // either way, and the count is then whatever the lock holds.
+        if let Ok(mut asking) = counting.asking.lock() {
+            asking.entry(counting.token.clone()).or_default().serving += 1;
+        }
+        counting
+    }
+}
+
+impl Drop for Counting {
+    fn drop(&mut self) {
+        let Ok(mut asking) = self.asking.lock() else { return };
+        let Some(asked) = asking.get_mut(&self.token) else { return };
+        asked.serving = asked.serving.saturating_sub(1);
+        asked.last_finished = Some(Instant::now());
+    }
+}
+
 /// The workspace's provider relay, listened on for as long as this value lives.
 #[derive(Debug)]
 pub struct Listener {
     socket: PathBuf,
+    activity: Activity,
     #[cfg(unix)]
     open: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -472,6 +569,15 @@ impl Listener {
     pub fn socket(&self) -> &Path {
         &self.socket
     }
+
+    /// What this relay is doing for each of the workspace's tokens, as a handle the screen keeps.
+    ///
+    /// Cheap to clone and safe to keep: a clone held after this listener is closed still answers,
+    /// with the last thing that was true.
+    #[must_use]
+    pub fn activity(&self) -> Activity {
+        self.activity.clone()
+    }
 }
 
 /// Writes the relay's script into `folder` unless it is there already as this QCode carries it.
@@ -496,9 +602,9 @@ mod unix {
     use super::super::Wire;
     use super::super::ask::{Method, secret_of};
     use super::{
-        Cooling, Event, Listener, MOST_BODY, MOST_CONNECTIONS, MOST_HEAD, MOST_SAID, PATIENCE, Route, SOCKET_NAME,
-        STRIPPED, Upstream, UpstreamAsk, allowed, bound, cool, head_line, names, order_now, parse_incoming, pinned,
-        refusal_body, write_script,
+        Activity, Cooling, Counting, Event, Listener, MOST_BODY, MOST_CONNECTIONS, MOST_HEAD, MOST_SAID, PATIENCE,
+        Passing, Route, SOCKET_NAME, STRIPPED, Upstream, UpstreamAsk, allowed, bound, cool, head_line, lasting,
+        order_now, parse_incoming, passing, pinned, refusal_body, write_script,
     };
 
     /// The longest socket path the system takes, less the byte its terminator needs; the same
@@ -532,10 +638,14 @@ mod unix {
         // shares it. See [`ordered`].
         let cooling = Arc::new(Mutex::new(Cooling::new()));
         let cooling_in_threads = Arc::clone(&cooling);
-        std::thread::Builder::new()
-            .name("qcode-relay".to_owned())
-            .spawn(move || accept(&listener, &still_open, &resolve, &upstream, &cooling_in_threads, &report))?;
-        Ok(Listener { socket, open })
+        // Held by every thread that serves a connection and by whoever asked to watch, so a screen
+        // and the relay read the same counts.
+        let activity = Activity::default();
+        let watching = activity.clone();
+        std::thread::Builder::new().name("qcode-relay".to_owned()).spawn(move || {
+            accept(&listener, &still_open, &resolve, &upstream, &cooling_in_threads, &report, &watching);
+        })?;
+        Ok(Listener { socket, activity, open })
     }
 
     /// Runs `with` on the socket path, or, when the path is too long for a socket address, on the
@@ -560,6 +670,7 @@ mod unix {
         upstream: &Upstream,
         cooling: &Arc<Mutex<Cooling>>,
         report: &Arc<impl Fn(Event) + Send + Sync + 'static>,
+        activity: &Activity,
     ) {
         let serving = Arc::new(AtomicUsize::new(0));
         for stream in listener.incoming() {
@@ -571,10 +682,16 @@ mod unix {
                 continue;
             }
             serving.fetch_add(1, Ordering::SeqCst);
-            let (resolve, upstream, cooling, report, done) =
-                (Arc::clone(resolve), upstream.clone(), Arc::clone(cooling), Arc::clone(report), Arc::clone(&serving));
+            let (resolve, upstream, cooling, report, done, activity) = (
+                Arc::clone(resolve),
+                upstream.clone(),
+                Arc::clone(cooling),
+                Arc::clone(report),
+                Arc::clone(&serving),
+                activity.clone(),
+            );
             let spawned = std::thread::Builder::new().name("qcode-relay-call".to_owned()).spawn(move || {
-                serve(stream, resolve.as_ref(), &upstream, &cooling, report.as_ref());
+                serve(stream, resolve.as_ref(), &upstream, &cooling, report.as_ref(), &activity);
                 done.fetch_sub(1, Ordering::SeqCst);
             });
             if spawned.is_err() {
@@ -592,6 +709,7 @@ mod unix {
         upstream: &Upstream,
         cooling: &Arc<Mutex<super::Cooling>>,
         report: &(impl Fn(Event) + ?Sized),
+        activity: &Activity,
     ) {
         if stream.set_read_timeout(Some(PATIENCE)).is_err() {
             return;
@@ -617,6 +735,10 @@ mod unix {
             refuse(&mut writing, 401, "unknown tab");
             return;
         };
+        // From here the token is one a tab really has, so whatever this connection goes on to do
+        // counts as that tab asking: a request refused for its method or its path was still made,
+        // and a screen watching this is told the tab was busy rather than that it was idle.
+        let _asking = Counting::serving(activity, &incoming.token);
         let Some(method) = (match incoming.method.as_str() {
             "GET" => Some(Method::Get),
             "POST" => Some(Method::Post),
@@ -669,6 +791,10 @@ mod unix {
         let steps = order_now(cooling, &route, &key, asked_at);
 
         let mut waiting = steps.iter();
+        // The first answer of this request that only failed for now, kept in case every step after
+        // it fails for good. Nothing is decided on it while there is still a step to ask: the step
+        // after a busy one may well answer, and an answer nobody was shown is not a claim.
+        let mut remembered: Option<Passing> = None;
         while let Some(model) = waiting.next() {
             let to = waiting.clone().next().map(String::as_str);
             let ask = UpstreamAsk {
@@ -680,12 +806,13 @@ mod unix {
             };
             match upstream.call(ask) {
                 Ok(mut answer) => {
-                    // A `400` and a `404` only say which model they are about in what they say, so
-                    // that much is read before the step is given up on. What is read is kept: a
-                    // step that turns out not to be a reason to fall back still answers the
-                    // harness whole, and so does the last step of all.
+                    // A `400` and a `404` only say which model they are about in what they say, and
+                    // an answer that may be kept has to be held rather than streamed, so that much of
+                    // the body is read before the head is decided on. What is read is kept: a step
+                    // that turns out not to be a reason to fall back still answers the harness whole,
+                    // and so does the last step of all.
                     let mut said = Vec::new();
-                    if matches!(answer.status, 400 | 404) {
+                    if matches!(answer.status, 400 | 404) || (to.is_some() && passing(answer.status)) {
                         let _ = answer.body.by_ref().take(bound(MOST_SAID)).read_to_end(&mut said);
                     }
                     let status = answer.status;
@@ -693,10 +820,7 @@ mod unix {
                     // harness as it arrives and this request's model is decided for good: a
                     // stream that breaks halfway is a thing the harness must see, not a reason to
                     // spend the same question twice.
-                    let giving_up = to.is_some()
-                        && (matches!(status, 402 | 403 | 408 | 429)
-                            || status >= 500
-                            || (matches!(status, 400 | 404) && names(&said, model)));
+                    let giving_up = to.is_some() && (passing(status) || lasting(status, &said, model));
                     if giving_up {
                         let Some(to) = to else { return };
                         cool(cooling, &key, model);
@@ -708,7 +832,40 @@ mod unix {
                             to: to.to_owned(),
                             status: Some(status),
                         });
+                        // The first passing answer is kept: it is the model the person wrote first,
+                        // and a later one says less about what this request ran into.
+                        if remembered.is_none() && passing(status) {
+                            remembered = Some(Passing::Answer { status, headers: answer.headers, said });
+                        }
                         continue;
+                    }
+                    // What is left is a step that is not given up on: the last of the request,
+                    // and an answer that is not a reason to fall back. That answer is the harness's as
+                    // it is, except where this request already produced a reason to wait and this one
+                    // will not go away by waiting: a passing reason tells the person to wait and a
+                    // lasting one tells them to change the lineup, and when one request ran into
+                    // both, the reason to wait is the true story of it. Nothing is cooled and no
+                    // fall back is said: the walking stops here either way, and what the last step
+                    // answered is still what happened.
+                    if let Some(kept) = remembered.filter(|_| lasting(status, &said, model)) {
+                        match kept.reframed() {
+                            Passing::Answer { status: shown, headers, said: body } => {
+                                report(Event::Forwarded {
+                                    tag: route.entry.tag.to_string(),
+                                    path: incoming.path,
+                                    status: shown,
+                                });
+                                let head = head_line(shown, &headers);
+                                if writing.write_all(head.as_bytes()).is_ok() {
+                                    let _ = writing.write_all(&body);
+                                }
+                            }
+                            Passing::Unreachable { reason } => {
+                                report(Event::Unreachable { tag: route.entry.tag.to_string(), reason });
+                                refuse(&mut writing, 502, "the provider could not be reached");
+                            }
+                        }
+                        return;
                     }
                     report(Event::Forwarded { tag: route.entry.tag.to_string(), path: incoming.path, status });
                     let head = head_line(status, &answer.headers);
@@ -725,7 +882,9 @@ mod unix {
                 Err(error) => {
                     // The last step's own answer, whatever it is, is the harness's: a provider
                     // that cannot be reached has said so in its own words, and a harness can show
-                    // those where a refusal QCode made up would only hide them.
+                    // those where a refusal QCode made up would only hide them. Being unreachable is
+                    // itself a reason to come back rather than a complaint about the model, so this
+                    // one is shown as it is and nothing kept from an earlier step stands in its place.
                     let Some(to) = to else {
                         report(Event::Unreachable { tag: route.entry.tag.to_string(), reason: error.reason });
                         refuse(&mut writing, 502, "the provider could not be reached");
@@ -740,6 +899,11 @@ mod unix {
                         to: to.to_owned(),
                         status: None,
                     });
+                    // Kept like an answer, and replayed as the same refusal the last step's own
+                    // unreachable writes, since that is all there was to say about this provider.
+                    if remembered.is_none() {
+                        remembered = Some(Passing::Unreachable { reason: error.reason });
+                    }
                 }
             }
         }
@@ -806,6 +970,58 @@ fn names(said: &[u8], model: &str) -> bool {
     !model.is_empty() && said.windows(model.len()).any(|window| window == model)
 }
 
+/// Whether `status` is a reason to come back rather than a complaint that will not go away: a
+/// provider that is busy, one that was too slow, and one that broke. Another model of the lineup is
+/// worth asking now, and so is this one in a minute, which is what makes such an answer the one to
+/// keep when every step that comes after it fails for good.
+fn passing(status: u16) -> bool {
+    matches!(status, 408 | 429) || status >= 500
+}
+
+/// Whether `status` is a complaint about the model that was asked, as `said` read up to [`MOST_SAID`]
+/// says: a provider that will not sell it, will not let this key near it, or has never heard of
+/// it. Such an answer does not change by waiting, so it is not what a person waiting is shown.
+///
+/// A `401` is none of these: there is one key and the next step would be refused the same way. Nor
+/// is a `400` that does not name the model — that is the request's own fault, and every model of the
+/// lineup would refuse it the same way.
+fn lasting(status: u16, said: &[u8], model: &str) -> bool {
+    matches!(status, 402 | 403) || (matches!(status, 400 | 404) && names(said, model))
+}
+
+/// An earlier step's answer, kept while the steps after it are asked in case none of them can answer:
+/// then this is what the harness is shown rather than a complaint that will not go away.
+enum Passing {
+    /// A provider that answered with a reason to wait, in its own status, its own headers and as much
+    /// of its own body as was read before the step was given up on.
+    Answer {
+        /// The status the provider answered with.
+        status: u16,
+        /// The headers it answered with, minus the ones [`REPLAYED_WITHOUT`] names.
+        headers: Vec<(String, String)>,
+        /// Its body as it was read.
+        said: Vec<u8>,
+    },
+    /// A provider that could not be reached at all, in the transport's own words. The harness is shown
+    /// the relay's own refusal in its place, exactly as it is when the last step could not be reached.
+    Unreachable {
+        /// What the transport said.
+        reason: String,
+    },
+}
+
+impl Passing {
+    /// Takes away the headers of a replayed answer that do not go with the body it is shown behind.
+    /// Called on the way out of the listener rather than on the way in, so what a step was given up
+    /// on for is never touched.
+    fn reframed(mut self) -> Self {
+        if let Self::Answer { headers, .. } = &mut self {
+            headers.retain(|(name, _)| !REPLAYED_WITHOUT.contains(&name.as_str()));
+        }
+        self
+    }
+}
+
 /// Remembers that `model` is not to be asked of this route again for [`COOLING`]. Nothing is done
 /// with a lock that cannot be taken: the step is asked again on the next request rather than
 /// never, which is what a plain order does.
@@ -819,8 +1035,9 @@ mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Condvar, Mutex};
 
     use serde_json::Value;
 
@@ -1252,6 +1469,10 @@ mod tests {
     /// What the second model answers when it is asked.
     const THE_ANSWER: &str = r#"{"id":"chatcmpl-kyaz-1","choices":[{"text":"done"}]}"#;
 
+    /// A lineup of three, for the tests that need more than one step to have failed before the last
+    /// one does: the first answer kept is only the first one when something answered before it.
+    const THREE_MODELS: &[&str] = &["a/one", "b/two", "c/three"];
+
     /// A stand-in that refuses `A_LINEUP`'s first model and answers its second, and records every
     /// request that reaches it.
     fn one_busy_one_willing(seen: Sender<SeenAsk>) -> Upstream {
@@ -1421,6 +1642,209 @@ mod tests {
         assert_eq!(head["status"], 503);
         assert_eq!(body, said.as_bytes(), "the last step's body is not QCode's to change");
         assert_eq!(asked_models(&seen_rx, 2), A_LINEUP, "both were asked and there was nowhere else to go");
+    }
+
+    #[test]
+    fn a_busy_first_model_is_the_answer_the_harness_gets_when_the_last_one_names_a_model_that_is_not_there() {
+        let scratch = Scratch::new("passing");
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let busy = r#"{"error":"busy, retry shortly"}"#;
+        let missing = r#"{"error":{"message":"model b/two not found"}}"#;
+        let reported: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
+        let told = Arc::clone(&reported);
+        let listener = Listener::open(
+            &scratch.0,
+            resolve_steps("tok", ollama_entry(None), A_LINEUP, Some("bilim")),
+            by_model(vec![(A_LINEUP[0], (429, busy)), (A_LINEUP[1], (404, missing))], seen_tx),
+            move |event| told.lock().expect("the events are not poisoned").push(event),
+        )
+        .expect("the socket opens");
+
+        // A person told to wait does wait; a person told a model does not exist goes and changes a
+        // lineup that works. This is what the tab said before the lineup was ever written down.
+        let (head, body) = ask(listener.socket(), "tok", "POST", "/v1/messages", A_HARNESS_ASKING);
+        assert_eq!(head["status"], 429);
+        assert_eq!(body, busy.as_bytes(), "the provider's own words, whole and unedited");
+        assert_eq!(asked_models(&seen_rx, 2), A_LINEUP, "both models were asked");
+        // The last step is not cooled and is not said to be passed over: there was nowhere to fall
+        // back to, and what the harness was shown is not what the last step answered.
+        assert_eq!(
+            taken(&reported).last(),
+            Some(&Event::Forwarded { tag: "ev".to_owned(), path: "/v1/messages".to_owned(), status: 429 }),
+            "what the harness got is the one thing said about this request: {reported:?}"
+        );
+    }
+
+    #[test]
+    fn of_several_passing_answers_the_first_one_is_the_answer_the_harness_gets() {
+        let scratch = Scratch::new("firstpassing");
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let first = r#"{"error":"the model server is down"}"#;
+        let second = r#"{"error":"busy, retry shortly"}"#;
+        let listener = Listener::open(
+            &scratch.0,
+            resolve_steps("tok", ollama_entry(None), THREE_MODELS, Some("bilim")),
+            by_model(
+                vec![
+                    (THREE_MODELS[0], (503, first)),
+                    (THREE_MODELS[1], (429, second)),
+                    (THREE_MODELS[2], (404, r#"{"error":{"message":"model c/three not found"}}"#)),
+                ],
+                seen_tx,
+            ),
+            |_| {},
+        )
+        .expect("the socket opens");
+
+        // The first model of the lineup is the one the person wrote first, so its answer is the one
+        // worth showing even though a later model was passing as well.
+        let (head, body) = ask(listener.socket(), "tok", "POST", "/v1/messages", A_HARNESS_ASKING);
+        assert_eq!(head["status"], 503);
+        assert_eq!(body, first.as_bytes());
+        assert_eq!(asked_models(&seen_rx, 3), THREE_MODELS, "all three were asked");
+    }
+
+    #[test]
+    fn a_provider_that_could_not_be_reached_is_the_answer_the_harness_gets_when_the_last_one_is_not_there() {
+        let scratch = Scratch::new("unreachable-passing");
+        let (seen_tx, seen_rx) = mpsc::channel();
+        // The provider is not there at all for the first model, and has never heard of the second:
+        // what this request ran into is a provider that is down, not a lineup that is wrong.
+        let upstream = Upstream::new(move |mut ask| {
+            let mut sent = Vec::new();
+            let _ = ask.body.read_to_end(&mut sent);
+            let asked: Option<String> =
+                serde_json::from_slice::<Value>(&sent).ok().and_then(|body| body["model"].as_str().map(str::to_owned));
+            let _ = seen_tx.send(SeenAsk {
+                url: ask.url.clone(),
+                headers: ask.headers.clone(),
+                secret: ask.secret.clone(),
+                body: sent,
+            });
+            if asked.as_deref() == Some(A_LINEUP[0]) {
+                return Err(UpstreamError { url: ask.url.clone(), reason: "connection refused".to_owned() });
+            }
+            Ok(UpstreamAnswer {
+                status: 404,
+                headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+                body: Box::new(std::io::Cursor::new(
+                    r#"{"error":{"message":"model b/two not found"}}"#.as_bytes().to_vec(),
+                )),
+            })
+        });
+        let listener =
+            Listener::open(&scratch.0, resolve_steps("tok", ollama_entry(None), A_LINEUP, None), upstream, |_| {})
+                .expect("the socket opens");
+
+        // The relay's own refusal, exactly the one a last step that cannot be reached writes: what
+        // the harness is shown is a provider to come back to rather than a model to go and find.
+        let (head, body) = ask(listener.socket(), "tok", "POST", "/v1/messages", A_HARNESS_ASKING);
+        assert_eq!(head["status"], 502);
+        assert_eq!(body, refusal_body("the provider could not be reached"));
+        assert_eq!(asked_models(&seen_rx, 2), A_LINEUP, "both were asked");
+    }
+
+    #[test]
+    fn a_busy_first_model_does_not_take_the_place_of_a_complaint_about_the_request() {
+        let scratch = Scratch::new("abouttherequest");
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let about_the_request = r#"{"error":{"message":"too many tokens"}}"#;
+        let listener = Listener::open(
+            &scratch.0,
+            resolve_steps("tok", ollama_entry(None), A_LINEUP, None),
+            by_model(
+                vec![
+                    (A_LINEUP[0], (429, r#"{"error":"busy, retry shortly"}"#)),
+                    (A_LINEUP[1], (400, about_the_request)),
+                ],
+                seen_tx,
+            ),
+            |_| {},
+        )
+        .expect("the socket opens");
+
+        // Nothing about the lineup is wrong: every model of it would refuse a request this long, so
+        // being told to wait would send the person to wait for an answer that never comes.
+        let (head, body) = ask(listener.socket(), "tok", "POST", "/v1/messages", A_HARNESS_ASKING);
+        assert_eq!(head["status"], 400);
+        assert_eq!(body, about_the_request.as_bytes(), "the request's own complaint reaches the harness whole");
+        assert_eq!(asked_models(&seen_rx, 2), A_LINEUP);
+    }
+
+    #[test]
+    fn a_route_of_one_model_that_does_not_exist_is_answered_as_it_is() {
+        let scratch = Scratch::new("nostep");
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let listener = Listener::open(
+            &scratch.0,
+            resolve_one("tok", ollama_entry(None), A_LINEUP[0]),
+            by_model(vec![(A_LINEUP[0], (404, NO_SUCH_MODEL))], seen_tx),
+            |_| {},
+        )
+        .expect("the socket opens");
+
+        // There was no earlier step to pass for now, so there is nothing to show in place of the
+        // model's own complaint — which is the one thing a person can act on here.
+        let (head, body) = ask(listener.socket(), "tok", "POST", "/v1/messages", A_HARNESS_ASKING);
+        assert_eq!(head["status"], 404);
+        assert_eq!(body, NO_SUCH_MODEL.as_bytes());
+        assert_eq!(asked_models(&seen_rx, 1), [A_LINEUP[0].to_owned()]);
+    }
+
+    #[test]
+    fn a_replayed_answer_carries_neither_the_length_nor_the_framing_of_the_one_it_was_read_from() {
+        let scratch = Scratch::new("replayedhead");
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let busy = r#"{"error":"busy, retry shortly"}"#;
+        // What a provider really sends: the length of the body and the framing it is written in.
+        // The body was read before the step was given up on, so neither of them describes what the
+        // harness would be sent, and a head the script writes as it stands would cut the answer.
+        let upstream = Upstream::new(move |mut ask| {
+            let mut sent = Vec::new();
+            let _ = ask.body.read_to_end(&mut sent);
+            let asked: Option<String> =
+                serde_json::from_slice::<Value>(&sent).ok().and_then(|body| body["model"].as_str().map(str::to_owned));
+            let _ = seen_tx.send(SeenAsk {
+                url: ask.url.clone(),
+                headers: ask.headers.clone(),
+                secret: ask.secret.clone(),
+                body: sent,
+            });
+            if asked.as_deref() == Some(A_LINEUP[0]) {
+                return Ok(UpstreamAnswer {
+                    status: 429,
+                    headers: vec![
+                        ("content-type".to_owned(), "application/json".to_owned()),
+                        ("content-length".to_owned(), busy.len().to_string()),
+                        ("transfer-encoding".to_owned(), "chunked".to_owned()),
+                    ],
+                    body: Box::new(std::io::Cursor::new(busy.as_bytes().to_vec())),
+                });
+            }
+            Ok(UpstreamAnswer {
+                status: 404,
+                headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+                body: Box::new(std::io::Cursor::new(
+                    r#"{"error":{"message":"model b/two not found"}}"#.as_bytes().to_vec(),
+                )),
+            })
+        });
+        let listener =
+            Listener::open(&scratch.0, resolve_steps("tok", ollama_entry(None), A_LINEUP, None), upstream, |_| {})
+                .expect("the socket opens");
+
+        let (head, body) = ask(listener.socket(), "tok", "POST", "/v1/messages", A_HARNESS_ASKING);
+        assert_eq!(head["status"], 429);
+        assert_eq!(body, busy.as_bytes(), "the whole of what was read is what the harness gets");
+        for gone in ["content-length", "transfer-encoding"] {
+            assert!(
+                head["headers"].get(gone).is_none(),
+                "{gone} describes a body that was read and may have been cut: {:?}",
+                head["headers"]
+            );
+        }
+        assert_eq!(head["headers"]["content-type"], "application/json", "the rest of the provider's head is its own");
+        assert_eq!(asked_models(&seen_rx, 2), A_LINEUP);
     }
 
     #[test]
@@ -1759,5 +2183,123 @@ mod tests {
                 seen.headers
             );
         }
+    }
+
+    /// An upstream that holds every request until the test has let as many go, which is what makes a
+    /// request in flight observable: without a stand-in that waits, every request here would be
+    /// finished before a test could look at it.
+    fn held(arrived: Sender<()>, released: Arc<(Mutex<usize>, Condvar)>) -> Upstream {
+        let next = Arc::new(AtomicUsize::new(0));
+        Upstream::new(move |_| {
+            let at = next.fetch_add(1, Ordering::SeqCst);
+            arrived.send(()).expect("the test is waiting for it");
+            let (free, wake) = &*released;
+            let mut free = free.lock().expect("the lock");
+            while *free <= at {
+                free = wake.wait(free).expect("the lock");
+            }
+            Ok(UpstreamAnswer { status: 200, headers: Vec::new(), body: Box::new(io::empty()) })
+        })
+    }
+
+    /// Lets `count` of the requests [`held`] is holding go.
+    fn release(released: &Arc<(Mutex<usize>, Condvar)>, count: usize) {
+        let (free, wake) = &**released;
+        *free.lock().expect("the lock") = count;
+        wake.notify_all();
+    }
+
+    /// The handle a screen would keep, and what it says while a request is on its way to a model
+    /// and once it is not.
+    #[test]
+    fn a_request_on_its_way_to_a_model_is_busy_and_then_is_not() {
+        let scratch = Scratch::new("busy");
+        let (arrived_tx, arrived_rx) = mpsc::channel();
+        let released = Arc::new((Mutex::new(0), Condvar::new()));
+        let listener = Listener::open(
+            &scratch.0,
+            resolve_one("tok", ollama_entry(None), CHOSEN),
+            held(arrived_tx, Arc::clone(&released)),
+            |_| {},
+        )
+        .expect("the socket opens");
+        let activity = listener.activity();
+
+        // Nothing has asked yet: a screen reading this before the first turn of a conversation is
+        // told the tab is idle, which is what it wants to show.
+        assert!(!activity.busy("tok"), "a tab that has not asked is not busy");
+        assert_eq!(activity.last_finished("tok"), None, "and has no finished time");
+
+        let asking = std::thread::spawn({
+            let socket = listener.socket().to_owned();
+            move || ask(&socket, "tok", "POST", "/v1/messages", A_HARNESS_ASKING)
+        });
+        arrived_rx.recv().expect("the request reached the provider");
+        assert!(activity.busy("tok"), "the tab is waiting on the model: this is what a screen shows");
+        assert_eq!(activity.last_finished("tok"), None, "nothing of this token has finished yet");
+
+        release(&released, 1);
+        let (head, _) = asking.join().expect("the answer came back");
+        assert_eq!(head["status"], 200);
+        assert!(!activity.busy("tok"), "the answer is here, so the tab is idle again");
+        let finished = activity.last_finished("tok").expect("a request that finished has a time");
+        assert!(finished <= Instant::now(), "and it is a time that has already been");
+    }
+
+    /// A token no tab has is not busy and has no time: the two answers a screen needs before a tab
+    /// of this workspace has ever made a request.
+    #[test]
+    fn a_token_no_tab_has_is_not_busy_and_has_no_time() {
+        let scratch = Scratch::new("unknown-busy");
+        let (seen_tx, _seen_rx) = mpsc::channel();
+        let listener = Listener::open(
+            &scratch.0,
+            resolve_one("tok", ollama_entry(None), CHOSEN),
+            canned(200, "{}", seen_tx),
+            |_| {},
+        )
+        .expect("the socket opens");
+        let activity = listener.activity();
+
+        assert!(!activity.busy("never-asked"), "no tab of that token has asked");
+        assert_eq!(activity.last_finished("never-asked"), None, "and nothing of it has finished");
+
+        // A request refused before its token was read is not a tab asking either: there was no tab
+        // behind it, so nothing is counted and nothing has a time.
+        let (head, _) = ask(listener.socket(), "wrong", "GET", "/v1/models", b"");
+        assert_eq!(head["status"], 401);
+        assert!(!activity.busy("wrong"), "a refused request leaves no tab busy");
+        assert_eq!(activity.last_finished("wrong"), None, "and no time behind it");
+    }
+
+    /// Two tabs of one workspace can be on different providers, so what is counted is counted for
+    /// the token a request came with and for no other: the screen writes what it is told under the
+    /// tab it belongs to.
+    #[test]
+    fn a_request_is_counted_for_its_own_token_and_never_for_another_tabs() {
+        let scratch = Scratch::new("two-busy");
+        let (arrived_tx, arrived_rx) = mpsc::channel();
+        let released = Arc::new((Mutex::new(0), Condvar::new()));
+        let listener = Listener::open(
+            &scratch.0,
+            resolve_one("tok", ollama_entry(None), CHOSEN),
+            held(arrived_tx, Arc::clone(&released)),
+            |_| {},
+        )
+        .expect("the socket opens");
+        let activity = listener.activity();
+
+        let asking = std::thread::spawn({
+            let socket = listener.socket().to_owned();
+            move || ask(&socket, "tok", "POST", "/v1/messages", A_HARNESS_ASKING)
+        });
+        arrived_rx.recv().expect("the request reached the provider");
+        assert!(activity.busy("tok"), "the tab that asked is waiting on the model");
+        assert!(!activity.busy("other"), "and no other tab of the workspace is");
+
+        release(&released, 1);
+        let _ = asking.join().expect("the answer came back");
+        assert!(!activity.busy("tok"));
+        assert!(activity.last_finished("other").is_none(), "the other tab never asked, so it has no time");
     }
 }

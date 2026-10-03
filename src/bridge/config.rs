@@ -42,6 +42,40 @@ pub enum Unregistered {
 /// The exit code of the reading script for a file that is not there.
 const ABSENT: i32 = 3;
 
+/// Reads the file at `path` under the home directory of the running container `container`, and
+/// answers `None` when it is not there.
+///
+/// A volume is only reached through a container, so the file is read by a shell in it. Runs an
+/// engine command, so it belongs on a background thread.
+pub(crate) fn read_in_home(engine: &Engine, container: &str, path: &str) -> Result<Option<String>, EngineError> {
+    let read = ["sh", "-c", "[ -e \"$HOME/$1\" ] || exit 3; cat -- \"$HOME/$1\"", "sh", path];
+    match capture(&engine.exec_without_terminal(&Exec { container, command: &read })) {
+        Ok(text) => Ok(Some(text)),
+        Err(EngineError::Failed(failure)) if failure.code == Some(ABSENT) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Writes `text` to the file at `path` under the home directory of the running container
+/// `container`.
+///
+/// The new text goes through the shell's input, because a harness's settings can be longer than
+/// one argument may be, and the file is written beside the old one with the old one's mode and
+/// moved over it, so a harness reading at that moment finds the old file or the new one, never
+/// half of one. Runs engine commands, so it belongs on a background thread.
+pub(crate) fn write_in_home(engine: &Engine, container: &str, path: &str, text: &str) -> Result<(), EngineError> {
+    let write = [
+        "sh",
+        "-c",
+        "set -e; file=\"$HOME/$1\"; mkdir -p -- \"$(dirname -- \"$file\")\"; \
+         cp -p -- \"$file\" \"$file.qcode-new\" 2>/dev/null || true; \
+         cat > \"$file.qcode-new\"; mv -f -- \"$file.qcode-new\" \"$file\"",
+        "sh",
+        path,
+    ];
+    feed(&engine.exec_reading(&Exec { container, command: &write }), text.as_bytes()).map(|_| ())
+}
+
 /// Registers the server in the settings of `harness` inside the running container `container`,
 /// whose home is the workspace's home volume for the profile. `token` is the tab's, for the one
 /// harness whose entry carries it instead of its container's environment.
@@ -59,30 +93,15 @@ const ABSENT: i32 = 3;
 pub fn register(engine: &Engine, container: &str, harness: HarnessKind, token: &str) -> Result<(), Unregistered> {
     // A harness that reads no servers has nothing to register and nothing to complain about.
     let Some(settings) = harness.record().mcp else { return Ok(()) };
-    let read = ["sh", "-c", "[ -e \"$HOME/$1\" ] || exit 3; cat -- \"$HOME/$1\"", "sh", settings.path];
-    let existing = match capture(&engine.exec_without_terminal(&Exec { container, command: &read })) {
-        Ok(text) => Some(text),
-        Err(EngineError::Failed(failure)) if failure.code == Some(ABSENT) => None,
-        Err(error) => return Err(Unregistered::Engine(words(&error))),
-    };
+    let existing =
+        read_in_home(engine, container, settings.path).map_err(|error| Unregistered::Engine(words(&error)))?;
     let text = match merge(settings.shape, existing.as_deref(), token) {
         Merged::Unchanged => return Ok(()),
         Merged::Write(text) => text,
         Merged::Taken => return Err(Unregistered::Taken(settings.path.to_owned())),
         Merged::Unreadable(place) => return Err(Unregistered::Unreadable(settings.path.to_owned(), place)),
     };
-    let write = [
-        "sh",
-        "-c",
-        "set -e; file=\"$HOME/$1\"; mkdir -p -- \"$(dirname -- \"$file\")\"; \
-         cp -p -- \"$file\" \"$file.qcode-new\" 2>/dev/null || true; \
-         cat > \"$file.qcode-new\"; mv -f -- \"$file.qcode-new\" \"$file\"",
-        "sh",
-        settings.path,
-    ];
-    feed(&engine.exec_reading(&Exec { container, command: &write }), text.as_bytes())
-        .map(|_| ())
-        .map_err(|error| Unregistered::Engine(words(&error)))
+    write_in_home(engine, container, settings.path, &text).map_err(|error| Unregistered::Engine(words(&error)))
 }
 
 /// What an engine said when it refused, for the person to read.
@@ -264,7 +283,7 @@ fn codex_is_ours(found: &DeValue<'_>) -> bool {
 }
 
 /// `line:column` of the byte where `span` starts in `text`, counted from 1.
-fn place(text: &str, span: Option<std::ops::Range<usize>>) -> String {
+pub(crate) fn place(text: &str, span: Option<std::ops::Range<usize>>) -> String {
     let start = span.map_or(0, |span| span.start).min(text.len());
     let before = &text[..text.floor_char_boundary(start)];
     let line = before.matches('\n').count() + 1;

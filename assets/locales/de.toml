@@ -314,6 +314,10 @@ unguided.title = "Die Anweisungen für {harness} in diesem Arbeitsbereich konnte
 unguided.graphify = "graphify konnte sich im Arbeitsbereich nicht einrichten, daher weiß der Agent vielleicht nicht, dass er seine Karte nutzen soll: {words}"
 unguided.unwritten = "{file} konnte nicht geschrieben werden, daher erfährt der Agent nicht, wie er die anderen Tabs erreicht: {words}"
 unguided.broken = "{file} enthält nur eine der Zeilen <!-- qcode:begin --> und <!-- qcode:end -->, deshalb blieb die Datei unverändert. Entferne die übrige."
+asked.title = "{harness} kann in diesem Arbeitsbereich nachfragen, bevor es etwas tut"
+unapproved.title = "Der Agent in diesem Fenster kann nachfragen, bevor er etwas tut"
+asked.theirs = "Seiner Einstellungsdatei {file} konnten die Antworten, die es nicht nachfragen lassen, nicht gegeben werden; sie wurde deshalb gelassen, wie sie ist: {says}"
+asked.unreadable = "Seine Einstellungsdatei {file} konnte unter {place} nicht gelesen werden; sie wurde deshalb gelassen, wie sie ist."
 no-engine = "Es wurde keine Container-Engine gefunden, es lässt sich also nichts öffnen. Repariere sie in den Einstellungen."
 none.title = "Es ist kein Arbeitsbereich offen"
 none.message = "Öffne einen Arbeitsbereich, und seine Tabs, Dateien und Container erscheinen hier."
@@ -375,6 +379,7 @@ containers.restart = "Neu starten"
 state.created = "angelegt"
 state.running = "läuft"
 state.paused = "pausiert"
+state.frozen = "eingefroren"
 state.restarting = "startet neu"
 state.removing = "wird entfernt"
 state.exited = "angehalten"
@@ -410,7 +415,8 @@ window.no-wayland = "Diese Sitzung hat keinen Wayland-Compositor, und QCode öff
 window.no-socket = "Der Socket des Compositors liegt nicht mehr unter {socket}. Ein Compositor, der neu gestartet ist, lässt ein offenes Fenster zurück; es wieder zu öffnen ist der Weg zurück."
 window.open = "Das Fenster öffnen"
 window.signin-open-yourself = "Das Fenster wollte diese Seite öffnen, und sie ließ sich hier nicht zeigen:"
-window.raise = "Nach vorn holen"
+window.raise = "Nach vorne bitten"
+window.raise-note = "Unter Wayland kommt ein Fenster nur nach vorne, wenn deine Arbeitsumgebung es erlaubt; bleibt es dahinter, wechsle über die Fensterliste oder die Taskleiste deiner Arbeitsumgebung zu ihm."
 window.close = "Das Fenster schließen"
 window.raise-failed = "Das Fenster konnte nicht nach vorn geholt werden"
 window.close-failed = "Das Fenster konnte nicht geschlossen werden"
@@ -665,6 +671,8 @@ on-close-text = "Was die Container von QCode tun, sobald kein QCode mehr offen i
 on-close-windows = "Unter Windows laufen die Container weiter."
 on-close-stop = "Anhalten"
 on-close-keep = "Weiterlaufen lassen"
+freeze-idle = "Ruhige Profile im Hintergrund einfrieren"
+freeze-idle-text = "Ein Profil, dessen Tab nicht auf dem Bildschirm ist und das seit zehn Minuten nichts tut, wird angehalten und sein Speicher in den Auslagerungsspeicher verschoben. Es wacht auf, sobald du einen seiner Tabs öffnest oder ihm eine Nachricht schickst. Nur mit rootless Podman und Auslagerungsspeicher."
 
 backup = "SICHERUNG"
 backup-every = "Offene Arbeitsbereiche sichern"
@@ -962,11 +970,11 @@ slim-offline = "Die Container dieses Profils haben kein Netzwerk, daher antworte
 summary-base = "wie es kommt"
 download-graphify = "graphify wird aus {system} und PyPI heruntergeladen, während das Image gebaut wird; der Build braucht also das Netz, auch wenn die Container dieses Profils keines haben. Ohne das bricht der Build ab und sagt das; ein Image wird nie mit einem fehlenden Teil erstellt."
 download = "Was {template} hinzufügt, wird aus {system}, PyPI, npm und GitHub heruntergeladen, während das Image gebaut wird; der Build braucht also das Netz, auch wenn die Container dieses Profils keines haben. Ohne das bricht der Build ab und sagt das; ein Image wird nie mit einem fehlenden Teil erstellt."
-build-failed = "{template} konnte das, was es hinzufügt, nicht herunterladen, daher wurde kein Image erstellt. Der Build braucht das Netz; im Log unten steht, welcher Schritt stoppte."
+build-failed = "{template} konnte das, was es hinzufügt, nicht herunterladen, daher wurde kein Image erstellt. Der Build braucht das Netz; im Log unten steht, welcher Schritt stoppte. Ein Netz, das einen Moment ausfällt, reicht schon, um es zu stoppen, deshalb geht Erneut bauen oft durch."
 adds-none = "Neben dem Werkzeug wird nichts installiert, daher wird nichts mehr heruntergeladen."
 dev-chromium = "Ein echter Browser, für die Tests, die einen steuern."
 dev-download = "Was Quvyta-Entwicklung hinzufügt, wird aus {system}, PyPI, npm, GitHub, rustup.rs und astral.sh heruntergeladen, während das Image gebaut wird; der Build braucht also das Netz, auch wenn die Container dieses Profils keines haben. Ohne das bricht der Build ab und sagt das; ein Image wird nie mit einem fehlenden Teil erstellt."
-dev-build-failed = "Quvyta-Entwicklung konnte das, was es hinzufügt, nicht herunterladen, daher wurde kein Image erstellt. Der Build braucht das Netz; im Log unten steht, welcher Schritt stoppte."
+dev-build-failed = "Quvyta-Entwicklung konnte das, was es hinzufügt, nicht herunterladen, daher wurde kein Image erstellt. Der Build braucht das Netz; im Log unten steht, welcher Schritt stoppte. Ein Netz, das einen Moment ausfällt, reicht schon, um es zu stoppen, deshalb geht Erneut bauen oft durch."
 # The template page as a picker and one switch per part.
 name-custom = "Eigene"
 claude-plugins = "Plugins für Claude Code"
@@ -1079,8 +1087,15 @@ discard = "Verwerfen"
 [workspace.busy]
 timing = "Arbeitende Tabs werden markiert"
 
+[workspace.freezing]
+looking = "Es wird nachgesehen, was die Profile tun"
+
 [workspace.relay]
 listening = "Warten darauf, welches Modell für einen Tab geantwortet hat"
 fell-back = "{what}: {from} hat mit {status} geantwortet, jetzt {to}"
 fell-back-unreachable = "{what}: {from} war nicht erreichbar, jetzt {to}"
 telling = "Die Zeile unter einem Tab, das zurückgefallen ist, wird weggenommen"
+
+[build]
+looking = "Es wird nachgesehen, ob der Build noch schreibt"
+stuck = "Seit {minutes} Minuten schreibt der Build nichts Neues. Er hängt vielleicht; du kannst ihn anhalten."

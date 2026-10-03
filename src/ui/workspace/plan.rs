@@ -425,6 +425,12 @@ fn written(command: &EngineCommand) -> String {
 /// container is never made again, because tabs are working in it; it keeps its old plan until
 /// it is next stopped, which happens by the latest when no QCode is open.
 ///
+/// A frozen container is woken instead, for the same reason and with more to lose: it holds every
+/// tab of the profile, each with its own process and its own terminal, so a person coming back to
+/// it finds the work exactly as it was. Making it again would end all of them at once, so an
+/// engine that will not wake it is a failure the person is shown rather than a container QCode
+/// throws away and makes anew.
+///
 /// This runs engine commands and waits for them, so it belongs on a background thread: give it
 /// to `Command::perform`, never to `update` or `view`.
 ///
@@ -458,6 +464,14 @@ pub fn ensure_running_noting(
     let state = run::capture(&engine.container_state(&plan.name)).map(|word| ContainerState::parse(&word)).ok();
     let exists = match state {
         Some(ContainerState::Running) => return Ok(None),
+        // A frozen container is not a stopped one: it is up, with every tab in it still running
+        // and everything they wrote still in memory. So it is woken and nothing else, the same
+        // answer a running container gives. Making it again would end all of them at once, so an
+        // engine that refuses to wake it is said to the person rather than acted on.
+        Some(ContainerState::Paused) => {
+            run::capture(&engine.unpause_container(&plan.name)).map_err(|error| LaunchFailure::from(&error))?;
+            return Ok(None);
+        }
         Some(_) => {
             let Stopped { current, replaced, before } = stopped(engine, plan, user);
             if !current {
@@ -523,7 +537,33 @@ pub fn ensure_running_noting(
         }
     }
     run::capture(&engine.start_container(&plan.name)).map_err(|error| LaunchFailure::from(&error))?;
+    name_the_user(engine, &plan.name, user);
     Ok(behind)
+}
+
+/// Gives the person a name inside the container `container` on the engine whose daemon runs it as
+/// the ids QCode hands it; does nothing on the engine that maps the person into the container's own
+/// user namespace, nor for a host that has no POSIX ids to map.
+///
+/// On docker the container is created with `--user uid:gid` and the image names nobody but the uid
+/// it was built with, so a person whose uid is another one comes up as a number: `whoami` cannot
+/// answer, `git commit` refuses to write an author, and Node's `os.userInfo()` throws on it. The
+/// home directory and the person's own files are right, so this is the whole of what is missing.
+/// Whether the uid needs a name at all is asked of the container's own password file rather than
+/// of the image's build: the shell looks for the uid in its own field and writes nothing into a
+/// container that already knows the person, which is every container of an image made for the uid
+/// the base was built with.
+///
+/// An engine that will not write it is not said on screen and does not stop the tab: a name is
+/// worth less than a tab that comes up, and the tab works either way.
+fn name_the_user(engine: &Engine, container: &str, user: HostUser) {
+    if !engine.needs_a_user_entry() {
+        return;
+    }
+    let HostUser::Ids { uid, gid } = user else { return };
+    let (uid, gid) = (uid.to_string(), gid.to_string());
+    let command = ["sh", "-c", base::paths::NAME_THE_USER, "sh", &uid, &gid];
+    let _ = run::capture(&engine.exec_as_root_without_terminal(&Exec { container, command: &command }));
 }
 
 /// Makes a stopped container of a profile anew when it is not the one its plan asks for now —
@@ -539,9 +579,26 @@ pub fn ensure_running_noting(
 /// are in the home volume, which the new one mounts, and what the administrator changed in the
 /// system is kept first (the `keep` module).
 ///
+/// A frozen container is woken, never made anew, and answered as renewed: it is up, and making a
+/// new one beside it would end every tab in it.
+///
 /// Runs engine commands and waits for them, so it belongs on a background thread.
 pub fn renew_stale(engine: &Engine, plan: &ContainerPlan, user: HostUser) -> (bool, Option<String>) {
     let state = run::capture(&engine.container_state(&plan.name)).map(|word| ContainerState::parse(&word)).ok();
+    // A frozen container is up, so it is never made anew: every tab in it is still running and
+    // everything they hold is still in memory, and a container made from a newer image or plan
+    // would end all of them at once. It is not started either, which would be refused; it is
+    // woken, so the conversation this page is about to read is read from the same container the
+    // tabs are in. A frozen container whose plan has gone stale keeps it, exactly as a running
+    // one does, until it is next stopped.
+    if matches!(state, Some(ContainerState::Paused)) {
+        return match run::capture(&engine.unpause_container(&plan.name)) {
+            Ok(_) => (true, None),
+            // Left frozen: the engine's own words are the caller's to show, and a container QCode
+            // cannot wake is not one it may throw away either.
+            Err(_) => (false, None),
+        };
+    }
     let stopped_now = matches!(state, Some(state) if state != ContainerState::Running);
     if !stopped_now || stopped(engine, plan, user).current {
         return (false, None);
@@ -607,7 +664,8 @@ pub enum Window {
     Opened,
     /// A container of that name was already running, so the tab took that window rather than
     /// opening a second one. This is what a QCode that crashed with a window open leaves behind,
-    /// and what a second tab of the same profile would otherwise duplicate.
+    /// what a second tab of the same profile would otherwise duplicate, and what a frozen
+    /// container is treated as once it has been woken.
     Adopted,
 }
 
@@ -618,12 +676,16 @@ pub enum Window {
 /// and the window is opened fresh. Nothing of the person's is in it — the settings, the history and
 /// the login are all in the home volume, which the new container mounts.
 ///
+/// A frozen container is not such a remainder: its window is still there, with the work in it, so
+/// it is woken and its window taken rather than taken away. A window profile is never frozen by
+/// QCode's own rules, so this is here for a container something else froze.
+///
 /// Runs engine commands and waits for them, so it belongs on a background thread.
 ///
 /// # Errors
 ///
-/// The engine's own words when it cannot be started, or refuses to remove the old container or to
-/// run the new one; and the machine's when the seccomp profile cannot be written.
+/// The engine's own words when it cannot be started, or refuses to wake, remove or start the
+/// container, or to run the new one; and the machine's when the seccomp profile cannot be written.
 pub fn open_window(
     engine: &Engine,
     plan: &ContainerPlan,
@@ -633,6 +695,10 @@ pub fn open_window(
     let state = run::capture(&engine.container_state(&plan.name)).map(|word| ContainerState::parse(&word)).ok();
     match state {
         Some(ContainerState::Running) => return Ok(Window::Adopted),
+        Some(ContainerState::Paused) => {
+            run::capture(&engine.unpause_container(&plan.name)).map_err(|error| LaunchFailure::from(&error))?;
+            return Ok(Window::Adopted);
+        }
         Some(_) => {
             run::capture(&engine.remove_container(&plan.name)).map_err(|error| LaunchFailure::from(&error))?;
         }
@@ -680,10 +746,13 @@ pub fn give_window_login(engine: &Engine, plan: &ContainerPlan, user: HostUser) 
     identity::first_fill(engine, home, user).map_err(|error| LaunchFailure::from(&error))
 }
 
-/// What was made ready for a window before it opened: the bridge's server registered in its
-/// settings, and its instruction files in the workspace; each of them either done or why not.
+/// What was made ready for a window before it opened: the agent's own answers written into its
+/// home, the bridge's server registered in its settings, and its instruction files in the
+/// workspace; each of them either done or why not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prepared {
+    /// The agent's approvals and permission grants, for a window's home whatever else it holds.
+    pub approvals: Result<(), String>,
     /// The bridge's registration.
     pub bridge: Result<(), Unregistered>,
     /// The instruction files, for a profile on QCode high.
@@ -691,9 +760,16 @@ pub struct Prepared {
 }
 
 /// Makes `plan`'s window ready before it opens, from a container made for that and nothing else:
-/// registers the bridge's server in the settings on its home volume, for the tab whose token is
-/// `token`, and, for a profile on QCode high, brings its instruction files in the workspace up to
-/// date the way [`guide`] does for a terminal's container.
+/// writes what the window's agent may do without asking into the home on its volume, registers the
+/// bridge's server in the settings there for the tab whose token is `token`, and, for a profile on
+/// QCode high, brings its instruction files in the workspace up to date the way [`guide`] does for
+/// a terminal's container.
+///
+/// The agent's answers come first, since the application reads its database as it starts and a
+/// window that asks about every file read, every command and every edit is the one thing a
+/// container is not supposed to cost. They are written for every window with a home, under every
+/// template and into a home that was signed in to by hand, and merged into what is there rather
+/// than written over it, so the settings a person made in the window are kept.
 ///
 /// A window's own container cannot be written to from the inside: it is created and started in one
 /// go with the application as its only program, so by the time it is there the settings have been
@@ -705,11 +781,8 @@ pub struct Prepared {
 /// Runs engine commands and waits for them, so it belongs on a background thread.
 #[must_use]
 pub fn prepare_window(engine: &Engine, plan: &ContainerPlan, user: HostUser, token: &str) -> Prepared {
-    let mut prepared = Prepared { bridge: Ok(()), guidance: Ok(()) };
+    let mut prepared = Prepared { approvals: Ok(()), bridge: Ok(()), guidance: Ok(()) };
     let Some(home) = &plan.home else { return prepared };
-    if plan.bridge.is_none() && plan.guidance.is_none() {
-        return prepared;
-    }
     let name = home.settings_container();
     let volume = home.volume();
     let mut mounts =
@@ -737,6 +810,7 @@ pub fn prepare_window(engine: &Engine, plan: &ContainerPlan, user: HostUser, tok
     let up = run::capture(&create).and_then(|_| run::capture(&engine.start_container(&name)));
     match up {
         Ok(_) => {
+            prepared.approvals = answer(engine, &desktop::login::approve_command(), &name);
             if let Some(bridge) = &plan.bridge {
                 prepared.bridge = config::register(engine, &name, bridge.harness, token);
             }
@@ -746,6 +820,7 @@ pub fn prepare_window(engine: &Engine, plan: &ContainerPlan, user: HostUser, tok
         }
         Err(error) => {
             let words = config::words(&error);
+            prepared.approvals = Err(words.clone());
             if plan.bridge.is_some() {
                 prepared.bridge = Err(Unregistered::Engine(words.clone()));
             }
@@ -756,6 +831,14 @@ pub fn prepare_window(engine: &Engine, plan: &ContainerPlan, user: HostUser, tok
     }
     let _ = run::capture(&remove);
     prepared
+}
+
+/// Runs `command` in the container `container` and answers the engine's own words when it refuses.
+fn answer(engine: &Engine, command: &[String], container: &str) -> Result<(), String> {
+    let command: Vec<&str> = command.iter().map(String::as_str).collect();
+    run::capture(&engine.exec_without_terminal(&Exec { container, command: &command }))
+        .map(|_| ())
+        .map_err(|error| config::words(&error))
 }
 
 /// Brings the instruction files of `harness` in the workspace up to date, from the running
@@ -908,6 +991,11 @@ pub fn await_window(engine: &Engine, name: &str) -> Option<u32> {
 /// there
 /// to stop, and saying so is not a failure; the removal is what must succeed.
 ///
+/// A frozen container is woken first, because a stop is refused on one and the removal after it
+/// would take a window that never got the grace to write its state out. What is closed here is
+/// what the person asked to be closed; the wake only lets the closing happen the way it does for
+/// every other window.
+///
 /// Runs engine commands and waits for them, so it belongs on a background thread.
 ///
 /// # Errors
@@ -918,8 +1006,9 @@ pub fn close_window(engine: &Engine, name: &str) -> Result<(), LaunchFailure> {
     // container answers the moment it is gone and clears up after it. Whichever arrives second
     // finds nothing, and must not report the first one's work as a failure — docker refuses to
     // remove a container it does not know, where podman shrugs.
-    if run::capture(&engine.container_state(name)).is_err() {
-        return Ok(());
+    let Ok(word) = run::capture(&engine.container_state(name)) else { return Ok(()) };
+    if matches!(ContainerState::parse(&word), ContainerState::Paused) {
+        let _ = run::capture(&engine.unpause_container(name));
     }
     let _ = run::capture(&engine.stop_container_within(name, desktop::WINDOW_GRACE));
     run::capture(&engine.remove_container(name)).map(|_| ()).map_err(|error| LaunchFailure::from(&error))
@@ -954,13 +1043,19 @@ pub fn open_page(engine: &Engine, plan: &ContainerPlan, address: &str) -> Result
     Ok(!said.contains(desktop::signin::NO_BROWSER))
 }
 
-/// Whether the container of `plan` is running right now.
+/// Whether the container of `plan` is there right now, which is what a tab asks about the moment
+/// its terminal ends.
+///
+/// A frozen container is there: nothing took it away, and the tabs in it are all still running.
+/// Answering "no" would call the tab stopped and take its container off the list while the person
+/// is away from the desk.
 ///
 /// Runs an engine command, so it belongs on a background thread. An engine that cannot answer
 /// says "not running", which is the answer that offers the person a way out.
 #[must_use]
 pub fn is_running(engine: &Engine, plan: &ContainerPlan) -> bool {
-    run::capture(&engine.container_state(&plan.name)).is_ok_and(|word| ContainerState::parse(&word).is_running())
+    run::capture(&engine.container_state(&plan.name))
+        .is_ok_and(|word| matches!(ContainerState::parse(&word), ContainerState::Running | ContainerState::Paused))
 }
 
 /// Every container the engine knows that belongs to `workspace`, in the engine's order.
@@ -978,26 +1073,44 @@ pub fn workspace_containers(engine: &Engine, workspace: &str) -> Result<Vec<Cont
 
 /// Stops a container and waits for it to be stopped.
 ///
+/// A frozen container is woken first: a stop of a paused container is refused by the engine, so the
+/// panel's Stop would say the engine's words and leave the container as it is.
+///
 /// Runs an engine command, so it belongs on a background thread.
 ///
 /// # Errors
 ///
 /// The engine's own words when it refuses.
 pub fn stop(engine: &Engine, name: &str) -> Result<(), LaunchFailure> {
+    wake(engine, name);
     run::capture(&engine.stop_container(name)).map(|_| ()).map_err(|error| LaunchFailure::from(&error))
 }
 
 /// Stops a container and starts it again.
 ///
 /// Runs an engine command, so it belongs on a background thread. A container that was already
-/// stopped is only started, so a restart never fails for having nothing to stop.
+/// stopped is only started, so a restart never fails for having nothing to stop. A frozen one is
+/// woken, for the same reason [`stop`] wakes it.
 ///
 /// # Errors
 ///
 /// The engine's own words when it refuses to start the container.
 pub fn restart(engine: &Engine, name: &str) -> Result<(), LaunchFailure> {
+    wake(engine, name);
     let _ = run::capture(&engine.stop_container(name));
     run::capture(&engine.start_container(name)).map(|_| ()).map_err(|error| LaunchFailure::from(&error))
+}
+
+/// Wakes `container` when the engine says it is frozen, and says nothing about whether it woke: a
+/// container that is not frozen is what this is asked about most of the time, and one the engine
+/// would not wake is the caller's own work to report or not.
+///
+/// Runs engine commands, so it belongs on a background thread.
+fn wake(engine: &Engine, container: &str) {
+    let state = run::capture(&engine.container_state(container)).ok().map(|word| ContainerState::parse(&word));
+    if matches!(state, Some(ContainerState::Paused)) {
+        let _ = run::capture(&engine.unpause_container(container));
+    }
 }
 
 /// The engine's word for a profile's access to `Assets/`.
@@ -1022,6 +1135,7 @@ mod own_copy {
     //! can reach is the profile's own: its definition file or its stored login.
 
     use super::*;
+    use crate::base::paths::NAME_THE_USER;
     use crate::engine::EngineKind;
     use crate::profile::{AccountKind, SafeName, Template};
 
@@ -1165,6 +1279,30 @@ mod own_copy {
     }
 
     #[test]
+    fn a_window_of_a_profile_on_base_is_told_what_its_agent_may_do_before_it_opens() {
+        // Nothing but the home: no bridge and no guidance to bring the container up for, and a
+        // window's own container cannot be written to once the application has read its database.
+        // So the container comes up anyway, and the answers are written into the home first.
+        let (engine, calls, folder) = recording("window-answers", "qcode-home-firefly-anti\\n");
+        let id = WorkspaceId::parse("firefly").expect("an id");
+        let profile = Profile { template: Template::Base, ..window_profile() };
+        let plan = ContainerPlan::window(&id, &paths(&folder), &profile).expect("a window");
+        let prepared = prepare_window(&engine, &plan, HostUser::Ids { uid: 1000, gid: 1000 }, "tok");
+        assert_eq!(prepared, Prepared { approvals: Ok(()), bridge: Ok(()), guidance: Ok(()) });
+        let written = std::fs::read_to_string(&calls).expect("calls");
+        // The program is many lines, so what the call is holds is read out of the whole of it.
+        let database = format!("{HOME_DIR}/{}", crate::desktop::login::DATABASE);
+        let answered = written
+            .find(&format!(" approve {database}"))
+            .unwrap_or_else(|| panic!("the answers are written: {written}"));
+        let made = written.find("create --name qcode-firefly-anti.mcp ").expect("the container is made");
+        assert!(made < answered, "made before it is answered: {written}");
+        assert!(written.contains("qcode-home-firefly-anti:/home/qcode:rw"), "on the home volume: {written}");
+        assert!(written.lines().any(|call| call == "rm --force qcode-firefly-anti.mcp"), "{written}");
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
     fn a_window_of_a_profile_never_signed_in_and_a_terminal_are_given_nothing_here() {
         let (engine, calls, folder) = recording("window-none", "qcode-home-firefly-anti\\n");
         let id = WorkspaceId::parse("firefly").expect("an id");
@@ -1174,6 +1312,290 @@ mod own_copy {
         give_window_login(&engine, &terminal, HostUser::Ids { uid: 1000, gid: 1000 }).expect("not a window");
         let written = std::fs::read_to_string(&calls).unwrap_or_default();
         assert_eq!(written.lines().collect::<Vec<_>>(), ["volume ls --format {{.Name}}"], "{written}");
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// A stand-in engine that answers for a container frozen in place: its state is `paused`, the plan
+    /// label it carries is the digest of `plan` — so the engine sees the very container the plan
+    /// asks for, not an old one — its volumes are `volumes`, and it has no images at all, since a
+    /// container made long ago was not made from an image this stand-in has. Every call is written
+    /// down, and a call named in `refused` is refused in an engine's own words.
+    ///
+    /// A frozen container is the case that needs one: the engine has to say `paused` and QCode has
+    /// to be watched through what it does next, on a machine with no container runtime at all.
+    fn frozen_engine(folder: &Path, plan: &ContainerPlan, volumes: &str, refused: &str) -> (Engine, PathBuf) {
+        let (binary, calls) = (folder.join("engine"), folder.join("calls"));
+        let digest = plan.digest(&Engine::new(EngineKind::Podman, &binary), user());
+        let refusing = refused
+            .split(' ')
+            .filter(|word| !word.is_empty())
+            .map(|word| format!("  {word}) printf 'Error: the stand-in refuses {word}\\n' >&2; exit 125 ;;"))
+            .collect::<Vec<String>>()
+            .join("\n");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{calls}'\ncase \"$1\" in\n{refusing}\nesac\ncase \"$1\" in\n  \
+             image) printf 'Error: no such image\\n' >&2; exit 125 ;;\nesac\ncase \"$1 $2\" in\n  'volume ls') \
+             printf '{volumes}';;\n  'container inspect') case \"$4\" in\n    *Labels*) printf '{digest}\\n';;\n    \
+             *) printf 'paused\\n';;\n  esac;;\nesac\nexit 0\n",
+            calls = calls.display(),
+        );
+        std::fs::write(&binary, script).expect("the stand-in engine");
+        std::fs::set_permissions(&binary, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("runnable");
+        (Engine::new(EngineKind::Podman, &binary), calls)
+    }
+
+    /// A folder of this test's own for a workspace and the stand-in engine in it.
+    fn scratch(name: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let folder = std::env::temp_dir().join(format!("qcode-plan-{name}-{stamp}"));
+        std::fs::create_dir_all(&folder).expect("a folder");
+        folder
+    }
+
+    /// Every call the stand-in engine was given, in order.
+    fn recorded(calls: &Path) -> Vec<String> {
+        std::fs::read_to_string(calls).unwrap_or_default().lines().map(str::to_owned).collect()
+    }
+
+    fn user() -> HostUser {
+        HostUser::Ids { uid: 1000, gid: 1000 }
+    }
+
+    /// The plan of a profile in `folder`'s own workspace.
+    fn profile_plan(folder: &Path) -> ContainerPlan {
+        ContainerPlan::profile(&WorkspaceId::parse("firefly").expect("an id"), &paths(folder), &profile())
+    }
+
+    /// The window plan of a desktop profile in `folder`'s own workspace.
+    fn window_plan(folder: &Path) -> ContainerPlan {
+        ContainerPlan::window(&WorkspaceId::parse("firefly").expect("an id"), &paths(folder), &window_profile())
+            .expect("a window")
+    }
+
+    /// A display of this test's own, so the window tests name one that need not be there.
+    fn display(folder: &Path) -> crate::desktop::Display {
+        crate::desktop::Display { socket: folder.join("wayland-0"), name: "wayland-0".to_owned(), device: None }
+    }
+
+    /// Every call QCode must never make about a container it is only waking.
+    const NEVER: [&str; 5] = ["rm ", "stop ", "commit ", "create ", "start "];
+
+    /// A frozen container is woken, and nothing about it is thrown away and made again. Every tab
+    /// of the profile is still running in it, so a `rm`, a `stop` or a `commit` here would end a
+    /// conversation the person was in the middle of.
+    #[test]
+    fn a_frozen_container_is_woken_and_never_made_again() {
+        let folder = scratch("frozen");
+        let plan = profile_plan(&folder);
+        let (engine, calls) = frozen_engine(&folder, &plan, "", "");
+        assert_eq!(ensure_running_noting(&engine, &plan, user()).expect("woken"), None, "nothing was made anew");
+        let asked = recorded(&calls);
+        assert!(asked.iter().any(|call| call == &format!("unpause {}", plan.name)), "{asked:?}");
+        for never in NEVER {
+            assert!(!asked.iter().any(|call| call.starts_with(never)), "not {never}{asked:?}");
+        }
+        // The same question twice: a container that has just been woken is running, so a tab asked
+        // while its tabs are still thawing is answered the same way rather than woken again.
+        ensure_running_noting(&engine, &plan, user()).expect("woken again");
+        let twice = recorded(&calls);
+        assert_eq!(twice.iter().filter(|call| call.starts_with("unpause ")).count(), 2, "woken each time: {twice:?}");
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// An engine that will not wake a frozen container is a failure the person is shown, and never
+    /// a reason for QCode to make the container again: every tab in it would end at once.
+    #[test]
+    fn a_container_that_cannot_be_woken_says_so_instead_of_being_made_again() {
+        let folder = scratch("frozen-refused");
+        let plan = profile_plan(&folder);
+        let (engine, calls) = frozen_engine(&folder, &plan, "", "unpause");
+        let failure = ensure_running_noting(&engine, &plan, user()).expect_err("an engine that refuses is a failure");
+        assert!(failure.output.contains("refuses unpause"), "{failure:?}");
+        assert!(failure.command.contains("unpause"), "the command that failed is named: {failure:?}");
+        let asked = recorded(&calls);
+        for never in NEVER {
+            assert!(!asked.iter().any(|call| call.starts_with(never)), "not {never}{asked:?}");
+        }
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// The page of a new tab reads a profile's conversations. A frozen container holds them, and
+    /// the tabs reading them, so it is woken rather than renewed: a container made anew from a
+    /// newer image would end every tab in it.
+    #[test]
+    fn a_frozen_container_is_woken_for_the_conversations_rather_than_renewed() {
+        let folder = scratch("frozen-renew");
+        let plan = profile_plan(&folder);
+        let (engine, calls) = frozen_engine(&folder, &plan, "qcode-home-firefly-claude-sub\n", "");
+        let (renewed, behind) = renew_stale(&engine, &plan, user());
+        assert!(renewed && behind.is_none(), "the container is left running, as one read into is");
+        let asked = recorded(&calls);
+        assert!(asked.iter().any(|call| call == &format!("unpause {}", plan.name)), "{asked:?}");
+        for never in NEVER {
+            assert!(!asked.iter().any(|call| call.starts_with(never)), "not {never}{asked:?}");
+        }
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// A window's container that is frozen still holds that window and everything open in it, so
+    /// opening it wakes the container and takes that window rather than taking the container away
+    /// and starting the application over.
+    #[test]
+    fn a_frozen_windows_container_is_woken_and_its_window_taken() {
+        let folder = scratch("frozen-window");
+        let plan = window_plan(&folder);
+        let (engine, calls) = frozen_engine(&folder, &plan, "", "");
+        let opened = open_window(&engine, &plan, user(), &display(&folder)).expect("the window is up");
+        assert_eq!(opened, Window::Adopted, "the window that was there is the one that is opened");
+        let asked = recorded(&calls);
+        assert!(asked.iter().any(|call| call == &format!("unpause {}", plan.name)), "{asked:?}");
+        for never in NEVER {
+            assert!(!asked.iter().any(|call| call.starts_with(never)), "not {never}{asked:?}");
+        }
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// Closing a window gives its application the grace to write its state out, and a stop is
+    /// refused on a frozen container; so it is woken first, and the closing that follows is the one
+    /// the person asked for.
+    #[test]
+    fn a_frozen_windows_container_is_woken_before_it_is_closed() {
+        let folder = scratch("frozen-close");
+        let plan = window_plan(&folder);
+        let (engine, calls) = frozen_engine(&folder, &plan, "", "");
+        close_window(&engine, &plan.name).expect("closed");
+        let asked = recorded(&calls);
+        let woken = asked.iter().position(|call| call == &format!("unpause {}", plan.name)).expect("woken first");
+        let stopped = asked.iter().position(|call| call.starts_with("stop ")).expect("then stopped");
+        assert!(woken < stopped, "a stop is refused on a frozen container: {asked:?}");
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// A tab whose terminal ends asks whether its container is still there. A frozen one is: it
+    /// holds every tab of the profile, and telling the tab its container was taken away would mark
+    /// it stopped while the person is away from the desk.
+    #[test]
+    fn a_frozen_container_is_still_there_when_a_tabs_terminal_ends() {
+        let folder = scratch("frozen-there");
+        let plan = profile_plan(&folder);
+        let (engine, _calls) = frozen_engine(&folder, &plan, "", "");
+        assert!(is_running(&engine, &plan), "a frozen container is up, and takes nothing away");
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// The naming command as the engine is given it, all of it one line: `exec --user 0` and the
+    /// container, then the script with the ids as its arguments.
+    fn naming_call(container: &str, uid: u32, gid: u32) -> String {
+        format!("exec --user 0 {container} sh -c {NAME_THE_USER} sh {uid} {gid}")
+    }
+
+    /// A stand-in engine of `kind` answering for a stopped container of `plan`: it is the very
+    /// container the plan asks for as `as_user` — its plan label is the digest of that plan — so
+    /// bringing it up is a `start` and then whatever QCode does next, which is where the naming
+    /// belongs, and a second call finds the container already running and is answered by it.
+    /// Every call is written down, and a call named in `refused` is refused in an engine's own
+    /// words.
+    fn stopped_engine(
+        kind: EngineKind,
+        folder: &Path,
+        plan: &ContainerPlan,
+        as_user: HostUser,
+        refused: &str,
+    ) -> (Engine, PathBuf) {
+        let (binary, calls, up) = (folder.join("engine"), folder.join("calls"), folder.join("up"));
+        let digest = plan.digest(&Engine::new(kind, &binary), as_user);
+        let refusing = refused
+            .split(' ')
+            .filter(|word| !word.is_empty())
+            .map(|word| format!("  {word}) printf 'Error: the stand-in refuses {word}\\n' >&2; exit 125 ;;"))
+            .collect::<Vec<String>>()
+            .join("\n");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{calls}'\ncase \"$1\" in\n{refusing}\nesac\ncase \"$1\" in\n  \
+             image) printf 'Error: no such image\\n' >&2; exit 125 ;;\n  start) : > '{up}' ;;\nesac\ncase \
+             \"$1 $2\" in\n  'container inspect') case \"$4\" in\n    *Labels*) printf '{digest}\\n';;\n    \
+             *) if [ -f '{up}' ]; then printf 'running\\n'; else printf 'exited\\n'; fi;;\n  esac;;\nesac\nexit 0\n",
+            calls = calls.display(),
+            up = up.display(),
+        );
+        std::fs::write(&binary, script).expect("the stand-in engine");
+        std::fs::set_permissions(&binary, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("runnable");
+        (Engine::new(kind, &binary), calls)
+    }
+
+    /// Docker names no one: its daemon runs the container as the ids it is handed, and the image
+    /// knows nobody but the uid it was built with. So a person whose uid is another one is given
+    /// an entry of their own, once, as root, right after the container comes up. The home, the
+    /// files and the mounts are already right; what had nothing to read was the name that
+    /// `whoami`, `git commit` and Node's `os.userInfo()` look up.
+    #[test]
+    fn a_person_the_image_does_not_know_is_named_inside_the_container_on_docker() {
+        let folder = scratch("named-docker");
+        let plan = profile_plan(&folder);
+        let someone = HostUser::Ids { uid: 1234, gid: 1234 };
+        let (engine, calls) = stopped_engine(EngineKind::Docker, &folder, &plan, someone, "");
+        ensure_running(&engine, &plan, someone).expect("the container comes up");
+        let asked = recorded(&calls);
+        let started = asked.iter().position(|call| call == &format!("start {}", plan.name)).expect("it is started");
+        // Every word of it: as root, in the container, with the ids as arguments of the shell
+        // rather than written into it.
+        let naming = naming_call(&plan.name, 1234, 1234);
+        let named = asked.iter().position(|call| call == &naming).unwrap_or_else(|| panic!("named: {asked:#?}"));
+        assert!(started < named, "named once the container is up, not before: {asked:#?}");
+        // And once per container: a container that is already up is not written into again, so
+        // every later tab of it costs no further command.
+        ensure_running(&engine, &plan, someone).expect("the running container is left as it is");
+        let again = recorded(&calls);
+        assert_eq!(again.iter().filter(|call| call.as_str() == naming).count(), 1, "{again:#?}");
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// Podman writes that entry itself: `--userns=keep-id` maps the person into the container's
+    /// user namespace, and podman puts the matching line in the password file as it starts the
+    /// container. So there is nothing for QCode to do there, and it asks no root command of an
+    /// engine that would only be second at its own work.
+    #[test]
+    fn podman_names_the_person_itself_and_qcode_runs_nothing() {
+        let folder = scratch("named-podman");
+        let plan = profile_plan(&folder);
+        let someone = HostUser::Ids { uid: 1234, gid: 1234 };
+        let (engine, calls) = stopped_engine(EngineKind::Podman, &folder, &plan, someone, "");
+        ensure_running(&engine, &plan, someone).expect("the container comes up");
+        let asked = recorded(&calls);
+        assert!(asked.iter().any(|call| call == &format!("start {}", plan.name)), "{asked:#?}");
+        assert!(!asked.iter().any(|call| call.contains("--user 0")), "no root command: {asked:#?}");
+        assert!(!asked.iter().any(|call| call.contains(NAME_THE_USER)), "no script: {asked:#?}");
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// A host with no POSIX ids of its own — Windows, where the engine's own machine owns that
+    /// side of a mount — has no uid to name, so there is nothing to write and nothing to ask.
+    #[test]
+    fn a_host_with_no_ids_of_its_own_is_named_nowhere() {
+        let folder = scratch("named-none");
+        let plan = profile_plan(&folder);
+        let nobody = HostUser::ImageDefault;
+        let (engine, calls) = stopped_engine(EngineKind::Docker, &folder, &plan, nobody, "");
+        ensure_running(&engine, &plan, nobody).expect("the container comes up");
+        let asked = recorded(&calls);
+        assert!(asked.iter().any(|call| call == &format!("start {}", plan.name)), "{asked:#?}");
+        assert!(!asked.iter().any(|call| call.contains(NAME_THE_USER)), "{asked:#?}");
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// An engine that will not write the entry is not a reason to fail a tab. The person comes up
+    /// as a number, which is what they came up as before, and a tab that does not open at all is
+    /// worse than a tab whose `whoami` cannot answer. Nothing is said on screen either: there is
+    /// nothing the person could do about it, and the common case of a uid the image knows shows
+    /// them no sign of it at all.
+    #[test]
+    fn an_engine_that_will_not_name_the_person_still_brings_the_tab_up() {
+        let folder = scratch("named-refused");
+        let plan = profile_plan(&folder);
+        let someone = HostUser::Ids { uid: 1234, gid: 1234 };
+        let (engine, calls) = stopped_engine(EngineKind::Docker, &folder, &plan, someone, "exec");
+        ensure_running(&engine, &plan, someone).expect("the container comes up");
+        assert!(recorded(&calls).iter().any(|call| call.starts_with("exec --user 0")), "it was asked: {calls:?}");
         let _ = std::fs::remove_dir_all(&folder);
     }
 }

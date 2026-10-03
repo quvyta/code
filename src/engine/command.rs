@@ -136,6 +136,29 @@ impl Engine {
         self.command(args)
     }
 
+    /// Lists the images QCode left behind when a rebuild replaced them: every image of a profile
+    /// that carries [`PROFILE_LABEL`](super::names::PROFILE_LABEL) and is under no name at all,
+    /// one full identifier a line.
+    ///
+    /// A rebuild gives the new image the name the old one had, and the old one keeps its gigabytes
+    /// of layers with nothing to find it by. Both engines can say which images are of ours and
+    /// carry no name; a container still made from one is not named in the answer here, and the
+    /// engine then refuses to take that one away, which is the answer wanted.
+    #[must_use]
+    pub fn our_leftover_images(&self) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("images");
+        // The whole identifier, so a name that was shortened can still be given to `image rm` as
+        // it stands; and nothing but identifiers, so a person could read the answer as it is.
+        args.push("--quiet");
+        args.push("--no-trunc");
+        args.push("--filter");
+        args.push("dangling=true");
+        args.push("--filter");
+        args.push(format!("label={}", super::names::PROFILE_LABEL));
+        self.command(args)
+    }
+
     /// Asks for the value of one label of an image. The image being absent is a failure; a
     /// label it does not carry comes back empty or as `<no value>`, depending on the engine.
     #[must_use]
@@ -452,6 +475,47 @@ impl Engine {
         self.command(args)
     }
 
+    /// Freezes a running container without stopping it: every process inside it keeps its
+    /// memory and its terminals, and nothing of them runs until it is thawed.
+    ///
+    /// This is the only way to give back a container's memory without ending what is in it. What
+    /// QCode does with the pages afterwards is its own business and its own commands; the engine is
+    /// only asked for the freeze here, and both engines spell it the same way.
+    #[must_use]
+    pub fn pause_container(&self, name: &str) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("pause");
+        args.push(name);
+        self.command(args)
+    }
+
+    /// Wakes a paused container: it goes on from the state it was frozen in, so every tab still
+    /// running in it is still running. The counterpart of [`Engine::pause_container`], spelled the
+    /// same way on both engines.
+    #[must_use]
+    pub fn unpause_container(&self, name: &str) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("unpause");
+        args.push(name);
+        self.command(args)
+    }
+
+    /// Asks where the container's control group is on this machine, as a path under
+    /// `/sys/fs/cgroup` that belongs to the person who ran the engine.
+    ///
+    /// The cgroup is the only place QCode can hand a frozen container's pages back to, and only a
+    /// rootless podman puts one where the person may write to it.
+    #[must_use]
+    pub fn cgroup_of(&self, name: &str) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("container");
+        args.push("inspect");
+        args.push("--format");
+        args.push("{{.State.CgroupPath}}");
+        args.push(name);
+        self.command(args)
+    }
+
     /// Removes a container, stopping it first if it runs.
     #[must_use]
     pub fn remove_container(&self, name: &str) -> EngineCommand {
@@ -582,6 +646,20 @@ impl Engine {
         args.push("--format");
         args.push("{{.State.Status}}");
         args.push(name);
+        self.command(args)
+    }
+
+    /// Asks whether the engine runs as the person who ran it rather than as root, which only
+    /// podman does by default.
+    ///
+    /// The answer decides what may be written into a container's control group: a rootful engine's
+    /// cgroup belongs to root and the person may not write to it, however the engine is started.
+    #[must_use]
+    pub fn rootless(&self) -> EngineCommand {
+        let mut args = Args::new();
+        args.push("info");
+        args.push("--format");
+        args.push("{{.Host.Security.Rootless}}");
         self.command(args)
     }
 
@@ -1116,6 +1194,26 @@ mod tests {
     }
 
     #[test]
+    fn asks_both_engines_for_the_images_its_own_rebuilds_left_behind() {
+        let asked = ["images", "--quiet", "--no-trunc", "--filter", "dangling=true", "--filter", "label=qcode.profile"];
+        assert_eq!(args(&podman().our_leftover_images()), asked);
+        assert_eq!(args(&docker().our_leftover_images()), asked);
+    }
+
+    /// The listing is a question, so it can take nothing away; and the two flags that would let it
+    /// take more than QCode's own are checked here rather than trusted, because both engines read
+    /// `--all` on a removal as every image on the machine and a prune as whatever nobody holds.
+    #[test]
+    fn asking_for_the_leftovers_never_asks_for_anything_to_be_taken_away() {
+        for engine in [podman(), docker()] {
+            let asked = args(&engine.our_leftover_images());
+            for never in ["--force", "--all", "-a", "prune", "volume", "rm", "system"] {
+                assert!(!asked.iter().any(|word| word == never), "{never} is in {asked:?}");
+            }
+        }
+    }
+
+    #[test]
     fn asks_an_image_for_a_label_and_a_container_for_its_image() {
         assert_eq!(
             args(&podman().image_label("qcode/profile/anti", "qcode.profile.revision")),
@@ -1555,6 +1653,33 @@ mod tests {
             ["container", "inspect", "--format", "{{.State.Status}}", "qcode-p-base"]
         );
         assert_eq!(args(&docker().list_containers()), ["ps", "--all", "--format", "{{.Names}}\t{{.State}}"]);
+    }
+
+    #[test]
+    fn a_container_is_frozen_and_woken_again_wherever_its_cgroup_is() {
+        // Freezing has to be something both engines spell the same way: a profile whose engine is
+        // docker rather than podman is the same profile, and the freeze is not a second thing to
+        // write per engine.
+        for engine in [podman(), docker()] {
+            assert_eq!(
+                args(&engine.pause_container("qcode-firefly-claude-sub")),
+                ["pause", "qcode-firefly-claude-sub"]
+            );
+            assert_eq!(
+                args(&engine.unpause_container("qcode-firefly-claude-sub")),
+                ["unpause", "qcode-firefly-claude-sub"]
+            );
+            assert_eq!(
+                args(&engine.cgroup_of("qcode-firefly-claude-sub")),
+                ["container", "inspect", "--format", "{{.State.CgroupPath}}", "qcode-firefly-claude-sub"],
+                "the same inspect the state is asked through, for one field of it"
+            );
+            assert_eq!(
+                args(&engine.rootless()),
+                ["info", "--format", "{{.Host.Security.Rootless}}"],
+                "one question of podman; docker is not asked, since it has no such answer to give"
+            );
+        }
     }
 
     #[test]

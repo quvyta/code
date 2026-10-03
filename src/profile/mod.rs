@@ -38,6 +38,7 @@ mod permission_live;
 #[cfg(test)]
 mod plugins_live;
 mod template;
+pub mod unattended;
 
 pub use definition::{
     ASSUMED_CONTEXT_TOKENS, Loaded, MountAccess, NetworkMode, OPENCODE_CONFIG_CONTENT, Pick, Profile, ProviderChoice,

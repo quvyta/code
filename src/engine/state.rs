@@ -46,6 +46,13 @@ impl ContainerState {
     pub fn is_running(&self) -> bool {
         matches!(self, Self::Running)
     }
+
+    /// Whether the container is up, frozen or not: there is something in it to act on, and waking
+    /// it is a step rather than the whole of what is done to it.
+    #[must_use]
+    pub fn is_up(&self) -> bool {
+        matches!(self, Self::Running | Self::Paused)
+    }
 }
 
 /// One container as [`Engine::list_containers`](super::Engine::list_containers) lists it.

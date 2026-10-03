@@ -17,9 +17,12 @@
 mod backups;
 mod blank;
 mod bridge;
+mod builds;
 mod busy;
 mod desktop;
 mod files;
+mod freeze;
+mod freezing;
 mod history;
 mod keep;
 mod panel;
@@ -45,11 +48,15 @@ pub(crate) use bridge::type_in;
 pub use bridge::{Letter, Letters, Undelivered};
 pub use desktop::Opening;
 pub use files::DocumentTrouble;
+pub use freezing::Read;
+pub use freezing::waking_on_the_way_out;
 pub use history::HistoryKey;
 pub use keep::{BASE_LABEL as WORKSPACE_BASE_LABEL, enter_admin, image as workspace_image};
 pub use panel::{Panel, PanelWidget};
 #[cfg(test)]
 pub(crate) use plan::open_window as plan_open_window;
+#[cfg(test)]
+pub(crate) use plan::prepare_window as plan_prepare_window;
 pub use plan::{
     ASSETS_DIR, Bridge, CODE_DIR, ContainerPlan, HOME_DIR, KEEP_ALIVE, LaunchFailure, MCP_DIR, PLAN_LABEL, SHELL,
     ensure_running, ensure_running_noting, give_window_login, open_page,
@@ -81,6 +88,7 @@ use crate::bridge::socket::Call;
 use crate::engine::{Container, Engine, EngineCommand, EngineKind, Exec, HostUser};
 use crate::profile::guidance::Unguided;
 use crate::profile::history::Conversation;
+use crate::profile::unattended::{self, Asks};
 use crate::profile::{HarnessKind, Pick, Profile, ProviderChoice};
 use crate::store::{
     Registry, Session, SessionTab, SessionTabKind, SessionWorkspace, Store, WorkspaceFile, WorkspaceId, WorkspacePaths,
@@ -89,6 +97,7 @@ use crate::store::{
 use crate::ui::page;
 use crate::ui::profiles::work::Problem;
 use crate::ui::settings::engine::{Help, help, name as engine_name};
+use crate::ui::stalling;
 
 /// Width of the workspace rail: the framework's collapsed strip, which is the same four cells on
 /// every screen. The rail never gives way to a narrow terminal, because losing it would mean
@@ -116,6 +125,24 @@ pub enum Msg {
     /// The list of workspaces was asked for, to open another one beside these. The screen itself
     /// cannot go there; the application that holds both answers this message.
     AddWorkspace,
+    /// Whether this machine can freeze a container at all was asked, and this is the answer: only
+    /// rootless podman with swap can, and nothing else about freezing happens without it.
+    Freezable(bool),
+    /// It is time to look at the open workspaces and see whether a profile's container has gone
+    /// quiet. Nothing is timed at all while freezing is off or the machine cannot do it.
+    Look,
+    /// One profile's container was read for a look: the workspace of the rail it belongs to, by its
+    /// place, and the profile by name, so a reading is matched to the profile it was about even if
+    /// the store was read again while the reading was in flight. With the CPU the container had
+    /// used when the reading was taken and the command line of every process in it; either may be
+    /// missing, and a missing one is not a yes.
+    Looked(usize, String, String, freezing::Read, std::time::Instant),
+    /// A profile's container was frozen, and this is whether it is: a freeze the engine or the
+    /// kernel refused leaves the container exactly as it was and says nothing to the person.
+    Frozen(String, bool),
+    /// A container QCode had frozen was woken, and this is whether it is awake. One that is still
+    /// frozen stays frozen, and the next thing that needs it asks the engine again.
+    Thawed(String, bool),
     /// A tab was opened.
     OpenTab(usize),
     /// A tab was closed.
@@ -189,6 +216,9 @@ pub enum Msg {
     ImageBuilt(TabKey, Result<(), Option<String>>),
     /// Stop building a tab's image.
     StopBuild(TabKey),
+    /// The moment a tab whose image is being built was looked at, which is what says whether its
+    /// log has gone quiet for long enough to be stuck.
+    BuildLooked(std::time::Instant),
     /// Do not open this tab after all: its image is missing and the person would rather not
     /// build it now.
     CancelOpen(TabKey),
@@ -367,7 +397,7 @@ pub enum Msg {
     Deliver,
     /// Time to look at the Return this tab owes a message it has already taken.
     Return(TabKey),
-    /// Time to turn the mark of the working tabs, looking at them as of this moment.
+    /// Time to look at the tabs again and mark the ones still working, as of this moment.
     Turn(std::time::Instant),
     /// The relay of an open workspace reported something. A report is a closure on the relay's own
     /// thread, so what it found arrives as a message like any other and is said in this update.
@@ -375,6 +405,12 @@ pub enum Msg {
     /// The line under a tab about a fall back has been said for its ten seconds: the token of the
     /// tab it was under, and which fall back it was, so a line that came after it stays.
     Silence(String, u64),
+    /// The settings that keep a harness from asking could not be merged into the home of a tab
+    /// whose container came up; the message that came with the start follows.
+    Asked(HarnessKind, Asks, Box<Msg>),
+    /// The agent of a window whose home came up could not be told what it may do without asking;
+    /// the message that came with the open follows.
+    Unapproved(String, Box<Msg>),
     /// The bridge could not be registered in the settings of a harness whose container came up;
     /// the message that came with the start follows.
     Unbridged(HarnessKind, Unregistered, Box<Msg>),
@@ -787,18 +823,36 @@ pub struct WorkspaceScreen {
     delivering: bool,
     /// Whether the person is asked before one tab first sends to another.
     ask_first: bool,
+    /// Whether a profile whose container is doing nothing is frozen in the background, and its
+    /// memory written out to swap. On until the person turns it off in the settings.
+    freeze_idle: bool,
+    /// What the screen knows about freezing: whether this machine can do it, which containers it
+    /// has frozen, and where each one's CPU was last read.
+    freezing: freezing::Freezing,
+    /// The lengths a look is judged by and where the machine's control groups are read from. The
+    /// product's are the measured ones; a test shortens the first and points the last at a folder
+    /// of its own.
+    where_: freezing::Where,
+    /// The lengths a build's silence is judged by. The product's are the measured ones; a test
+    /// shortens them, since a test cannot wait five minutes for a warning.
+    stall: stalling::Lengths,
+    /// Whether the next look at a build is timed, so that one is timed at a time.
+    watching: bool,
     /// The tab being named, while the dialog that names it is open.
     renaming: Option<rename::Renaming>,
+    /// The tab the keyboard is owed to because it was opened while it was still starting: there was
+    /// no terminal to put it in then, and it takes it as soon as its container comes up. Cleared
+    /// wherever the person puts the keyboard somewhere else on purpose, and by a tab whose start
+    /// failed, which is never given a terminal at all.
+    owed_focus: Option<TabKey>,
     /// Whether a key on the tab strip or the rail is being handled, so that a switch it makes
     /// leaves the keyboard walking there instead of putting it in the tab.
     walking: bool,
-    /// The moment the tabs were last looked at to mark the working ones: the last turn of the
-    /// mark, or the last output of a tab since.
+    /// The moment the tabs were last looked at to mark the working ones: the last look, or the last
+    /// output of a tab since.
     looked: std::time::Instant,
-    /// Whether the next turn of the mark is timed, so one is timed at a time.
+    /// Whether the next look at the tabs is timed, so one is timed at a time.
     turning: bool,
-    /// How many times the mark has turned, which picks its frame.
-    turn: usize,
 }
 
 impl WorkspaceScreen {
@@ -840,11 +894,16 @@ impl WorkspaceScreen {
             asking: Vec::new(),
             delivering: false,
             ask_first: false,
+            freeze_idle: true,
+            freezing: freezing::Freezing::default(),
+            where_: freezing::Where::default(),
+            stall: stalling::Lengths::default(),
+            watching: false,
             renaming: None,
+            owed_focus: None,
             walking: false,
             looked: std::time::Instant::now(),
             turning: false,
-            turn: 0,
         }
     }
 
@@ -969,6 +1028,61 @@ impl WorkspaceScreen {
     #[must_use]
     pub fn ask_first(&self) -> bool {
         self.ask_first
+    }
+
+    /// Makes a profile whose container is doing nothing be frozen in the background, and its
+    /// memory written out to swap, when `freeze` is true; nothing of the kind when it is false.
+    pub fn set_freeze_idle(&mut self, freeze: bool) {
+        self.freeze_idle = freeze;
+    }
+
+    /// Whether a quiet profile's container is frozen in the background.
+    #[must_use]
+    pub fn freezes_idle(&self) -> bool {
+        self.freeze_idle
+    }
+
+    /// Asks on the screen's own account whether this machine can freeze a container at all, which
+    /// is asked once, on a background thread, the first time the screen is opened, and then keeps
+    /// the answer. Without an engine there is nothing to ask and the answer stays unknown, which
+    /// runs no timer at all.
+    pub fn settled(&mut self) -> Command<Msg> {
+        let asking = match self.engine.clone() {
+            Some(engine) if self.freezing.supported.is_none() => freezing::ask(engine),
+            _ => Command::none(),
+        };
+        Command::batch([asking, freezing::again(self)])
+    }
+
+    /// The same screen, looking every `every` and judging a quiet time and a CPU window as short as
+    /// `lengths` says, and reading the machine's control groups under `cgroups` rather than the
+    /// real ones.
+    ///
+    /// Only for a test: the product uses [`freezing::EVERY`], [`freeze::QUIET`],
+    /// [`freeze::CPU_WINDOW`] and the machine's own cgroup root, since a test cannot wait ten
+    /// minutes for a rule to be judged and may not write to the real control group.
+    #[cfg(test)]
+    #[must_use]
+    pub fn looking(
+        mut self,
+        lengths: freeze::Lengths,
+        every: std::time::Duration,
+        cgroups: std::path::PathBuf,
+    ) -> Self {
+        self.where_ = freezing::Where { quiet: lengths.quiet, window: lengths.window, every, cgroups };
+        self
+    }
+
+    /// The same screen, saying a tab's build is stuck after `quiet` of silence and looking every
+    /// `look`, which the product uses as [`stalling::QUIET`] and [`stalling::LOOK`].
+    ///
+    /// Only for a test: the product uses those two measured lengths, since a test cannot wait five
+    /// minutes to hear a warning and cannot make a build that really takes that long.
+    #[cfg(test)]
+    #[must_use]
+    pub fn stalling(mut self, lengths: stalling::Lengths) -> Self {
+        self.stall = lengths;
+        self
     }
 
     /// The same screen, looking for the sound server's socket in `runtime` rather than in the
@@ -1237,8 +1351,9 @@ impl WorkspaceScreen {
 pub fn opened(screen: &mut WorkspaceScreen) -> Command<Msg> {
     let relay = relay::follow(screen);
     let command = Command::batch([load_root(screen), list_containers(screen), wake(screen), show_page(screen, true)]);
+    let settled = screen.settled();
     follow_disk(screen);
-    Command::batch([command, backups::keep(screen), bridge::follow(screen), relay])
+    Command::batch([command, settled, backups::keep(screen), bridge::follow(screen), relay])
 }
 
 /// Adds `workspace` to the rail and opens it, or only opens it when the rail has it already; the
@@ -1268,7 +1383,10 @@ pub fn update(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
     let command = apply(screen, message);
     follow_disk(screen);
     let kept = Command::batch([reread(screen), backups::keep(screen), bridge::follow(screen), busy::follow(screen)]);
-    Command::batch([command, relay, wake(screen), show_page(screen, profiles), kept])
+    // After the message, since a look is asked for on the state the screen is left in: a switch
+    // turned off in the settings stops the timer before it can come round again.
+    let settled = freezing::again(screen);
+    Command::batch([command, relay, wake(screen), show_page(screen, profiles), kept, settled])
 }
 
 /// Lets the watches of the workspaces that are not open go: their trees are not on screen, and
@@ -1288,10 +1406,18 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
     match message {
         Msg::OpenWorkspace(index) => {
             screen.set_active(index);
-            Command::batch([load_root(screen), list_containers(screen), settle(screen, walking)])
+            Command::batch([
+                load_root(screen),
+                list_containers(screen),
+                settle(screen, walking),
+                freezing::shown(screen),
+            ])
         }
         Msg::CloseWorkspace(index) => {
             let backed = backups::closing(screen, index);
+            // A workspace that leaves the rail takes its containers' readings with it: there is
+            // nothing here that will look at them again.
+            freezing::left(screen, index);
             let (silenced, shut) = match screen.workspaces.get(index) {
                 Some(workspace) => {
                     let tabs: Vec<&Tab> = workspace.tabs.iter().collect();
@@ -1316,18 +1442,58 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
             bridge::closed(screen, &keys);
             rename::closed(screen, &keys);
             TabEdit::Close(index).apply(&mut screen.workspaces, &mut screen.active);
-            Command::batch([backed, silenced, load_root(screen), list_containers(screen), settle(screen, walking)])
+            Command::batch([
+                backed,
+                silenced,
+                load_root(screen),
+                list_containers(screen),
+                settle(screen, walking),
+                freezing::shown(screen),
+            ])
         }
         // The application opens the list; nothing on this screen changes until a workspace comes
         // back from it.
         Msg::AddWorkspace => Command::none(),
+        // What this machine can do about freezing is asked once and kept, and the timer starts as
+        // soon as the answer is a yes, since nothing else about freezing runs without it.
+        Msg::Freezable(can) => {
+            screen.freezing.supported = Some(can);
+            freezing::again(screen)
+        }
+        // The minute came round. The timer is armed again first, so that a look which is a while
+        // finding out is not a look that never comes again.
+        Msg::Look => {
+            screen.freezing.timed = false;
+            let looked = freezing::look(screen);
+            Command::batch([looked, freezing::again(screen)])
+        }
+        Msg::Looked(index, id, name, read, at) => freezing::looked(screen, index, &id, &name, read, at),
+        // The person may have come back to a tab of the profile while the freeze was on its way, and
+        // the screen did not wake a container it did not yet call frozen: it is woken now.
+        // The panel is asked again as well, so that it says "frozen" of the container from now on
+        // rather than what the engine said of it before.
+        Msg::Frozen(container, frozen) => {
+            screen.freezing.note(&container, frozen);
+            Command::batch([freezing::shown(screen), list_containers(screen)])
+        }
+        // A container that woke is not frozen any more, and the reading it had before it slept says
+        // nothing about what it has done since, so the next look starts it from this moment.
+        Msg::Thawed(container, awake) => {
+            screen.freezing.woke(&container);
+            screen.freezing.note(&container, !awake);
+            if awake {
+                screen.freezing.forgot(&container);
+            }
+            // The panel would otherwise go on saying what the engine said while it was asleep.
+            list_containers(screen)
+        }
         Msg::OpenTab(index) => {
             if let Some(workspace) = screen.workspaces.get_mut(screen.active)
                 && index < workspace.tabs.len()
             {
                 workspace.active_tab = index;
             }
-            settle(screen, walking)
+            Command::batch([settle(screen, walking), freezing::shown(screen)])
         }
         Msg::CloseTab(index) => {
             // Messages other agents left in the tab would go with it, and those agents were told
@@ -1363,7 +1529,7 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
             if let Some(workspace) = screen.workspaces.get_mut(screen.active) {
                 TabEdit::Move { from, to }.apply(&mut workspace.tabs, &mut workspace.active_tab);
             }
-            Command::none()
+            freezing::shown(screen)
         }
         Msg::NewTab => open_blank(screen),
         Msg::RenameTab(index) => rename::open(screen, index),
@@ -1379,7 +1545,10 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
         Msg::CancelRename => rename::cancel(screen),
         // The strip, because from there the arrows switch tabs and Tab reaches the rest of the
         // screen, the terminal included.
-        Msg::LeaveTerminal => Command::focus(TABS_ID),
+        Msg::LeaveTerminal => {
+            screen.owed_focus = None;
+            Command::focus(TABS_ID)
+        }
         // Only a tab with a terminal on it has somewhere to go back into; on a blank or a
         // Markdown tab the key does nothing rather than send the keyboard nowhere.
         Msg::EnterTerminal => {
@@ -1399,12 +1568,12 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
             }
             workspace.active_tab =
                 if forward { (workspace.active_tab + 1) % count } else { (workspace.active_tab + count - 1) % count };
-            land(screen)
+            Command::batch([land(screen), freezing::shown(screen)])
         }
         Msg::GoToTab(index) => match screen.workspaces.get_mut(screen.active) {
             Some(workspace) if index < workspace.tabs.len() => {
                 workspace.active_tab = index;
-                land(screen)
+                Command::batch([land(screen), freezing::shown(screen)])
             }
             _ => Command::none(),
         },
@@ -1459,8 +1628,18 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
             // person is told so rather than finding the profile gone from the file later.
             Err(reason) => Command::toast(Toast::warning(t!("workspace.add-failed")).body(reason)),
         },
-        Msg::Ready(key, run, result) => ready(screen, key, run, &result),
-        Msg::BuildImage(key) => build_image(screen, key),
+        // The engine's own bringing a tab up wakes a container QCode froze, so the screen stops
+        // calling it frozen here rather than asking the engine to wake what it is waking already.
+        Msg::Ready(key, run, result) => {
+            if result.is_ok() {
+                freezing::up(screen, key);
+            }
+            ready(screen, key, run, &result)
+        }
+        Msg::BuildImage(key) => {
+            let building = build_image(screen, key);
+            Command::batch([building, builds::follow(screen)])
+        }
         Msg::ImageLine(key, text) => {
             if let Some((_, tab)) = screen.owner_mut(key).and_then(|workspace| workspace.find(key)) {
                 tab.build_line(&text, false);
@@ -1468,6 +1647,9 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
             Command::none()
         }
         Msg::ImageBuilt(key, result) => image_built(screen, key, result),
+        // The look came round: every tab building an image is marked by how long its log has been
+        // quiet, and the next one is timed while a build is still running.
+        Msg::BuildLooked(now) => builds::looked(screen, now),
         Msg::StopBuild(key) => {
             let Some((_, tab)) = screen.owner_mut(key).and_then(|workspace| workspace.find(key)) else {
                 return Command::none();
@@ -1491,6 +1673,9 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
             }
             if let Some(conversation) = shown {
                 show(screen, key, run, conversation);
+            }
+            if result.is_ok() {
+                freezing::up(screen, key);
             }
             ready(screen, key, run, &result)
         }
@@ -1530,7 +1715,12 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
             screen.panel.show_chooser(show);
             // The list takes the keyboard as it opens, so a widget is chosen with the arrows and
             // Enter as readily as with the pointer.
-            if show { Command::focus(panel::CHOOSER_ID) } else { Command::none() }
+            if show {
+                screen.owed_focus = None;
+                Command::focus(panel::CHOOSER_ID)
+            } else {
+                Command::none()
+            }
         }
         Msg::HighlightWidget(row) => {
             screen.panel.highlight(row);
@@ -1599,6 +1789,9 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
         }
         Msg::RefreshContainers => list_containers(screen),
         Msg::ContainersRead(id, result) => {
+            if let Ok(containers) = &result {
+                screen.freezing.listed(containers);
+            }
             if let Some(workspace) = screen.workspace_mut(&id) {
                 workspace.busy = false;
                 match result {
@@ -1701,6 +1894,8 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
             relay::silence(screen, &token, run);
             Command::none()
         }
+        Msg::Asked(harness, trouble, message) => Command::batch([asked(harness, &trouble), update(screen, *message)]),
+        Msg::Unapproved(words, message) => Command::batch([unapproved(&words), update(screen, *message)]),
         Msg::Unbridged(harness, trouble, message) => {
             Command::batch([bridge::unregistered(harness, &trouble), update(screen, *message)])
         }
@@ -1728,17 +1923,30 @@ fn apply(screen: &mut WorkspaceScreen, message: Msg) -> Command<Msg> {
 
 /// After a switch: the keyboard lands in the tab, unless the switch was the keyboard walking the
 /// strip or the rail, where it stays.
-fn settle(screen: &WorkspaceScreen, walking: bool) -> Command<Msg> {
+fn settle(screen: &mut WorkspaceScreen, walking: bool) -> Command<Msg> {
     if walking { Command::none() } else { land(screen) }
 }
 
 /// Puts the keyboard in the open tab: its terminal, the page of a blank tab, a document, a
 /// window's button, or else the first thing on it that takes the keyboard. A tab still starting
-/// has none yet and is given it when its terminal comes up.
+/// has none yet and is given it when its terminal comes up, which is what it was owed.
+///
+/// The keyboard is where the person last wanted it, so no tab is owed it any more — except the tab
+/// landed in, when that is the tab still starting that was owed it: there is nothing in it to take
+/// the keyboard, so the debt stands until its terminal is there.
 ///
 /// The widget is named rather than found inside the tab's part of the screen, because the runtime
 /// looks for it in the frame drawn before the switch, where that part still holds the tab left.
-fn land(screen: &WorkspaceScreen) -> Command<Msg> {
+fn land(screen: &mut WorkspaceScreen) -> Command<Msg> {
+    let waiting_for_its_terminal = screen.owed_focus.is_some_and(|owed| {
+        screen
+            .workspace()
+            .and_then(OpenWorkspace::active_tab)
+            .is_some_and(|tab| tab.key() == owed && tab.session().is_none())
+    });
+    if !waiting_for_its_terminal {
+        screen.owed_focus = None;
+    }
     let Some(tab) = screen.workspace().and_then(OpenWorkspace::active_tab) else { return Command::none() };
     let target = match tab.kind() {
         TabKind::New => blank::CHOICES_ID,
@@ -1759,7 +1967,7 @@ fn open_blank(screen: &mut WorkspaceScreen) -> Command<Msg> {
     workspace.active_tab = workspace.join(Tab::blank(key));
     screen.blank_row = 0;
     screen.expanded.clear();
-    Command::focus(blank::CHOICES_ID)
+    Command::batch([Command::focus(blank::CHOICES_ID), freezing::shown(screen)])
 }
 
 /// Turns the blank tab `key` into what was chosen on its page, in its own place in the strip,
@@ -1811,14 +2019,24 @@ fn choose(screen: &mut WorkspaceScreen, key: TabKey, choice: Choice) -> Command<
     // A window is not entered with a terminal, so it takes the window's own path and the keyboard
     // goes to the tab's one action rather than to a terminal that is not there.
     if window {
-        return Command::batch([desktop::open(screen, key, run), Command::focus(desktop::WINDOW_ID), record, closed]);
+        screen.owed_focus = None;
+        return Command::batch([
+            desktop::open(screen, key, run),
+            Command::focus(desktop::WINDOW_ID),
+            record,
+            closed,
+            freezing::shown(screen),
+        ]);
     }
+    // The tab is only just starting, so there is no terminal to put the keyboard in yet: it is owed
+    // the keyboard instead, and takes it from [`ready`] once its container is up.
+    screen.owed_focus = Some(key);
     let launch = Launch::new(key, run, token, provider, providers_path);
     Command::batch([
         harness_start(registry, engine, plan, user, launch, serving),
-        Command::focus(TERMINAL_ID),
         record,
         closed,
+        freezing::shown(screen),
     ])
 }
 
@@ -1955,13 +2173,21 @@ fn close_tab(screen: &mut WorkspaceScreen, index: usize) -> Command<Msg> {
                 return None;
             }
             let plan = workspace.plan(tab.kind())?;
-            Some(plan.end_tab(screen.engine.as_ref()?, tab.token()))
+            Some((plan.end_tab(screen.engine.as_ref()?, tab.token()), tab.key()))
         })
-        .map_or_else(Command::none, |command| {
-            Command::perform(move || {
-                let _ = crate::engine::run::capture(&command);
-                Msg::TabEnded
-            })
+        .map_or_else(Command::none, |(command, key)| {
+            let asleep = freezing::closing(screen, key);
+            match asleep {
+                // A container QCode froze refuses the command that ends a tab's processes, so the
+                // two are one: the container is woken, and only then is the work ended. A harness
+                // nobody is left to read would go on working otherwise, in a container that stays
+                // up until the reaper stops it.
+                Some(container) => freezing::thawing_then(screen, container, command),
+                None => Command::perform(move || {
+                    let _ = crate::engine::run::capture(&command);
+                    Msg::TabEnded
+                }),
+            }
         });
     let silenced = match screen.workspace() {
         Some(workspace) => {
@@ -1989,7 +2215,13 @@ fn close_tab(screen: &mut WorkspaceScreen, index: usize) -> Command<Msg> {
     TabEdit::Close(index).apply(&mut workspace.tabs, &mut workspace.active_tab);
     bridge::closed(screen, &gone);
     rename::closed(screen, &gone);
-    Command::batch([silenced, ending])
+    // A tab that is gone is never owed the keyboard: no terminal of it is coming up.
+    if screen.owed_focus.is_some_and(|owed| gone.contains(&owed)) {
+        screen.owed_focus = None;
+    }
+    // The tab that takes this one's place is on the screen now, and may be one a frozen container
+    // is holding.
+    Command::batch([silenced, ending, freezing::shown(screen)])
 }
 
 /// The provider and model a profile of `kind` runs on, when `kind` is a harness tab of a profile
@@ -2251,6 +2483,11 @@ fn restart_tab(screen: &mut WorkspaceScreen, key: TabKey) -> Command<Msg> {
     {
         relay::entered(workspace, asking(serving.as_ref(), &token), provider);
     }
+    // The button that asked for the start goes with the page it was on, so the tab in front of the
+    // person is owed the keyboard until its terminal is there; one started behind them is not.
+    if screen.workspace().and_then(OpenWorkspace::active_tab).is_some_and(|tab| tab.key() == key) {
+        screen.owed_focus = Some(key);
+    }
     let launch = Launch::new(key, run, token, provider, providers_path);
     if serving.is_some() {
         return harness_start(registry, engine, plan, user, launch, serving);
@@ -2393,6 +2630,15 @@ fn start(
     let behind = noted_start.as_ref().ok().cloned().flatten();
     let result = noted_start.map(|_| ());
     let up = result.is_ok();
+    // The keys that keep a harness from asking, merged into the home before anything else reads
+    // it: the image filled the home once, so a workspace opened before the key existed has the
+    // question in every start, and a profile on a custom set of additions has it in the first.
+    let asked = match &plan.bridge {
+        Some(bridge) if up => {
+            unattended::ensure(engine, &plan.name, bridge.harness).err().map(|trouble| (bridge.harness, trouble))
+        }
+        _ => None,
+    };
     // Registered before the harness starts, so it finds the bridge's server at its first start.
     let unregistered = match &plan.bridge {
         Some(bridge) if up => bridge_config::register(engine, &plan.name, bridge.harness, token)
@@ -2415,6 +2661,9 @@ fn start(
         plan::build_map(engine, &plan.name, &plan.code);
     }
     let mut message = answer(result);
+    if let Some((harness, trouble)) = asked {
+        message = Msg::Asked(harness, trouble, Box::new(message));
+    }
     if let Some((harness, trouble)) = unregistered {
         message = Msg::Unbridged(harness, trouble, Box::new(message));
     }
@@ -2425,6 +2674,27 @@ fn start(
         message = Msg::Behind(home.profile().to_string(), failed, Box::new(message));
     }
     if up { noted(registry, engine.kind(), &plan.name, message) } else { message }
+}
+
+/// The words for a window whose agent could not be told what it may do without asking. The window
+/// opens all the same: the agent works, and only some of its questions are left to the person.
+fn unapproved(words: &str) -> Command<Msg> {
+    Command::toast(Toast::warning(t!("workspace.unapproved.title")).body(words.to_owned()))
+}
+
+/// The words for a harness whose home could not be brought to what keeps it from asking. Its tab
+/// starts all the same: the agent works, and only some of its questions were left to be answered
+/// by the person.
+pub(super) fn asked(harness: HarnessKind, trouble: &Asks) -> Command<Msg> {
+    let body = match trouble {
+        Asks::Theirs(file, says) => t!("workspace.asked.theirs", file = file.as_str(), says = says.as_str()),
+        Asks::Unreadable(file, place) => {
+            t!("workspace.asked.unreadable", file = file.as_str(), place = place.as_str())
+        }
+        Asks::Engine(words) => words.clone(),
+    };
+    let title = t!("workspace.asked.title", harness = harness.record().display_name);
+    Command::toast(Toast::warning(title).body(body))
 }
 
 /// The words for a QCode high profile whose instruction files in the workspace could not be
@@ -2535,15 +2805,26 @@ fn open_tab(screen: &mut WorkspaceScreen, kind: TabKind) -> Command<Msg> {
     };
     if let Some(index) = workspace.tabs.iter().position(|tab| tab.kind() == &kind) {
         workspace.active_tab = index;
-        return Command::focus(focus);
+        // A tab whose terminal is already there takes the keyboard at once; one still waiting for
+        // its container is owed it until it comes up, as a tab chosen on a blank page is.
+        let owed = {
+            let tab = &workspace.tabs[index];
+            (tab.session().is_none() && focus == TERMINAL_ID).then_some(tab.key())
+        };
+        screen.owed_focus = owed;
+        return Command::batch([Command::focus(focus), freezing::shown(screen)]);
     }
     screen.next_key += 1;
     workspace.active_tab = workspace.join(Tab::waiting(key, kind));
-    Command::focus(focus)
+    screen.owed_focus = (focus == TERMINAL_ID).then_some(key);
+    Command::batch([Command::focus(focus), freezing::shown(screen)])
 }
 
 /// Attaches a session to a tab whose container came up, or tells it why it did not.
 fn ready(screen: &mut WorkspaceScreen, key: TabKey, run: u64, result: &Result<(), LaunchFailure>) -> Command<Msg> {
+    // A tab that is still starting is owed the keyboard only while the person is looking at it.
+    let owed = screen.owed_focus == Some(key)
+        && screen.workspace().and_then(OpenWorkspace::active_tab).is_some_and(|tab| tab.key() == key);
     let Some(command) = screen.launch_command(key) else { return Command::none() };
     let Some(workspace) = screen.owner_mut(key) else { return Command::none() };
     let folder = workspace.paths.root.clone();
@@ -2562,6 +2843,10 @@ fn ready(screen: &mut WorkspaceScreen, key: TabKey, run: u64, result: &Result<()
             TabState::Failed(failure.clone())
         };
         tab.settled(state);
+        // The tab will never have a terminal to take the keyboard, so it is owed nothing.
+        if screen.owed_focus == Some(key) {
+            screen.owed_focus = None;
+        }
         return containers_of(screen, &id);
     }
     let args: Vec<OsString> = command.args.clone();
@@ -2571,10 +2856,19 @@ fn ready(screen: &mut WorkspaceScreen, key: TabKey, run: u64, result: &Result<()
             tab.attached(session);
             let next = Command::perform(move || Msg::Output(key, run, watch.next()));
             // A harness that has just come back takes whatever waited for it while it was gone.
-            Command::batch([next, bridge::deliver(screen, std::time::Instant::now())])
+            let mut took = bridge::deliver(screen, std::time::Instant::now());
+            if owed {
+                // There is a terminal in the tab at last, so the keyboard it was owed goes in.
+                screen.owed_focus = None;
+                took = Command::batch([took, Command::focus(TERMINAL_ID)]);
+            }
+            Command::batch([next, took])
         }
         Err(error) => {
             tab.settled(TabState::Failed(LaunchFailure::spawn(&command, &error)));
+            if screen.owed_focus == Some(key) {
+                screen.owed_focus = None;
+            }
             Command::none()
         }
     };
@@ -2824,9 +3118,8 @@ fn rail(screen: &WorkspaceScreen, ui: &mut View<'_, Msg>) {
 /// `+` follows the last tab while they fit and keeps its place at the right end once they scroll.
 fn header(screen: &WorkspaceScreen, ui: &mut View<'_, Msg>) {
     let Some(workspace) = screen.workspace() else { return };
-    let labels: Vec<String> =
-        (0..workspace.tabs.len()).map(|index| busy::label(screen, workspace, index, ui.env())).collect();
-    let tabs = Tabs::new(labels)
+    let labels: Vec<String> = (0..workspace.tabs.len()).map(|index| workspace.tab_label(index)).collect();
+    let mut tabs = Tabs::new(labels)
         .active(workspace.active_tab)
         .tab_width(TabWidth::Fit)
         .closable(Msg::CloseTab)
@@ -2834,6 +3127,10 @@ fn header(screen: &WorkspaceScreen, ui: &mut View<'_, Msg>) {
         .on_select(Msg::OpenTab)
         .on_add(|| Msg::NewTab)
         .context_menu(|index| vec![ContextItem::new(t!("workspace.rename.item"), Msg::RenameTab(index))]);
+    // The mark of a working tab is the framework's own, so a tab is only asked whether it works.
+    for (index, tab) in workspace.tabs.iter().enumerate() {
+        tabs = tabs.busy(index, busy::working(tab, screen.looked));
+    }
     // The strip runs across, so the arrow that points at the tab steps into it.
     ui.add(strip::Walked::new(tabs, &[Key::Enter, Key::Down])).fill_width().id(TABS_ID);
     rename::view(screen, ui);
@@ -2959,7 +3256,7 @@ fn tab_body(screen: &WorkspaceScreen, ui: &mut View<'_, Msg>) {
             }
         }
         TabState::NoImage => no_image(screen, tab, ui),
-        TabState::Building(_) => building(tab, ui),
+        TabState::Building(_) => building(screen, tab, ui),
         TabState::Missing | TabState::Unreadable(_) => file_trouble(tab, ui),
     }
 }
@@ -2992,8 +3289,9 @@ fn no_image(screen: &WorkspaceScreen, tab: &Tab, ui: &mut View<'_, Msg>) {
     });
 }
 
-/// A profile's tab whose image is being built: the build as it speaks, and the way to stop it.
-fn building(tab: &Tab, ui: &mut View<'_, Msg>) {
+/// A profile's tab whose image is being built: the build as it speaks, the way to stop it, and a
+/// build that has said nothing long enough to wonder about.
+fn building(screen: &WorkspaceScreen, tab: &Tab, ui: &mut View<'_, Msg>) {
     let key = tab.key();
     let profile = match tab.kind() {
         TabKind::Profile(name) => name.clone(),
@@ -3002,12 +3300,21 @@ fn building(tab: &Tab, ui: &mut View<'_, Msg>) {
     page::column(ui, page::WIDTH, |ui| {
         ui.column(|ui| {
             ui.row(|ui| {
-                ui.add(ShimmerText::new(t!("workspace.image.building", profile = profile)));
+                ui.add(ShimmerText::new(t!("profiles.working.build")));
                 ui.spacer();
                 ui.add(Button::new(t!("workspace.image.stop")).on_press(Msg::StopBuild(key)))
                     .id("workspace-stop-build");
             })
             .fill_width();
+            // A shimmer is one line that is never wrapped, so the row it shares with the Stop
+            // carries the short word and the sentence wraps under it, where all of it is read.
+            ui.add(Text::new(t!("workspace.image.building", profile = profile)).role("secondary")).fill_width();
+            // A build with no time limit is not one to stop on its own, so all that is offered is
+            // the truth about the log: it has said nothing for a while, and the Stop above is
+            // there for anyone who has waited long enough.
+            if tab.is_stuck() {
+                ui.add(Text::new(t!("build.stuck", minutes = screen.stall.minutes())).color("warning")).fill_width();
+            }
             ui.add(LogView::new(tab.build_log())).fill().id("workspace-build-log");
         })
         .gap(1)

@@ -16,7 +16,7 @@ use crate::provider::Providers;
 
 use super::{
     Blocked, Build, Draft, Listing, Login, Msg, Page, Problem, Profiles, Readiness, Stage, Unfinished, WindowBack,
-    WindowLogin, remove, work,
+    WindowLogin, builds, remove, work,
 };
 
 /// Starts deleting the chosen profile by asking the engine what it holds of it, so the question
@@ -266,8 +266,8 @@ pub(super) fn start_build(state: &mut Profiles) -> Command<Msg> {
             let built = work::rebuild(&engine, &profile, &profiles, &cancel, started, &mut line);
             Ok(Msg::BuildEnded(built))
         });
-        draft.build = Build::Running(task.id());
-        return Command::task(task);
+        draft.building(task.id());
+        return Command::batch([Command::task(task), builds::follow(state)]);
     }
     let task = Task::new(t!("profiles.wizard.step-image"), move |cx| {
         let cancel = || cx.is_cancelled();
@@ -282,8 +282,8 @@ pub(super) fn start_build(state: &mut Profiles) -> Command<Msg> {
             built.and_then(|()| store.write_profile(&profile).map_err(|problem| Problem::Machine(problem.message)));
         Ok(Msg::BuildEnded(result))
     });
-    draft.build = Build::Running(task.id());
-    Command::task(task)
+    draft.building(task.id());
+    Command::batch([Command::task(task), builds::follow(state)])
 }
 
 /// Saves the changes to a profile: its definition file, after building its image again when the
@@ -322,8 +322,8 @@ fn save_edit(state: &mut Profiles) -> Command<Msg> {
             built.and_then(|()| store.write_profile(&profile).map_err(|problem| Problem::Machine(problem.message)));
         Ok(Msg::BuildEnded(saved))
     });
-    draft.build = Build::Running(task.id());
-    Command::task(task)
+    draft.building(task.id());
+    Command::batch([Command::task(task), builds::follow(state)])
 }
 
 /// Opens the container the login happens in and starts the harness on a terminal.

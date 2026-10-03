@@ -64,7 +64,9 @@ const DIALOG_FRAME: u16 = 8;
 /// with its label and the line of help under it, the filter with its label, the lineup's own
 /// steps, the two lines a warning about a price or a refusal takes, and the blank row between
 /// each pair. A dialog is measured to what is inside it, so a list left to itself is as tall as
-/// the one or two models in it and there is nothing to scroll in.
+/// the one or two models in it and there is nothing to scroll in. The steps are counted here at
+/// the two rows they take on the shortest terminal, and the rows a taller screen has over and
+/// above those two are the steps' to grow into, the models having stopped at their own most.
 const ROWS_AROUND_MODELS: u16 = 13;
 
 /// Fewest rows the list of the provider's models takes: a list of one row is no list to move
@@ -72,18 +74,42 @@ const ROWS_AROUND_MODELS: u16 = 13;
 const MODEL_ROWS_MIN: u16 = 2;
 
 /// Most: a list taller than this is further from the steps under it than the eye follows in one
-/// go, and the rows a tall terminal has spare are better left to the page behind.
+/// go, and the rows a tall terminal has spare are better spent on the order than on more of the
+/// hundred models the filter is there to find.
 const MODEL_ROWS_MAX: u16 = 12;
 
-/// The rows the lineup's own steps take. An order is a handful of models: the list grows and
-/// scrolls rather than taking the row of buttons away.
+/// Fewest rows the lineup's own steps take, and what they take wherever the models list has been
+/// given every row there was. An order is a handful of models: the list grows and scrolls rather
+/// than taking the row of buttons away.
 const STEP_ROWS: u16 = 2;
+
+/// Most: an order is a handful of models, so a list of steps taller than this is taller than any
+/// lineup there is, and the rows beyond it are better left to the page behind. The steps are
+/// given their rows only out of what the models list left over, so nothing above them is cut
+/// short to reach this many.
+const STEP_ROWS_MAX: u16 = 8;
+
+/// The rows of the screen the editor's two lists share between them once the dialog's own rows
+/// are off it, before either list has been given what it may take of them. Both lists are
+/// measured against this, so their rows together come to no more than the screen holds.
+fn rows_for_the_two_lists(ui: &View<'_, Msg>) -> u16 {
+    ui.size().height.saturating_sub(DIALOG_FRAME + ROWS_AROUND_MODELS)
+}
 
 /// The rows the list of the provider's models takes. The dialog's own rows come off the screen
 /// first, so however many models a provider offers, and however short the terminal is, the
 /// buttons under them stay where a hand can reach them.
 fn model_rows(ui: &View<'_, Msg>) -> u16 {
-    ui.size().height.saturating_sub(DIALOG_FRAME + ROWS_AROUND_MODELS).clamp(MODEL_ROWS_MIN, MODEL_ROWS_MAX)
+    rows_for_the_two_lists(ui).clamp(MODEL_ROWS_MIN, MODEL_ROWS_MAX)
+}
+
+/// The rows the lineup's own steps take. They begin at the two the shortest terminal can spare,
+/// where an order is read two steps at a time, and grow into what the models list left over: a
+/// lineup of six steps is not read at all through two rows of it, and the rows a tall terminal
+/// has spare say more of the order rather than more of the hundred models above it.
+fn step_rows(ui: &View<'_, Msg>) -> u16 {
+    let spare = rows_for_the_two_lists(ui);
+    (STEP_ROWS + spare.saturating_sub(model_rows(ui))).clamp(STEP_ROWS, STEP_ROWS_MAX)
 }
 
 /// What the screen is waiting for, so a button that has been pressed shows the work and takes no
@@ -382,12 +408,7 @@ pub fn update(state: &mut Providers, message: Msg) -> Command<Msg> {
         }
         Msg::New => {
             state.draft = Some(Draft::new());
-            // A dialog gives the keyboard back, as it closes, to what had it as it opened, over
-            // any focus asked for in the same moment. The list is where both ways out of this
-            // one mean to leave it, the new provider chosen on it or nothing changed, so the list
-            // is what has the keyboard as the dialog opens, for the moment before the tag takes it.
-            let back = if state.entries().is_empty() { Command::none() } else { Command::focus(LIST) };
-            Command::batch([back, Command::focus(TAG_FIELD)])
+            Command::focus(TAG_FIELD)
         }
         Msg::Cancel => {
             // The key the person was typing goes with the dialog: nothing keeps it.
@@ -531,10 +552,7 @@ pub fn update(state: &mut Providers, message: Msg) -> Command<Msg> {
             let mut dialog = Lineups::new();
             dialog.open(entry);
             state.lineups = Some(dialog);
-            // As the add dialog does, the keyboard goes back to what had it as this one opens, and
-            // on to the list inside it: both ways out of it leave the list of providers.
-            let back = if state.entries().is_empty() { Command::none() } else { Command::focus(LIST) };
-            Command::batch([back, Command::focus(LINEUPS)])
+            Command::focus(LINEUPS)
         }
         Msg::LineupsClosed => {
             // A lineup left half-written is not kept: it reaches the file when it is saved, as
@@ -1112,6 +1130,7 @@ fn draw_editor(dialog: &Lineups, editor: &Editor, entry: &ProviderEntry, ui: &mu
     ui.add(list.wrap(true)).id(LINEUP_MODELS).height(Length::Cells(rows));
 
     let steps = dialog.steps();
+    let step_height = step_rows(ui);
     let rows: Vec<ListItem> = steps
         .iter()
         .enumerate()
@@ -1124,7 +1143,7 @@ fn draw_editor(dialog: &Lineups, editor: &Editor, entry: &ProviderEntry, ui: &mu
         .empty_text(t!("provider.lineup-none-yet"))
         .selected((!steps.is_empty()).then(|| dialog.step().min(steps.len() - 1)))
         .on_select(Msg::LineupStep);
-    ui.add(step_list.wrap(true)).id(LINEUP_STEPS).height(Length::Cells(STEP_ROWS));
+    ui.add(step_list.wrap(true)).id(LINEUP_STEPS).height(Length::Cells(step_height));
 
     // A step that costs money is said out loud where the order is chosen, not in a bill later.
     let paid = dialog.paid(entry);

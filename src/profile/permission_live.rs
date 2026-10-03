@@ -1,13 +1,21 @@
 //! That no harness stops to ask the person before it acts, shown on the harness itself: in a real
-//! container of a QCode template's image, started by the line a tab starts it with, in a real
-//! terminal, the harness is given one task by a model that answers with a shell command and then
-//! with a file to write, and both happen with not one key pressed after the task.
+//! container of a profile's image under any template, started by the line a tab starts it with, in
+//! a real terminal, the harness is given one task by a model that answers with a shell command and
+//! then with a file to write, and both happen with not one key pressed after the task.
 //!
-//! The model is `fake_model.py`, a server on the container's own loopback at the relay's port, the
+//! The model is `fake_model.js`, a server on the container's own loopback at the relay's port, the
 //! address a profile on a provider is pointed at: it speaks each harness's shape (Anthropic
 //! messages, OpenAI chat completions and responses, Gemini's generateContent) and needs neither the
 //! network nor an account. The relay itself is left out: it carries requests to the person's
-//! provider, and here the provider stands where the relay would.
+//! provider, and here the provider stands where the relay would. It runs under Node, which every
+//! image carries, rather than under the Python of `fake_model.py`, which the `base` image does not:
+//! what is being shown here is what a harness does under `base`, where the image is one a person
+//! would have built themselves.
+//!
+//! The container is brought up the way a tab brings it up, answers and all: the keys that keep a
+//! harness from asking are merged into the home before the harness starts
+//! ([`unattended`](super::unattended)), which is what makes these tests mean the same under every
+//! template.
 //!
 //! The shell command also touches a file outside the workspace. That is a step opencode asks about
 //! on its own (its `external_directory` permission), so a harness that asks about anything at all
@@ -32,6 +40,7 @@ use qframe::widgets::TerminalSession;
 
 use super::harness_live::{build, clear};
 use super::identity::Home;
+use super::unattended;
 use super::{AccountKind, HarnessKind, MountAccess, NetworkMode, Profile, ProviderChoice, SafeName, Template};
 use crate::engine::run::capture;
 use crate::engine::{Engine, EngineKind, Exec, HostUser, detect};
@@ -39,10 +48,10 @@ use crate::store::{WorkspaceId, WorkspacePaths};
 use crate::ui::workspace::{ContainerPlan, ensure_running};
 
 /// The model every harness is pointed at, started in the container before the harness.
-const FAKE_MODEL: &str = include_str!("fake_model.py");
+const FAKE_MODEL: &str = include_str!("fake_model.js");
 
 /// What the model's shell command leaves in the workspace, and the file its second answer writes
-/// there; both are named in `fake_model.py`.
+/// there; both are named in `fake_model.js`.
 const TOUCHED: &str = "asked-nothing";
 const WRITTEN: &str = "edited-without-asking.txt";
 const WRITTEN_TEXT: &str = "written without asking\n";
@@ -50,13 +59,24 @@ const WRITTEN_TEXT: &str = "written without asking\n";
 /// The task typed into the harness's prompt.
 const TASK: &str = "Do the step the model asks for.";
 
+/// What is written into Gemini CLI's own settings for the harness to start on its prompt with a key
+/// and not open its sign-in dialog, which is what a person's first start leaves behind. Under Node,
+/// since that is in every image.
+const GEMINI_ON_A_KEY: &str = r#"node -e 'const fs = require("node:fs");
+const file = process.env.HOME + "/.gemini/settings.json";
+const own = JSON.parse(fs.readFileSync(file, "utf8"));
+own.security = own.security || {};
+own.security.auth = own.security.auth || {};
+own.security.auth.selectedType = "gemini-api-key";
+fs.writeFileSync(file, JSON.stringify(own, null, 2) + "\n");'"#;
+
 /// The workspace the containers here belong to, which nobody has.
 const WORKSPACE: &str = "izintest";
 
 /// The words each harness's own approval question is drawn with, as each one drew it in a
 /// container when it was started without what keeps it from asking. None of them may ever be on
 /// the screen of a tab.
-const QUESTIONS: [&str; 10] = [
+const QUESTIONS: [&str; 11] = [
     // Claude Code, before a command.
     "Do you want to proceed?",
     // opencode, before a step its permissions say to ask about.
@@ -75,6 +95,8 @@ const QUESTIONS: [&str; 10] = [
     // about the mode QCode starts it in.
     "No, exit",
     "Bypass Permissions mode",
+    // Claude Code 2.1.285's offer to trade the mode for its auto mode, "Yes" highlighted.
+    "Make auto mode your default permission mode?",
 ];
 
 /// The engines installed on this machine, or nothing at all when the tests are switched off.
@@ -249,10 +271,13 @@ fn start(engine: Engine, profile: Profile, model: bool) -> Tab {
         capture(&engine.exec_without_terminal(&Exec { container: &plan.name, command: &["sh", "-c", script] }))
             .unwrap_or_else(|error| panic!("{kind:?}: `{script}`: {error:?}"))
     };
+    // Where the product puts them, and before the harness starts: without them a harness under
+    // `base` is asked before every step, and these tests would be measuring the asking.
+    unattended::ensure(&engine, &plan.name, harness).unwrap_or_else(|trouble| panic!("{kind:?}: {trouble:?}"));
     let port = crate::provider::relay::PORT;
     if model {
-        run(&format!("cat > /tmp/fake_model.py <<'PYTHON'\n{FAKE_MODEL}PYTHON"));
-        run(&format!("cd /tmp && (nohup python3 fake_model.py {port} > /tmp/fake-model.out 2>&1 &) && sleep 2"));
+        run(&format!("cat > /tmp/fake_model.js <<'SCRIPT'\n{FAKE_MODEL}SCRIPT"));
+        run(&format!("cd /tmp && (nohup node fake_model.js {port} > /tmp/fake-model.out 2>&1 &) && sleep 2"));
     }
 
     let mut line = harness.command_line(None);
@@ -265,10 +290,9 @@ fn start(engine: Engine, profile: Profile, model: bool) -> Tab {
         None => {
             // Gemini CLI on a key: the key is taken from its variable and the address it asks from
             // its own, and the answer its sign-in dialog writes is written for it, as a person's
-            // first start would have.
-            run("python3 -c \"import json, os; p = os.path.expanduser('~/.gemini/settings.json'); \
-                 d = json.load(open(p)); d.setdefault('security', {}).setdefault('auth', {})['selectedType'] = \
-                 'gemini-api-key'; json.dump(d, open(p, 'w'))\"");
+            // first start would have. Node rather than Python, so that it also happens on the base
+            // image, which carries no Python.
+            run(GEMINI_ON_A_KEY);
             envs.push(("GEMINI_API_KEY".to_owned(), "x".to_owned()));
             envs.push(("GOOGLE_GEMINI_BASE_URL".to_owned(), format!("http://127.0.0.1:{port}")));
         }
@@ -280,6 +304,114 @@ fn start(engine: Engine, profile: Profile, model: bool) -> Tab {
         .expect("a pseudo-terminal for the tab");
     let screen = Screen::new(Watched(session.clone()), 120, 36);
     Tab { engine, plan, home, profile, session, screen, scratch }
+}
+
+/// The model under Node, on this machine, answering each shape a harness asks in. The images
+/// under test are not needed for this, and the base image has no Python: what these tests ask of
+/// the model is that it speaks, and this is where that is shown.
+#[test]
+fn the_model_under_node_answers_each_harness_in_the_shape_it_asks_in() {
+    use std::io::Read as _;
+
+    let Some(node) = crate::testing::node("answering for the harnesses") else { return };
+    let folder = crate::engine::scratch::Scratch::new("fake-model").expect("a folder");
+    // Written to a file and run as one, the way a container runs it, so the port is where the
+    // script looks for it.
+    let script = folder.path().join("fake_model.js");
+    std::fs::write(&script, FAKE_MODEL).expect("the model is written");
+    let port = 41_000 + u16::try_from(std::process::id() % 2_000).expect("a port");
+    let mut server = std::process::Command::new(&node)
+        .arg(&script)
+        .arg(port.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the model starts");
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(20))).build(),
+    );
+    let address = format!("http://127.0.0.1:{port}");
+    let mut listening = Err("not asked yet".to_owned());
+    for _ in 0..40 {
+        listening = agent
+            .get(format!("{address}/v1/models"))
+            .force_send_body()
+            .send_empty()
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+        if listening.is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    if let Err(refused) = listening {
+        let _ = server.kill();
+        let out = server.wait_with_output().expect("the model ends");
+        panic!("the model is listening on {address}: {refused}\n{}", String::from_utf8_lossy(&out.stderr));
+    }
+    let ask = |path: &str, body: &str| {
+        let answer = agent.post(format!("{address}{path}")).send(body).expect("the model answers");
+        let mut said = String::new();
+        answer.into_body().into_reader().read_to_string(&mut said).expect("the answer is text");
+        said
+    };
+    let schema = r#"{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}"#;
+
+    // Anthropic messages, as Claude Code asks them, then the same again with the command's result.
+    let first = ask(
+        "/v1/messages",
+        &format!(
+            r#"{{"model":"m","tools":[{{"name":"Bash","input_schema":{schema}}}],"messages":[{{"role":"user","content":"go"}}]}}"#
+        ),
+    );
+    assert!(first.contains(r#""stop_reason":"tool_use""#), "{first}");
+    assert!(first.contains("touch /tmp/outside-the-workspace /work/asked-nothing"), "{first}");
+    let second = ask(
+        "/v1/messages",
+        &format!(
+            r#"{{"model":"m","tools":[{{"name":"Bash","input_schema":{schema}}}],
+                "messages":[{{"role":"user","content":"go"}},
+                {{"role":"user","content":[{{"type":"tool_result","tool_use_id":"t","content":"done"}}]}}]}}"#
+        ),
+    );
+    assert!(second.contains("edited-without-asking.txt"), "{second}");
+
+    // OpenAI chat completions, as opencode and Kimi Code CLI ask them.
+    let chat = ask(
+        "/v1/chat/completions",
+        &format!(
+            r#"{{"model":"m","tools":[{{"type":"function","function":{{"name":"shell","parameters":{schema}}}}}],"messages":[{{"role":"user","content":"go"}}]}}"#
+        ),
+    );
+    assert!(chat.contains(r#""finish_reason":"tool_calls""#), "{chat}");
+    assert!(chat.contains("asked-nothing"), "{chat}");
+
+    // OpenAI responses, as Codex asks them.
+    let responses = ask(
+        "/v1/responses",
+        &format!(r#"{{"model":"m","tools":[{{"type":"function","name":"shell","parameters":{schema}}}],"input":[]}}"#),
+    );
+    assert!(responses.contains(r#""type":"function_call""#), "{responses}");
+    assert!(responses.contains("asked-nothing"), "{responses}");
+
+    // Gemini's generateContent, streamed and not, as Gemini CLI and Qwen Code ask them.
+    let gemini = ask(
+        "/v1beta/models/m:streamGenerateContent",
+        &format!(
+            r#"{{"contents":[{{"parts":[{{"text":"go"}}]}}],"tools":[{{"functionDeclarations":[{{"name":"run_shell_command","parameters":{schema}}}]}}]}}"#
+        ),
+    );
+    assert!(gemini.contains(r#""functionCall""#), "{gemini}");
+    assert!(gemini.contains("asked-nothing"), "{gemini}");
+    // The side question of its own, which it asks with a schema and is answered in that schema.
+    let side = ask(
+        "/v1beta/models/m:generateContent",
+        r#"{"contents":[{"parts":[{"text":"how hard"}]}],"generationConfig":{"responseMimeType":"application/json","responseSchema":{"type":"object","properties":{"level":{"type":"string","enum":["easy","hard"]}},"required":["level"]}}}"#,
+    );
+    assert!(side.contains(r#"{\"level\":\"easy\"}"#), "{side}");
+
+    let _ = server.kill();
+    let _ = server.wait();
 }
 
 /// The whole check for one harness under one QCode template, on every engine.
@@ -364,47 +496,44 @@ fn qwen_code_runs_and_writes_without_asking_under_qcode_basic() {
     acts_without_asking(HarnessKind::QwenCode, Template::Recommended);
 }
 
-/// Under `base` the image holds none of QCode's files, so Claude Code meets its first start as it
-/// comes: the text style, its security notes and whether the folder is trusted, which are its own
-/// questions and are answered here as a person would, moving to "Yes" where "No, exit" is
-/// highlighted. What must never come is the warning about the permission mode, whose highlighted
-/// answer leaves: the mode is QCode's choice, made by the argument every template passes, so the
-/// same argument has to carry the answer too.
+/// Under `base` the image holds none of QCode's files, so every question a harness asks on the way
+/// is QCode's to answer, and it is answered in the home before the harness starts: the folder's
+/// trust, the permission mode, the first start itself. So the same check as under a template is
+/// made here, on the same task and with not one key pressed.
 #[test]
 #[ignore = "needs a container engine and the network once for the image; run with QCODE_CONTAINER_TESTS=1"]
-fn claude_code_under_base_is_never_warned_about_the_mode_qcode_starts_it_in() {
-    let harness = HarnessKind::ClaudeCode;
-    for engine in engines() {
-        let kind = engine.kind();
-        // No model: Claude Code draws its prompt as soon as it has an address to speak to, and the
-        // base image has no Python to run one with.
-        let mut tab = start(engine, profile(harness, Template::Base), false);
-        let wanted = prompt_of(harness);
-        let deadline = Instant::now() + Duration::from_secs(240);
-        let mut before = String::new();
-        let mut seen = Vec::new();
-        let drawn = loop {
-            tab.screen.render();
-            let drawn = tab.screen.screen();
-            assert!(!drawn.contains("Bypass Permissions mode"), "{kind:?}: the mode warning came up:\n{drawn}");
-            if drawn.contains(wanted) || Instant::now() > deadline {
-                break drawn;
-            }
-            // Still on the same screen and no prompt: it is waiting for an answer.
-            if drawn == before && seen.len() < 6 {
-                seen.push(drawn.lines().find(|line| line.contains('❯')).unwrap_or_default().trim().to_owned());
-                if drawn.contains("❯ No, exit") {
-                    let _ = tab.session.write(b"\x1b[B");
-                    std::thread::sleep(Duration::from_millis(500));
-                }
-                let _ = tab.session.write(b"\r");
-            }
-            before = drawn;
-            std::thread::sleep(Duration::from_secs(3));
-        };
-        assert!(drawn.contains(wanted), "{kind:?}: no prompt came up:\n{drawn}");
-        eprintln!("{kind:?}: under base, Claude Code asked on its first start: {seen:?}");
-    }
+fn claude_code_runs_and_writes_without_asking_under_base() {
+    acts_without_asking(HarnessKind::ClaudeCode, Template::Base);
+}
+
+#[test]
+#[ignore = "needs a container engine and the network once for the image; run with QCODE_CONTAINER_TESTS=1"]
+fn opencode_runs_and_writes_without_asking_under_base() {
+    acts_without_asking(HarnessKind::OpenCode, Template::Base);
+}
+
+#[test]
+#[ignore = "needs a container engine and the network once for the image; run with QCODE_CONTAINER_TESTS=1"]
+fn gemini_cli_runs_and_writes_without_asking_under_base() {
+    acts_without_asking(HarnessKind::GeminiCli, Template::Base);
+}
+
+#[test]
+#[ignore = "needs a container engine and the network once for the image; run with QCODE_CONTAINER_TESTS=1"]
+fn codex_runs_and_writes_without_asking_under_base() {
+    acts_without_asking(HarnessKind::Codex, Template::Base);
+}
+
+#[test]
+#[ignore = "needs a container engine and the network once for the image; run with QCODE_CONTAINER_TESTS=1"]
+fn kimi_code_runs_and_writes_without_asking_under_base() {
+    acts_without_asking(HarnessKind::KimiCode, Template::Base);
+}
+
+#[test]
+#[ignore = "needs a container engine and the network once for the image; run with QCODE_CONTAINER_TESTS=1"]
+fn qwen_code_runs_and_writes_without_asking_under_base() {
+    acts_without_asking(HarnessKind::QwenCode, Template::Base);
 }
 
 /// The checker of [`antigravity_reads_every_setting_the_templates_write`].

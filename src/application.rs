@@ -87,7 +87,7 @@ impl App for QCode {
             Some(setup) => ui::setup::opened(setup).map(Msg::Setup),
             // Not while the wizard is open: a first start has enough to say, and the next start
             // asks.
-            None => Command::batch([self.take_focus(), self.survey(), self.ask_for_update()]),
+            None => Command::batch([self.take_focus(), self.survey(), self.ask_for_update(), self.clear_leftovers()]),
         }
     }
 
@@ -220,6 +220,9 @@ impl App for QCode {
             Msg::SignedOut(Ok(())) => Command::toast(Toast::success(t!("settings.signed-out"))),
             Msg::SignedOut(Err(reason)) => Command::toast(Toast::danger(t!("settings.sign-out-failed")).body(reason)),
             Msg::Refreshed(profile, outcome) => Command::toast(refreshed(&profile, outcome)),
+            // Nothing to say and nothing to ask: the images went or they did not, and the next
+            // start asks again.
+            Msg::Cleared(_) => Command::none(),
             Msg::NewVersion(update) => Command::toast(update.toast()),
         }
     }

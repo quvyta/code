@@ -106,11 +106,15 @@ pub(super) fn open(screen: &WorkspaceScreen, key: TabKey, run: u64) -> Command<M
         let unregistered =
             plan.bridge.as_ref().and_then(|bridge| prepared.bridge.err().map(|trouble| (bridge.harness, trouble)));
         let unguided = plan.guidance.and_then(|harness| prepared.guidance.err().map(|trouble| (harness, trouble)));
+        let unapproved = prepared.approvals.err();
         let opened = plan::open_window(&engine, &plan, user, &display).map(|_| Opening::Up);
         // Noted like every container QCode starts, so a QCode that is closed while a window is
         // open stops it rather than leaving it on the screen with nothing behind it.
         let up = opened.is_ok();
         let mut message = Msg::WindowOpened(key, run, opened);
+        if let Some(words) = unapproved {
+            message = Msg::Unapproved(words, Box::new(message));
+        }
         if let Some((harness, trouble)) = unregistered {
             message = Msg::Unbridged(harness, trouble, Box::new(message));
         }
@@ -479,6 +483,12 @@ pub(super) fn view(screen: &WorkspaceScreen, tab: &Tab, profile: &str, ui: &mut 
                 })
                 .gap(2)
                 .fill_width();
+                // Under Wayland the compositor alone puts a window in front, and only for a program
+                // holding a token it handed out; a terminal application has no way to get one. So the
+                // button can only ask, and the person is told where the window is found if it stays.
+                if tab.state() == &TabState::Running {
+                    ui.add(Text::new(t!("workspace.window.raise-note")).role("secondary")).fill_width();
+                }
             })
             .gap(1)
             .fill_width();

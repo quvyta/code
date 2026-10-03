@@ -309,8 +309,8 @@ const FIRST_SUBORDINATE_ID: u64 = 100_000;
 /// See [`FIRST_SUBORDINATE_ID`].
 const SUBORDINATE_IDS: u64 = 65_536;
 
-/// The account QCode runs as and what `/etc/subuid` and `/etc/subgid` say, which is everything
-/// needed to know whether rootless podman can map the ids an image uses.
+/// The account QCode runs as and what `/etc/passwd`, `/etc/subuid` and `/etc/subgid` say, which
+/// is everything needed to know whether rootless podman can map the ids an image uses.
 ///
 /// Plain data, so every case is checked without touching the machine's files; only
 /// [`IdRanges::here`] reads them.
@@ -318,6 +318,11 @@ const SUBORDINATE_IDS: u64 = 65_536;
 pub struct IdRanges {
     /// The account's name.
     pub user: String,
+    /// Whether `user` is the name the environment gave. It is not when the environment named
+    /// nobody, which is the case for a qcode a service or `env -i` started: the name then comes
+    /// from `/etc/passwd`, so [`IdRanges::line`] writes it out in full instead of leaving
+    /// `$USER` to a shell that has none.
+    pub from_env: bool,
     /// The account's numeric id; either may stand at the start of a line.
     pub uid: u32,
     /// The text of `/etc/subuid`, empty when it is missing.
@@ -327,9 +332,9 @@ pub struct IdRanges {
 }
 
 impl IdRanges {
-    /// Reads this machine: the account from the environment and the owner of this process, the
-    /// two files as they are. A file that cannot be read counts as empty, which is what podman
-    /// makes of it too.
+    /// Reads this machine: the account from the environment, or from `/etc/passwd` when the
+    /// environment names nobody, the owner of this process, and the two id files as they are. A
+    /// file that cannot be read counts as empty, which is what podman makes of it too.
     #[must_use]
     pub fn here() -> Self {
         #[cfg(unix)]
@@ -339,13 +344,32 @@ impl IdRanges {
         };
         #[cfg(not(unix))]
         let uid = u32::MAX;
-        let user = std::env::var("USER").or_else(|_| std::env::var("LOGNAME")).unwrap_or_default();
-        Self {
-            user,
+        let environment =
+            std::env::var("USER").or_else(|_| std::env::var("LOGNAME")).ok().filter(|name| !name.is_empty());
+        Self::of(
+            environment.as_deref(),
             uid,
-            subuid: std::fs::read_to_string("/etc/subuid").unwrap_or_default(),
-            subgid: std::fs::read_to_string("/etc/subgid").unwrap_or_default(),
-        }
+            &std::fs::read_to_string("/etc/passwd").unwrap_or_default(),
+            &std::fs::read_to_string("/etc/subuid").unwrap_or_default(),
+            &std::fs::read_to_string("/etc/subgid").unwrap_or_default(),
+        )
+    }
+
+    /// The ranges of the account `environment` names, or of the one the `passwd` file holds for
+    /// `uid` when the environment names nobody.
+    ///
+    /// `/etc/subuid` names an account by name far more often than by number, so an empty name
+    /// makes a machine on which podman works look like one that has no id ranges for it: the
+    /// account is read from `passwd`, whose own lines name every account there is.
+    ///
+    /// The files are parameters so a test can describe any machine from any other one.
+    #[must_use]
+    pub fn of(environment: Option<&str>, uid: u32, passwd: &str, subuid: &str, subgid: &str) -> Self {
+        let (user, from_env) = match environment {
+            Some(name) if !name.is_empty() => (name.to_owned(), true),
+            _ => (passwd_name(passwd, uid).unwrap_or_default(), false),
+        };
+        Self { user, from_env, uid, subuid: subuid.to_owned(), subgid: subgid.to_owned() }
     }
 
     /// Whether both files give this account a range.
@@ -363,14 +387,34 @@ impl IdRanges {
     ///
     /// The range starts after every range either file already hands out, so it never overlaps
     /// another account's: two accounts sharing ids could read each other's container files.
-    /// `$USER` is left for the shell, which knows the name for certain.
+    /// `$USER` is left for the shell, which knows the name for certain; a name `/etc/passwd` gave
+    /// is written out instead, because a shell as bare as the one this program was started from
+    /// would leave `$USER` empty and `usermod` would range nobody.
     #[must_use]
     pub fn line(&self) -> String {
         let taken = entries(&self.subuid).chain(entries(&self.subgid)).map(|(_, start, count)| start + count).max();
         let start = taken.unwrap_or(0).max(FIRST_SUBORDINATE_ID);
         let end = start + SUBORDINATE_IDS - 1;
-        format!("sudo usermod --add-subuids {start}-{end} --add-subgids {start}-{end} $USER && podman system migrate")
+        let account = if self.from_env { "$USER" } else { self.user.as_str() };
+        format!(
+            "sudo usermod --add-subuids {start}-{end} --add-subgids {start}-{end} {account} && podman system migrate"
+        )
     }
+}
+
+/// The name the `passwd` file gives `uid`: the first field of the line whose third field is
+/// `uid`, as every account a machine has is in there.
+///
+/// A line that does not parse is skipped, so one unreadable line does not hide the accounts the
+/// rest of the file names; a `uid` the file holds no line for names nobody, which is what an
+/// empty name already meant.
+fn passwd_name(passwd: &str, uid: u32) -> Option<String> {
+    passwd.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        let name = fields.next()?;
+        let _password = fields.next()?;
+        (fields.next()?.trim().parse::<u32>().ok()? == uid).then_some(name.to_owned())
+    })
 }
 
 /// The `owner:start:count` lines of a subordinate id file, skipping anything that is not one.
@@ -403,8 +447,14 @@ mod tests {
         }
     }
 
+    /// `ada`'s ranges, an account the environment named, with the two id files as given.
     fn ranges(subuid: &str, subgid: &str) -> IdRanges {
-        IdRanges { user: "ada".to_owned(), uid: 1001, subuid: subuid.to_owned(), subgid: subgid.to_owned() }
+        IdRanges::of(Some("ada"), 1001, "", subuid, subgid)
+    }
+
+    /// The text of `/etc/passwd` on a machine with two accounts and a line nothing can read.
+    fn passwd() -> &'static str {
+        "root:x:0:0:root:/root:/bin/bash\nnot an account\nalice:x:1000:1000:Alice:/home/alice:/bin/bash\n"
     }
 
     #[test]
@@ -415,6 +465,25 @@ mod tests {
         assert!(!ranges("ada:100000:65536\n", "").present(), "a group range is needed too");
         assert!(!ranges("bob:100000:65536\n", "bob:100000:65536\n").present(), "another account's range");
         assert!(!ranges("ada:100000:0\n", "ada:100000:0\n").present(), "a range of nothing");
+    }
+
+    #[test]
+    fn the_name_a_uid_has_in_passwd_is_found_past_a_line_that_does_not_parse() {
+        assert_eq!(passwd_name(passwd(), 1000).as_deref(), Some("alice"));
+        assert_eq!(passwd_name(passwd(), 0).as_deref(), Some("root"));
+        assert_eq!(passwd_name(passwd(), 4242), None, "a uid the file holds no line for names nobody");
+        assert_eq!(passwd_name("", 0), None, "a passwd file that could not be read names nobody");
+    }
+
+    #[test]
+    fn an_account_the_environment_leaves_unnamed_is_found_in_passwd() {
+        // A qcode a service or `env -i` started has neither `$USER` nor `$LOGNAME`, and the id
+        // files name an account by name, so an empty name reads as an account podman has no
+        // ranges for on a machine where it works.
+        let ranges = IdRanges::of(None, 1000, passwd(), "alice:100000:65536\n", "alice:100000:65536\n");
+        assert_eq!(ranges.user, "alice", "the uid is the one thing qcode knows of its own account");
+        assert!(ranges.present());
+        assert_eq!(IdRanges::of(Some(""), 1000, passwd(), "", "").user, "alice", "an empty name is no name");
     }
 
     #[test]
@@ -429,6 +498,15 @@ mod tests {
             "{}",
             crowded.line()
         );
+    }
+
+    #[test]
+    fn the_line_names_the_account_the_way_the_shell_that_runs_it_will_know_it() {
+        let from_passwd = IdRanges::of(None, 1000, passwd(), "", "");
+        let line = from_passwd.line();
+        assert!(line.contains(" --add-subgids 100000-165535 alice &&"), "{line}");
+        assert!(!line.contains("$USER"), "a shell as bare as the one qcode was started from has none: {line}");
+        assert!(ranges("", "").line().contains("$USER"), "a name the environment gave is left to the shell");
     }
 
     #[test]

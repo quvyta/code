@@ -1,4 +1,5 @@
-//! Where things are inside every QCode container, and what a container runs to stay up.
+//! Where things are inside every QCode container, what a container runs to stay up, and the shell
+//! that gives the person running it a name when the image has none for them.
 //!
 //! These are one contract with one owner. The image below makes the directories and hands them
 //! to whoever the container runs as; the mounts, the working directory and the keep-alive
@@ -72,10 +73,43 @@ pub const KEEP_ALIVE: &[&str] = &["sh", "-c", "trap 'exit 0' TERM INT; while :; 
 /// See the block that installs it in the Containerfile for what goes wrong without it.
 pub const OPEN_HOME: &str = "qcode-open-home";
 
+/// The shell that gives the person a name inside a container whose image has none for them, run as
+/// root in the container once it is up.
+///
+/// On docker the daemon runs the container as the ids QCode hands it (`--user uid:gid`), and an
+/// image can only name the uid it was built with: [`USER`] at 1000. A person whose uid is another
+/// one then has no name inside, and everything that looks one up fails on it — `whoami` cannot
+/// answer, `git commit` refuses to write an author, Node's `os.userInfo()` throws. The home
+/// directory and the person's own files are right; only the name is missing. Podman rootless maps
+/// the person into the container's user namespace and writes that entry itself, so nothing is
+/// missing there and nothing here runs.
+///
+/// Run as `sh -c <this> sh <uid> <gid>`, with the ids as arguments rather than written into the
+/// script, and the two files after them so that the same shell can be run against a copy of them:
+/// `passwd` and `group` default to `/etc/passwd` and `/etc/group`.
+///
+/// Each line is looked for by the id in its own field and not by the name beside it, because the
+/// name is what this writes and the image may have written another one: so an image that already
+/// knows the uid is left as it is, and a container brought up twice is written once.
+///
+/// Nothing but `sh`, `grep` and `echo` is used, because every base QCode offers is somebody else's
+/// and none of the four carries the same set of programs.
+pub const NAME_THE_USER: &str = "passwd=${3:-/etc/passwd}; group=${4:-/etc/group}; \
+     grep -q \"^[^:]*:[^:]*:$2:\" \"$group\" || echo \"qcode-$2:x:$2:\" >> \"$group\"; \
+     grep -q \"^[^:]*:[^:]*:$1:\" \"$passwd\" || echo \"qcode-$1:x:$1:$2:QCode:/home/qcode:/bin/sh\" >> \"$passwd\"";
+
 #[cfg(test)]
 mod tests {
-    use super::{ASSETS_DIR, BACKUP_DIR, CODE_DIR, HOME_DIR, KEEP_ALIVE, LEGACY_CODE_DIR, MCP_DIR, OPEN_HOME, USER};
+    use super::{
+        ASSETS_DIR, BACKUP_DIR, CODE_DIR, HOME_DIR, KEEP_ALIVE, LEGACY_CODE_DIR, MCP_DIR, NAME_THE_USER, OPEN_HOME,
+        USER,
+    };
     use crate::base::CONTAINERFILE;
+    #[cfg(unix)]
+    use std::{
+        ffi::OsString,
+        path::{Path, PathBuf},
+    };
 
     #[test]
     fn every_path_is_absolute_and_no_two_of_them_are_the_same_place() {
@@ -127,5 +161,67 @@ mod tests {
         let script = KEEP_ALIVE.get(2).expect("the loop is the third word");
         assert!(script.contains("trap 'exit 0' TERM"), "{script}");
         assert!(script.contains("sleep 3600 & wait"), "{script}");
+    }
+
+    #[test]
+    fn the_entry_the_person_is_given_is_of_the_contract_s_own_home_and_shell() {
+        // The line is the one the image gives the user it was built with, with the ids in it: a
+        // name of QCode's own, the home the image opens and a shell every base carries. An entry
+        // naming another home sends a harness's login where nothing reads it, and one whose shell
+        // a base does not have stops the person at their first command.
+        let entry = format!("{USER}-$1:x:$1:$2:QCode:{HOME_DIR}:/bin/sh");
+        assert!(NAME_THE_USER.contains(&entry), "{NAME_THE_USER}");
+    }
+
+    /// The shell run for real, against a copy of the two files it writes, so what it appends and
+    /// what it leaves alone is read here rather than believed. Bounded like every other command
+    /// QCode runs, and through the runner the engine layer uses, so a shell that does not answer
+    /// fails the test rather than hanging the run.
+    #[cfg(unix)]
+    fn named(folder: &Path, uid: u32, gid: u32) {
+        let (uid, gid) = (uid.to_string(), gid.to_string());
+        let mut args: Vec<OsString> = ["-c", NAME_THE_USER, "sh", &uid, &gid].iter().map(OsString::from).collect();
+        args.push(folder.join("passwd").into_os_string());
+        args.push(folder.join("group").into_os_string());
+        crate::engine::run::capture(&crate::engine::EngineCommand {
+            program: PathBuf::from("/bin/sh"),
+            args,
+            deadline: Some(crate::engine::ANSWER_WITHIN),
+        })
+        .expect("the shell answers");
+    }
+
+    /// The image names uid 1000 and nobody else, and the container is started again every time it
+    /// is stopped, so the two lines are written once and once only. A password file with two names
+    /// for one uid sends whichever lookup comes second to the wrong home.
+    #[cfg(unix)]
+    #[test]
+    fn the_naming_shell_writes_one_line_per_file_and_leaves_an_entry_the_image_already_knows() {
+        use crate::engine::scratch::Scratch;
+
+        let scratch = Scratch::new("name-the-user").expect("a folder of its own");
+        let (passwd, group) = (scratch.path().join("passwd"), scratch.path().join("group"));
+        // The two files as the image's own build leaves them: `useradd` was given no comment, so
+        // the entry QCode gave uid 1000 carries no name of its own either.
+        std::fs::write(&passwd, "root:x:0:0:root:/root:/bin/sh\nqcode:x:1000:1000::/home/qcode:/bin/bash\n")
+            .expect("a copy of the image's password file");
+        std::fs::write(&group, "root:x:0:\nqcode:x:1000:\n").expect("a copy of the image's group file");
+
+        named(scratch.path(), 1234, 1234);
+        named(scratch.path(), 1234, 1234);
+
+        let entry = format!("qcode-1234:x:1234:1234:QCode:{HOME_DIR}:/bin/sh");
+        let written = std::fs::read_to_string(&passwd).expect("the password file was read");
+        assert_eq!(written.matches(&entry).count(), 1, "{written}");
+        let written = std::fs::read_to_string(&group).expect("the group file was read");
+        assert_eq!(written.matches("qcode-1234:x:1234:").count(), 1, "{written}");
+
+        // The very common case is the one the image already answers for, and nothing is written
+        // into it: a second name for uid 1000 would send the person to a home that is not theirs.
+        let (before, was) =
+            (std::fs::read_to_string(&passwd).expect("read"), std::fs::read_to_string(&group).expect("read"));
+        named(scratch.path(), 1000, 1000);
+        assert_eq!(std::fs::read_to_string(&passwd).expect("read"), before);
+        assert_eq!(std::fs::read_to_string(&group).expect("read"), was);
     }
 }

@@ -12,6 +12,7 @@ mod display;
 mod parts;
 mod placement;
 mod rebuild;
+mod stalling;
 mod systems;
 mod wizard_pages;
 

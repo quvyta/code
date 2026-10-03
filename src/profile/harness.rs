@@ -507,9 +507,10 @@ static CLAUDE_CODE: Harness = Harness {
 const CLAUDE_NO_MODE_WARNING: &str = "{\"skipDangerousModePermissionPrompt\":true}";
 
 /// Claude Code's answers to its first-start questions, for the workspace mounted at
-/// [`CODE_DIR`](crate::base::paths::CODE_DIR). The same file is where the bridge registers its
+/// [`CODE_DIR`](crate::base::paths::CODE_DIR), and to its offer (2.1.285) to trade the mode the
+/// settings name for its auto mode. The same file is where the bridge registers its
 /// server, and it merges into what it finds, so these keys stay.
-const CLAUDE_FIRST_START: &str = "{\n  \"hasCompletedOnboarding\": true,\n  \"projects\": {\n    \"/work\": {\n      \"hasTrustDialogAccepted\": true\n    }\n  }\n}\n";
+const CLAUDE_FIRST_START: &str = "{\n  \"hasCompletedOnboarding\": true,\n  \"projects\": {\n    \"/work\": {\n      \"hasTrustDialogAccepted\": true\n    }\n  },\n  \"hasSeenAutoDefaultNudge\": true\n}\n";
 
 /// opencode. Install and start command from the opencode documentation (`opencode.ai/docs`), the
 /// argument from `opencode.ai/docs/cli` and `opencode.ai/docs/permissions`, the configuration
@@ -537,6 +538,15 @@ const CLAUDE_FIRST_START: &str = "{\n  \"hasCompletedOnboarding\": true,\n  \"pr
 /// MCP servers, from `opencode.ai/docs/mcp-servers` (`mcp` in the configuration, a `local`
 /// server by one `command` list) and checked against 1.18.31: with the entry written into the
 /// file the template writes, `opencode mcp list` starts it and prints `✓ qcode connected`.
+///
+/// The image holds one binary out of the several npm brings for it. `opencode-ai` is a metapackage
+/// whose postinstall script (read in 1.18.33) picks the package for the processor the build runs
+/// on and puts that package's binary at `bin/opencode.exe`; npm installs the other optional
+/// platform packages that fit the machine as well, and nothing reads them once the program is
+/// there — on x86_64 that was 177 MB each for `opencode-linux-x64` and
+/// `opencode-linux-x64-baseline`, in every opencode image including the bare one. So the step
+/// takes those packages away and then asks the program for its version: an image whose binary
+/// went missing with them fails the build instead of being made.
 static OPENCODE: Harness = Harness {
     id: "opencode",
     display_name: "opencode",
@@ -545,7 +555,7 @@ static OPENCODE: Harness = Harness {
     // no network on an ollama server.
     accounts: &[AccountKind::Free, AccountKind::Subscription, AccountKind::ApiKey, AccountKind::Provider],
     withdrawn: &[],
-    install: &["npm install -g opencode-ai"],
+    install: &[OPENCODE_INSTALL],
     command: "opencode",
     auto_run: &["--auto"],
     environment: &[],
@@ -560,6 +570,16 @@ static OPENCODE: Harness = Harness {
     mcp: Some(McpSettings { path: ".config/opencode/opencode.json", shape: McpShape::OpenCode }),
     key_only: None,
 };
+
+/// What the opencode install step runs, as one command so that it stays one `RUN` step
+/// ([`Harness::image_steps`]): install the metapackage, take the platform packages the postinstall
+/// did not use away, and then ask the program that was left for its version. The glob is inside
+/// the metapackage's own `node_modules`, where the postinstall put them, and matches nothing when
+/// the processor's package is the only one npm brought — `rm -rf` is given the name as written
+/// then and removes nothing.
+const OPENCODE_INSTALL: &str = "npm install -g opencode-ai \
+     && rm -rf /usr/local/npm/lib/node_modules/opencode-ai/node_modules/opencode-* \
+     && opencode --version";
 
 /// Gemini CLI. Install and start command from the workspace's readme, the argument from
 /// `docs/cli/cli-reference.md` (`--yolo` is deprecated in favour of `--approval-mode=yolo`), and
@@ -1253,6 +1273,35 @@ mod tests {
         assert_eq!(record.auto_run, ["--auto"]);
         assert_eq!(record.identity, [".local/share/opencode/auth.json"]);
         assert!(record.install.iter().any(|step| step.contains("opencode-ai")));
+    }
+
+    #[test]
+    fn opencode_keeps_the_binary_its_install_linked_and_no_other_platform_package() {
+        // npm brings a package for every processor that fits the machine and the postinstall picks
+        // one of them; the rest are read by nothing and are 177 MB each on x86_64, so the step
+        // takes them away — and then asks the program, so an install that lost the binary fails
+        // the build rather than leaving an image opencode cannot be started in.
+        let record = HarnessKind::OpenCode.record();
+        assert_eq!(record.install.len(), 1, "one `RUN` step of its own");
+        let step = record.install[0];
+        let installed = step.find("npm install -g opencode-ai").expect("opencode is installed");
+        let removed = step
+            .find("rm -rf /usr/local/npm/lib/node_modules/opencode-ai/node_modules/opencode-*")
+            .expect("the platform packages are taken away");
+        let asked = step.find("opencode --version").expect("the program is asked after them");
+        assert!(installed < removed && removed < asked, "{step}");
+
+        // The whole of it is one step, and the cache npm downloaded into goes with it.
+        let steps = record.image_steps();
+        assert_eq!(steps.len(), 1, "{steps:?}");
+        assert!(steps[0].contains(step), "{steps:?}");
+        assert!(steps[0].ends_with("&& rm -rf /tmp/qcode-npm-cache"), "{steps:?}");
+        // No other harness installs a metapackage of platform packages.
+        for harness in HarnessKind::ALL.into_iter().filter(|harness| *harness != HarnessKind::OpenCode) {
+            for step in harness.record().install {
+                assert!(!step.contains("opencode-*"), "{harness:?}: {step}");
+            }
+        }
     }
 
     #[test]

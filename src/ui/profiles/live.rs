@@ -16,7 +16,6 @@
 
 use std::path::Path;
 
-use crate::base::paths::OPEN_HOME;
 use crate::engine::names;
 use crate::engine::run::{build_image, capture};
 use crate::engine::{Engine, EngineKind, Exec, ImageBuild, detect};
@@ -76,10 +75,7 @@ fn stand_in_image(engine: &Engine, folder: &Path) -> String {
         )
         // The harness itself is not installed: npm is not in alpine, and what is under test is
         // everything the recipe does around the install.
-        .replace("RUN npm install -g @anthropic-ai/claude-code", "RUN true")
-        // The step that opens the home directory is a program of the base image; alpine has
-        // only the shell command it stands for.
-        .replace(&format!("RUN {OPEN_HOME}"), &format!("RUN chmod -R a+rwX {home}"));
+        .replace("RUN npm install -g @anthropic-ai/claude-code", "RUN true");
     std::fs::write(folder.join("Containerfile"), &containerfile).expect("a Containerfile");
     for (path, contents) in &recipe.files {
         let target = folder.join(path);

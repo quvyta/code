@@ -132,9 +132,13 @@ fn every_screen_carries_one_key_hint_and_no_hint_bar() {
                 "{page:?}:\n{screen}"
             ),
         }
-        // The words of the old bars are gone: moving, choosing, quitting and the tab keys.
+        // The words of the old bars are gone: moving, choosing, quitting and the tab keys. A
+        // whole word and not a part of one, since a bar said `move` and a sentence that happens
+        // to carry `moved` is not the bar back.
         for word in ["move", "choose", "quit", "close tab"] {
-            assert!(!screen.contains(word), "{page:?} still says `{word}`:\n{screen}");
+            let said =
+                screen.split_whitespace().any(|token| token.trim_matches(|cell: char| !cell.is_alphanumeric()) == word);
+            assert!(!said, "{page:?} still says `{word}`:\n{screen}");
         }
     }
 }

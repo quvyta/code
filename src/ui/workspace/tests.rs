@@ -36,11 +36,13 @@ mod desktop;
 mod engine_help;
 mod files;
 mod focus;
+mod freezing;
 mod guidance;
 mod history;
 mod identity;
 mod missing_image;
 mod new_line;
+mod owed;
 mod pages;
 mod rebuilt_image;
 mod registry;
@@ -48,6 +50,7 @@ mod relay;
 mod shared;
 mod shine;
 mod sound;
+mod stalling;
 mod viewers;
 mod watch;
 use super::{Choice, Msg, OpenWorkspace, PanelWidget, Tab, TabKey, TabKind, TabState, WorkspaceScreen};
@@ -1545,6 +1548,20 @@ fn panel_lines(harness: &Harness<Screen>) -> Vec<String> {
         .collect()
 }
 
+/// The same column of a screen whose test application is not [`Screen`], so a test that stands
+/// another screen over the workspace screen can still read the panel the workspace drew.
+fn panel_of<A: App>(harness: &Harness<A>, width: u16) -> Vec<String> {
+    let width = usize::from(width);
+    harness
+        .screen()
+        .lines()
+        .map(|line| {
+            let cells: Vec<char> = line.chars().collect();
+            cells[cells.len().saturating_sub(width)..].iter().collect::<String>().trim().to_owned()
+        })
+        .collect()
+}
+
 #[test]
 fn a_container_a_tab_brings_up_appears_in_the_panel_without_a_refresh() {
     // An engine that knows no container until one is started, and lists the started ones after.
@@ -2123,6 +2140,48 @@ fn recording_engine(scratch: &Scratch) -> (Engine, PathBuf) {
     std::fs::write(&binary, script).expect("the stand-in engine is written");
     std::fs::set_permissions(&binary, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("it can be run");
     (Engine::new(EngineKind::Podman, &binary), calls)
+}
+
+#[test]
+fn a_terminal_tab_hands_its_harness_the_answers_that_keep_it_from_asking() {
+    // A home volume is filled from the image once, so under `base` — which writes none of the
+    // templates' files — and in a workspace opened before the keys existed, the only way a harness
+    // is not asked anything is for QCode to merge them into the home as the tab starts. What the
+    // home ends up holding is read back from the writes themselves, since the file the bridge
+    // registers in is the same one for Gemini CLI.
+    let scratch = Scratch::new("unattended");
+    let (engine, written) = keeping_engine(&scratch);
+    let gemini = Profile { template: Template::Base, ..profile("gemini-base", HarnessKind::GeminiCli) };
+    let screen = WorkspaceScreen::new(
+        Some(engine),
+        HostUser::Ids { uid: 1000, gid: 1000 },
+        vec![workspace("firefly", "Firefly", scratch.paths(), vec![gemini])],
+    );
+    let mut harness = harness(screen, SIZE.0, SIZE.1);
+    // Through the harness, so the work of the start really runs as it does for the person.
+    open_in(&mut harness, Choice::NewChat("gemini-base".to_owned()));
+    harness.advance(Duration::from_secs(2)).render();
+
+    let said = fs::read_to_string(&written).unwrap_or_default();
+    assert!(said.contains("\"folderTrust\""), "the folder trust is off in the home: {said}");
+    assert!(said.contains("\"enabled\": false"), "{said}");
+    assert!(said.contains("\"mcpServers\""), "the bridge's own entry is written beside it: {said}");
+    assert!(!harness.screen().contains("may ask before it does anything"), "{}", harness.screen());
+}
+
+/// A stand-in engine that answers every call with success and appends what each write into a home
+/// would have put there, so what reaches the harness can be read back.
+fn keeping_engine(scratch: &Scratch) -> (Engine, PathBuf) {
+    let (binary, written) = (scratch.0.join("engine"), scratch.0.join("home"));
+    let script = format!(
+        "#!/bin/sh\n\
+         for word in \"$@\"; do case \"$word\" in *qcode-new*) cat >> {written} ;; esac; done\n\
+         exit 0\n",
+        written = written.display(),
+    );
+    std::fs::write(&binary, script).expect("the stand-in engine is written");
+    std::fs::set_permissions(&binary, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("it can be run");
+    (Engine::new(EngineKind::Podman, &binary), written)
 }
 
 #[test]

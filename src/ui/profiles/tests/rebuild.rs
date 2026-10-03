@@ -8,6 +8,9 @@ use super::*;
 /// way an image an earlier QCode built has, until a build finishes, and then `sha-new` with
 /// the label the built Containerfile carried. The base image is always the current one. A build
 /// fails when `fail` exists in the folder.
+///
+/// It also has two images of ours under no name, one of which a container is still made from and
+/// which the engine therefore refuses to take away, the way the real one does.
 struct Rebuilt {
     folder: PathBuf,
     engine: Engine,
@@ -20,6 +23,10 @@ impl Rebuilt {
         std::fs::create_dir_all(&folder).expect("a scratch folder");
         let script = r#"#!/bin/sh
 printf '%s\n' "$*" >> FOLDER/calls
+case "$1 $2 $3" in
+'image rm sha-kept') echo 'Error: image is in use by container qcode-firefly-claude-sub' >&2; exit 125 ;;
+esac
+[ "$1 $2" = 'images --quiet' ] && { printf 'sha-untagged\nsha-kept\n'; exit 0; }
 case "$1 $2 $4" in
 'image inspect {{.Id}}') [ -e FOLDER/label ] && echo sha-new || echo sha-old; exit 0 ;;
 esac
@@ -126,6 +133,47 @@ fn a_rebuilt_image_no_longer_says_an_earlier_qcode_built_it() {
     let screen = harness.screen();
     assert!(screen.contains("Image ready"), "{screen}");
     assert!(!screen.contains("built by an earlier QCode"), "{screen}");
+}
+
+/// A build that ends is the moment images of ours pile up, so it is where the ones earlier builds
+/// left behind go: the untagged one nobody holds, and not the one a container still runs from,
+/// which the engine refuses and which therefore stays. A build that fails is where they must all
+/// stay, because the build that would have replaced them did not happen.
+#[test]
+fn a_rebuild_that_ends_takes_away_the_images_of_ours_it_left_behind() {
+    let engine = Rebuilt::new("rebuild-leftovers");
+    let mut harness = engine.screen(profile("claude-sub", HarnessKind::ClaudeCode));
+    harness.click_text("Rebuild image").advance(std::time::Duration::from_millis(400));
+    harness.click_text("Build it again").render();
+    let calls = engine.calls();
+    let listed = calls
+        .iter()
+        .position(|call| call.starts_with("images "))
+        .unwrap_or_else(|| panic!("they were asked about: {calls:#?}"));
+    for id in ["sha-untagged", "sha-kept"] {
+        let removed = calls.iter().position(|call| call == &format!("image rm {id}"));
+        assert!(removed.is_some_and(|at| at > listed), "{id} is asked for after the listing: {calls:#?}");
+    }
+    // Once the leftovers are known, one plain `image rm` each and nothing else: no force, no
+    // volume of a workspace, no container, no prune of the whole engine.
+    for call in &calls[listed..] {
+        assert!(
+            call.starts_with("image rm ")
+                || call == "images --quiet --no-trunc --filter dangling=true --filter label=qcode.profile",
+            "{call} is not a removal of one of our own images: {calls:#?}"
+        );
+    }
+
+    let failed = Rebuilt::new("rebuild-leftovers-failed");
+    std::fs::write(failed.folder.join("fail"), "").expect("the build will fail");
+    let mut harness = failed.screen(profile("claude-sub", HarnessKind::ClaudeCode));
+    harness.click_text("Rebuild image").advance(std::time::Duration::from_millis(400));
+    harness.click_text("Build it again").render();
+    let calls = failed.calls();
+    assert!(
+        !calls.iter().any(|call| call.starts_with("image rm") || call.starts_with("images ")),
+        "a build that did not end takes nothing away: {calls:#?}"
+    );
 }
 
 /// The definition file of `name` in the store of `engine`, as the disk has it.

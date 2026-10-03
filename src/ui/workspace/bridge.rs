@@ -846,12 +846,30 @@ fn taken(screen: &WorkspaceScreen, to: TabKey, name: &str) -> Answer {
 /// Types the oldest message waiting in every tab into its harness, as far as the tabs allow it
 /// now, and asks to be called again while any message is still waiting. Nothing is timed while
 /// no tab holds a message.
+///
+/// A message waiting in a tab whose container QCode froze waits for the container: the paste would
+/// go into a harness that is not running. The engine is asked to wake it, and the timer this
+/// function arms looks again, so the message goes in as soon as it is awake.
 pub(super) fn deliver(screen: &mut WorkspaceScreen, now: Instant) -> Command<Msg> {
+    let asleep: Vec<Option<String>> = screen
+        .workspaces
+        .iter()
+        .flat_map(|workspace| {
+            workspace.tabs.iter().map(|tab| super::freezing::waiting_in(screen, workspace, tab)).collect::<Vec<_>>()
+        })
+        .collect();
+    // The engine is asked before the tabs are borrowed, since the screen itself is what is asked of.
+    let waking: Vec<Option<Command<Msg>>> =
+        asleep.into_iter().map(|container| container.map(|name| super::freezing::thawing(screen, name))).collect();
+    let mut waking = waking.into_iter();
     let mut commands = Vec::new();
     let mut waiting = false;
     for workspace in &mut screen.workspaces {
         for tab in &mut workspace.tabs {
-            commands.push(hand_over(tab, now));
+            match waking.next().flatten() {
+                Some(command) => commands.push(command),
+                None => commands.push(hand_over(tab, now)),
+            }
             // A window's messages wait for its agent, not for a moment of quiet, so nothing is
             // timed for them.
             waiting |= !tab.letters().is_empty() && !by_inbox(tab);

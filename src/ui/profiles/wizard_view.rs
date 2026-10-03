@@ -601,6 +601,12 @@ fn draw_image(state: &Profiles, draft: &Draft, ui: &mut View<'_, Msg>) {
     }
     ui.add(Text::new(lead).role(if matches!(draft.build, Build::Failed(_)) { "danger" } else { "secondary" }))
         .fill_width();
+    // A build has no time limit of its own, so nothing here stops one; what a build that has said
+    // nothing for a while gets is the truth about its log, under the sentence that says the page is
+    // waiting. The Stop button below stays the person's own way out of it.
+    if draft.is_stuck() {
+        ui.add(Text::new(t!("build.stuck", minutes = state.stall.minutes())).color("warning")).fill_width();
+    }
     if let Build::Failed(problem) = &draft.build {
         recognised(state, problem, ui);
     }

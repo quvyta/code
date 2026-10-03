@@ -315,6 +315,10 @@ unguided.title = "Les instructions de {harness} dans cet espace de travail n’o
 unguided.graphify = "graphify n’a pas pu s’installer dans l’espace de travail : l’agent ne saura peut-être pas se servir de sa carte. {words}"
 unguided.unwritten = "{file} n’a pas pu être écrit : l’agent ne saura pas comment joindre les autres onglets. {words}"
 unguided.broken = "{file} ne contient qu’une des lignes <!-- qcode:begin --> et <!-- qcode:end -->, il est donc resté tel quel. Retirez celle qui reste."
+asked.title = "{harness} peut poser une question dans cet espace de travail avant d’agir"
+unapproved.title = "L’agent de cette fenêtre peut poser une question avant d’agir"
+asked.theirs = "Les réponses qui l’évitent de demander n’ont pas pu être écrites dans son fichier de réglages {file} : il a été laissé tel quel : {says}"
+asked.unreadable = "Son fichier de réglages {file} n’a pas pu être lu à {place} : il a été laissé tel quel."
 no-engine = "Aucun moteur de conteneurs n’a été trouvé, rien ne peut donc être ouvert. Réparez-le dans les Réglages."
 none.title = "Aucun espace de travail n’est ouvert"
 none.message = "Ouvrez un espace de travail et ses onglets, ses fichiers et ses conteneurs apparaîtront ici."
@@ -376,6 +380,7 @@ containers.restart = "Redémarrer"
 state.created = "créé"
 state.running = "en marche"
 state.paused = "en pause"
+state.frozen = "gelé"
 state.restarting = "redémarre"
 state.removing = "se retire"
 state.exited = "arrêté"
@@ -411,7 +416,8 @@ window.no-wayland = "Cette session n’a pas de compositeur Wayland, et QCode n�
 window.no-socket = "La socket du compositeur n’est plus à {socket}. Un compositeur redémarré laisse derrière lui une fenêtre ouverte ; la rouvrir est le chemin du retour."
 window.open = "Ouvrir la fenêtre"
 window.signin-open-yourself = "La fenêtre a demandé à ouvrir cette page, et elle n’a pas pu être affichée ici :"
-window.raise = "Mettre au premier plan"
+window.raise = "Lui demander de passer devant"
+window.raise-note = "Sous Wayland, une fenêtre ne passe devant que si ton bureau le permet ; si elle reste derrière, passe-y depuis la liste des fenêtres ou la barre des tâches de ton bureau."
 window.close = "Fermer la fenêtre"
 window.raise-failed = "La fenêtre n’a pas pu être appelée au premier plan"
 window.close-failed = "La fenêtre n’a pas pu être fermée"
@@ -666,6 +672,8 @@ on-close-text = "Ce que font les conteneurs de QCode une fois qu’aucun QCode n
 on-close-windows = "Sous Windows, les conteneurs continuent de tourner."
 on-close-stop = "Arrêter"
 on-close-keep = "Laisser tourner"
+freeze-idle = "Geler les profils tranquilles en arrière-plan"
+freeze-idle-text = "Un profil dont aucun onglet n’est à l’écran et qui ne fait rien depuis dix minutes est mis en pause et sa mémoire est déplacée vers le fichier d’échange. Il se réveille dès que tu ouvres l’un de ses onglets ou que tu lui envoies un message. Uniquement avec podman rootless et un fichier d’échange."
 
 backup = "SAUVEGARDE"
 backup-every = "Sauvegarder les espaces de travail ouverts"
@@ -963,11 +971,11 @@ slim-offline = "Les conteneurs de ce profil n’ont pas de réseau : context7 et
 summary-base = "tel quel"
 download-graphify = "graphify est téléchargé depuis {system} et PyPI pendant la construction de l’image, la construction a donc besoin du réseau même si les conteneurs de ce profil n’en ont pas. Sans le réseau, la construction s’arrête et le dit ; aucune image n’est jamais construite avec une pièce manquante."
 download = "Ce que {template} ajoute est téléchargé depuis {system}, PyPI, npm et GitHub pendant la construction de l’image, la construction a donc besoin du réseau même si les conteneurs de ce profil n’en ont pas. Sans le réseau, la construction s’arrête et le dit ; aucune image n’est jamais construite avec une pièce manquante."
-build-failed = "{template} n’a pas pu télécharger ce qu’il ajoute, donc aucune image n’a été créée. La construction a besoin du réseau ; le journal ci-dessous indique quelle étape s’est arrêtée."
+build-failed = "{template} n’a pas pu télécharger ce qu’il ajoute, donc aucune image n’a été créée. La construction a besoin du réseau ; le journal ci-dessous indique quelle étape s’est arrêtée. Un réseau qui ne tombe qu’un instant suffit à l’arrêter, si bien que Construire de nouveau passe souvent."
 adds-none = "Rien n’est installé à côté de l’outil, donc rien d’autre n’est téléchargé."
 dev-chromium = "Un vrai navigateur, pour les tests qui en pilotent un."
 dev-download = "Ce que le développement Quvyta ajoute est téléchargé depuis {system}, PyPI, npm, GitHub, rustup.rs et astral.sh pendant la construction de l’image, la construction a donc besoin du réseau même si les conteneurs de ce profil n’en ont pas. Sans le réseau, la construction s’arrête et le dit ; aucune image n’est jamais construite avec une pièce manquante."
-dev-build-failed = "Le développement Quvyta n’a pas pu télécharger ce qu’il ajoute, donc aucune image n’a été créée. La construction a besoin du réseau ; le journal ci-dessous indique quelle étape s’est arrêtée."
+dev-build-failed = "Le développement Quvyta n’a pas pu télécharger ce qu’il ajoute, donc aucune image n’a été créée. La construction a besoin du réseau ; le journal ci-dessous indique quelle étape s’est arrêtée. Un réseau qui ne tombe qu’un instant suffit à l’arrêter, si bien que Construire de nouveau passe souvent."
 # The template page as a picker and one switch per part.
 name-custom = "Personnalisé"
 claude-plugins = "Extensions de Claude Code"
@@ -1080,8 +1088,15 @@ discard = "Le jeter"
 [workspace.busy]
 timing = "Marquage des onglets en cours de travail"
 
+[workspace.freezing]
+looking = "Lecture de ce que font les profils"
+
 [workspace.relay]
 listening = "Attendre de savoir quel modèle a répondu pour un onglet"
 fell-back = "{what}: {from} a répondu {status}, maintenant {to}"
 fell-back-unreachable = "{what}: {from} est injoignable, maintenant {to}"
 telling = "Reprise de la ligne sous l’onglet qui est passé au modèle suivant"
+
+[build]
+looking = "On regarde si la construction écrit encore"
+stuck = "Rien de neuf de la construction depuis {minutes} minutes. Elle est peut-être bloquée ; vous pouvez l’arrêter."

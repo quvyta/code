@@ -416,6 +416,29 @@ fn opencode_under_every_set_has_its_own_team_of_agents_and_neither_of_claude_cod
 }
 
 #[test]
+fn a_build_whose_graphify_could_not_download_says_it_was_its_own_sets() {
+    // graphify's step names no set, since every profile of a system shares it; the screen names
+    // the set of the profile being built.
+    for (row, name) in [("QCode extra", "QCode extra"), ("QCode recommended", "QCode recommended")] {
+        let mut harness = wizard_on(2);
+        harness.click_text(row).render();
+        for _ in 0..3 {
+            harness.send(Msg::Next);
+        }
+        let said = format!(
+            "{} could not install graphify. What the profile adds is downloaded while the image is built, so the build needs the network.",
+            recipe::GRAPHIFY_FAILED
+        );
+        harness
+            .send(Msg::BuildLine(said))
+            .send(Msg::BuildEnded(Err(Problem::Refused("exit status 1".to_owned()))))
+            .render();
+        let screen = harness.screen();
+        assert!(screen.contains(&format!("{name} could not download what it adds")), "{row}: {screen}");
+    }
+}
+
+#[test]
 fn a_build_of_a_qcode_template_that_could_not_download_says_whose_it_was() {
     for (row, failed, name) in [
         ("QCode extra", recipe::EXTRA_FAILED, "QCode extra"),
@@ -440,6 +463,131 @@ fn a_build_of_a_qcode_template_that_could_not_download_says_whose_it_was() {
     let mut harness = wizard_on(5);
     harness.send(Msg::BuildEnded(Err(Problem::Refused("no space left".to_owned())))).render();
     assert!(!harness.screen().contains("could not download what it adds"), "{}", harness.screen());
+}
+
+/// A stand-in podman for a build the network stopped: it writes down every call it is asked for,
+/// has the base image current, and fails the profile's build with the words of a step that could
+/// not download what it installs, for as long as `online` is not in the folder. Once that file is
+/// there the download gets through, the build ends, and what it was given to build is kept. The
+/// file is the whole of a network that dropped for a moment, seen from this side.
+struct Dropped {
+    folder: PathBuf,
+    engine: Engine,
+}
+
+impl Dropped {
+    fn new(name: &str) -> Self {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let folder = std::env::temp_dir().join(format!("qcode-profiles-{name}-{stamp}"));
+        std::fs::create_dir_all(&folder).expect("a scratch folder");
+        let script = r#"#!/bin/sh
+printf '%s\n' "$*" >> FOLDER/calls
+case "$1 $2 $5" in
+'image inspect qcode/base') echo BASE; exit 0 ;;
+esac
+[ "$1" = build ] || exit 0
+while [ "$#" -gt 0 ]; do case "$1" in --tag) tag="$2" ;; --file) file="$2" ;; esac; shift; done
+echo 'STEP 1/9: FROM qcode/base'
+if [ ! -e FOLDER/online ]; then
+echo 'QCode extra: could not install graphify. What QCode extra adds is downloaded while the image is built, so the build needs the network.'
+echo 'Error: building at STEP 4/9: exit status 1' >&2
+exit 1
+fi
+cp "$file" "FOLDER/built-$(echo "$tag" | tr / -)"
+echo "COMMIT $tag"
+"#
+        .replace("FOLDER", &folder.display().to_string())
+        .replace("BASE", &crate::base::revision());
+        let binary = folder.join("engine");
+        std::fs::write(&binary, script).expect("the stand-in engine is written");
+        std::fs::set_permissions(&binary, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("runnable");
+        let engine = Engine::new(crate::engine::EngineKind::Podman, &binary);
+        Self { folder, engine }
+    }
+
+    /// The wizard on this engine with nothing loaded, on a terminal wide enough for a page at its
+    /// own width, so that what the image page says is read off the screen whole.
+    fn wizard(&self) -> Harness<Host> {
+        let state = Profiles::new(Some(self.folder.clone()), Some(self.engine.clone())).with_providers_file(None);
+        let mut harness = Harness::with_env(Host { state }, env(), 120, 60);
+        harness.set_locale("en").set_glyph_mode(GlyphMode::Unicode).set_reduced_motion(true);
+        harness.send(Msg::Loaded(Listing { profiles: Vec::new(), diagnostics: Vec::new() })).render();
+        harness
+    }
+
+    /// The file whose being there lets the next build's download through.
+    fn online(&self) -> PathBuf {
+        self.folder.join("online")
+    }
+
+    /// Every build the stand-in was asked for, one call a line.
+    fn builds(&self) -> Vec<String> {
+        let calls = std::fs::read_to_string(self.folder.join("calls")).unwrap_or_default();
+        calls.lines().map(str::to_owned).filter(|call| call.starts_with("build")).collect()
+    }
+}
+
+impl Drop for Dropped {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.folder);
+    }
+}
+
+/// The screen as one line of words, so that a sentence the page wrapped is read as one sentence.
+fn as_words(harness: &Harness<Host>) -> String {
+    harness.screen().split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The first cell of `words` on the last row that carries them: the button of the image page,
+/// which stands below the sentences that name it.
+fn button_at(harness: &Harness<Host>, words: &str) -> (i32, i32) {
+    let screen = harness.screen();
+    let (y, line) = screen
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains(words))
+        .last()
+        .unwrap_or_else(|| panic!("`{words}` is on the screen:\n{screen}"));
+    let x = line[..line.find(words).expect("the words are on the row")].chars().count();
+    (i32::try_from(x).expect("on screen"), i32::try_from(y).expect("on screen"))
+}
+
+#[test]
+fn a_build_whose_download_failed_says_that_building_again_often_goes_through_and_the_button_does() {
+    let engine = Dropped::new("download-failed");
+    let mut harness = engine.wizard();
+    harness.click_text("New profile").render();
+    next(&mut harness);
+    next(&mut harness);
+    harness.click_text("QCode extra").render();
+    for _ in 0..3 {
+        next(&mut harness);
+    }
+    // The build that starts by itself stopped over a download, and the page says both that and
+    // what it takes to get past one: a network that dropped for a moment.
+    let failed = as_words(&harness);
+    assert!(failed.contains("QCode extra could not download what it adds"), "{failed}");
+    assert!(failed.contains("Build again often goes through"), "the retry is what the sentence offers:\n{failed}");
+
+    // The same page to a person who chose Turkish: the sentence is said in their own words and
+    // names the button by the words their language gives it, so what it tells them to press is
+    // what stands on the page under it.
+    harness.set_locale("tr").render();
+    let turkish = as_words(&harness);
+    assert!(turkish.contains("Ağın bir anlık kopması bile bunu yapar; Yeniden üret çoğu zaman geçer."), "{turkish}");
+    assert!(!turkish.contains("Build again often goes through"), "and not in the language it started in:\n{turkish}");
+    harness.set_locale("en").render();
+
+    // The network comes back and the build goes through this time, the button under the sentence
+    // being what presses it. The button carries the sentence's own words, so it is the one under
+    // them that is clicked, not the sentence that names it.
+    assert_eq!(engine.builds().len(), 1, "the failed build really ran: {:#?}", engine.builds());
+    std::fs::write(engine.online(), "").expect("this download gets through");
+    let (x, y) = button_at(&harness, "Build again");
+    harness.click(x, y).render();
+    assert_eq!(engine.builds().len(), 2, "the button built it again: {:#?}", engine.builds());
+    let built = as_words(&harness);
+    assert!(built.contains("The image is built and the profile is written to the QCode folder"), "{built}");
 }
 
 #[test]

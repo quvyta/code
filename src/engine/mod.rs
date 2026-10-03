@@ -101,4 +101,16 @@ impl Engine {
     pub fn needs_sandbox_profile(&self) -> bool {
         self.kind.dialect().sandboxing == dialect::Sandboxing::NeedsProfile
     }
+
+    /// Whether a container of this engine needs an entry of its own for the person running it.
+    ///
+    /// Docker's daemon runs the container as the ids QCode hands it, and an image can name only
+    /// the uid it was built with; podman rootless maps the person into the container's user
+    /// namespace and writes that entry itself. So a person whose uid the image knows nothing about
+    /// has no name inside on docker, and QCode is the one that has to give it one
+    /// ([`NAME_THE_USER`](crate::base::paths::NAME_THE_USER)).
+    #[must_use]
+    pub fn needs_a_user_entry(&self) -> bool {
+        self.kind.dialect().user_mapping == dialect::UserMapping::Ids
+    }
 }

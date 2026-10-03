@@ -5,6 +5,31 @@ Every release of quvyta-code, newest first. The format follows
 [Semantic Versioning](https://semver.org/); while the version starts with 0, a minor release may
 change files qcode writes, and the notes say so when it does.
 
+## 0.1.22 - 2026-10-03
+
+### Added
+
+- **Quiet profiles are frozen in the background.** A profile none of whose tabs is on screen, and that has done nothing for ten minutes, has its container paused and its memory moved to swap. It wakes the moment you open one of its tabs, a message is sent to it, or QCode quits. The containers panel shows which one is frozen. The switch is in the settings with the rest of what the containers do; it works with rootless podman and swap, and does nothing elsewhere.
+- **A stuck image build says so.** A build that has written nothing for five minutes says it may be stuck and that you can stop it. QCode never stops it by itself.
+
+### Changed
+
+- **No harness asks for permission.** The container is the boundary, so every harness starts without asking, under every template, in new and existing workspaces. Trust and approval questions are answered ahead of time, Claude Code's offer of auto mode included, and Antigravity IDE's agent is set to act without asking each time its window opens.
+- **Smaller images.** An opencode image keeps the one binary it runs, the security-guidance plugin uses the image's own Claude Code, and graphify's layer is shared by every profile of one system.
+- **Old profile images are removed.** A rebuild that ends, and a QCode that starts, remove the untagged profile images of QCode's own that no container uses, and nothing else on the disk.
+- **QCode opens in about half a second.** It asked podman for its info twice before the first frame; it asks once now.
+- **A lineup that fails everywhere gives the passing reason.** When every step fails and an earlier one was busy, the harness is given that busy answer rather than the last step's lasting one, so it waits instead of reporting a broken lineup.
+- **The lineup editor's list grows on a tall terminal**, up to eight rows.
+- **A failed download says Build again often works.** A moment's network drop is enough to stop a template build, and the next try usually goes through.
+- **A window tab's button asks the window to come forward.** On Wayland the desktop decides, so the button says so and where to find a window that stays behind.
+
+### Fixed
+
+- **A new tab takes the keyboard.** A tab opened from the New tab page, or started again, takes the keyboard when its terminal comes up; before, nothing you typed reached it until you clicked into it. If you put the keyboard somewhere else while it was starting, it stays there.
+- **A name inside the container on Docker.** On Docker, a person whose user id the image does not know now has a name inside the container, so `whoami`, git commits and Node's user info work.
+- **Setup without `USER`.** Started without `USER` or `LOGNAME`, the setup no longer says podman has no user id ranges; it finds the account by its id, and the line it offers names it.
+- **Stop is whole at 80x24** while a tab's image is being built.
+
 ## 0.1.21 - 2026-09-30
 
 ### Added

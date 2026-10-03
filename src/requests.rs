@@ -196,6 +196,13 @@ impl QCode {
                 }
                 self.save()
             }
+            Request::FreezeIdle(freeze) => {
+                self.config.set_freeze_idle(freeze);
+                if let Some(screen) = self.workspace.as_mut() {
+                    screen.set_freeze_idle(freeze);
+                }
+                self.save()
+            }
             Request::OpenEngineStep => self.repair(SetupStep::Engine),
             Request::OpenLocationStep => self.repair(SetupStep::Location),
             Request::SignOut(profile) => self.sign_out(&profile),
@@ -314,9 +321,18 @@ impl QCode {
     }
 
     /// Leaves the workspaces that are open where [`run`] finds them once the screen is given back,
-    /// and quits.
+    /// wakes every container the screen had frozen, and quits.
+    ///
+    /// The waking is waited for here, which is the one place this process may hold the screen still:
+    /// there is no later to run it in, and a container left paused is one the next QCode finds
+    /// asleep with every tab in it holding what it held, and one the reaper cannot stop.
     pub(super) fn quit(&self) -> Command<Msg> {
         self.farewell.keep(self.workspace.as_ref().and_then(ui::workspace::leaving));
+        if let Some(screen) = self.workspace.as_ref() {
+            for command in ui::workspace::waking_on_the_way_out(screen) {
+                let _ = capture(&command);
+            }
+        }
         Command::quit()
     }
 

@@ -7,6 +7,7 @@ pub mod profiles;
 pub mod providers;
 pub mod settings;
 pub mod setup;
+pub mod stalling;
 pub mod switch;
 pub mod workspace;
 pub mod workspaces;

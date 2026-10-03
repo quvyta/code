@@ -21,6 +21,20 @@ pub(super) fn wrap(id: &str) -> impl Fn(FileManagerMsg) -> Msg + Send + Sync + C
 /// Hands a message of the file manager to the workspace `id`; one for a workspace that has been
 /// closed meanwhile changes nothing.
 pub(super) fn update(screen: &mut WorkspaceScreen, id: &str, message: FileManagerMsg) -> Command<Msg> {
+    // The person is working in the tree, so a tab still waiting for its container is owed nothing;
+    // answers from the background are not the person and leave the debt standing.
+    let answer = matches!(
+        message,
+        FileManagerMsg::Read(..)
+            | FileManagerMsg::Listed(..)
+            | FileManagerMsg::Work(_)
+            | FileManagerMsg::Done(_)
+            | FileManagerMsg::Refresh
+            | FileManagerMsg::DropCut
+    );
+    if !answer {
+        screen.owed_focus = None;
+    }
     let Some(workspace) = screen.workspace_mut(id) else { return Command::none() };
     workspace.files.update(message, wrap(id))
 }

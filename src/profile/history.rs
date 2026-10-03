@@ -488,6 +488,8 @@ pub struct Reading {
     pub state: EngineCommand,
     /// Starts it, when it is there but stopped.
     pub start: EngineCommand,
+    /// Wakes it, when it is there and frozen.
+    pub wake: EngineCommand,
     /// Runs the harness's script in it, as the user the container runs as, without a terminal.
     pub list: EngineCommand,
 }
@@ -503,6 +505,7 @@ pub fn reading(engine: &Engine, container: &str, harness: HarnessKind) -> Option
     Some(Reading {
         state: engine.container_state(container),
         start: engine.start_container(container),
+        wake: engine.unpause_container(container),
         list: engine.exec_without_terminal(&Exec { container, command: &command }),
     })
 }
@@ -517,6 +520,11 @@ enum Steps {
     List,
     /// It is there and not running: it is started, and then the script is run.
     StartThenList,
+    /// It is frozen: it is woken, and then the script is run. A frozen container is up, with every
+    /// tab in it still running and everything they wrote still in memory, so it is read as it is
+    /// and never started again — the engine refuses a start of a paused container, and a container
+    /// made afresh beside it would end every tab in it at once.
+    WakeThenList,
 }
 
 /// The steps for a container in `state`; `None` is a container the engine could not answer for.
@@ -524,6 +532,7 @@ fn steps(state: Option<&ContainerState>) -> Steps {
     match state {
         None => Steps::Nothing,
         Some(ContainerState::Running) => Steps::List,
+        Some(ContainerState::Paused) => Steps::WakeThenList,
         Some(_) => Steps::StartThenList,
     }
 }
@@ -566,6 +575,12 @@ pub fn read_starting(
         Steps::StartThenList => {
             capture(&reading.start)?;
             started();
+        }
+        // A frozen container is up: waking it is not starting it, so nothing is noted as a
+        // container QCode left running, and the conversations are read out of the container the
+        // tabs are in rather than one made beside it.
+        Steps::WakeThenList => {
+            capture(&reading.wake)?;
         }
     }
     Ok(parse(&capture(&reading.list)?))
@@ -787,6 +802,17 @@ mod tests {
         for state in [ContainerState::Exited, ContainerState::Created, ContainerState::Unknown("stopping".to_owned())] {
             assert_eq!(steps(Some(&state)), Steps::StartThenList, "{state:?}");
         }
+    }
+
+    #[test]
+    fn a_frozen_container_is_woken_before_it_is_read_and_never_started() {
+        // A frozen container is up with every tab in it still holding what it held, so it is read as
+        // it is: the engine refuses a start of a paused container, and a container made afresh
+        // beside it would end every tab in it at once.
+        assert_eq!(steps(Some(&ContainerState::Paused)), Steps::WakeThenList);
+        let engine = Engine::new(EngineKind::Podman, "/usr/bin/podman");
+        let reading = reading(&engine, "qcode-p-codex", HarnessKind::Codex).expect("a script");
+        assert_eq!(args(&reading.wake), ["unpause", "qcode-p-codex"], "the reading wakes the container");
     }
 
     #[test]

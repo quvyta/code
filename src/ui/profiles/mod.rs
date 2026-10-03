@@ -12,12 +12,18 @@
 //! in a test with no container runtime.
 
 mod actions;
+mod builds;
+#[cfg(test)]
+mod cleanup_live;
 #[cfg(test)]
 mod inbox_tests;
 mod list;
 #[cfg(test)]
 mod live;
-pub(crate) mod recipe;
+// Public for the README's recording (tests/readme_gif.rs), which builds a profile's image with
+// QCode's own recipe; it is not part of the library's interface, so it is left out of its documentation.
+#[doc(hidden)]
+pub mod recipe;
 mod remove;
 pub(crate) mod shell;
 mod shell_page;
@@ -48,6 +54,7 @@ use crate::profile::own::Own;
 use crate::profile::{AccountKind, Extra, MountAccess, Profile, SafeName, Template};
 use crate::provider::{ProviderEntry, Providers};
 use crate::store::Store;
+use crate::ui::stalling;
 
 pub use list::{closed_sign_in, entry, hints, view};
 pub use shell_page::{ShellMsg, ShellPage, Side as ShellSide, Stage as ShellStage};
@@ -180,6 +187,9 @@ pub enum Msg {
     BaseImageStarted,
     /// The build printed a line.
     BuildLine(String),
+    /// The build was looked at, which is what says whether its log has gone quiet for long enough
+    /// to be stuck.
+    BuildLooked(std::time::Instant),
     /// The build ended.
     BuildEnded(Result<(), Problem>),
     /// Stop the build.
@@ -265,6 +275,11 @@ pub struct Profiles {
     shell: Option<ShellPage>,
     /// What each profile had added in its shell, by the profile's name, as last read.
     own: HashMap<String, Own>,
+    /// The lengths a build's silence is judged by. The product's are the measured ones; a test
+    /// shortens them, since a test cannot wait five minutes for a warning.
+    stall: stalling::Lengths,
+    /// Whether the next look at a build is timed, so that one is timed at a time.
+    watching: bool,
 }
 
 impl Profiles {
@@ -295,6 +310,8 @@ impl Profiles {
             display: crate::desktop::current(),
             shell: None,
             own: HashMap::new(),
+            stall: stalling::Lengths::default(),
+            watching: false,
         }
     }
 
@@ -303,6 +320,18 @@ impl Profiles {
     #[must_use]
     pub fn showing_on(mut self, display: Result<Display, NoDisplay>) -> Self {
         self.display = display;
+        self
+    }
+
+    /// The same screen, saying a build is stuck after `lengths.quiet` of silence and looking every
+    /// `lengths.look`, which the product uses as [`stalling::QUIET`] and [`stalling::LOOK`].
+    ///
+    /// Only for a test: the product uses those two measured lengths, since a test cannot wait five
+    /// minutes to hear a warning and cannot ask the engine for a build that really takes that long.
+    #[cfg(test)]
+    #[must_use]
+    pub fn stalling(mut self, lengths: stalling::Lengths) -> Self {
+        self.stall = lengths;
         self
     }
 
@@ -585,15 +614,21 @@ pub fn update(state: &mut Profiles, message: Msg) -> Command<Msg> {
         Msg::BaseImageStarted => {
             if let Some(draft) = &mut state.draft {
                 draft.log.push(LogLine::new(LogLevel::Info, t!("profiles.wizard.build-base")));
+                // A line of the build's own is what ends the silence the page warns about.
+                draft.build_said();
             }
             Command::none()
         }
         Msg::BuildLine(text) => {
             if let Some(draft) = &mut state.draft {
                 draft.log.push(LogLine::new(LogLevel::Info, text));
+                draft.build_said();
             }
             Command::none()
         }
+        // The look came round: the draft is marked by how long its log has been quiet, and the
+        // next look is timed while a build is still running.
+        Msg::BuildLooked(now) => builds::looked(state, now),
         Msg::BuildEnded(result) => {
             let Some(draft) = &mut state.draft else { return Command::none() };
             match result {
@@ -603,6 +638,7 @@ pub fn update(state: &mut Profiles, message: Msg) -> Command<Msg> {
                     draft.build = if problem == Problem::Cancelled { Build::Stopped } else { Build::Failed(problem) };
                 }
             }
+            draft.build_ended();
             Command::none()
         }
         Msg::BuildCancel => {
@@ -610,6 +646,7 @@ pub fn update(state: &mut Profiles, message: Msg) -> Command<Msg> {
             let Build::Running(id) = draft.build else { return Command::none() };
             // The build removes the half-made image itself as soon as it notices the stop.
             draft.build = Build::Stopped;
+            draft.build_ended();
             let stopping =
                 if draft.is_only_rebuild() { "profiles.rebuild.stopping" } else { "profiles.wizard.build-stopping" };
             draft.log.push(LogLine::new(LogLevel::Warn, t!(stopping)));

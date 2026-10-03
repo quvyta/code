@@ -38,8 +38,9 @@ fn loads_a_plugin(profile: &Profile) -> bool {
 /// The build step that has opencode fetch its configuration folder's packages into the image's
 /// home, for a profile whose tabs wait for them; `None` for every other profile.
 ///
-/// It comes after every file the profile writes into the home and before the step that opens the
-/// home to whoever runs the container.
+/// It comes after every file the profile writes into the home, and it opens the packages it wrote
+/// itself, in its own layer, so the step that opens the home afterwards has almost nothing left to
+/// do.
 #[must_use]
 pub fn step(profile: &Profile) -> Option<String> {
     if !loads_a_plugin(profile) {
@@ -56,8 +57,10 @@ pub fn step(profile: &Profile) -> Option<String> {
          OPENCODE_CONFIG_CONTENT=\"{{\\\"plugin\\\":[\\\"file://$scratch/wait.js\\\"]}}\" opencode debug config > /dev/null \\\n \
          && cd / && rm -rf \"$scratch\" \\\n \
          && chmod -R a+rwX \"${{NPM_CONFIG_CACHE:-/var/cache/npm}}/_cacache\" \\\n \
+         && {opens} \\\n \
          && test -f \"$HOME/.config/opencode/node_modules/{PLUGIN_PACKAGE}/package.json\"; }} \\\n \
-         || {{ echo 'opencode could not fetch {PLUGIN_PACKAGE} into its settings folder; the build needs the network.' >&2; exit 1; }}"
+         || {{ echo 'opencode could not fetch {PLUGIN_PACKAGE} into its settings folder; the build needs the network.' >&2; exit 1; }}",
+        opens = crate::ui::profiles::recipe::OPEN_HOME_ONLY,
     ))
 }
 
@@ -65,6 +68,7 @@ pub fn step(profile: &Profile) -> Option<String> {
 mod tests {
     use super::*;
     use crate::profile::{AccountKind, MountAccess, NetworkMode, SafeName};
+    use crate::ui::profiles::recipe::OPEN_HOME_ONLY;
 
     fn profile(harness: HarnessKind, template: Template) -> Profile {
         Profile {
@@ -96,7 +100,7 @@ mod tests {
         for template in [Template::Recommended, Template::High, Template::QuvytaDev, Template::Slim] {
             let recipe = crate::ui::profiles::recipe::image(&profile(HarnessKind::OpenCode, template)).containerfile;
             let fetched = recipe.find("opencode debug config").expect("the step is there");
-            let opened = recipe.rfind(crate::base::paths::OPEN_HOME).expect("the home is opened");
+            let opened = recipe.rfind(OPEN_HOME_ONLY).expect("the home is opened");
             assert!(fetched < opened, "{template:?}: {recipe}");
             for written in recipe.match_indices("cp '/qcode-template/").map(|(at, _)| at) {
                 assert!(written < fetched, "{template:?}: a file after the step: {recipe}");

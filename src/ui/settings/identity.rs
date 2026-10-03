@@ -98,7 +98,9 @@ mod tests {
     use crate::ui::settings::testing::{self, Host};
     use crate::ui::settings::{Msg, Request};
 
-    const SIZE: (u16, u16) = (100, 42);
+    // Tall enough for the settings list and the logins under it: the list grows as the settings
+    // do, and what these tests read is the part below it.
+    const SIZE: (u16, u16) = (100, 50);
 
     fn named(name: &str) -> SafeName {
         SafeName::parse(name).expect("the test names are already safe")

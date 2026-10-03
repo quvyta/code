@@ -12,6 +12,14 @@
 /// The image every profile image is built on.
 pub const BASE_IMAGE: &str = "qcode/base";
 
+/// The label every profile image carries, whose value is the name of the profile it was built
+/// for.
+///
+/// It is what tells an image of ours from one the person built on the same engine, and it is why
+/// the images QCode takes away for itself are only ever images of ours: an image without this
+/// label is the person's, whatever it is called.
+pub const PROFILE_LABEL: &str = "qcode.profile";
+
 /// The machine name every container QCode creates answers to.
 ///
 /// It is one name for all of them, never the engine's random one, because a harness may bake
@@ -93,8 +101,8 @@ pub fn home_volume(workspace: &str, profile: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BASE_IMAGE, HOSTNAME, base_container, credential_volume, desktop_container, home_volume, profile_container,
-        profile_image, settings_container, sound_container,
+        BASE_IMAGE, HOSTNAME, PROFILE_LABEL, base_container, credential_volume, desktop_container, home_volume,
+        profile_container, profile_image, settings_container, sound_container,
     };
     use crate::profile::SafeName;
 
@@ -172,6 +180,7 @@ mod tests {
     fn the_names_are_the_ones_the_design_settled_on() {
         assert_eq!(BASE_IMAGE, "qcode/base");
         assert_eq!(HOSTNAME, "qcode");
+        assert_eq!(PROFILE_LABEL, "qcode.profile");
         assert_eq!(profile_image("claude-sub"), "qcode/profile/claude-sub");
         assert_eq!(profile_container("my-app", "claude-sub"), "qcode-my-app-claude-sub");
         assert_eq!(base_container("my-app"), "qcode-my-app-base");

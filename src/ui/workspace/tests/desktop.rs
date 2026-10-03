@@ -519,7 +519,7 @@ fn the_open_window_is_said_plainly_with_the_two_things_that_can_be_done_to_it() 
     harness.render();
     let shown = harness.screen();
     assert!(shown.contains("Window open"), "{shown}");
-    assert!(shown.contains("Bring to front") && shown.contains("Close the window"), "{shown}");
+    assert!(shown.contains("Ask it to come forward") && shown.contains("Close the window"), "{shown}");
     // A profile signed in on the Profiles page opens signed in; otherwise the one sign-in the
     // window asks for is said before it comes: in the person's own browser, carried back, kept.
     assert!(shown.contains("signed in on the Profiles page, the window opens already"), "{shown}");
@@ -547,6 +547,56 @@ fn the_person_closing_the_window_closes_the_tabs_window_and_leaves_the_way_back(
     assert!(shown.contains("Window closed"), "{shown}");
     assert!(shown.contains("Open the window"), "the way back is offered: {shown}");
     assert!(shown.contains("stay in this workspace"), "nothing of the person's was lost: {shown}");
+}
+
+/// What the page says, with the rows it wraps over joined back into one text.
+fn said(shown: &str) -> String {
+    shown.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Under Wayland a terminal application cannot put a window in front, so the button only asks, and
+/// the page says so beside it while there is a window to ask.
+#[test]
+fn the_window_is_asked_to_come_forward_and_the_page_says_the_desktop_decides() {
+    let engine = Recording::new("window-raise-asked");
+    let mut screen = engine.screen();
+    open(&mut screen, window());
+    let key = key(&screen, 0);
+    apply(&mut screen, Msg::WindowOpened(key, 0, Ok(Opening::Up)));
+    let mut harness = harness(screen, SIZE.0, SIZE.1);
+    harness.render();
+    let note = "On Wayland a window comes forward only when your desktop allows it";
+    assert!(said(&harness.screen()).contains(note), "{}", harness.screen());
+    harness.click_text("Ask it to come forward").render();
+    let asked = |calls: &[String]| {
+        calls.iter().any(|call| call.starts_with("exec qcode-firefly-anti.desk /opt/antigravity-ide/antigravity-ide"))
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !asked(&engine.calls()) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        harness.render();
+    }
+    assert!(asked(&engine.calls()), "the button reaches the application: {:#?}", engine.calls());
+
+    harness.send(Msg::WindowEnded(key, 0, Some(0)));
+    harness.render();
+    assert!(harness.screen().contains("Window closed"), "{}", harness.screen());
+    assert!(!said(&harness.screen()).contains(note), "no window, nothing to ask: {}", harness.screen());
+}
+
+#[test]
+fn the_button_that_asks_the_window_forward_reads_in_turkish() {
+    let session = Session::new("window-raise-tr");
+    let mut screen = session.screen();
+    open(&mut screen, window());
+    let key = key(&screen, 0);
+    apply(&mut screen, Msg::WindowOpened(key, 0, Ok(Opening::Up)));
+    let mut harness = harness(screen, SIZE.0, SIZE.1);
+    harness.set_locale("tr").render();
+    let shown = harness.screen();
+    assert!(shown.contains("Öne gelmesini iste"), "{shown}");
+    assert!(said(&shown).contains("masaüstün izin verirse öne gelir"), "{shown}");
+    harness.set_locale("en").render();
 }
 
 #[test]

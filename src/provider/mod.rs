@@ -42,5 +42,5 @@ pub use key::Key;
 pub use record::{
     CRAMPED, Lineup, Measured, Model, Price, ProviderEntry, ProviderKind, Published, Region, Wire, trim_base,
 };
-pub use relay::{Event as RelayEvent, Listener as RelayListener, Route, Upstream};
+pub use relay::{Activity, Event as RelayEvent, Listener as RelayListener, Route, Upstream};
 pub use tag::{Tag, TagError};

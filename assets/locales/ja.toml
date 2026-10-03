@@ -314,6 +314,10 @@ unguided.title = "このワークスペースの {harness} への指示を更新
 unguided.graphify = "graphify がワークスペースに自分を組み込めなかったため、エージェントはコードの地図を使うことを知らないかもしれません: {words}"
 unguided.unwritten = "{file} に書き込めなかったため、エージェントはほかのタブへの届け方を知らされていません: {words}"
 unguided.broken = "{file} には <!-- qcode:begin --> と <!-- qcode:end --> の片方しかないため、そのままにしました。残っている行を消してください。"
+asked.title = "{harness} はこのワークスペースで、動作する前に尋ねることがあるかもしれません"
+unapproved.title = "このウィンドウのエージェントは、動作する前に尋ねることがあるかもしれません"
+asked.theirs = "尋ねずに済む回答を設定ファイル {file} に与えられませんでした、そのままにしました: {says}"
+asked.unreadable = "設定ファイル {file} を {place} で読めなかったため、そのままにしました。"
 no-engine = "コンテナエンジンが見つからないので、何も開けません。設定で直してください。"
 none.title = "ワークスペースを開いていません"
 none.message = "ワークスペースを開くと、そのタブ、ファイル、コンテナがここに出ます。"
@@ -375,6 +379,7 @@ containers.restart = "再起動"
 state.created = "作成済み"
 state.running = "実行中"
 state.paused = "一時停止"
+state.frozen = "凍結中"
 state.restarting = "再起動中"
 state.removing = "削除中"
 state.exited = "停止"
@@ -410,7 +415,8 @@ window.no-wayland = "このセッションに Wayland のコンポジターが�
 window.no-socket = "コンポジターのソケットが {socket} にもうありません。再起動したコンポジターは開いたままのウィンドウを残します。開き直すのが戻り道です。"
 window.open = "ウィンドウを開く"
 window.signin-open-yourself = "ウィンドウがこのページを開こうとしましたが、ここでは表示できませんでした:"
-window.raise = "手前に出す"
+window.raise = "前面に出すよう頼む"
+window.raise-note = "Wayland では、デスクトップが許可したときだけウィンドウが前面に出ます。後ろに残った場合は、デスクトップのウィンドウ一覧やタスクバーから切り替えてください。"
 window.close = "ウィンドウを閉じる"
 window.raise-failed = "ウィンドウを手前に呼べませんでした"
 window.close-failed = "ウィンドウを閉じられませんでした"
@@ -665,6 +671,8 @@ on-close-text = "QCode がひとつも開いていない状態になったとき
 on-close-windows = "Windows ではコンテナは動き続けます。"
 on-close-stop = "止める"
 on-close-keep = "動かしたままにする"
+freeze-idle = "バックグラウンドで静かなプロファイルを凍結する"
+freeze-idle-text = "タブが画面に出ておらず、10 分間何もしていないプロファイルは一時停止され、そのメモリはスワップへ移されます。タブのどれかを開いたときやメッセージを送ったときにすぐ復帰します。rootless な podman とスワップがある場合だけです。"
 
 backup = "バックアップ"
 backup-every = "開いているワークスペースをバックアップ"
@@ -962,11 +970,11 @@ slim-offline = "このプロファイルのコンテナにはネットワーク�
 summary-base = "そのまま"
 download-graphify = "graphify はイメージのビルド中に {system} と PyPI からダウンロードされます。そのため、このプロファイルのコンテナにネットワークがなくても、ビルドにはネットワークが必要です。ダウンロードできなければビルドはそこで止まり、その旨を伝えます。一部が欠けたイメージができることはありません。"
 download = "{template} が追加するものは、イメージのビルド中に {system}、PyPI、npm、GitHub からダウンロードされます。そのため、このプロファイルのコンテナにネットワークがなくても、ビルドにはネットワークが必要です。ダウンロードできなければビルドはそこで止まり、その旨を伝えます。一部が欠けたイメージができることはありません。"
-build-failed = "{template} が追加するものをダウンロードできなかったため、イメージは作成されませんでした。ビルドにはネットワークが必要です。どの手順で止まったかは下のログをご覧ください。"
+build-failed = "{template} が追加するものをダウンロードできなかったため、イメージは作成されませんでした。ビルドにはネットワークが必要です。どの手順で止まったかは下のログをご覧ください。ネットワークが一瞬でも切れると止まってしまうので、もう一度組み立てるとたいてい成功します。"
 adds-none = "ツールのほかにインストールされるものはないため、これ以上ダウンロードされるものもありません。"
 dev-chromium = "本物のブラウザー。ブラウザーを動かすテストのため。"
 dev-download = "Quvyta 開発が追加するものは、イメージのビルド中に {system}、PyPI、npm、GitHub、rustup.rs、astral.sh からダウンロードされます。そのため、このプロファイルのコンテナにネットワークがなくても、ビルドにはネットワークが必要です。ダウンロードできなければビルドはそこで止まり、その旨を伝えます。一部が欠けたイメージができることはありません。"
-dev-build-failed = "Quvyta 開発が追加するものをダウンロードできなかったため、イメージは作成されませんでした。ビルドにはネットワークが必要です。どの手順で止まったかは下のログをご覧ください。"
+dev-build-failed = "Quvyta 開発が追加するものをダウンロードできなかったため、イメージは作成されませんでした。ビルドにはネットワークが必要です。どの手順で止まったかは下のログをご覧ください。ネットワークが一瞬でも切れると止まってしまうので、もう一度組み立てるとたいてい成功します。"
 # The template page as a picker and one switch per part.
 name-custom = "カスタム"
 claude-plugins = "Claude Code のプラグイン"
@@ -1079,8 +1087,15 @@ discard = "捨てる"
 [workspace.busy]
 timing = "作業中のタブに印を付けています"
 
+[workspace.freezing]
+looking = "各プロファイルが何をしているか見ています"
+
 [workspace.relay]
 listening = "タブの代わりにどのモデルが答えたかを待っています"
 fell-back = "{what}: {from} が {status} と答え、{to} に切り替わりました"
 fell-back-unreachable = "{what}: {from} に到達できなかったので、{to} に切り替わりました"
 telling = "次のモデルに回り込んだタブの下の行を取り消しています"
+
+[build]
+looking = "ビルドがまだ出力しているか見ています"
+stuck = "{minutes} 分間、ビルドは何も出力していません。止まっているかもしれません。中止できます。"

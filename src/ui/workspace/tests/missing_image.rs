@@ -129,6 +129,53 @@ fn the_build_is_shown_as_it_speaks_and_can_be_stopped() {
     assert!(harness.screen().contains("Build it now"), "{}", harness.screen());
 }
 
+/// A screen with one workspace whose only profile is `name`, as a tab of it would build it.
+fn profile_named(scratch: &Scratch, name: &str) -> WorkspaceScreen {
+    let workspaces =
+        vec![workspace("firefly", "Firefly", scratch.paths(), vec![profile(name, HarnessKind::ClaudeCode)])];
+    WorkspaceScreen::new(Some(engine()), HostUser::Ids { uid: 1000, gid: 1000 }, workspaces)
+}
+
+/// What the open tab's page says, read row by row with the rail's own gutter left out: a sentence
+/// QCode wraps over two rows is still one sentence to whoever reads it.
+fn said_by_the_page(screen: &str) -> String {
+    let rows: Vec<String> =
+        screen.lines().map(|row| row.chars().skip(usize::from(super::super::RAIL_WIDTH)).collect()).collect();
+    rows.join(" ").split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A build takes minutes and its one way out is the Stop beside it. That row is a single line which
+/// is never wrapped, so a sentence about the build cannot share it in a terminal of eighty columns:
+/// Stop stands whole on the row and the sentence wraps under it, where all of it is read.
+#[test]
+fn a_build_in_eighty_columns_can_be_stopped_and_says_which_image_it_builds() {
+    let scratch = Scratch::new("image-log-narrow");
+    let name = "claude-code-for-the-team";
+    let mut screen = profile_named(&scratch, name);
+    open(&mut screen, Choice::NewChat(name.to_owned()));
+    let tab = key(&screen, 0);
+    let missing = LaunchFailure { command: String::new(), output: String::new(), image_missing: true };
+    apply(&mut screen, Msg::Ready(tab, 0, Err(missing)));
+    apply(&mut screen, Msg::BuildImage(tab));
+    apply(&mut screen, Msg::ImageLine(tab, "STEP 4/9: RUN npm install -g @anthropic-ai/claude-code".to_owned()));
+    let mut harness = harness(screen, 80, 24);
+    let screen = harness.screen();
+    // The build's own row is the one that says the build is under way; the panel beside it has a
+    // Stop of its own, so the row has to be found by what is on it and not by the word.
+    let (_, row) =
+        harness.find("Building the image").unwrap_or_else(|| panic!("the build's row says its word:\n{screen}"));
+    let row = screen.lines().nth(usize::try_from(row).expect("a row of the screen")).unwrap_or_default();
+    assert!(row.split_whitespace().any(|word| word == "Stop"), "Stop stands as a whole word: {row:?}\n{screen}");
+    assert!(!screen.contains("St…"), "nothing of the build's row is cut:\n{screen}");
+    assert!(
+        said_by_the_page(&screen).contains("Building the image of claude-code-for-the-team"),
+        "the sentence is whole, however many rows it takes:\n{screen}"
+    );
+    harness.click_text("Stop").render();
+    assert_eq!(harness.app().0.workspace().expect("a workspace").tabs()[0].state(), &TabState::NoImage);
+    assert!(harness.screen().contains("Build it now"), "{}", harness.screen());
+}
+
 /// The profile of the open workspace, as the tab would build it.
 fn workspace_profile(harness: &Harness<Screen>) -> Profile {
     harness.app().0.workspace().expect("a workspace").profiles[0].clone()

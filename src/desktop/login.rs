@@ -90,10 +90,13 @@ pub const ASK_EVERY: std::time::Duration = std::time::Duration::from_millis(250)
 /// with an access (1) or refresh (3) token, beside the account row's `userStatusSentinelKey`
 /// entry, a `UserStatus` with an e-mail (7) — the two things the extension asks for.
 ///
-/// With a fourth word `approve`, `keep` and `replace` also write what makes the agent act without
-/// asking, in the same breath as the login and only where the login is written: see [`APPROVALS`].
-/// `approvals <database>` prints those three settings as the application would read them, one
-/// `name=value` line each, empty for one that is not there.
+/// With a third word `approve`, the agent's own approvals are merged into the database: what makes
+/// the window's agent run a command, write a file, go past a plan and act in its browser without
+/// asking, and what the language server is told it may do on its own — see [`ANSWERED`] for the
+/// rows and [`approve_command`] for where the program is run. A database that is not there is made
+/// with them, as `keep` and `replace` make it for a login. `approvals <database>` prints every one
+/// of those settings as the application would read them, one `name=value` line each, empty for one
+/// that is not there.
 ///
 /// `seen <database>` answers 0 when there is a login; `take <database> <file>` writes the two rows
 /// into the file and fails when there is none; `keep <file> <database>` puts them into the database
@@ -105,7 +108,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { DatabaseSync } = require("node:sqlite");
 const KEYS = ["antigravityUnifiedStateSync.oauthToken", "antigravityUnifiedStateSync.userStatus"];
-const [mode, from, to, approve] = process.argv.slice(1);
+const [mode, from, to] = process.argv.slice(1);
 const text = (value) => (typeof value === "string" ? value : Buffer.from(value).toString("utf8"));
 const fields = (bytes) => {
   const out = [];
@@ -165,6 +168,26 @@ const entry = (topic, wanted) => {
   }
   return "";
 };
+const entries = (topic) => {
+  const out = [];
+  try {
+    for (const [number, data] of fields(Buffer.from(topic, "base64"))) {
+      if (number !== 1 || typeof data === "bigint") continue;
+      let key = "";
+      let value = "";
+      for (const [part, piece] of fields(data)) {
+        if (part === 1 && typeof piece !== "bigint") key = text(piece);
+        if (part === 2 && typeof piece !== "bigint") {
+          for (const [held, row] of fields(piece)) if (held === 1 && typeof row !== "bigint") value = text(row);
+        }
+      }
+      if (key) out.push([key, value]);
+    }
+  } catch (error) {
+    return [];
+  }
+  return out;
+};
 const token = (login) => entry(login[KEYS[0]] || "", "oauthTokenInfoSentinelKey");
 const signed = (login) => field(token(login), 1).length > 0 || field(token(login), 3).length > 0;
 const account = (login) => field(entry(login[KEYS[1]] || "", "userStatusSentinelKey"), 7);
@@ -200,14 +223,20 @@ const utf8 = (value) => [...Buffer.from(value, "utf8")];
 const base64 = (value) => Buffer.from(value).toString("base64");
 const topic = (entries) => base64(entries.flatMap(([key, value]) => bytes(1, [...bytes(1, utf8(key)), ...bytes(2, bytes(1, utf8(value)))])));
 const whole_number = (number, value) => base64([...varint(number << 3), ...varint(value)]);
-const APPROVALS = [
-  ["antigravityUnifiedStateSync.agentPreferences", topic([
-    ["terminalAutoExecutionPolicySentinelKey", whole_number(2, 3)],
-    ["artifactReviewPolicySentinelKey", whole_number(2, 2)],
-  ])],
-  ["antigravityUnifiedStateSync.browserPreferences", topic([["browser_js_execution_config_sentinel_key", whole_number(1, 4)]])],
-  ["antigravityOnboarding", "true"],
-];
+const AGENT = "antigravityUnifiedStateSync.agentPreferences";
+const BROWSER = "antigravityUnifiedStateSync.browserPreferences";
+const ONBOARDING = "antigravityOnboarding";
+// What the agent panel asks of the agent: `Primitive.int32_value` (2) 3 is EAGER, 2 is TURBO,
+// `bool_value` (1) true lets it at the files outside the workspace, and
+// `PermissionGrantsConfig.allow` (1) is what the language server reads for everything.
+const ANSWERS = {
+  terminalAutoExecutionPolicySentinelKey: whole_number(2, 3),
+  artifactReviewPolicySentinelKey: whole_number(2, 2),
+  allowAgentAccessNonWorkspaceFilesSentinelKey: base64([8, 1]),
+};
+// What the language server itself asks for to be told "everything": each action with the `*`
+// target. One of them is `execute_url(localhost)`, the address of the workspace itself.
+const EVERY = ["read_file(*)", "write_file(*)", "command(*)", "unsandboxed(*)", "mcp(*)", "read_url(*)", "execute_url(*)"];
 const number = (message, wanted) => {
   try {
     for (const [at, value] of fields(Buffer.from(message, "base64"))) if (at === wanted && typeof value === "bigint") return String(value);
@@ -215,6 +244,37 @@ const number = (message, wanted) => {
     return "";
   }
   return "";
+};
+const listed = (message, wanted) => {
+  const out = [];
+  try {
+    for (const [at, value] of fields(Buffer.from(message, "base64"))) if (at === wanted && typeof value !== "bigint") out.push(text(value));
+  } catch (error) {
+    return [];
+  }
+  return out;
+};
+// The grants as the application reads them: what is allowed, then what is refused, and never an
+// ask, since an ask is a question the person would have to be there for.
+const grants = (allow, deny) => base64([
+  ...allow.flatMap((one) => bytes(1, utf8(one))),
+  ...deny.flatMap((one) => bytes(2, utf8(one))),
+]);
+// A topic with `wanted` in it and every other entry of the home exactly as it was: the
+// settings the application keeps beside the approvals, such as the planning mode, are not ours to
+// touch and would be lost by a row written from scratch.
+const merged = (held, wanted) => {
+  const kept = entries(held);
+  const out = [];
+  for (const [key, value] of kept) out.push([key, wanted[key] === undefined ? value : wanted[key]]);
+  for (const [key, value] of Object.entries(wanted)) {
+    if (!kept.some(([was]) => was === key)) out.push([key, value]);
+  }
+  return topic(out);
+};
+const prepared = (db) => {
+  db.exec("CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)");
+  return db.prepare("INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)");
 };
 const row = (file, key) => {
   if (!fs.existsSync(file)) return "";
@@ -229,12 +289,16 @@ const row = (file, key) => {
   }
 };
 if (mode === "approvals") {
-  const agent = row(from, APPROVALS[0][0]);
-  const browser = row(from, APPROVALS[1][0]);
+  const agent = row(from, AGENT);
+  const browser = row(from, BROWSER);
+  const granted = entry(agent, "permission_grants_global");
   console.log("terminal=" + number(entry(agent, "terminalAutoExecutionPolicySentinelKey"), 2));
   console.log("review=" + number(entry(agent, "artifactReviewPolicySentinelKey"), 2));
   console.log("javascript=" + number(entry(browser, "browser_js_execution_config_sentinel_key"), 1));
-  console.log("onboarding=" + row(from, APPROVALS[2][0]));
+  console.log("files=" + number(entry(agent, "allowAgentAccessNonWorkspaceFilesSentinelKey"), 1));
+  console.log("allow=" + listed(granted, 1).join(","));
+  console.log("ask=" + listed(granted, 3).join(","));
+  console.log("onboarding=" + row(from, ONBOARDING));
   process.exit(0);
 }
 if (mode === "seen") process.exit(whole(read(from)) ? 0 : 1);
@@ -252,48 +316,46 @@ if (mode === "keep" || mode === "replace") {
   if (mode === "keep" && signed(read(to))) process.exit(0);
   fs.mkdirSync(path.dirname(to), { recursive: true });
   const db = new DatabaseSync(to);
-  db.exec("CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)");
-  const put = db.prepare("INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)");
+  const put = prepared(db);
   for (const key of KEYS) put.run(key, login[key]);
-  if (approve === "approve") for (const [key, value] of APPROVALS) put.run(key, value);
+  db.close();
+  process.exit(0);
+}
+if (mode === "approve") {
+  fs.mkdirSync(path.dirname(from), { recursive: true });
+  const db = new DatabaseSync(from);
+  const put = prepared(db);
+  const agent = row(from, AGENT);
+  const granted = entry(agent, "permission_grants_global");
+  const allow = listed(granted, 1);
+  put.run(AGENT, merged(agent, {
+    ...ANSWERS,
+    permission_grants_global: grants([...allow, ...EVERY.filter((one) => !allow.includes(one))], listed(granted, 2)),
+  }));
+  put.run(BROWSER, merged(row(from, BROWSER), { browser_js_execution_config_sentinel_key: whole_number(1, 4) }));
+  put.run(ONBOARDING, "true");
   db.close();
   process.exit(0);
 }
 process.exit(2);
 "#;
 
-/// The file a profile image on a QCode template carries so that the courier giving a home its login
-/// also writes the agent's approvals into it. Its presence is the whole of the decision: the image
-/// is built from the profile's template, and built again when the template changes, so the courier
-/// never has to be told which template the profile is on. An image on `base` has no such file, and
-/// the application's first start asks the person as it comes.
+/// The file a profile image on a QCode template carries as the mark of a QCode-made image, and the
+/// place a recipe on a QCode template puts it.
 ///
-/// What is written, read in Antigravity IDE 2.5.5's `main.js` and `workbench.desktop.main.js`:
-///
-/// - `antigravityUnifiedStateSync.agentPreferences`, a state-sync `Topic` whose
-///   `terminalAutoExecutionPolicySentinelKey` is a `Primitive` with `int32_value` (2) 3, `EAGER`
-///   ("Always Proceed" for terminal commands), and `artifactReviewPolicySentinelKey` one with 2,
-///   `TURBO` ("Always Proceed" for artifacts).
-/// - `antigravityUnifiedStateSync.browserPreferences`, whose `browser_js_execution_config_sentinel_key`
-///   is a `BrowserJavascriptExecutionConfig` with `browser_js_execution_policy` (1) 4, `TURBO`.
-/// - `antigravityOnboarding` = `"true"`. The first-start onboarding ends by writing all three
-///   policies from the mode the person picks, "Review-driven" unless they change it, over whatever
-///   was there; `maybeStart()` skips it when this key holds anything. It is stored with
-///   `store(key, "true", 0, 0)`, the profile scope, which for the default profile is this same
-///   database. Nothing else is gated on it: the agent panel's barrier opens on it, and the login-only
-///   flow comes up only when the person presses "Log in" or "Sign In" (`showLoginFlow`), which with a
-///   login present the title bar does not even offer (`updateLoginNudgeVisibility`).
-///
-/// A person who changes a policy inside a workspace afterwards keeps it: a home that has a login is
-/// never written again by [`Fill::Keep`].
+/// Nothing reads it any more: the courier carries the login alone, and the agent's approvals are
+/// merged into every window's home as it is prepared, under every template and into a home that
+/// has a login of its own. The recipe is left writing it, so that no image is rebuilt over a file
+/// nothing opens; an image on `base` carries no such file, as it always did.
 pub const APPROVALS: &str = "/usr/share/qcode/antigravity-approvals";
 
-/// The rows the program writes for [`APPROVALS`], as the application stores them, so a test can hold
-/// the program to them without running it.
-pub const APPROVAL_ROWS: [(&str, &str); 3] = [
+/// The rows a home is given its approvals in, as the application stores them, so a test can hold
+/// the program to them without running it. They are what a home with nothing in its database ends
+/// up with; a home that holds more keeps the rest, as [`PROGRAM`] merges rather than writes.
+pub const ANSWERED: [(&str, &str); 3] = [
     (
         "antigravityUnifiedStateSync.agentPreferences",
-        "CjAKJnRlcm1pbmFsQXV0b0V4ZWN1dGlvblBvbGljeVNlbnRpbmVsS2V5EgYKBEVBTT0KKQofYXJ0aWZhY3RSZXZpZXdQb2xpY3lTZW50aW5lbEtleRIGCgRFQUk9",
+        "CjAKJnRlcm1pbmFsQXV0b0V4ZWN1dGlvblBvbGljeVNlbnRpbmVsS2V5EgYKBEVBTT0KKQofYXJ0aWZhY3RSZXZpZXdQb2xpY3lTZW50aW5lbEtleRIGCgRFQUk9CjYKLGFsbG93QWdlbnRBY2Nlc3NOb25Xb3Jrc3BhY2VGaWxlc1NlbnRpbmVsS2V5EgYKBENBRT0KoAEKGHBlcm1pc3Npb25fZ3JhbnRzX2dsb2JhbBKDAQqAAUNneHlaV0ZrWDJacGJHVW9LaWtLRFhkeWFYUmxYMlpwYkdVb0tpa0tDbU52YlcxaGJtUW9LaWtLRG5WdWMyRnVaR0p2ZUdWa0tDb3BDZ1p0WTNBb0tpa0tDM0psWVdSZmRYSnNLQ29wQ2c1bGVHVmpkWFJsWDNWeWJDZ3FLUT09",
     ),
     (
         "antigravityUnifiedStateSync.browserPreferences",
@@ -326,14 +388,13 @@ impl Fill {
 ///
 /// What the store holds decides how: a window's login is the two rows, put into the home's
 /// database; every other harness's is files, copied over. So the one courier serves both, and a
-/// home never needs to be told which harness it belongs to. The courier runs from the profile's
-/// image, so an image on a QCode template ([`APPROVALS`]) has the agent's approvals written with the
-/// login, and one on `base` has the login alone.
+/// home never needs to be told which harness it belongs to. What the agent may do without asking
+/// is not the courier's business: it is merged into every window's home by [`approve_command`],
+/// whichever template the image was built from and whatever the home holds already.
 #[must_use]
 pub fn give(fill: Fill) -> Vec<String> {
     let script = format!(
-        "if [ -f '{STORE_DIR}/{STORED}' ]; then approve=; [ -f '{APPROVALS}' ] && approve=approve; \
-         exec node -e \"$1\" \"$2\" '{STORE_DIR}/{STORED}' '{HOME_DIR}/{DATABASE}' \"$approve\"; \
+        "if [ -f '{STORE_DIR}/{STORED}' ]; then exec node -e \"$1\" \"$2\" '{STORE_DIR}/{STORED}' '{HOME_DIR}/{DATABASE}'; \
          else cp -R {STORE_DIR}/. {HOME_DIR}/; fi"
     );
     ["sh", "-c", &script, "sh", PROGRAM, fill.word()].map(str::to_owned).to_vec()
@@ -350,6 +411,20 @@ pub fn capture_script() -> String {
 #[must_use]
 pub fn seen_command() -> Vec<String> {
     ["node", "-e", PROGRAM, "seen", &format!("{HOME_DIR}/{DATABASE}")].map(str::to_owned).to_vec()
+}
+
+/// The command that answers the window's agent for itself inside a running container, run before
+/// the window opens, from a container that has the home volume and nothing else.
+///
+/// A window's own container cannot be written to from the inside: it is created and started in one
+/// go with the application as its only program, so by the time it is there the application has read
+/// its database. This runs on the same volume and from the same image beforehand instead, so what
+/// it merges is what the application finds. It merges rather than writes, so the settings the
+/// person made in the window are kept, and a home that was signed in to by hand gets the same
+/// answers as one that was given the profile's login.
+#[must_use]
+pub fn approve_command() -> Vec<String> {
+    ["node", "-e", PROGRAM, "approve", &format!("{HOME_DIR}/{DATABASE}")].map(str::to_owned).to_vec()
 }
 
 /// The window a profile is signed in from, and everything made for it.
@@ -585,10 +660,18 @@ mod tests {
     }
 
     #[test]
-    fn the_courier_asks_for_the_approvals_only_from_an_image_that_carries_the_mark() {
+    fn the_courier_carries_the_login_alone_and_the_answers_come_from_a_command_of_their_own() {
+        // The mark file is still what a recipe on a QCode template writes, so no image is rebuilt
+        // over it; what is read of it is nothing, and the answers are written where the home is
+        // prepared, under every template.
         let script = &give(Fill::Keep)[2];
-        assert!(script.contains(&format!("approve=; [ -f '{APPROVALS}' ] && approve=approve;")), "{script}");
-        assert!(script.contains(&format!("'{HOME_DIR}/{DATABASE}' \"$approve\";")), "{script}");
+        assert!(!script.contains("approve"), "{script}");
+        assert!(!PROGRAM.contains("\"$approve\""), "the courier does not ask for them");
+        let approve = approve_command();
+        assert_eq!(&approve[..2], ["node", "-e"]);
+        assert_eq!(approve[0], "node");
+        assert_eq!(&approve[1..3], ["-e", PROGRAM]);
+        assert_eq!(&approve[3..], ["approve".to_owned(), format!("{HOME_DIR}/{DATABASE}")]);
     }
 
     /// A state-sync `Topic` decoded down to each key's `Primitive` fields.
@@ -662,19 +745,55 @@ mod tests {
             .collect()
     }
 
+    /// The `PermissionGrantsConfig` of an `agentPreferences` row, as `(allow, deny, ask)`.
+    fn grants(row: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let value = topic(row).into_iter().find(|(key, _)| key == "permission_grants_global").map(|(_, value)| value);
+        grants_of(&value.expect("the grants are there"))
+    }
+
+    /// The lists of a decoded `PermissionGrantsConfig`, by the field each is read from.
+    fn grants_of(value: &[u8]) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let list = |number: u64| {
+            message(value)
+                .into_iter()
+                .filter(|(at, _)| *at == number)
+                .map(|(_, held)| String::from_utf8(held).expect("a grant"))
+                .collect::<Vec<String>>()
+        };
+        (list(1), list(2), list(3))
+    }
+
     #[test]
-    fn the_approval_rows_say_always_proceed_as_the_application_reads_them() {
+    fn the_answered_rows_say_always_proceed_as_the_application_reads_them() {
         // Decoded here without the program, so the rows are held to what the application's own
-        // reading of them means: `Primitive.int32_value` (2) 3 is EAGER and 2 is TURBO, and
+        // reading of them means: `Primitive.int32_value` (2) 3 is EAGER and 2 is TURBO,
+        // `bool_value` (1) true is the files outside the workspace, and
         // `browser_js_execution_policy` (1) 4 is TURBO.
-        let [(agent_key, agent), (browser_key, browser), (onboarding_key, onboarding)] = APPROVAL_ROWS;
+        let [(agent_key, agent), (browser_key, browser), (onboarding_key, onboarding)] = ANSWERED;
         assert_eq!(agent_key, "antigravityUnifiedStateSync.agentPreferences");
         let agent: Decoded = topic(agent).into_iter().map(|(key, value)| (key, message(&value))).collect();
+        for (key, field, wanted) in [
+            ("terminalAutoExecutionPolicySentinelKey", 2, b"3"),
+            ("artifactReviewPolicySentinelKey", 2, b"2"),
+            ("allowAgentAccessNonWorkspaceFilesSentinelKey", 1, b"1"),
+        ] {
+            let found =
+                agent.iter().find(|(held, _)| held == key).unwrap_or_else(|| panic!("{key} is there: {agent:?}"));
+            assert_eq!(found.1, vec![(field, wanted.to_vec())], "{key}");
+        }
+        let (allow, deny, ask) = grants(ANSWERED[0].1);
+        assert_eq!(deny, Vec::<String>::new());
+        assert_eq!(ask, Vec::<String>::new(), "an ask is a question, and there is nobody to answer it");
         assert_eq!(
-            agent,
+            allow,
             [
-                ("terminalAutoExecutionPolicySentinelKey".to_owned(), vec![(2, b"3".to_vec())]),
-                ("artifactReviewPolicySentinelKey".to_owned(), vec![(2, b"2".to_vec())]),
+                "read_file(*)",
+                "write_file(*)",
+                "command(*)",
+                "unsandboxed(*)",
+                "mcp(*)",
+                "read_url(*)",
+                "execute_url(*)"
             ]
         );
         assert_eq!(browser_key, "antigravityUnifiedStateSync.browserPreferences");
@@ -710,53 +829,150 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
-    #[test]
-    fn the_approvals_are_written_as_the_application_stores_them_and_only_with_a_login_given() {
-        let Some(node) = node() else { return };
-        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
-        let folder = std::env::temp_dir().join(format!("qcode-approvals-{stamp}"));
-        std::fs::create_dir_all(&folder).expect("a folder");
-        let login = folder.join(STORED);
-        std::fs::write(&login, LOGIN).expect("a stored login");
-        let spelled = |path: &Path| path.to_str().expect("a path").to_owned();
+    /// Writes into the database at `argv[1]` the values the first-start onboarding leaves behind:
+    /// the "Review-driven" mode, which is what a person who changes nothing gets, a planning mode
+    /// of their own, and the permission grants the language server asks for one at a time.
+    const REVIEW_DRIVEN: &str = r#"const { DatabaseSync } = require("node:sqlite");
+const [file] = process.argv.slice(1);
+const v = (n) => { const o = []; while (n > 127) { o.push((n & 127) | 128); n = Math.floor(n / 128); } o.push(n); return o; };
+const f = (no, bytes) => [...v((no << 3) | 2), ...v(bytes.length), ...bytes];
+const s = (t) => [...Buffer.from(t, "utf8")];
+const b64 = (a) => Buffer.from(a).toString("base64");
+const topic = (pairs) => b64(pairs.flatMap(([key, value]) => f(1, [...f(1, s(key)), ...f(2, f(1, s(value)))])));
+const whole = (no, n) => b64([...v(no << 3), ...v(n)]);
+const list = (no, items) => items.flatMap((one) => f(no, s(one)));
+const db = new DatabaseSync(file);
+db.exec("CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)");
+const put = db.prepare("INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)");
+put.run("antigravityUnifiedStateSync.agentPreferences", topic([
+  ["terminalAutoExecutionPolicySentinelKey", whole(2, 1)],
+  ["artifactReviewPolicySentinelKey", whole(2, 1)],
+  ["planningModeSentinelKey", whole(2, 2)],
+  ["permission_grants_global", b64([...list(1, ["execute_url(localhost)"]), ...list(2, ["read_file(/secret)"]), ...list(3, ["command(rm)"])])],
+]));
+put.run("antigravityUnifiedStateSync.browserPreferences", topic([["browser_js_execution_config_sentinel_key", whole(1, 1)]]));
+put.run("antigravityOnboarding", "true");
+db.close();"#;
 
-        // A home on a QCode template: the login and the three rows, byte for byte as the
-        // application writes them, and read back as the application reads them.
-        let approved = folder.join("approved/state.vscdb");
-        program(&node, &["keep", &spelled(&login), &spelled(&approved), "approve"]);
-        for (key, value) in APPROVAL_ROWS {
-            assert_eq!(raw(&node, &approved, key), value, "{key}");
-        }
+    /// The rows a home is given, as `key=value` lines, in the order the application reads them.
+    fn rows_of(node: &Path, database: &Path) -> Vec<String> {
+        let mut rows: Vec<String> =
+            ANSWERED.iter().map(|(key, _)| format!("{key}={}", raw(node, database, key))).collect();
+        rows.sort();
+        rows
+    }
+
+    #[test]
+    fn the_answers_are_merged_into_a_home_that_asks_as_it_comes_and_keep_what_it_holds() {
+        let Some(node) = node() else { return };
+        let folder = Scratch::new("approvals").expect("a folder");
+        let spelled = |path: &Path| path.to_str().expect("a path").to_owned();
+        let home = folder.path().join("state.vscdb");
+        let written = |node: &Path| {
+            std::process::Command::new(node)
+                .args(["-e", REVIEW_DRIVEN])
+                .arg(&home)
+                .output()
+                .expect("node runs")
+                .status
+                .success()
+        };
+        assert!(written(&node), "the first start's own values are in the database");
+        let planning = raw(&node, &home, "antigravityUnifiedStateSync.agentPreferences");
+        let theirs =
+            topic(&planning).into_iter().find(|(key, _)| key == "planningModeSentinelKey").map(|(_, value)| value);
+
+        // What the application asked of the agent, and what it asked the language server.
         assert_eq!(
-            program(&node, &["approvals", &spelled(&approved)]),
-            "terminal=3\nreview=2\njavascript=4\nonboarding=true\n"
+            program(&node, &["approvals", &spelled(&home)]),
+            "terminal=1\nreview=1\njavascript=1\nfiles=\n\
+             allow=execute_url(localhost)\nask=command(rm)\nonboarding=true\n"
         );
+
+        program(&node, &["approve", &spelled(&home)]);
+        assert_eq!(
+            program(&node, &["approvals", &spelled(&home)]),
+            "terminal=3\nreview=2\njavascript=4\nfiles=1\n\
+             allow=execute_url(localhost),read_file(*),write_file(*),command(*),unsandboxed(*),mcp(*),read_url(*),execute_url(*)\n\
+             ask=\nonboarding=true\n"
+        );
+        // The planning mode is the person's and is kept byte for byte, beside the answers.
+        let after = topic(&raw(&node, &home, "antigravityUnifiedStateSync.agentPreferences"));
+        assert_eq!(
+            after.iter().find(|(key, _)| key == "planningModeSentinelKey").map(|(_, value)| value.clone()),
+            theirs
+        );
+        assert!(after.iter().any(|(key, _)| key == "permission_grants_global"), "{after:?}");
+        let (_, deny, ask) = grants(&raw(&node, &home, "antigravityUnifiedStateSync.agentPreferences"));
+        assert_eq!(deny, ["read_file(/secret)"], "a refusal is not a question, and is kept");
+        assert!(ask.is_empty(), "an ask is a question: {ask:?}");
+
+        // Answered once, a home that is answered again changes nothing at all.
+        let rows = rows_of(&node, &home);
+        program(&node, &["approve", &spelled(&home)]);
+        assert_eq!(rows_of(&node, &home), rows, "the same bytes a second time");
+        let _ = std::fs::remove_dir_all(folder.path());
+    }
+
+    #[test]
+    fn a_home_with_no_database_is_given_the_answers_and_no_login_at_all() {
+        let Some(node) = node() else { return };
+        let folder = Scratch::new("approvals-fresh").expect("a folder");
+        let home = folder.path().join("deep/state.vscdb");
+        let spelled = |path: &Path| path.to_str().expect("a path").to_owned();
+        program(&node, &["approve", &spelled(&home)]);
+        for (key, value) in ANSWERED {
+            assert_eq!(raw(&node, &home, key), value, "{key}");
+        }
+        for key in KEYS {
+            assert_eq!(raw(&node, &home, key), "", "{key}: the answer never makes a login");
+        }
+        assert!(
+            !std::process::Command::new(&node)
+                .args(["-e", PROGRAM, "seen"])
+                .arg(&home)
+                .status()
+                .expect("runs")
+                .success(),
+            "and it is not signed in"
+        );
+        let _ = std::fs::remove_dir_all(folder.path());
+    }
+
+    #[test]
+    fn the_courier_writes_a_login_and_never_the_answers() {
+        let Some(node) = node() else { return };
+        let folder = Scratch::new("approvals-courier").expect("a folder");
+        let spelled = |path: &Path| path.to_str().expect("a path").to_owned();
+        let login = folder.path().join(STORED);
+        std::fs::write(&login, LOGIN).expect("a stored login");
+
+        // A home the profile's login is given, and one the person signed in to by hand: neither
+        // is told what the agent may do, which is what the approve command is for.
+        let given = folder.path().join("given/state.vscdb");
+        program(&node, &["keep", &spelled(&login), &spelled(&given)]);
         assert!(
             std::process::Command::new(&node)
                 .args(["-e", PROGRAM, "seen"])
-                .arg(&approved)
+                .arg(&given)
                 .status()
                 .expect("runs")
-                .success()
+                .success(),
+            "the login is there"
         );
-
-        // A home on base: the login alone, and the application asks as it comes.
-        let plain = folder.join("plain/state.vscdb");
-        program(&node, &["keep", &spelled(&login), &spelled(&plain), ""]);
-        assert_eq!(program(&node, &["approvals", &spelled(&plain)]), "terminal=\nreview=\njavascript=\nonboarding=\n");
-
-        // A home that has a login of its own keeps it and every choice made in it.
-        let own = folder.join("own/state.vscdb");
-        program(&node, &["keep", &spelled(&login), &spelled(&own), ""]);
-        program(&node, &["keep", &spelled(&login), &spelled(&own), "approve"]);
-        assert_eq!(program(&node, &["approvals", &spelled(&own)]), "terminal=\nreview=\njavascript=\nonboarding=\n");
-        // Asked for again by the person, it is written whatever the home had.
-        program(&node, &["replace", &spelled(&login), &spelled(&own), "approve"]);
-        assert_eq!(
-            program(&node, &["approvals", &spelled(&own)]),
-            "terminal=3\nreview=2\njavascript=4\nonboarding=true\n"
-        );
-        let _ = std::fs::remove_dir_all(&folder);
+        for (key, _) in ANSWERED {
+            assert_eq!(raw(&node, &given, key), "", "{key}");
+        }
+        // A home that has a login of its own keeps it, and asked for again it is written anyway.
+        let own = folder.path().join("own/state.vscdb");
+        program(&node, &["keep", &spelled(&login), &spelled(&own)]);
+        let before = raw(&node, &own, KEYS[0]);
+        program(&node, &["replace", &spelled(&login), &spelled(&own)]);
+        assert_eq!(raw(&node, &own, KEYS[0]), before);
+        for (key, _) in ANSWERED {
+            assert_eq!(raw(&node, &own, key), "", "{key}");
+        }
+        let _ = std::fs::remove_dir_all(folder.path());
     }
 
     #[cfg(unix)]
@@ -769,7 +985,7 @@ mod tests {
         let login = folder.path().join(STORED);
         std::fs::write(&login, LOGIN).expect("a stored login");
         let home = folder.path().join("home/state.vscdb");
-        program(&node, &["keep", &spelled(&login), &spelled(&home), ""]);
+        program(&node, &["keep", &spelled(&login), &spelled(&home)]);
         // Taken out the way the courier does it, into a folder the program makes itself.
         let taken = folder.path().join("capture/out").join(STORED);
         program(&node, &["take", &spelled(&home), &spelled(&taken)]);

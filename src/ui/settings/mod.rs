@@ -73,6 +73,9 @@ pub enum Request {
     /// Store whether the first message from one tab to another asks the person, and do that
     /// from now on.
     AskFirst(bool),
+    /// Store whether a profile whose container is doing nothing is frozen in the background, and
+    /// do that from now on.
+    FreezeIdle(bool),
     /// Run the setup wizard's engine step on its own. This is what the repair strip asks for.
     OpenEngineStep,
     /// Run the setup wizard's location step on its own, to move the store somewhere else.
@@ -147,6 +150,8 @@ pub enum Msg {
     Sound(Sound),
     /// The switch that asks before the first message between two tabs was moved.
     AskFirst(bool),
+    /// The switch that freezes a profile's container in the background was moved.
+    FreezeIdle(bool),
     /// A profile was chosen.
     Profile(usize),
     /// Refreshing the chosen profile's login was asked for; the question follows.
@@ -184,6 +189,7 @@ pub struct Settings {
     editor: Editor,
     sound: Sound,
     ask_first: bool,
+    freeze_idle: bool,
     store: Option<PathBuf>,
     repairs: Vec<Diagnostic>,
     repairs_read: bool,
@@ -208,6 +214,7 @@ impl Settings {
             editor: config.editor(),
             sound: config.sound(),
             ask_first: config.ask_first(),
+            freeze_idle: config.freeze_idle(),
             store: config.folder_path(),
             repairs: config.diagnostics().to_vec(),
             repairs_read: false,
@@ -340,6 +347,10 @@ pub fn update(screen: &mut Settings, message: Msg) -> (Command<Msg>, Option<Requ
         Msg::AskFirst(ask) => {
             screen.ask_first = ask;
             (Command::none(), Some(Request::AskFirst(ask)))
+        }
+        Msg::FreezeIdle(freeze) => {
+            screen.freeze_idle = freeze;
+            (Command::none(), Some(Request::FreezeIdle(freeze)))
         }
         Msg::Profile(index) => {
             if index < screen.profiles.as_ref().map_or(0, Vec::len) {
@@ -544,6 +555,14 @@ pub fn view(screen: &Settings, ui: &mut View<'_, Msg>) {
                         if let Some(row) = screen.service {
                             service_row(list, row);
                         }
+                        // With the engine, what the containers do while QCode is open: a profile
+                        // nothing of is on screen and that has done nothing for a while hands its
+                        // memory back to the machine, and wakes the moment it is needed.
+                        let row =
+                            SettingRow::new(t!("settings.freeze-idle")).description(t!("settings.freeze-idle-text"));
+                        list.row(row, |ui| {
+                            ui.add(Switch::new(screen.freeze_idle).on_toggle(Msg::FreezeIdle)).id("freeze-idle");
+                        });
 
                         list.heading(t!("settings.backup"));
                         let choices =
@@ -1205,6 +1224,31 @@ mod tests {
 
         let screen = testing::from_config("[bridge]\nask-first = true\n", EngineKind::Podman, Health::Working);
         assert!(screen.ask_first, "a file that turned it on opens the screen with it on");
+    }
+
+    #[test]
+    fn a_quiet_profile_is_frozen_in_the_background_until_the_person_turns_that_off() {
+        let mut harness = testing::host(testing::screen(EngineKind::Podman, Health::Working), SIZE.0, 60);
+        let screen = harness.screen();
+        for label in [
+            "Freeze quiet profiles in the background",
+            "A profile none of whose tabs is on screen",
+            "rootless podman and swap",
+        ] {
+            assert!(screen.contains(label), "`{label}` is missing:\n{screen}");
+        }
+        assert!(harness.app().screen.freeze_idle, "a file without the key freezes");
+
+        let switch = harness.find("Freeze quiet profiles in the background").expect("the row is on screen");
+        let (edge, _) = harness.find("▾").expect("the language drop-down");
+        harness.click(edge - 1, switch.1).render();
+        assert_eq!(harness.app().asked, [Request::FreezeIdle(false)]);
+        assert!(!harness.app().screen.freeze_idle, "and the switch shows it is off");
+
+        // A settings file that turned it off opens the screen with it off.
+        let screen = testing::from_config("freeze_idle = false\n", EngineKind::Podman, Health::Working);
+        assert!(!screen.freeze_idle, "a file that turned it off opens the screen with it off");
+        assert!(testing::from_config("", EngineKind::Podman, Health::Working).freeze_idle);
     }
 
     #[test]

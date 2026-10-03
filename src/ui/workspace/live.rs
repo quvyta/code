@@ -2,9 +2,10 @@
 //! really is inside a container.
 //!
 //! The tests here are `#[ignore]`d and do nothing unless `QCODE_CONTAINER_TESTS=1`, so
-//! `cargo test` stays clean on a machine with no engine. They pull `alpine` the first time, so
-//! the first run needs the network. They never touch a real QCode image, workspace or profile:
-//! the container they make is named after a workspace nobody has.
+//! `cargo test` stays clean on a machine with no engine. They pull `alpine` the first time and
+//! build the base image, so the first run needs the network. They never touch a workspace or a
+//! profile of the person's: every container they make is named after a workspace nobody has, and
+//! the image is the base QCode itself is built on.
 //!
 //! ```text
 //! QCODE_CONTAINER_TESTS=1 cargo test -- --ignored --test-threads=1
@@ -126,6 +127,60 @@ fn every_container_of_the_plan_answers_to_the_same_machine_name() {
         // Not the engine's random name, and not this machine's either: the one QCode fixed, so a
         // login keyed to the machine name decrypts in whichever container it is copied into.
         assert_eq!(answered, [HOSTNAME, HOSTNAME], "{:?}", engine.kind());
+    }
+}
+
+/// The container of the check that a person the image knows nothing about is named inside.
+const NAMED: &str = "qcode-uiworkspacelive-named";
+
+/// What the naming run leaves behind on the machine, taken away when the run ends however it ends:
+/// its container. The base image it runs in is QCode's own, and is left where it is.
+struct Left {
+    engine: Engine,
+    container: String,
+}
+
+impl Drop for Left {
+    fn drop(&mut self) {
+        let _ = capture(&self.engine.remove_container(&self.container));
+    }
+}
+
+#[test]
+#[ignore = "needs a container engine; run with QCODE_CONTAINER_TESTS=1"]
+fn a_person_whose_uid_the_image_does_not_know_is_named_inside_the_container() {
+    use crate::engine::names::BASE_IMAGE;
+
+    use super::plan::ensure_running;
+
+    // Docker alone, which is the whole of what there is to see: podman writes the entry itself as
+    // it starts the container, so on podman there is nothing QCode could be asked for.
+    for engine in engines().into_iter().filter(|engine| engine.kind() == EngineKind::Docker) {
+        crate::base::ensure(&engine, &|| false, &mut |_| {}).expect("the base image is there");
+        let scratch = Scratch::new();
+        // A uid the image has no entry for: it belongs to uid 1000, and a person whose uid is
+        // another one comes up as a number with nothing to read it in.
+        let someone = HostUser::Ids { uid: 4321, gid: 4321 };
+        let plan = ContainerPlan { image: BASE_IMAGE.to_owned(), ..scratch.plan(NAMED) };
+        let _left = Left { engine: engine.clone(), container: NAMED.to_owned() };
+        // What an interrupted run may have left is cleared first, or the create is refused.
+        let _ = capture(&engine.remove_container(NAMED));
+        ensure_running(&engine, &plan, someone).expect("the container comes up");
+
+        let run = |script: &str| {
+            capture(&engine.exec_without_terminal(&Exec { container: NAMED, command: &["sh", "-c", script] }))
+                .unwrap_or_else(|error| panic!("{:?}: `{script}` failed: {error:?}", engine.kind()))
+        };
+        // As that person, in a container the image never saw, the name is there.
+        assert_eq!(run("whoami").trim(), "qcode-4321", "the name the person is given");
+        // And what the missing name was worth: a harness asked to commit could not, because git
+        // has nobody to write an author for. The address is given on the command line and the
+        // name has to come from the entry, so the commit says who QCode said the person was.
+        let commit = "rm -rf /tmp/qcode-named && mkdir /tmp/qcode-named && cd /tmp/qcode-named \
+             && git init --quiet && echo qcode > file && git add file \
+             && git -c user.email=a@b commit --quiet -m first \
+             && git log -1 --pretty='%an <%ae>'";
+        assert_eq!(run(commit).trim(), "QCode <a@b>", "git wrote an author for the person");
     }
 }
 

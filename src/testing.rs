@@ -76,6 +76,14 @@ pub fn app_with_absent_engine(config: Config) -> QCode {
         .with_providers(Some(providers_file()), no_web())
 }
 
+/// An application on its home screen holding an engine the test wrote, which is how a test
+/// watches what QCode asks of one: the binary is a script of the test's own and every call it is
+/// given is written down where the test can read it.
+pub fn app_with_engine(config: Config, engine: Engine) -> QCode {
+    QCode::new(config, dirs(), host(), &settled(), Some(engine), None, None)
+        .with_providers(Some(providers_file()), no_web())
+}
+
 /// Runs the test `name` of this crate again in a process of its own, with none of the
 /// person's XDG folders and with `vars` set, and answers what it printed.
 ///

@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use crate::base::paths::{HOME_DIR, OPEN_HOME, USER};
 use crate::desktop::signin;
+use crate::engine::names::PROFILE_LABEL;
 use crate::profile::guidance;
 use crate::profile::{
     ACCESSLINT_PLUGIN, ACCESSLINT_PROGRAM, ACCESSLINT_SERVER, AGENT_SDK, AGENT_SDK_VENV, AccountKind, Addition,
@@ -31,6 +32,19 @@ pub const USER_PREFIX: &str = ".local";
 
 /// The npm prefix the base image installs the harnesses into.
 const IMAGE_NPM: &str = "/usr/local/npm";
+
+/// The command that opens to everyone what the build wrote into the home directory, touching only
+/// what is not open yet: a directory not yet 0777, and any other file not yet read and written by
+/// everyone or executable by someone and not by all. A symbolic link is never given to `chmod`,
+/// which follows one and would open whatever it points at.
+///
+/// It leaves the home exactly as `chmod -R a+rwX "$HOME"` does ([`OPEN_HOME`]), and costs half a
+/// layer where that costs two: on an overlay filesystem a `chmod` copies every file it touches
+/// into a new layer even when the mode does not change, so a recursive chmod of a home a previous
+/// step has already written writes all of it again — 331 MB of QCode recommended's image, 366 MB
+/// of QCode extra's. This is what the steps that write the big parts of the home run at the end of
+/// their own layer, where only what they wrote is copied.
+pub const OPEN_HOME_ONLY: &str = "find \"$HOME\" ! -type l \\( \\( -type d ! -perm -0777 \\) -o \\( ! -type d \\( ! -perm -0666 -o \\( -perm /0111 ! -perm -0111 \\) \\) \\) \\) -exec chmod a+rwX {} +";
 
 /// A build context: the file that describes the image and everything the build copies in.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,14 +93,17 @@ impl Recipe {
 /// the home directory: the build runs as the image's user and the container as the person's,
 /// and where those differ a login could otherwise not be stored beside the settings.
 ///
-/// A harness that opens a window is installed by [`desktop_steps`] instead of from a registry: it
+/// A harness that opens a window is installed by `desktop_steps` instead of from a registry: it
 /// needs system packages and an archive unpacked into `/opt`, neither of which the base image's
 /// own user may do, so those steps run as root and the image ends as its user again.
 ///
-/// What a profile's parts add is installed by [`addition_step`], in an order that matters: graphify's
-/// system packages as root and nothing else as root; the configuration files before the Claude
-/// Code plugins, because installing a plugin adds it to the settings file and copying the file
-/// afterwards would forget every one of them.
+/// What a profile's parts add is installed by `addition_step`, in an order that matters: graphify
+/// first of all, right after the `FROM` line, so that every profile of one system that carries it
+/// has the very same step and every step before it and stores its layer once; then the
+/// configuration files before the Claude Code plugins, because installing a plugin adds it to the
+/// settings file and copying the file afterwards would forget every one of them. graphify's own
+/// skill and section stay below the harness, where the home they read and write is the one the
+/// harness is already there for.
 #[must_use]
 pub fn image(profile: &Profile) -> Recipe {
     let harness = profile.harness.record();
@@ -95,6 +112,14 @@ pub fn image(profile: &Profile) -> Recipe {
     // The base image of the system the profile chose: Debian's is `qcode/base`, the name every
     // profile image was built from before there was a choice.
     let mut lines = vec![format!("FROM {}", profile.os.image())];
+    if additions.contains(&Addition::Graphify) {
+        // Root, because graphify's system packages are not the image user's to write, and back to
+        // the image's own user at once, which is the user every step below expects to be: a
+        // window's image brings its own root for its own packages.
+        lines.push("USER root".to_owned());
+        lines.push(addition_step(Addition::Graphify, profile));
+        lines.push(format!("USER {USER}"));
+    }
     let desktop = profile.harness.desktop();
     if let Some(desktop) = desktop {
         // Root, because system packages and /opt are not the image user's to write. The image
@@ -135,14 +160,9 @@ pub fn image(profile: &Profile) -> Recipe {
         files.push((staged, file.contents.to_owned()));
     }
     if additions.contains(&Addition::Graphify) {
-        // A window's image is root at this point already, and goes back at the end.
-        if desktop.is_none() {
-            lines.push("USER root".to_owned());
-        }
-        lines.push(addition_step(Addition::Graphify, profile));
-        if desktop.is_none() {
-            lines.push(format!("USER {USER}"));
-        }
+        // Where it has always been: the skill is written into the home directory, which the
+        // harness's own steps are what prepared, and it is written as the image's own user. A
+        // window's image is root at this point and goes back to its user at the end, as it did.
         lines.push(graphify_skill(profile.harness));
     }
     // Quvyta development's system packages, toolchain and browser, as root like graphify's
@@ -216,6 +236,11 @@ pub fn image(profile: &Profile) -> Recipe {
     if additions.contains(&Addition::ClaudePlugins) {
         lines.push(addition_step(Addition::ClaudePlugins, profile));
     }
+    // The step that has opencode fetch its settings folder's packages, which is the other step
+    // that writes a big part of the home, and so is the other one that opens what it wrote itself
+    // ([`crate::profile::opencode_packages`]).
+    let packages = crate::profile::opencode_packages::step(profile);
+    let opened_its_own_files = additions.contains(&Addition::ClaudePlugins) || packages.is_some();
     // Only a mark, read by the courier that gives a workspace's home its login: the approvals are
     // written into the application's database there, beside the login (`desktop::login`). It is
     // the recommended settings that grant them, so without that part there is nothing to mark.
@@ -225,7 +250,7 @@ pub fn image(profile: &Profile) -> Recipe {
             marker = crate::desktop::login::APPROVALS
         ));
     }
-    lines.extend(crate::profile::opencode_packages::step(profile));
+    lines.extend(packages.clone());
     // Last, after every step that installs with npm, so those still land in the image's own
     // prefix. From here on whatever the person installs for their user — `npm -g`, `pipx`,
     // `uv tool` — goes into the home, which is the workspace's own volume: it stays when the
@@ -233,9 +258,16 @@ pub fn image(profile: &Profile) -> Recipe {
     // own layer does not. The home's programs come first, the image's harness right behind.
     lines.push(format!("ENV NPM_CONFIG_PREFIX=\"{HOME_DIR}/{USER_PREFIX}\""));
     lines.push(format!("ENV PATH=\"{HOME_DIR}/{USER_PREFIX}/bin:{IMAGE_NPM}/bin:$PATH\""));
-    lines.push(format!("RUN {OPEN_HOME}"));
-    // The name is on the image so that a stray image can be traced back to its profile.
-    lines.push(format!("LABEL qcode.profile=\"{}\"", profile.name));
+    // Where one of the two steps that write the big parts of the home has already opened what it
+    // wrote, that is the whole of what is left to do and this command does it: a recursive chmod
+    // of a home that is already open would copy all of it into a layer of its own
+    // ([`OPEN_HOME_ONLY`]). Every other profile keeps the image's own opener, so its recipe says
+    // what it always said.
+    let opens = if opened_its_own_files { OPEN_HOME_ONLY } else { OPEN_HOME };
+    lines.push(format!("RUN {opens}"));
+    // The name is on the image so that a stray image can be traced back to its profile, and so
+    // that the images QCode may take away for itself can be told from the person's own.
+    lines.push(format!("LABEL {PROFILE_LABEL}=\"{}\"", profile.name));
     if desktop.is_some() {
         lines.push(format!("USER {USER}"));
     }
@@ -311,6 +343,12 @@ pub const DEV_FAILED: &str = "Quvyta development:";
 /// The same for a profile whose parts are its own, which no ready-made template names.
 pub const CUSTOM_FAILED: &str = "Custom:";
 
+/// The words graphify's step starts its complaint with, whichever set the profile is of. It is the
+/// one step that names no set: every profile of a system has the very same graphify step, so that
+/// the engine stores its layer once for all of them, and the screen reads these words as the
+/// failure of the set the profile it is building is of.
+pub const GRAPHIFY_FAILED: &str = "graphify:";
+
 /// The step that installs `addition` for `profile`, checked before it counts: each one ends by
 /// asking what it installed, so a step that seemed to work and left something out still fails the
 /// build. Of the Claude Code plugins, only the ones `profile` has switched on are installed, and
@@ -353,6 +391,9 @@ fn addition_step(addition: Addition, profile: &Profile) -> String {
             if plugins.contains(&SECURITY_GUIDANCE_PLUGIN) {
                 commands.extend(security_guidance_in_the_image());
             }
+            // The plugins write more of the home than any other step, so what they wrote is opened
+            // here, where only this layer's own files are copied again (see [`OPEN_HOME_ONLY`]).
+            commands.push(OPEN_HOME_ONLY.to_owned());
             ("the Claude Code plugins", commands)
         }
         // rustup's own installer, which picks the build for the machine the image is built on:
@@ -419,7 +460,12 @@ fn addition_step(addition: Addition, profile: &Profile) -> String {
             ],
         ),
     };
-    let (failed, template) = failure_words(profile.template);
+    // graphify's step says nothing of the set, so that it reads the same in every profile of one
+    // system ([`GRAPHIFY_FAILED`]).
+    let (failed, template) = match addition {
+        Addition::Graphify => (GRAPHIFY_FAILED, "the profile"),
+        _ => failure_words(profile.template),
+    };
     format!(
         "RUN {{ {steps}; }} \\\n || {{ echo '{failed} could not install {what}. What {template} adds is downloaded while the image is built, so the build needs the network.' >&2; exit 1; }}",
         steps = commands.join(" \\\n && "),
@@ -483,10 +529,23 @@ fn accesslint_in_the_image() -> Vec<String> {
 /// own. A plugin that moved its state somewhere else, or stopped looking at the environment at all,
 /// builds one here and fails the build rather than leaving an image whose first tab needs the
 /// network.
+///
+/// The wheel carries a Claude Code of its own, 231 MB at `_bundled/claude` in its own
+/// `site-packages`, and the SDK runs that one whenever the file is there (read in 0.2.162,
+/// `_internal/transport/subprocess_cli.py`, `_find_cli`). What the plugin's security checks would
+/// then be looking at is a second copy of Claude Code inside the environment, of a version nothing
+/// else in the image knows anything about, rather than the one the image installs for the harness
+/// itself. So the copy is taken away right after the package is proved to import, and the SDK
+/// falls through to `shutil.which("claude")`, which in the image is
+/// `/usr/local/npm/bin/claude`. The SDK asks for 2.0.0 at least, the image holds a later one, and
+/// the step asks for the program on the path afterwards, so an image that has no Claude Code where
+/// the SDK would fall back on it fails the build rather than waiting for the first tab to need the
+/// network.
 fn security_guidance_in_the_image() -> Vec<String> {
     let venv = format!("\"$HOME\"/{AGENT_SDK_VENV}");
     let python = format!("{venv}/bin/python");
     let mark = format!("{venv}/{SECURITY_GUIDANCE_MARK}");
+    let bundled = format!("{venv}/{AGENT_SDK_BUNDLED_CLAUDE}");
     let hook =
         format!("\"$HOME\"/.claude/plugins/cache/claude-plugins-official/security-guidance/*/{SECURITY_GUIDANCE_HOOK}");
     vec![
@@ -495,6 +554,12 @@ fn security_guidance_in_the_image() -> Vec<String> {
             "{python} -m pip install --quiet --disable-pip-version-check --prefer-binary --no-cache-dir {AGENT_SDK}"
         ),
         format!("{python} -c 'import {}'", AGENT_SDK.replace('-', "_")),
+        // Taken away with `-r` whatever the wheel of this version brought, and asked for afterwards:
+        // the glob matches nothing where the wheel carried no Claude Code, and `rm -rf` is then
+        // given the name as written and removes nothing.
+        format!("rm -rf {bundled}"),
+        format!("! test -e {bundled}"),
+        "command -v claude".to_owned(),
         format!("touch {mark}"),
         format!("python3 {hook} > /dev/null"),
         format!("test -f {mark}"),
@@ -503,6 +568,10 @@ fn security_guidance_in_the_image() -> Vec<String> {
         format!("rm -f {mark}"),
     ]
 }
+
+/// Where the agent SDK's wheel keeps a Claude Code of its own, as a pattern rather than a path:
+/// the wheel puts it under whichever `lib/python3*` the interpreter it was installed for made.
+const AGENT_SDK_BUNDLED_CLAUDE: &str = "lib/python3*/site-packages/claude_agent_sdk/_bundled/claude";
 
 /// Whether this profile's set carries the security-guidance plugin, which is the one that decides
 /// the image gets the agent SDK ([`SECURITY_GUIDANCE_PLUGIN`]).
@@ -826,7 +895,12 @@ mod tests {
             "{file}"
         );
         assert!(file.contains("Quvyta development: could not install Chromium."), "{file}");
-        assert!(file.contains("Quvyta development: could not install graphify."), "QCode extra's steps too: {file}");
+        assert!(
+            file.contains("Quvyta development: could not install the Claude Code plugins."),
+            "QCode extra's steps too: {file}"
+        );
+        // graphify's step names no set, so that every profile of the system shares it.
+        assert!(file.contains(&format!("{GRAPHIFY_FAILED} could not install graphify.")), "{file}");
         assert!(!file.contains(EXTRA_FAILED), "{file}");
     }
 
@@ -966,17 +1040,118 @@ mod tests {
         // The install and the template both write under `$HOME` as the image's user, and the
         // container is run as the person's own uid. When that is not 1000 the login has nowhere
         // to go unless the build ends by opening what it wrote, so the check is on the last
-        // `RUN`, whatever came before it.
+        // `RUN`, whatever came before it. Where one of the two steps that write the big parts of
+        // the home opened its own files in its own layer, that command is what the last step
+        // runs; every other profile keeps the image's own opener.
         for harness in HarnessKind::ALL {
             for template in Template::ALL {
-                let recipe = image(&profile(harness, template));
+                let profile = profile(harness, template);
+                let recipe = image(&profile);
+                let wanted = if profile.additions().contains(&Addition::ClaudePlugins)
+                    || crate::profile::opencode_packages::step(&profile).is_some()
+                {
+                    OPEN_HOME_ONLY
+                } else {
+                    OPEN_HOME
+                };
                 let last_run = recipe.containerfile.lines().rfind(|line| line.starts_with("RUN "));
-                assert_eq!(last_run, Some(format!("RUN {OPEN_HOME}").as_str()), "{harness:?} {template:?}");
-                let opened = recipe.containerfile.find(OPEN_HOME).expect("the step is there");
+                assert_eq!(last_run, Some(format!("RUN {wanted}").as_str()), "{harness:?} {template:?}");
+                let opened = recipe.containerfile.rfind(wanted).expect("the step is there");
                 let label = recipe.containerfile.find("LABEL ").expect("the label is there");
                 assert!(opened < label, "{harness:?} {template:?}: the label may only follow the last step");
             }
         }
+    }
+
+    #[test]
+    fn the_steps_that_write_the_big_parts_of_the_home_open_what_they_wrote_themselves() {
+        // The two of them are the Claude Code plugins and opencode's settings folder packages;
+        // whichever of them an image has, the home is opened in that step's own layer, where only
+        // what that step wrote is copied into the layer. The opencode step keeps the check for the
+        // package it fetched as its very last command, and the plugins' step is the last one to
+        // run inside its own braces.
+        let in_its_own_layer = |recipe: &Recipe, word: &str| -> String {
+            let file = &recipe.containerfile;
+            let step = steps(file).into_iter().find(|step| step.contains(word)).unwrap_or_else(|| panic!("{word}"));
+            let end = file.find(&step).expect("the step is in the file") + step.len();
+            file[..end].to_owned()
+        };
+        for (harness, template, word, what_comes_next) in [
+            (HarnessKind::ClaudeCode, Template::High, "claude plugin install", "; }"),
+            (HarnessKind::ClaudeCode, Template::QuvytaDev, "claude plugin install", "; }"),
+            (HarnessKind::OpenCode, Template::Recommended, "opencode debug config", " \\\n && test -f"),
+            (HarnessKind::OpenCode, Template::QuvytaDev, "opencode debug config", " \\\n && test -f"),
+        ] {
+            let step = in_its_own_layer(&image(&profile(harness, template)), word);
+            let at = step.find(OPEN_HOME_ONLY).unwrap_or_else(|| panic!("{harness:?} {template:?}: {step}"));
+            assert!(step[at + OPEN_HOME_ONLY.len()..].starts_with(what_comes_next), "{harness:?} {template:?}: {step}");
+        }
+        // A set of the person's own with neither of them is the image's own opener and nothing
+        // else, and so says nothing about what is still closed.
+        let bare = custom(HarnessKind::ClaudeCode, &[Extra::Graphify]);
+        let file = image(&bare).containerfile;
+        assert!(!file.contains(OPEN_HOME_ONLY), "{file}");
+        assert!(file.contains(&format!("RUN {OPEN_HOME}\n")), "{file}");
+    }
+
+    /// A folder of this test's own, with a name nothing else on the machine is using.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        std::env::temp_dir().join(format!("qcode-{name}-{}-{stamp}", std::process::id()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_home_is_opened_only_where_it_is_still_closed_in_a_real_shell() {
+        // A recursive chmod copies every file it touches into a new layer even where the mode does
+        // not change, so the last step must not walk the whole home twice over. Two copies of one
+        // folder are opened, one by each of the commands, and their modes are compared entry by
+        // entry; the link points outside the folder, where a chmod that followed it would show.
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = scratch("open-home");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).expect("a folder");
+        let target = outside.join("target");
+        std::fs::write(&target, "x").expect("a file");
+        let mode_of = |path: &std::path::Path| -> u32 {
+            std::fs::symlink_metadata(path).expect("the entry is there").permissions().mode() & 0o777
+        };
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).expect("a mode");
+        // A folder nobody but its owner may enter, a file nobody but its owner may read, a program
+        // only its owner may run, a file everybody may read, and a folder everybody already has.
+        for name in ["mine", "theirs"] {
+            let home = root.join(name);
+            std::fs::create_dir_all(home.join("closed")).expect("a folder");
+            std::fs::create_dir_all(home.join("open")).expect("a folder");
+            std::fs::write(home.join("private"), "x").expect("a file");
+            std::fs::write(home.join("program"), "#!/bin/sh\n").expect("a file");
+            std::fs::write(home.join("readable"), "x").expect("a file");
+            for (path, mode) in [
+                (home.join("closed"), 0o700),
+                (home.join("private"), 0o600),
+                (home.join("program"), 0o700),
+                (home.join("readable"), 0o644),
+                (home.join("open"), 0o777),
+            ] {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("a mode");
+            }
+            symlink(&target, home.join("link")).expect("a link");
+        }
+        let (mine, theirs) = (root.join("mine"), root.join("theirs"));
+        for (home, command) in [(mine.clone(), OPEN_HOME_ONLY), (theirs.clone(), "chmod -R a+rwX \"$HOME\"")] {
+            let ran = std::process::Command::new("sh")
+                .args(["-c", command])
+                .env("HOME", &home)
+                .output()
+                .expect("a shell runs the command");
+            assert!(ran.status.success(), "{command}: {}", String::from_utf8_lossy(&ran.stderr));
+        }
+        for entry in ["closed", "private", "program", "readable", "open", "link"] {
+            assert_eq!(mode_of(&mine.join(entry)), mode_of(&theirs.join(entry)), "{entry}");
+        }
+        assert_eq!(mode_of(&mine), mode_of(&theirs), "and the folder itself");
+        assert_eq!(mode_of(&target), 0o644, "the file the link points at is not touched");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1172,9 +1347,12 @@ mod tests {
             assert!(step.contains(&format!("test -f \"$HOME/{}\"", guidance::skill(harness))), "{step}");
             assert!(step.contains("rm -rf \"$scratch\""), "the folder it ran in is removed: {step}");
             if harness.desktop().is_none() {
-                let back = file.find(&format!("USER {USER}")).expect("back to the user");
+                // Whichever user the image was left as by the step before the skill is the one the
+                // skill is written as; a window's image is root at this point and goes back to its
+                // user at the end, as it did.
                 let at = file.find("graphify install --platform").expect("the skill");
-                assert!(back < at, "written as the image's user, not root: {file}");
+                let last = file[..at].rfind("USER ").expect("the image names a user");
+                assert!(file[last..].starts_with(&format!("USER {USER}")), "written as the image's user: {file}");
             }
             let base = image(&profile(harness, Template::Base)).containerfile;
             assert!(!base.contains("--platform"), "{harness:?}: {base}");
@@ -1473,11 +1651,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_agent_sdks_own_claude_code_is_taken_away_and_the_images_is_asked_for_instead() {
+        // The wheel carries a Claude Code of its own and the SDK runs that one whenever it is
+        // there; only where it is gone does the SDK fall through on `which`, which is the image's
+        // own program. The removal comes after the import that proves the package is there, and
+        // the program on the path is asked for after the removal.
+        let venv = format!("\"$HOME\"/{AGENT_SDK_VENV}");
+        let bundled = format!("{venv}/{AGENT_SDK_BUNDLED_CLAUDE}");
+        for template in [Template::Recommended, Template::High, Template::QuvytaDev] {
+            let step = steps(&image(&profile(HarnessKind::ClaudeCode, template)).containerfile)
+                .into_iter()
+                .find(|step| step.contains("claude plugin install"))
+                .expect("the plugins' step");
+            let imported = step.find(&format!("{venv}/bin/python -c 'import claude_agent_sdk'")).expect(&step);
+            let removed = step.find(&format!("rm -rf {bundled}")).expect(&step);
+            let gone = step.find(&format!("! test -e {bundled}")).expect(&step);
+            let asked = step.find("command -v claude").expect(&step);
+            assert!(imported < removed && removed < gone && gone < asked, "{template:?}: {step}");
+        }
+        for without in [
+            profile(HarnessKind::ClaudeCode, Template::Base),
+            profile(HarnessKind::ClaudeCode, Template::Slim),
+            profile(HarnessKind::OpenCode, Template::High),
+        ] {
+            let file = image(&without).containerfile;
+            assert!(!file.contains("_bundled"), "{:?} {:?}: {file}", without.harness, without.template);
+        }
+    }
+
     /// Runs, in a real shell with `home` as the home directory, the commands of the security-guidance
     /// step that check the environment: the mark it leaves, the plugin's own hook and what is asked
-    /// of what the hook left behind.
+    /// of what the hook left behind. The removal of the wheel's own Claude Code and the two checks
+    /// before them are left out; what they touch is a file of a wheel no pip of this machine ever
+    /// downloads here.
     fn check_the_agent_sdk(home: &std::path::Path) -> std::process::Output {
-        let commands: Vec<String> = security_guidance_in_the_image().into_iter().skip(3).collect();
+        let commands: Vec<String> = security_guidance_in_the_image().into_iter().skip(6).collect();
         std::process::Command::new("sh")
             .arg("-c")
             .arg(commands.join(" && "))
@@ -1680,6 +1889,10 @@ print('{"metrics": {"sdk_bootstrap": 1}}')
                     "{template:?} {harness:?}: {file}"
                 );
                 for step in added {
+                    // graphify's step names no set, so that every profile of the system shares it;
+                    // the wizard reads its words as the failure of the set it builds.
+                    let (failed, name) =
+                        if step.contains("pipx") { (GRAPHIFY_FAILED, "the profile") } else { (failed, name) };
                     assert!(step.starts_with("{ "), "the whole step is one group: {step}");
                     assert!(step.contains(&format!("|| {{ echo '{failed} ")), "{step}");
                     assert!(step.contains(&format!("What {name} adds")), "{step}");
@@ -1696,16 +1909,61 @@ print('{"metrics": {"sdk_bootstrap": 1}}')
     }
 
     #[test]
-    fn a_failing_graphify_step_of_qcode_recommended_says_it_is_its_own_in_a_real_shell() {
-        let file = image(&profile(HarnessKind::Codex, Template::Recommended)).containerfile;
-        let step = steps(&file).into_iter().find(|step| step.contains("pipx install")).expect("step");
-        let script = step.replace("graphify --version", "false");
-        let ran = std::process::Command::new("sh").arg("-c").arg(&script).output().expect("a shell runs the step");
-        let said = String::from_utf8_lossy(&ran.stderr);
-        // The installs themselves fail too on a machine without apt; what counts is the words.
-        assert!(!ran.status.success(), "{script}");
-        assert!(said.contains(&format!("{RECOMMENDED_FAILED} could not install graphify")), "{said}");
-        assert!(said.contains("What QCode recommended adds") && !said.contains(EXTRA_FAILED), "{said}");
+    fn graphify_is_installed_before_the_harness_so_two_profiles_of_one_system_share_its_layer() {
+        // An engine reuses a build step's layer when the step and every step before it read the
+        // same. graphify's step reads the system's own package names and nothing at all of the
+        // harness, so it is the first step after the `FROM` line: two profiles of one system whose
+        // harness differs then carry byte for byte the same lines up to and including it, and its
+        // 238 MB is stored once for the system instead of once for every profile.
+        let through_graphify = |profile: &Profile| -> String {
+            let file = &image(profile).containerfile;
+            let step =
+                steps(file).into_iter().find(|step| step.contains("pipx install")).expect("graphify is installed");
+            let end = file.find(&step).expect("the step is in the file") + step.len();
+            file[..end].to_owned()
+        };
+        // Nor anything of the set: QCode recommended's Claude Code, QCode extra's opencode and
+        // oh my opencode slim share the one layer.
+        let (claude, opencode, slim) = (
+            through_graphify(&profile(HarnessKind::ClaudeCode, Template::Recommended)),
+            through_graphify(&profile(HarnessKind::OpenCode, Template::High)),
+            through_graphify(&profile(HarnessKind::OpenCode, Template::Slim)),
+        );
+        assert_eq!(claude, opencode, "one layer, stored once");
+        assert_eq!(claude, slim, "one layer, stored once");
+        // Nothing of a harness is read before it: the very first thing the image does is graphify.
+        assert!(claude.starts_with(&format!("FROM {BASE_IMAGE}\nUSER root\n")), "{claude}");
+        assert!(!claude.contains("npm install -g"), "{claude}");
+        // A window's image brings its own root for its own packages and still ends as its own user.
+        let window = image(&profile(HarnessKind::AntigravityIde, Template::High)).containerfile;
+        let installed = window.find("pipx install").expect("graphify is installed");
+        let packages = window.find("libgtk-3-0t64").expect("the window's packages");
+        assert!(installed < packages, "graphify comes before the window: {window}");
+        let back = window.find(&format!("USER {USER}\n")).expect("and the image goes back to its user");
+        assert!(installed < back, "{window}");
+        assert!(window.trim_end().ends_with(&format!("USER {USER}")), "{window}");
+        // A set without graphify has no such step, and the harness is installed where it always was.
+        let bare = image(&profile(HarnessKind::ClaudeCode, Template::Base)).containerfile;
+        assert!(!bare.contains("pipx") && !bare.contains("USER root"), "{bare}");
+        assert!(bare.contains("npm install -g @anthropic-ai/claude-code"), "{bare}");
+    }
+
+    #[test]
+    fn a_failing_graphify_step_says_it_is_graphifys_whatever_the_set_in_a_real_shell() {
+        // graphify's step names no set, so that it reads the same in every profile of one system;
+        // the screen reads its words as the failure of the set it is building.
+        for template in [Template::Recommended, Template::High] {
+            let file = image(&profile(HarnessKind::Codex, template)).containerfile;
+            let step = steps(&file).into_iter().find(|step| step.contains("pipx install")).expect("step");
+            let script = step.replace("graphify --version", "false");
+            let ran = std::process::Command::new("sh").arg("-c").arg(&script).output().expect("a shell runs the step");
+            let said = String::from_utf8_lossy(&ran.stderr);
+            // The installs themselves fail too on a machine without apt; what counts is the words.
+            assert!(!ran.status.success(), "{script}");
+            assert!(said.contains(&format!("{GRAPHIFY_FAILED} could not install graphify")), "{said}");
+            assert!(said.contains("needs the network"), "{said}");
+            assert!(!said.contains(RECOMMENDED_FAILED) && !said.contains(EXTRA_FAILED), "{said}");
+        }
     }
 
     #[test]

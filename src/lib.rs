@@ -41,7 +41,7 @@ use qframe::runtime::{Runtime, Update, UpdateCheck};
 use qframe::storage::Family;
 
 use engine::run::capture;
-use engine::{Engine, EngineKind, HostUser, detect};
+use engine::{Engine, EngineKind, HostUser, Unavailable, detect};
 use profile::identity::{RefreshError, Refreshed};
 use profile::{Profile, SafeName};
 use requests::health;
@@ -301,6 +301,10 @@ pub enum Msg {
     SignedOut(Result<(), String>),
     /// A profile's stored login was written into the workspaces that use it, or it was not.
     Refreshed(SafeName, Result<Refreshed, RefreshError>),
+    /// The images QCode's own rebuilds left behind were taken away, and this is how many of them
+    /// there were. Nothing is said about it: nobody asked for it, and a disk that gave its
+    /// gigabytes back is not a thing a person is shown.
+    Cleared(usize),
     /// A newer version of QCode is out.
     NewVersion(Update),
 }
@@ -390,14 +394,24 @@ impl QCode {
     /// [`entry`](Self::entry) turns their answer into the step the wizard opens on, if any.
     #[must_use]
     pub fn start(config: Config, dirs: HostDirs, host: InstallHost) -> Self {
-        let gates = Gates::probe(&config);
-        // The gates only answer whether the engine works; the engine itself is what every screen
-        // that reaches into a container needs, so it is looked up once more when it does work.
+        Self::start_with(config, dirs, host, &detect)
+    }
+
+    /// The same application, with every engine question put to `detect` instead of to the
+    /// machine, so that a test can count what a start asks of the engines.
+    ///
+    /// The gates are asked once and the engine that answered is the engine the application
+    /// keeps: `podman info` takes about 0.4 s before the first frame, so asking it a second time
+    /// for the engine itself would be half the wait from launch to the home screen.
+    #[must_use]
+    pub fn start_with(
+        config: Config,
+        dirs: HostDirs,
+        host: InstallHost,
+        detect: &dyn Fn(EngineKind) -> Result<Engine, Unavailable>,
+    ) -> Self {
+        let (gates, found) = Gates::probe_with(&config, detect);
         let kind = config.engine_kind().and_then(EngineKind::from_name);
-        let found = match (kind, gates.engine == EngineCheck::Working) {
-            (Some(kind), true) => detect(kind).ok(),
-            _ => None,
-        };
         let entry = Self::entry(&config, &gates);
         // The saved engine does not answer and the other one does: the same page a change in the
         // settings opens is offered, and nothing is changed until the person takes it. Only
@@ -624,6 +638,18 @@ impl QCode {
         )
         .in_folders(folders.config.clone(), folders.state.clone());
         Command::check_for_update(check)
+    }
+
+    /// Takes away the images of ours that a rebuild left without a name, once at start and off the
+    /// render path.
+    ///
+    /// This is the moment for it: an image a rebuild replaced is found by the engine and by nothing
+    /// else, and an engine asked at start would hold the first frame while it answers, so it is
+    /// asked on a thread of its own and the person is told nothing. Without an engine there is
+    /// nothing to ask, and a machine still in the wizard has nothing on it to take away yet.
+    fn clear_leftovers(&self) -> Command<Msg> {
+        let Some(engine) = self.found.clone() else { return Command::none() };
+        Command::perform(move || Msg::Cleared(ui::profiles::work::clear_leftovers(&engine)))
     }
 
     /// Turns the family's update notice on or off in its shared file, off the render path.

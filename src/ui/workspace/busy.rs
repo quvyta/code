@@ -7,25 +7,28 @@
 //! marked: the mark says the program is at work, not that the person is. A window has no terminal
 //! to listen to, so its tab works while its state says the window is being brought up.
 //!
-//! A working tab's label starts with a turning mark, one frame of the framework's dots spinner, and
-//! a still dot when motion is reduced. The mark takes its cell only while the tab works: that is how
-//! the framework's own mark on a tab is asked to behave, so the strip keeps its look when the mark
-//! moves there, and every frame is one cell, so a tab never changes its width while it turns.
+//! The mark itself is the framework's: [`Tabs::busy`](qframe::widgets::Tabs::busy) turns a thin
+//! spinner before a tab's name, in the accent colour and on the framework's own clock, in the cell
+//! the resting name slides into, so it takes no room and no tab moves when it comes or goes. What is
+//! left here is the two things the framework cannot know: which tab works, and when to look again to
+//! notice that its program has stopped.
 //!
-//! The strip is looked at again every [`TURN_EVERY`] only while a tab of the open workspace works; a
+//! The strip is looked at again every [`LOOK_EVERY`] only while a tab of the open workspace works; a
 //! screen of quiet tabs times nothing and draws nothing on its own.
 
 use std::time::{Duration, Instant};
 
-use qframe::env::Env;
 use qframe::prelude::*;
 use qframe::runtime::Task;
-use qframe::widgets::SpinnerStyle;
 
-use super::{Msg, OpenWorkspace, Tab, TabKind, TabState, WorkspaceScreen, bridge};
+use super::{Msg, Tab, TabKind, TabState, WorkspaceScreen, bridge};
 
-/// How often the mark turns while a tab works.
-pub(super) const TURN_EVERY: Duration = Duration::from_millis(100);
+/// How often the tabs are looked at again while one of them works.
+///
+/// The framework turns the mark on its own clock, so a look is not what moves it: a look is what
+/// notices that a program has gone quiet, and the mark goes away on the next one. A quarter of a
+/// second late is not seen, and a look costs a pass over the tabs.
+pub(super) const LOOK_EVERY: Duration = Duration::from_millis(250);
 
 /// Whether `tab` is working as of `now`.
 pub(super) fn working(tab: &Tab, now: Instant) -> bool {
@@ -35,7 +38,7 @@ pub(super) fn working(tab: &Tab, now: Instant) -> bool {
     }
 }
 
-/// Times the next turn of the mark while a tab of the open workspace works and none is timed yet.
+/// Times the next look at the tabs while a tab of the open workspace works and none is timed yet.
 pub(super) fn follow(screen: &mut WorkspaceScreen) -> Command<Msg> {
     let looked = screen.looked;
     let any = screen.workspace().is_some_and(|workspace| workspace.tabs.iter().any(|tab| working(tab, looked)));
@@ -44,38 +47,13 @@ pub(super) fn follow(screen: &mut WorkspaceScreen) -> Command<Msg> {
     }
     screen.turning = true;
     Command::task(Task::new(t!("workspace.busy.timing"), |cx| {
-        if cx.sleep(TURN_EVERY) { Ok(Msg::Turn(Instant::now())) } else { Err(String::new()) }
+        if cx.sleep(LOOK_EVERY) { Ok(Msg::Turn(Instant::now())) } else { Err(String::new()) }
     }))
 }
 
-/// Takes a turn of the mark: the tabs are looked at as of `now`, and a working one shows the next
-/// frame.
+/// Looks at the tabs as of `now`: a tab whose program has stopped writing shows no mark, and one
+/// that is still writing is asked for its mark again.
 pub(super) fn turn(screen: &mut WorkspaceScreen, now: Instant) {
     screen.turning = false;
     screen.looked = now;
-    screen.turn = screen.turn.wrapping_add(1);
-}
-
-/// The label of the tab at `index` of `workspace` on the strip: its mark first while it works.
-pub(super) fn label(screen: &WorkspaceScreen, workspace: &OpenWorkspace, index: usize, env: &Env) -> String {
-    let label = workspace.tab_label(index);
-    match workspace.tabs.get(index) {
-        Some(tab) if working(tab, screen.looked) => format!("{} {label}", mark(screen.turn, env)),
-        _ => label,
-    }
-}
-
-/// The mark of a working tab at turn `turn`: a frame of the framework's dots spinner, or a still
-/// dot when motion is reduced.
-fn mark(turn: usize, env: &Env) -> String {
-    let icons = env.icons();
-    if env.reduced_motion() {
-        return icons.glyph("bullet").into_owned();
-    }
-    match icons.animation(SpinnerStyle::Dots.animation()) {
-        Some(frames) if !frames.frames().is_empty() => {
-            frames.glyph(turn % frames.frames().len(), icons.mode()).to_owned()
-        }
-        _ => icons.glyph("bullet").into_owned(),
-    }
 }

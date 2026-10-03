@@ -975,6 +975,64 @@ fn the_lineups_dialog_keeps_its_buttons_and_scrolls_at_eighty_by_twenty_four() {
     let _ = std::fs::remove_dir_all(path.parent().expect("its folder"));
 }
 
+/// An order of six models, every one of them in the listing these tests are given: the three at
+/// the top of it, which the other lineup tests reach for by name, and three more of the vendor
+/// models after them. Six is more than two rows hold, and not so many that a list of them is
+/// longer than the screen.
+const SIX_STEPS: [&str; 6] = [
+    "qwen/qwen3-coder:free",
+    "z-ai/glm-4.6:free",
+    "z-ai/glm-4.6",
+    "vendor/model-04",
+    "vendor/model-05",
+    "vendor/model-06",
+];
+
+/// The editor of that order open on a terminal of `size`, reached the way a person reaches it:
+/// the page, the dialog, the lineup's own Edit button. The file of the provider is left at `path`
+/// for the caller to clear up.
+fn editing_six_steps(path: &std::path::Path, size: (u16, u16)) -> Harness<QCode> {
+    let (web, _) = canned(Vec::new());
+    let mut harness = sized(path, web, size);
+    harness.click_text("Providers").render();
+    lineups(&mut harness);
+    harness.click_text("Edit").render();
+    harness
+}
+
+#[test]
+fn a_tall_terminal_says_a_whole_order_at_once_and_keeps_the_buttons_under_it() {
+    let path = openrouter_with("lineup-tall", &[("coder", &SIX_STEPS)]);
+    let harness = editing_six_steps(&path, (120, 50));
+    let screen = harness.screen();
+    // An order read two steps at a time is not read at all: the person scrolls down to find out
+    // what is in it and has forgotten the top of it by the time they reach the last step.
+    for (at, id) in SIX_STEPS.iter().enumerate() {
+        let row = format!("{}. {id}", at + 1);
+        assert!(screen.contains(&row), "120x50: the whole order is on the screen, `{row}`:\n{screen}");
+    }
+    // The rows the steps take come out of what the models list left over, so the rows under them
+    // are the same as they were on the shortest terminal.
+    for label in ["Save", "Cancel"] {
+        assert!(screen.contains(label), "120x50: `{label}` is on the screen:\n{screen}");
+    }
+    let _ = std::fs::remove_dir_all(path.parent().expect("its folder"));
+}
+
+#[test]
+fn a_short_terminal_still_says_the_first_step_of_an_order_with_the_buttons_over_it() {
+    let path = openrouter_with("lineup-short", &[("coder", &SIX_STEPS)]);
+    let harness = editing_six_steps(&path, (80, 24));
+    let screen = harness.screen();
+    assert!(screen.contains("1. qwen/qwen3-coder:free"), "80x24: the order begins where the hand is:\n{screen}");
+    // The buttons are what must never be pushed off: an order nobody can finish writing is an
+    // order they cannot save, and the two rows of steps are what stands between them and that.
+    for label in ["Save", "Cancel"] {
+        assert!(screen.contains(label), "80x24: `{label}` is on the screen:\n{screen}");
+    }
+    let _ = std::fs::remove_dir_all(path.parent().expect("its folder"));
+}
+
 #[test]
 fn turkish_reads_as_turkish() {
     let path = openrouter("turkish");

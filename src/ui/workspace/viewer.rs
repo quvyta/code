@@ -140,6 +140,9 @@ pub(super) fn show_page(screen: &mut WorkspaceScreen, key: TabKey, page: Option<
         tab.close_session();
         tab.turn(Pages { drawn: false, ..pages });
         tab.settled(TabState::Running);
+        // The keyboard is in the document again, so a tab still waiting for its container is owed
+        // nothing.
+        screen.owed_focus = None;
         return Command::focus(DOCUMENT_ID);
     };
     let Some(engine) = engine else { return Command::none() };

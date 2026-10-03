@@ -12,7 +12,7 @@ use std::path::Path;
 use qframe::diagnostics::Diagnostic;
 
 use crate::engine::run::EngineError;
-use crate::engine::{Container, Engine, EngineCommand, EngineKind};
+use crate::engine::{Container, ContainerState, Engine, EngineCommand, EngineKind};
 use crate::store::{Loaded, OnClose, PREFIX, Registered, Registry};
 
 /// What came of looking at the list of QCode's containers.
@@ -43,22 +43,34 @@ pub struct Stopping {
     pub remaining: Registry,
 }
 
-/// The commands that stop the containers of `registered` that `listing` shows running in
-/// `engine`, one per container, with its name.
+/// The commands that stop the containers of `registered` that `listing` shows as up in `engine`,
+/// one entry per container with its name and what is run for it, in that order.
 ///
 /// Only names with QCode's own prefix are ever considered, whatever the list says: the list is a
 /// file on disk and could hold anything by the time it is read.
+///
+/// A container the engine lists as paused is woken and then stopped. A stop of a paused container is
+/// refused by the engine, so a QCode that crashed with one frozen would leave it up for ever: it
+/// stays in the list, and every run after this one refuses it in the same way.
 #[must_use]
 pub fn stop_commands(
     engine: &Engine,
     registered: &[Registered],
     listing: &[Container],
-) -> Vec<(String, EngineCommand)> {
+) -> Vec<(String, Vec<EngineCommand>)> {
+    let state = |name: &str| listing.iter().find(|container| container.name == name).map(|container| &container.state);
     registered
         .iter()
         .filter(|known| known.engine == engine.kind() && known.name.starts_with(PREFIX))
-        .filter(|known| listing.iter().any(|container| container.name == known.name && container.state.is_running()))
-        .map(|known| (known.name.clone(), engine.stop_container(&known.name)))
+        .filter(|known| state(&known.name).is_some_and(|state| state.is_running() || *state == ContainerState::Paused))
+        .map(|known| {
+            let mut commands = Vec::new();
+            if state(&known.name) == Some(&ContainerState::Paused) {
+                commands.push(engine.unpause_container(&known.name));
+            }
+            commands.push(engine.stop_container(&known.name));
+            (known.name.clone(), commands)
+        })
         .collect()
 }
 
@@ -106,13 +118,22 @@ pub fn stop_orphans(
                 continue;
             }
         };
-        for (name, command) in stop_commands(&engine, &registered, &listing) {
-            match run(&command) {
-                Ok(_) => stopping.stopped.push(name),
-                Err(error) => {
-                    stopping.remaining.add(&name, kind);
-                    stopping.failed.push((name, said(&error)));
+        for (name, commands) in stop_commands(&engine, &registered, &listing) {
+            let mut refused = None;
+            for command in &commands {
+                if let Err(error) = run(command) {
+                    refused = Some(said(&error));
+                    break;
                 }
+            }
+            match refused {
+                // Whatever could not be stopped stays listed for the next time, and a container the
+                // engine would not even wake is one of those: it is still up, and still QCode's.
+                Some(reason) => {
+                    stopping.remaining.add(&name, kind);
+                    stopping.failed.push((name, reason));
+                }
+                None => stopping.stopped.push(name),
             }
         }
     }
@@ -172,7 +193,6 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::engine::ContainerState;
     use crate::engine::run::Failure;
 
     /// A binary that cannot be run: the tests hand their own runner, so it is only a name.
@@ -225,10 +245,65 @@ mod tests {
             "qcode-a-base\trunning\nqcode-a-codex\texited\npostgres\trunning\nqcode-c-base\trunning\n",
         );
         let commands = stop_commands(&podman, &foreign, &listing);
-        let spelled: Vec<(String, Vec<String>)> =
-            commands.iter().map(|(name, command)| (name.clone(), args(command))).collect();
-        assert_eq!(spelled, [("qcode-a-base".to_owned(), vec!["stop".to_owned(), "qcode-a-base".to_owned()])]);
-        assert_eq!(commands[0].1.program, PathBuf::from(NO_ENGINE));
+        let spelled: Vec<(String, Vec<Vec<String>>)> = commands
+            .iter()
+            .map(|(name, commands)| (name.clone(), commands.iter().map(args).collect::<Vec<_>>()))
+            .collect();
+        assert_eq!(spelled, [("qcode-a-base".to_owned(), vec![vec!["stop".to_owned(), "qcode-a-base".to_owned()]])]);
+        assert_eq!(commands[0].1[0].program, PathBuf::from(NO_ENGINE));
+    }
+
+    #[test]
+    fn a_paused_qcode_container_is_woken_and_then_stopped() {
+        // A QCode that crashed with a container frozen leaves it paused, and the engine refuses to
+        // stop a paused container: it would stay up, and stay in the list, for ever.
+        let podman = Engine::new(EngineKind::Podman, NO_ENGINE);
+        let registered =
+            registry(&[("qcode-a-base", EngineKind::Podman), ("qcode-a-codex", EngineKind::Podman)]).value.containers;
+        let mut foreign = registered.clone();
+        foreign.push(Registered { name: "postgres".to_owned(), engine: EngineKind::Podman });
+        let listing = Container::parse_list("qcode-a-base\tpaused\nqcode-a-codex\trunning\npostgres\tpaused\n");
+        let spelled: Vec<(String, Vec<Vec<String>>)> = stop_commands(&podman, &foreign, &listing)
+            .iter()
+            .map(|(name, commands)| (name.clone(), commands.iter().map(args).collect::<Vec<_>>()))
+            .collect();
+        assert_eq!(
+            spelled,
+            [
+                (
+                    "qcode-a-base".to_owned(),
+                    vec![
+                        vec!["unpause".to_owned(), "qcode-a-base".to_owned()],
+                        vec!["stop".to_owned(), "qcode-a-base".to_owned()]
+                    ]
+                ),
+                ("qcode-a-codex".to_owned(), vec![vec!["stop".to_owned(), "qcode-a-codex".to_owned()]]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_paused_container_that_will_not_wake_stays_listed_for_the_next_time() {
+        let list = registry(&[("qcode-a-base", EngineKind::Podman)]);
+        let mut seen = Vec::new();
+        let mut run = |command: &EngineCommand| {
+            let args = args(command);
+            seen.push(args.clone());
+            if args[0] == "ps" {
+                return Ok("qcode-a-base\tpaused\n".to_owned());
+            }
+            Err(EngineError::Failed(Failure {
+                command: command.clone(),
+                code: Some(125),
+                output: "no such container\n".to_owned(),
+            }))
+        };
+        let reaped = stop_orphans(&list, OnClose::Stop, &engine, &mut run);
+        let Reaped::Done(stopping) = reaped else { panic!("stopping was asked for") };
+        assert_eq!(seen, [vec!["ps", "--all", "--format", "{{.Names}}\t{{.State}}"], vec!["unpause", "qcode-a-base"],]);
+        assert!(stopping.stopped.is_empty(), "it is still frozen: {:?}", stopping.stopped);
+        assert_eq!(stopping.failed, [("qcode-a-base".to_owned(), "no such container".to_owned())]);
+        assert_eq!(stopping.remaining.containers.len(), 1, "and it stays listed for the next time");
     }
 
     #[test]
@@ -404,7 +479,7 @@ mod tests {
     fn a_state_the_engine_calls_by_another_word_is_not_running() {
         let podman = Engine::new(EngineKind::Podman, NO_ENGINE);
         let registered = registry(&[("qcode-a-base", EngineKind::Podman)]).value.containers;
-        let listing = [Container { name: "qcode-a-base".to_owned(), state: ContainerState::Paused }];
+        let listing = [Container { name: "qcode-a-base".to_owned(), state: ContainerState::Exited }];
         assert!(stop_commands(&podman, &registered, &listing).is_empty());
     }
 }

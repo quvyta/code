@@ -314,6 +314,10 @@ unguided.title = "Não foi possível atualizar as instruções de {harness} nest
 unguided.graphify = "O graphify não conseguiu se instalar no espaço de trabalho, então talvez o agente não saiba usar o mapa dele: {words}"
 unguided.unwritten = "Não foi possível gravar {file}, então o agente não fica sabendo como chegar às outras abas: {words}"
 unguided.broken = "{file} tem só uma das linhas <!-- qcode:begin --> e <!-- qcode:end -->, então ficou como estava. Apague a que sobrou."
+asked.title = "{harness} pode perguntar neste espaço de trabalho antes de fazer qualquer coisa"
+unapproved.title = "O agente desta janela pode perguntar antes de fazer qualquer coisa"
+asked.theirs = "O arquivo de ajustes dele, {file}, não recebeu as respostas que evitam as perguntas, então ficou como estava: {says}"
+asked.unreadable = "O arquivo de ajustes dele, {file}, não pôde ser lido em {place}, então ficou como estava."
 no-engine = "Nenhum motor de contêineres foi encontrado, então nada pode ser aberto. Conserte-o nos Ajustes."
 none.title = "Nenhum espaço de trabalho está aberto"
 none.message = "Abra um espaço de trabalho e as abas, os arquivos e os contêineres dele aparecem aqui."
@@ -375,6 +379,7 @@ containers.restart = "Reiniciar"
 state.created = "criado"
 state.running = "rodando"
 state.paused = "pausado"
+state.frozen = "congelado"
 state.restarting = "reiniciando"
 state.removing = "sendo removido"
 state.exited = "parado"
@@ -410,7 +415,8 @@ window.no-wayland = "Esta sessão não tem compositor Wayland, e o QCode não ab
 window.no-socket = "O socket do compositor não está mais em {socket}. Um compositor que reiniciou deixa para trás uma janela aberta; abri-la de novo é o caminho de volta."
 window.open = "Abrir a janela"
 window.signin-open-yourself = "A janela pediu para abrir esta página, e ela não pôde ser mostrada aqui:"
-window.raise = "Trazer para a frente"
+window.raise = "Pedir que venha para a frente"
+window.raise-note = "No Wayland uma janela só vem para a frente quando o seu ambiente de trabalho permite; se ela ficar atrás, mude para ela pela lista de janelas ou pela barra de tarefas do seu ambiente."
 window.close = "Fechar a janela"
 window.raise-failed = "Não foi possível pedir que a janela viesse para a frente"
 window.close-failed = "A janela não pôde ser fechada"
@@ -665,6 +671,8 @@ on-close-text = "O que os contêineres do QCode fazem quando nenhum QCode está 
 on-close-windows = "No Windows os contêineres continuam rodando."
 on-close-stop = "Parar"
 on-close-keep = "Deixar rodando"
+freeze-idle = "Congelar perfis ociosos em segundo plano"
+freeze-idle-text = "Um perfil em que nenhuma aba está na tela e que não faz nada há dez minutos é pausado e sua memória vai para a área de troca. Ele acorda assim que você abre uma das abas ou envia uma mensagem para ele. Só com podman sem privilégio e área de troca."
 
 backup = "BACKUP"
 backup-every = "Fazer backup dos espaços de trabalho abertos"
@@ -962,11 +970,11 @@ slim-offline = "Os contêineres deste perfil não têm rede, então o context7 e
 summary-base = "como vem"
 download-graphify = "O graphify é baixado de {system} e do PyPI enquanto a imagem é construída, então a construção precisa de rede mesmo que os contêineres deste perfil não tenham. Sem isso a construção para e avisa; nenhuma imagem é feita com uma peça faltando."
 download = "O que {template} adiciona é baixado de {system}, PyPI, npm e GitHub enquanto a imagem é construída, então a construção precisa de rede mesmo que os contêineres deste perfil não tenham. Sem isso a construção para e avisa; nenhuma imagem é feita com uma peça faltando."
-build-failed = "{template} não conseguiu baixar o que adiciona, então nenhuma imagem foi feita. A construção precisa de rede; o log abaixo diz qual etapa parou."
+build-failed = "{template} não conseguiu baixar o que adiciona, então nenhuma imagem foi feita. A construção precisa de rede; o log abaixo diz qual etapa parou. Basta a rede cair por um instante para a construção parar, então Construir de novo costuma passar."
 adds-none = "Nada é instalado ao lado da ferramenta, então nada mais é baixado."
 dev-chromium = "Um navegador de verdade, para os testes que controlam um."
 dev-download = "O que o desenvolvimento Quvyta adiciona é baixado de {system}, PyPI, npm, GitHub, rustup.rs e astral.sh enquanto a imagem é construída, então a construção precisa de rede mesmo que os contêineres deste perfil não tenham. Sem isso a construção para e avisa; nenhuma imagem é feita com uma peça faltando."
-dev-build-failed = "O desenvolvimento Quvyta não conseguiu baixar o que adiciona, então nenhuma imagem foi feita. A construção precisa de rede; o log abaixo diz qual etapa parou."
+dev-build-failed = "O desenvolvimento Quvyta não conseguiu baixar o que adiciona, então nenhuma imagem foi feita. A construção precisa de rede; o log abaixo diz qual etapa parou. Basta a rede cair por um instante para a construção parar, então Construir de novo costuma passar."
 # The template page as a picker and one switch per part.
 name-custom = "Personalizado"
 claude-plugins = "Plugins do Claude Code"
@@ -1079,8 +1087,15 @@ discard = "Descartá-lo"
 [workspace.busy]
 timing = "Marcando as abas que estão trabalhando"
 
+[workspace.freezing]
+looking = "Vendo o que os perfis estão fazendo"
+
 [workspace.relay]
 listening = "Esperando saber qual modelo respondeu por uma aba"
 fell-back = "{what}: {from} respondeu {status}, agora {to}"
 fell-back-unreachable = "{what}: não foi possível falar com {from}, agora {to}"
 telling = "Retirando a linha embaixo da aba que passou para o próximo modelo"
+
+[build]
+looking = "Vendo se a compilação ainda escreve"
+stuck = "Nada novo da compilação há {minutes} minutos. Ela pode estar travada; você pode interrompê-la."

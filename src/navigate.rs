@@ -194,6 +194,7 @@ impl QCode {
         screen.set_editor(self.config.editor());
         screen.set_sound(self.config.sound());
         screen.set_ask_first(self.config.ask_first());
+        screen.set_freeze_idle(self.config.freeze_idle());
         screen
     }
 

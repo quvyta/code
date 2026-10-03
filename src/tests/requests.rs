@@ -35,6 +35,39 @@ fn the_workspaces_open_as_qcode_quits_are_left_to_be_backed_up() {
 }
 
 #[test]
+fn quitting_wakes_every_container_the_screen_had_frozen() {
+    // A container left paused is one the next QCode finds asleep with every tab in it still holding
+    // what it held, and one the reaper cannot stop, since a stop of a paused container is refused.
+    // The quit is the last moment anything can be done about it: there is no later than this.
+    use crate::engine::{Engine, EngineKind};
+
+    let root = scratch("farewell-frozen");
+    store_of(&root, &["Alpha"]);
+    let folder = scratch("farewell-frozen-engine");
+    std::fs::create_dir_all(&folder).expect("a folder for the stand-in engine");
+    let (binary, calls) = (folder.join("engine"), folder.join("calls"));
+    std::fs::write(&binary, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n", calls.display()))
+        .expect("a stand-in engine");
+    std::fs::set_permissions(&binary, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("runnable");
+    let engine = Engine::new(EngineKind::Podman, &binary);
+    let mut harness = harness(app_with_engine(config(&root, &[]), engine), SIZE.0, SIZE.1);
+    open_from_the_list(&mut harness, "Alpha");
+    // The screen's own look is not what is under test here, so the message it would end with is
+    // sent in its place: a container of this workspace, frozen.
+    let container = "qcode-alpha-claude-sub";
+    harness.send(Msg::Workspace(crate::ui::workspace::Msg::Frozen(container.to_owned(), true)));
+    harness.press("ctrl+q");
+    assert!(harness.quit_requested());
+    let asked = std::fs::read_to_string(&calls).unwrap_or_default();
+    assert!(
+        asked.lines().any(|call| call == format!("unpause {container}")),
+        "the container is woken before QCode goes:\n{asked}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+#[test]
 fn quitting_from_the_menu_leaves_them_too_and_nothing_when_none_is_open() {
     let farewell = crate::Farewell::default();
     let app = app_with_absent_engine(config(&scratch("farewell-none"), &[])).with_farewell(farewell.clone());

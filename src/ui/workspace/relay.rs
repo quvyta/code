@@ -154,6 +154,12 @@ pub(super) enum Link {
         /// message loop, so this is held for nothing but its `Drop`, which closes the socket
         /// when the workspace does.
         _listener: RelayListener,
+        /// What the relay is doing for each of the workspace's tokens, which is the only side of a
+        /// request that knows whether one is on its way to a model: the container's script hands it
+        /// over and gets the answer back, so nothing between the harness and the provider is left
+        /// holding a moment in time. Read by the freeze rules, which ask whether a profile is
+        /// waiting on a model before they judge it idle.
+        activity: crate::provider::Activity,
         /// The tokens the relay's `resolve` closure was given at open, and this screen still
         /// writes into as tabs open and close.
         tokens: Tokens,
@@ -190,7 +196,8 @@ pub(super) fn follow(screen: &mut WorkspaceScreen) -> Command<Msg> {
         };
         match RelayListener::open(&workspace.paths.mcp(), resolve_provider, upstream.clone(), telling) {
             Ok(listener) => {
-                workspace.relay = Link::On { _listener: listener, tokens, lines: Notices::default() };
+                workspace.relay =
+                    Link::On { activity: listener.activity(), _listener: listener, tokens, lines: Notices::default() };
                 commands.push(listening(falls));
             }
             Err(_) => workspace.relay = Link::Failed,

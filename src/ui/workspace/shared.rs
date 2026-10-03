@@ -112,7 +112,7 @@ pub fn tab_program(conversation: Option<&str>) -> Vec<String> {
 
 /// The loop of [`tab_program`]: `$1` the script, `$2` the conversation. The note the keeper leaves
 /// is read by the same rule the script writes it by.
-const TAB_LOOP: &str = "[ -n \"$2\" ] || { echo 'qcode-opencode: no conversation to show' >&2; exit 1; }; \
+pub const TAB_LOOP: &str = "[ -n \"$2\" ] || { echo 'qcode-opencode: no conversation to show' >&2; exit 1; }; \
 node \"$1\" ensure || exit 1; \
 notes=\"${QCODE_OPENCODE_NOTES:-/tmp/qcode-opencode-$QCODE_OPENCODE_PORT}\"; \
 while :; do \

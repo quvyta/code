@@ -34,6 +34,8 @@ pub(super) fn open(screen: &mut WorkspaceScreen, index: usize) -> Command<Msg> {
     let Some(tab) = workspace.tabs.get(index) else { return Command::none() };
     let was = workspace.tab_label(index);
     screen.renaming = Some(Renaming { key: tab.key(), value: was.clone(), was, named: tab.name().is_some() });
+    // The keyboard is in the dialog, so a tab still waiting for its container is owed nothing.
+    screen.owed_focus = None;
     Command::focus(NAME_ID)
 }
 
@@ -58,12 +60,14 @@ pub(super) fn submit(screen: &mut WorkspaceScreen) -> Command<Msg> {
     if let Some((_, tab)) = screen.owner_mut(renaming.key).and_then(|workspace| workspace.find(renaming.key)) {
         tab.rename(name);
     }
+    screen.owed_focus = None;
     Command::focus(super::TABS_ID)
 }
 
 /// Closes the dialog and leaves the tab's name as it was.
 pub(super) fn cancel(screen: &mut WorkspaceScreen) -> Command<Msg> {
     screen.renaming = None;
+    screen.owed_focus = None;
     Command::focus(super::TABS_ID)
 }
 

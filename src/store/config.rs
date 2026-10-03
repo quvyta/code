@@ -144,6 +144,10 @@ impl Config {
     const SOUND: &'static str = "apps.sound";
     /// The key of whether the person is asked before one tab's agent first sends to another.
     const ASK_FIRST: &'static str = "bridge.ask-first";
+    /// The key of whether a profile's container is frozen while nothing of it is on screen and
+    /// nothing of it is going. It stands on its own rather than under a table, because it is the
+    /// one setting that is about the containers rather than about a part of the application.
+    const FREEZE_IDLE: &'static str = "freeze_idle";
 
     /// Every language QCode speaks, in the order the setup wizard offers them.
     ///
@@ -245,6 +249,11 @@ impl Config {
             // and what keeps a tab without the network from sending out is the network rule;
             // neither depends on this. A file written before the key existed reads as not asking.
             .flag(Self::ASK_FIRST, false)
+            // Freezing is the default, and a file written before the key existed reads as
+            // freezing: a profile nobody is looking at holds its whole conversation in memory for
+            // as long as QCode is open, and the page is written out for nothing until it is used.
+            // The switch is there for the machine that cannot do it, where `freeze` says so.
+            .flag(Self::FREEZE_IDLE, true)
     }
 
     /// Every problem found while reading the file, including every repair that was made.
@@ -474,6 +483,25 @@ impl Config {
             return self.settings.set(Self::ASK_FIRST, true);
         }
         self.settings.remove(Self::ASK_FIRST)
+    }
+
+    /// Whether a profile whose container is doing nothing is frozen in the background, and its
+    /// memory written out to swap. On until the person turns it off.
+    #[must_use]
+    pub fn freeze_idle(&self) -> bool {
+        self.settings.get::<bool>(Self::FREEZE_IDLE).unwrap_or(true)
+    }
+
+    /// Records whether a quiet profile's container is frozen in the background. Answers whether
+    /// anything changed.
+    ///
+    /// Freezing is the default and is taken out of the file rather than written down, so the file
+    /// of a person who turned it back on is the file of one who never turned it off.
+    pub fn set_freeze_idle(&mut self, freeze: bool) -> bool {
+        if freeze {
+            return self.settings.remove(Self::FREEZE_IDLE);
+        }
+        self.settings.set(Self::FREEZE_IDLE, false)
     }
 
     fn recent_ids(&self) -> Vec<String> {
@@ -914,6 +942,31 @@ mod tests {
         assert!(config.set_ask_first(false));
         assert!(!config.ask_first());
         assert_eq!(config.to_toml(), "", "not asking is not written down");
+    }
+
+    #[test]
+    fn quiet_profiles_are_frozen_in_the_background_until_the_person_says_otherwise() {
+        // A file written before the key existed, with other settings in it, freezes: nothing in it
+        // needs repairing, and the memory a profile nobody is looking at holds is memory for
+        // nothing until the person asks for one of its tabs.
+        let older = "[apps]\neditor = \"vim\"\n\n[containers]\non-close = \"keep\"\n";
+        let config = Config::parse_str(FILE, older);
+        assert!(config.is_clean(), "{:?}", config.diagnostics());
+        assert!(config.freeze_idle(), "a file that does not name it freezes");
+        assert_eq!(config.to_toml(), Config::parse_str(FILE, older).to_toml(), "and is left as it was");
+
+        let mut config = Config::parse_str(FILE, "");
+        assert!(config.freeze_idle());
+        assert!(config.set_freeze_idle(false));
+        assert_eq!(config.to_toml(), "freeze_idle = false\n");
+        let stored = Config::parse_str(FILE, &config.to_toml());
+        assert!(stored.is_clean(), "{:?}", stored.diagnostics());
+        assert!(!stored.freeze_idle(), "and a file that turned it off reads as off");
+
+        let mut config = stored;
+        assert!(config.set_freeze_idle(true));
+        assert!(config.freeze_idle());
+        assert_eq!(config.to_toml(), "", "freezing is the default and is not written down");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! The window's login taken whole, on a real engine: the sign-in window of a profile image built by
 //! QCode's own builder, a login written into its database the way the application writes one, the
-//! wizard's take-out, and workspaces whose homes are given it, with the agent's approvals the
-//! profile's QCode template brings, before their windows open.
+//! wizard's take-out, and workspaces whose homes are given it, with the agent told what it may do
+//! without asking before any of their windows opens.
 //!
 //! A real Google sign-in cannot be made by a test, so the two rows are written by hand, with the
 //! application running on them; everything around them is the product's own code. The window
@@ -164,9 +164,14 @@ fn approvals(engine: &Engine, volume: &str) -> String {
     in_home(engine, volume, &["node", "-e", login::PROGRAM, "approvals", &database]).unwrap_or_default()
 }
 
-/// What a home on a QCode template is given beside the login: nothing asks before the agent acts,
-/// and the first-start onboarding that would write "Review-driven" over it is done.
-const APPROVED: &str = "terminal=3\nreview=2\njavascript=4\nonboarding=true\n";
+/// The agent of a home on any template is told what it may do without asking before its window
+/// opens, and the first-start onboarding that would write "Review-driven" over it is done.
+///
+/// The home's own rows are what the application reads, so the language server's grants are read
+/// the same way: what it may do without a question, and that there is none left to ask.
+const APPROVED: &str = "terminal=3\nreview=2\njavascript=4\nfiles=1\n\
+                         allow=read_file(*),write_file(*),command(*),unsandboxed(*),mcp(*),read_url(*),execute_url(*)\n\
+                         ask=\nonboarding=true\n";
 
 /// Writes a login, or with no e-mail the "signed out" state, into `volume`'s database.
 fn write_into(engine: &Engine, volume: &str, access: &str, email: &str) {
@@ -232,6 +237,12 @@ fn a_login_taken_from_the_sign_in_window_reaches_every_workspace_whole_and_the_a
     let exec = ["node", "-e", WRITER, &database, "access-417", "owner@example.com"];
     capture(&engine.exec_without_terminal(&Exec { container: &sign_in.window, command: &exec })).expect("signed in");
     assert_eq!(login::seen(&engine, &sign_in), Seen::SignedIn);
+    // The rows were written by hand under a running application, which still holds "signed out"
+    // in memory and writes that over them when it is asked to quit, as the take-out asks it to.
+    // A real sign-in is in its memory and is what it writes; here the window is stopped first and
+    // the rows put back, so what is taken out is the login the application would have written.
+    let _ = capture(&engine.stop_container_within(&sign_in.window, super::WINDOW_GRACE));
+    write_into(&engine, &sign_in.volume, "access-417", "owner@example.com");
     let expected = rows(&engine, &sign_in.volume);
     assert!(
         expected.lines().all(|line| line.split_once('=').is_some_and(|(_, value)| !value.is_empty())),
@@ -255,15 +266,17 @@ fn a_login_taken_from_the_sign_in_window_reaches_every_workspace_whole_and_the_a
     for _ in 0..2 {
         for plan in &plans {
             give_window_login(&engine, plan, user).expect("the home is given the login");
+            // The answers are written where the window is prepared, which happens on every home
+            // and under every template: a workspace signed in to by hand is answered all the same.
+            let prepared = crate::ui::workspace::plan_prepare_window(&engine, plan, user, "tok");
+            assert_eq!(prepared.approvals, Ok(()), "the agent is answered: {prepared:?}");
         }
         assert_eq!(rows(&engine, &home(0)), expected, "a new home gets the rows byte for byte");
         assert_eq!(rows(&engine, &home(2)), expected, "a signed-out home gets them too");
         assert_eq!(rows(&engine, &home(1)), own, "a workspace's own login is never replaced");
-        // The profile is on QCode basic, so the approvals come with the login, and a home that
-        // kept its own login keeps whatever was chosen in it.
         assert_eq!(approvals(&engine, &home(0)), APPROVED, "a new home");
         assert_eq!(approvals(&engine, &home(2)), APPROVED, "a signed-out home");
-        assert_eq!(approvals(&engine, &home(1)), "terminal=\nreview=\njavascript=\nonboarding=\n");
+        assert_eq!(approvals(&engine, &home(1)), APPROVED, "a home signed in to by hand, too");
     }
 
     // The application starts on a home given the login, and the login is still there after it has.
@@ -285,8 +298,22 @@ fn a_login_taken_from_the_sign_in_window_reaches_every_workspace_whole_and_the_a
     println!("after the application ran on it:\n{after}\nsame as given: {}", after == expected);
     assert!(signed_in(&engine, &home(0)), "the application kept the login it was given: {after}");
     // Started offline on them, the application did not put its onboarding's review-driven values
-    // back over the approvals.
-    assert_eq!(approvals(&engine, &home(0)), APPROVED, "after the application ran");
+    // back over the approvals. It reads the grants as its own and writes them back with one of its
+    // own added (measured with 2.5.5: `execute_url(localhost)`, the allowlist entry it gives every
+    // home once), so the allowed list is held to holding every one of ours, whatever it adds.
+    let ran = approvals(&engine, &home(0));
+    for line in APPROVED.lines() {
+        match line.strip_prefix("allow=") {
+            Some(ours) => {
+                let allowed = ran.lines().find_map(|line| line.strip_prefix("allow=")).unwrap_or_default();
+                let allowed: Vec<&str> = allowed.split(',').collect();
+                for grant in ours.split(',') {
+                    assert!(allowed.contains(&grant), "{grant} is still allowed after the application ran:\n{ran}");
+                }
+            }
+            None => assert!(ran.lines().any(|held| held == line), "{line} after the application ran:\n{ran}"),
+        }
+    }
 
     clear(&engine);
     let _ = capture(&engine.remove_image(&profile().image()));

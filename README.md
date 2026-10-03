@@ -125,7 +125,10 @@ machine, qcode is made for that.
 ## What the container protects, and what it does not
 
 The harnesses run in an unattended mode, without asking before each command, because the
-container is what keeps them away from your machine. It helps to know exactly where that wall is.
+container is what keeps them away from your machine. qcode also answers their trust and approval
+questions ahead of time, under every template and in Antigravity IDE too: its terminal commands,
+file edits, browser actions and permission requests go ahead without a question. It helps to know
+exactly where that wall is.
 
 The container keeps the harness away from:
 
@@ -242,7 +245,8 @@ the network sends none of this anywhere.
 - **Disk space and a network connection** for the first images. The base image is Debian with
   Node.js (about 520 MB); each profile adds its harness on top of it. A profile can instead be
   built on Arch Linux (about 810 MB), Ubuntu 24.04 LTS (about 510 MB) or Alpine (about 310 MB,
-  not recommended: Gemini CLI, Qwen Code and Antigravity IDE do not run on it).
+  not recommended: Gemini CLI, Qwen Code and Antigravity IDE do not run on it). A profile image a
+  rebuild replaced is removed once no container is made from it, and nothing else on the engine is.
 - Rust 1.95 or later to install from source.
 
 qcode is developed and tested on Linux. The paths, engine checks and container settings for macOS
@@ -373,7 +377,7 @@ The tab is one line of status with two things you can do to the window:
 | The tab says | What it means |
 |---|---|
 | **Opening the window…** | The container is starting. The first time takes a few seconds longer |
-| **Window open** | The window is on your screen. **Bring to front** asks it to show itself, **Close the window** closes it |
+| **Window open** | The window is on your screen. **Ask it to come forward** asks it to show itself (under Wayland your desktop decides whether it does), **Close the window** closes it |
 | **Window closed** | It is not open. **Open the window** opens it again. Nothing was lost: the settings, the history and the sign-in are in the workspace's home volume |
 | **The window did not open** | Why, in the engine's own words |
 

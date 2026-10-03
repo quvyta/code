@@ -1,10 +1,13 @@
 //! Moving through the application: where it opens, how each screen is reached and left, and
 //! what the repair strip runs. Nothing here needs a container runtime or a settings file.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::time::Duration;
 
-use super::testing::{app, app_with_absent_engine, config, harness, scratch, settled};
-use super::{Gates, Msg, Page, SetupStep, WorkspaceId, WorkspaceScreen};
+use super::testing::{app, app_with_absent_engine, app_with_engine, config, harness, scratch, settled};
+use super::{Gates, Msg, Page, QCode, SetupStep, WorkspaceId, WorkspaceScreen};
+use crate::engine::{Engine, EngineKind, Unavailable};
 use crate::profile::SafeName;
 use crate::store::Config;
 use crate::ui::settings::Request;
@@ -133,6 +136,84 @@ fn a_saved_engine_that_does_not_answer_beside_one_that_does_opens_on_the_same_of
     assert!(harness.screen().contains("Moving from Podman to Docker"), "the rest of the page stays");
 }
 
+/// The engine questions a start asks, counted. The detector a test hands to
+/// [`QCode::start_with`] writes every question down here and answers with an engine of the kind
+/// it was asked for, or refuses the kind it is given, so no test needs an engine installed.
+#[derive(Default)]
+struct Asked {
+    questions: RefCell<HashMap<EngineKind, usize>>,
+}
+
+impl Asked {
+    /// How many questions `kind` has been asked.
+    fn of(&self, kind: EngineKind) -> usize {
+        self.questions.borrow().get(&kind).copied().unwrap_or_default()
+    }
+
+    /// The detector a start is given: an engine of the kind asked for, at `/bin/true`, which
+    /// answers every question with success and says nothing — so no engine work is really done
+    /// and the start reaches the first frame on the questions counted here and no others.
+    fn detector(&self, refused: Option<EngineKind>) -> impl Fn(EngineKind) -> Result<Engine, Unavailable> + '_ {
+        move |kind| {
+            *self.questions.borrow_mut().entry(kind).or_default() += 1;
+            if refused == Some(kind) {
+                return Err(Unavailable::NotInstalled);
+            }
+            Ok(Engine::new(kind, "/bin/true"))
+        }
+    }
+}
+
+/// A start asks its engine one question and keeps the answer, because the question is not cheap:
+/// `podman info` takes about 0.4 s, podman having asked the package manager about netavark,
+/// aardvark-dns, pasta, crun and conmon before it answers, and the first frame waits for it. So
+/// the engine the gates found is the engine the application holds, and asking for it a second
+/// time in `start` doubles the wait before anything is drawn.
+#[test]
+fn a_start_asks_the_engine_it_keeps_only_once() {
+    let store = scratch("ask-once-store");
+    let _ = std::fs::remove_dir_all(&store);
+    std::fs::create_dir_all(&store).expect("a folder for the store");
+    let asked = Asked::default();
+    let app =
+        QCode::start_with(config(&store, &[]), super::testing::dirs(), super::testing::host(), &asked.detector(None));
+    assert_eq!(asked.of(EngineKind::Podman), 1, "the engine the settings name is asked once, not twice");
+    assert_eq!(asked.of(EngineKind::Docker), 0, "a start of its own never asks about the other engine");
+    assert_eq!(app.page(), Page::Home, "every gate holds, so the home screen opens and not the wizard");
+    assert_eq!(
+        app.found,
+        Some(Engine::new(EngineKind::Podman, "/bin/true")),
+        "the engine the gates found is the one kept"
+    );
+    let _ = std::fs::remove_dir_all(&store);
+}
+
+/// The other engine is asked only when the saved one does not answer, and the offer that follows
+/// is the same one a change in the settings opens: one question each, and nothing changed until
+/// the person takes it.
+#[test]
+fn a_start_whose_saved_engine_cannot_be_used_asks_the_other_one_once_and_offers_the_move() {
+    let store = scratch("ask-once-offer-store");
+    let _ = std::fs::remove_dir_all(&store);
+    std::fs::create_dir_all(&store).expect("a folder for the store");
+    let asked = Asked::default();
+    let app = QCode::start_with(
+        config(&store, &[]),
+        super::testing::dirs(),
+        super::testing::host(),
+        &asked.detector(Some(EngineKind::Podman)),
+    );
+    assert_eq!(asked.of(EngineKind::Podman), 1, "the saved engine is asked once, whether it works or not");
+    assert_eq!(asked.of(EngineKind::Docker), 1, "the other engine is asked once, and only for the offer");
+    assert_eq!(app.page(), Page::Switch, "the offer opens the page a change of engine opens");
+    let offered = app.switch.as_ref().expect("the offer is on the screen");
+    assert_eq!(offered.engines(), (EngineKind::Podman, EngineKind::Docker));
+    assert!(offered.offered(), "nothing is switched until the person takes the offer");
+    assert_eq!(app.found, None, "an engine that cannot be used is none to keep");
+    assert_eq!(app.config.engine_kind(), Some("podman"), "the settings still name the engine they named");
+    let _ = std::fs::remove_dir_all(&store);
+}
+
 /// The mark the chosen row of a list of choices carries, read off `screen` as the one
 /// character that stands before `name` and before nothing else in `names`.
 ///
@@ -255,6 +336,58 @@ fn recording_engine(dir: &std::path::Path) -> (crate::engine::Engine, std::path:
         .expect("the stand-in is written");
     std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).expect("it can be run");
     (crate::engine::Engine::new(crate::engine::EngineKind::Podman, binary), calls)
+}
+
+/// A stand-in engine at `dir` that has one image of ours under no name and takes it away, the way
+/// an engine that answered the question and then agreed does. Every call is written into
+/// `dir/calls`.
+#[cfg(unix)]
+fn leftovers_engine(dir: &std::path::Path) -> (crate::engine::Engine, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let (binary, calls) = (dir.join("leftovers"), dir.join("calls"));
+    std::fs::write(
+        &binary,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n[ \"$1 $2\" = 'images --quiet' ] && printf 'sha-untagged\\n'\nexit 0\n",
+            calls.display()
+        ),
+    )
+    .expect("the stand-in is written");
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).expect("it can be run");
+    (crate::engine::Engine::new(crate::engine::EngineKind::Podman, binary), calls)
+}
+
+/// A start that finds an engine is the one moment the images QCode's own rebuilds left behind can
+/// go: nothing on screen is waiting for them, and the person is told nothing about it. Every other
+/// image — one with a name, one a container still runs from — is never asked about.
+#[cfg(unix)]
+#[test]
+fn a_start_takes_away_the_images_of_ours_that_a_rebuild_left_behind() {
+    let root = scratch("start-leftovers");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("a folder");
+    let (engine, calls) = leftovers_engine(&root);
+    let app = super::QCode::new(
+        config(&root, &[]),
+        super::testing::dirs(),
+        super::testing::host(),
+        &settled(),
+        Some(engine),
+        None,
+        None,
+    )
+    .with_providers(Some(super::testing::providers_file()), super::testing::no_web());
+    let mut harness = harness(app, SIZE.0, SIZE.1);
+    harness.render();
+    let asked: Vec<String> = std::fs::read_to_string(&calls).unwrap_or_default().lines().map(str::to_owned).collect();
+    assert_eq!(
+        asked,
+        ["images --quiet --no-trunc --filter dangling=true --filter label=qcode.profile", "image rm sha-untagged",],
+        "one question and one plain removal, and nothing else: {asked:#?}"
+    );
+    let screen = harness.screen();
+    assert!(!screen.is_empty(), "the person is on the home screen, not on a question");
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[cfg(unix)]
@@ -393,6 +526,47 @@ fn the_switch_that_asks_before_messages_between_tabs_reaches_the_open_workspace_
     opened.click_text("Workspaces").advance(MOMENT);
     opened.click_text("Firefly").advance(MOMENT);
     assert_eq!(asks(&opened), (true, true), "{}", opened.screen());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_switch_that_freezes_quiet_profiles_reaches_the_open_workspace_and_the_file() {
+    let root = scratch("freeze-idle");
+    let mut harness = open_workspace(&root);
+    let freezes = |harness: &qframe::runtime::Harness<super::QCode>| {
+        let screen = harness.app().workspace.as_ref().expect("the workspace screen is open");
+        (screen.freezes_idle(), harness.app().config.freeze_idle())
+    };
+    assert_eq!(freezes(&harness), (true, true), "QCode freezes a quiet profile until it is told not to");
+
+    rail_settings(&mut harness);
+    assert_eq!(harness.app().page(), Page::Settings, "{}", harness.screen());
+    harness.resize(SIZE.0, 70).render();
+    // A switch is drawn in colour alone; it stands at the column's right edge, which the
+    // language drop-down's arrow marks.
+    let (_, row) = harness.find("Freeze quiet profiles in the background").expect("the row is on screen");
+    let (edge, _) = harness.find("▾").expect("the language drop-down");
+    harness.click(edge - 1, row).advance(MOMENT);
+    assert_eq!(freezes(&harness), (false, false), "{}", harness.screen());
+
+    harness.click(edge - 1, row).advance(MOMENT);
+    assert_eq!(freezes(&harness), (true, true));
+    let file = harness.app().config.to_toml();
+    assert!(!file.contains("freeze_idle"), "freezing is not written down:\n{file}");
+    let _ = std::fs::remove_dir_all(&root);
+
+    // A settings file that turned it off opens its workspaces not freezing.
+    let root = scratch("freeze-idle-stored");
+    let _ = std::fs::remove_dir_all(&root);
+    crate::store::Store::new(&root)
+        .create_workspace("Firefly", qframe::date::Date::today_utc())
+        .expect("the store takes a workspace");
+    let mut stored = config(&root, &[]);
+    stored.set_freeze_idle(false);
+    let mut opened = super::testing::harness(app(stored, &settled(), None), SIZE.0, SIZE.1);
+    opened.click_text("Workspaces").advance(MOMENT);
+    opened.click_text("Firefly").advance(MOMENT);
+    assert_eq!(freezes(&opened), (false, false), "{}", opened.screen());
     let _ = std::fs::remove_dir_all(&root);
 }
 

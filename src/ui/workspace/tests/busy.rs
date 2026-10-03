@@ -1,20 +1,27 @@
-//! Which tab is working: the strip marks a tab whose program is writing, turns the mark on the
-//! screen's own clock while one is, and lets it go once the tab has been quiet for the bridge's
-//! quiet time.
+//! Which tab the strip shows as working: a tab whose program keeps writing shows the framework's
+//! own spinner before its name and gives up no room for it, a tab whose program has gone quiet
+//! shows nothing, and a tab holding a line the person has not sent shows nothing either.
 //!
 //! The tabs run real programs on real pseudo-terminals, given to them the way a container that came
-//! up gives a tab its session. The moment the marks are looked at is given where the test is about
-//! the quiet time, so it says exactly which side of it it looks from; the mark's own turns are the
-//! screen's timer, run on the harness clock.
+//! up gives a tab its session. What is asserted is what the person reads off the strip row, and
+//! every wait is bounded: a program writes in a loop that ends, and the strip is looked at until it
+//! says what it will.
 
 use std::ffi::OsStr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::*;
 
-use crate::ui::workspace::bridge::QUIET;
-use crate::ui::workspace::busy::TURN_EVERY;
+use crate::ui::workspace::busy::LOOK_EVERY;
 use qframe::widgets::TerminalChange;
+
+/// How long any one wait may last: generous enough for a loaded machine to start a shell, run a
+/// program in it and be quiet again.
+const WAIT: Duration = Duration::from_secs(10);
+
+/// The pause between two looks at the strip: a program's writing is real time, so a step waits for
+/// it.
+const PAUSE: Duration = Duration::from_millis(25);
 
 /// The workspace screen, with one more way in: a running program for a tab, as a container that
 /// came up gives it.
@@ -65,138 +72,149 @@ fn three_tabs(scratch: &Scratch) -> Harness<Busy> {
     harness
 }
 
-/// Starts `script` as the program of the tab at `index`, and waits until it has written.
+/// Starts `script` as the program of the tab at `index` and waits until it has written.
 fn running(harness: &mut Harness<Busy>, scratch: &Scratch, index: usize, script: &str) -> TerminalSession {
     let session = TerminalSession::spawn(OsStr::new("/bin/sh"), &["-c", script], &scratch.0)
         .expect("a pseudo-terminal for the tab");
     let watch = session.watch();
-    while watch.next_change_within(std::time::Duration::from_secs(20)).expect("the program writes within the wait")
-        != TerminalChange::Output
-    {}
+    while watch.next_change_within(WAIT).expect("the program writes within the wait") != TerminalChange::Output {}
     harness.send(Test::Attach(index, session.clone()));
+    // Opening the tab is what a person does with it, and what any message of the screen ends with:
+    // the tabs are looked at again while one of them works, and that timer brings every look after
+    // this one.
+    harness.send(Test::Screen(Msg::OpenTab(index)));
     session
 }
 
-/// A program that writes once and then only reads.
+/// A program that writes once and then only reads, as a harness whose work is done.
 const ONCE: &str = "stty -echo; printf 'ready'; exec cat > /dev/null";
-/// A program that keeps writing, as a harness does while it works.
-const WRITING: &str = "stty -echo; while :; do printf .; sleep 0.1; done";
+/// A program that writes for a while and then only reads: the loop is bounded, so a tab that has to
+/// go quiet can have one.
+const WORKING: &str =
+    "stty -echo; i=0; while [ $i -lt 25 ]; do printf .; sleep 0.1; i=$((i + 1)); done; exec cat > /dev/null";
+/// A program that keeps writing for longer than any test of it waits, still in a bounded loop.
+const WRITING: &str =
+    "stty -echo; i=0; while [ $i -lt 600 ]; do printf .; sleep 0.1; i=$((i + 1)); done; exec cat > /dev/null";
 
-/// Looks at the marks as of `now`, the moment the screen's own timer would reach.
-fn look_at(harness: &mut Harness<Busy>, now: Instant) {
-    harness.send(Test::Screen(Msg::Turn(now))).render();
+/// Has the screen look at its tabs as of now: the message its own timer sends while a tab works,
+/// and the moment the mark on the strip is decided at.
+fn look(harness: &mut Harness<Busy>) {
+    harness.send(Test::Screen(Msg::Turn(Instant::now()))).render();
 }
 
-/// The first line of the screen, where the strip is.
+/// Looks at the strip until `what` holds of it, for as long as that takes and no longer: each step is
+/// the screen's own clock coming round, which is what brings the next look, with the program's
+/// writing going on in between.
+fn until(harness: &mut Harness<Busy>, what: impl Fn(&Harness<Busy>) -> bool) {
+    let since = Instant::now();
+    while !what(harness) {
+        assert!(since.elapsed() < WAIT, "the strip never settled on it:\n{}", strip(harness));
+        std::thread::sleep(PAUSE);
+        harness.advance(LOOK_EVERY).render();
+    }
+}
+
+/// The strip row, where the tabs are.
 fn strip(harness: &Harness<Busy>) -> String {
     harness.screen().lines().next().unwrap_or_default().to_owned()
 }
 
-/// The mark in front of the tab labelled `label` on the strip, if it has one: a spinner's dots or
-/// the still dot in the cell just before the space before its label.
+/// The column the tab labelled `label` starts at on the strip row.
+fn at(harness: &Harness<Busy>, label: &str) -> usize {
+    let line: Vec<char> = strip(harness).chars().collect();
+    let letters: Vec<char> = label.chars().collect();
+    line.windows(letters.len())
+        .position(|cells| cells == letters.as_slice())
+        .unwrap_or_else(|| panic!("{label} is on the strip:\n{}", strip(harness)))
+}
+
+/// The mark in front of the tab labelled `label`, if it shows one. The framework's mark stands in
+/// the tab's own padding with a space between it and the name, so it is two cells back from where
+/// the name begins; the spinner turns in braille, and with reduced motion one dot stands still
+/// where it turns.
 fn mark(harness: &Harness<Busy>, label: &str) -> Option<char> {
     let line: Vec<char> = strip(harness).chars().collect();
-    let label: Vec<char> = label.chars().collect();
-    let at = line.windows(label.len()).position(|cells| cells == label.as_slice())?;
-    let before = at.checked_sub(2)?;
-    (line[at - 1] == ' ').then_some(line[before]).filter(|&cell| is_dots(cell) || cell == '•')
+    let name = at(harness, label);
+    let cell = *line.get(name.checked_sub(2)?)?;
+    (line[name - 1] == ' ').then_some(cell).filter(|&cell| is_dots(cell) || cell == '●')
 }
 
-/// The column of the close mark of the tab labelled `label`.
-fn close_at(harness: &Harness<Busy>, label: &str) -> usize {
-    let line: Vec<char> = strip(harness).chars().collect();
-    let label: Vec<char> = label.chars().collect();
-    let at = line.windows(label.len()).position(|cells| cells == label.as_slice()).expect("the tab is on the strip");
-    (at + label.len()..line.len()).find(|&x| line[x] == '×').expect("the tab has a close mark")
-}
-
-/// Whether `cell` is one of the braille dots the framework's dots spinner turns through.
+/// Whether `cell` is one of the braille dots the framework's spinner turns through.
 fn is_dots(cell: char) -> bool {
     ('\u{2800}'..='\u{28ff}').contains(&cell)
 }
 
+/// Whether the tab labelled `label` shows the framework's spinner.
+fn spinning(harness: &Harness<Busy>, label: &str) -> bool {
+    mark(harness, label).is_some_and(is_dots)
+}
+
 #[test]
-fn a_tab_whose_program_writes_is_marked_until_it_has_been_quiet_for_the_quiet_time() {
+fn a_tab_whose_program_writes_shows_the_spinner_before_its_name_and_keeps_its_room() {
+    let scratch = Scratch::new("busy-writing");
+    let mut harness = three_tabs(&scratch);
+    running(&mut harness, &scratch, 0, WORKING);
+
+    until(&mut harness, |harness| spinning(harness, "claude-sub"));
+    assert!(spinning(&harness, "claude-sub"), "the writing tab is marked: {}", strip(&harness));
+    assert_eq!(mark(&harness, "codex-main"), None, "a tab with no program is not: {}", strip(&harness));
+    // The mark takes no room of its own, so where the tab next along begins is read with the mark
+    // showing, and read again once it is gone.
+    let room = at(&harness, "Shell");
+
+    // The program stops writing for good, so the mark goes away on the look that notices it.
+    until(&mut harness, |harness| !spinning(harness, "claude-sub"));
+    assert!(strip(&harness).contains("claude-sub"), "the tab itself stays: {}", strip(&harness));
+    assert_eq!(at(&harness, "Shell"), room, "the mark took no room: {}", strip(&harness));
+}
+
+#[test]
+fn a_tab_is_marked_while_its_program_writes_and_not_once_it_has_been_quiet() {
     let scratch = Scratch::new("busy-quiet");
     let mut harness = three_tabs(&scratch);
-    let session = running(&mut harness, &scratch, 0, ONCE);
+    running(&mut harness, &scratch, 0, ONCE);
 
-    look_at(&mut harness, session.last_output() + QUIET / 2);
-    let shown = mark(&harness, "claude-sub");
-    assert!(shown.is_some_and(is_dots), "the writing tab is marked: {}", strip(&harness));
-    assert_eq!(mark(&harness, "codex-main"), None, "a tab with no program is not: {}", strip(&harness));
+    until(&mut harness, |harness| spinning(harness, "claude-sub"));
+    assert!(spinning(&harness, "claude-sub"), "a program that has written is working: {}", strip(&harness));
 
-    look_at(&mut harness, session.last_output() + QUIET);
-    assert_eq!(mark(&harness, "claude-sub"), None, "a quiet tab shows nothing: {}", strip(&harness));
-    assert!(strip(&harness).contains("claude-sub"), "{}", strip(&harness));
+    // Nothing is written after that, so the mark goes once the bridge's quiet time is over.
+    until(&mut harness, |harness| !spinning(harness, "claude-sub"));
+    assert!(strip(&harness).contains("claude-sub"), "the tab is still on the strip: {}", strip(&harness));
 }
 
 #[test]
-fn the_open_tab_and_a_tab_behind_it_are_both_marked_and_the_mark_turns_in_its_own_cell() {
-    let scratch = Scratch::new("busy-both");
+fn the_tabs_are_looked_at_again_while_one_of_them_works_and_not_once_none_does() {
+    let scratch = Scratch::new("busy-looked");
     let mut harness = three_tabs(&scratch);
-    running(&mut harness, &scratch, 0, WRITING);
-    running(&mut harness, &scratch, 2, WRITING);
-    // The first look starts the screen's timer; from there on the turns are its own.
-    look_at(&mut harness, Instant::now());
+    running(&mut harness, &scratch, 0, WORKING);
+    until(&mut harness, |harness| spinning(harness, "claude-sub"));
 
-    let first = (mark(&harness, "claude-sub"), mark(&harness, "codex-main"));
-    assert!(first.0.is_some_and(is_dots), "the open tab is marked: {}", strip(&harness));
-    assert!(first.1.is_some_and(is_dots), "so is the one behind it: {}", strip(&harness));
-    let close = (close_at(&harness, "claude-sub"), close_at(&harness, "codex-main"));
+    // A look is the only thing that moves the moment the tabs were looked at, so it is the screen's
+    // own clock that brings the next one.
+    let looked = harness.app().0.looked;
+    harness.advance(LOOK_EVERY).render();
+    assert!(harness.app().0.looked > looked, "the screen looked again while the tab worked");
 
-    harness.advance(TURN_EVERY);
-    let second = (mark(&harness, "claude-sub"), mark(&harness, "codex-main"));
-    assert!(second.0.is_some_and(is_dots) && second.1.is_some_and(is_dots), "{}", strip(&harness));
-    assert_ne!(first.0, second.0, "the mark turned on the screen's clock: {}", strip(&harness));
-    assert_eq!(
-        (close_at(&harness, "claude-sub"), close_at(&harness, "codex-main")),
-        close,
-        "no tab changed its width while its mark turned: {}",
-        strip(&harness)
-    );
+    until(&mut harness, |harness| !spinning(harness, "claude-sub"));
+    let looked = harness.app().0.looked;
+    harness.advance(LOOK_EVERY * 10).render();
+    assert_eq!(harness.app().0.looked, looked, "and nothing is timed once every tab is quiet");
 }
 
 #[test]
-fn nothing_is_timed_while_every_tab_is_quiet() {
-    let scratch = Scratch::new("busy-still");
-    let mut harness = three_tabs(&scratch);
-    let session = running(&mut harness, &scratch, 0, ONCE);
-    look_at(&mut harness, session.last_output() + QUIET);
-    assert_eq!(mark(&harness, "claude-sub"), None, "{}", strip(&harness));
-
-    let turned = harness.app().0.turn;
-    harness.advance(TURN_EVERY * 10);
-    assert!(!harness.app().0.turning, "no turn is timed");
-    assert_eq!(harness.app().0.turn, turned, "and none was taken");
-}
-
-#[test]
-fn with_motion_reduced_the_mark_is_a_still_dot() {
-    let scratch = Scratch::new("busy-reduced");
-    let mut harness = three_tabs(&scratch);
-    harness.set_reduced_motion(true);
-    running(&mut harness, &scratch, 0, WRITING);
-    look_at(&mut harness, Instant::now());
-    assert_eq!(mark(&harness, "claude-sub"), Some('•'), "{}", strip(&harness));
-    harness.advance(TURN_EVERY * 3);
-    assert_eq!(mark(&harness, "claude-sub"), Some('•'), "it does not move: {}", strip(&harness));
-}
-
-#[test]
-fn a_tab_is_not_marked_while_the_person_has_a_line_typed_into_it_and_is_once_it_is_sent() {
+fn a_tab_holding_a_line_the_person_has_not_sent_is_not_marked_and_is_once_it_is_sent() {
     let scratch = Scratch::new("busy-typing");
     let mut harness = three_tabs(&scratch);
-    // A program that keeps writing, so the only thing that changes below is the person's line;
-    // what it writes while they type stands for the echo of their keys.
+    // A program that keeps writing, so the only thing that changes below is the person's line; what
+    // it writes while they type stands for the echo of their own keys.
     let session = running(&mut harness, &scratch, 0, WRITING);
     // `write` is the path every key the tab's terminal sends takes; which tab the keyboard is in is
     // the focus tests' concern.
     session.write(b"hello").expect("the keys reach the program");
-    look_at(&mut harness, Instant::now());
+    look(&mut harness);
     assert_eq!(mark(&harness, "claude-sub"), None, "typing is not the program working: {}", strip(&harness));
 
     session.write(b"\r").expect("the line is sent");
-    look_at(&mut harness, Instant::now());
-    assert!(mark(&harness, "claude-sub").is_some_and(is_dots), "once sent, it is: {}", strip(&harness));
+    // The mark comes on the next look, as it does for any program that starts writing.
+    until(&mut harness, |harness| spinning(harness, "claude-sub"));
 }

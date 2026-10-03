@@ -822,6 +822,8 @@ pub(super) fn read(
     let Some(listing) = listing(screen, reading) else { return Command::none() };
     listing.entries = Some(found);
     listing.row = 0;
+    // The keyboard is in the list, so a tab still waiting for its container is owed nothing.
+    screen.owed_focus = None;
     Command::focus(LIST_ID)
 }
 
